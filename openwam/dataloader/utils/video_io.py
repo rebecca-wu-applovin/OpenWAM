@@ -1,6 +1,6 @@
 """Shared PyAV video-frame decoding helper.
 
-Hosts ``decode_video_frames`` — the seek-to-keyframe PyAV decode path used by
+Hosts ``decode_video_frames`` — the per-target seek-to-keyframe PyAV decode path used by
 every LeRobot v3 reader (the ``LeRobotV3Reader`` family). Kept as a leaf utility
 module so the shared base reader and the concrete readers depend on it instead
 of reaching into a sibling reader.
@@ -12,6 +12,7 @@ reader can import it without triggering heavy module side-effects or import cycl
 from __future__ import annotations
 
 import logging
+import os
 from typing import Dict, List, Optional
 
 from PIL import Image
@@ -54,13 +55,92 @@ def _warn_seek_fallback(video_path: str, min_idx: int, max_idx: int, reason: str
         )
 
 
+# Decoder threads per open file. The codec default (0 = auto) starts a thread pool sized for every core on each
+# open, which on a 208-core machine costs ~0.3-0.5 s per call and oversubscribes the CPU when many DataLoader
+# workers decode at once; the workers already decode in parallel, so one thread each is fastest
+# (Sharpa 640x480 AV1, 5-frame window: ~60-130 ms with 1 thread vs ~350-520 ms with auto).
+DECODER_THREADS = int(os.environ.get("OPENWAM_VIDEO_DECODE_THREADS", "1"))
+
+
+def set_decoder_threads(stream) -> None:
+    if DECODER_THREADS > 0:
+        stream.codec_context.thread_count = DECODER_THREADS
+
+
+# Keyframe spacing per file, probed once per process (files are immutable while training).
+_keyframe_interval_cache: Dict[str, int] = {}
+
+
+def _keyframe_interval(container, stream, video_path: str, pts_per_frame: float) -> int:
+    """Largest gap (in frames) between the first few keyframes; a very large value if fewer than 2 are found.
+
+    Only reads packet headers (no decoding). Leaves the demuxer at the start of the file; callers seek next.
+    """
+    gap = _keyframe_interval_cache.get(video_path)
+    if gap is None:
+        keys: List[int] = []
+        for i, packet in enumerate(container.demux(stream)):
+            if packet.pts is not None and packet.is_keyframe:
+                keys.append(int(round(packet.pts / pts_per_frame)))
+            if len(keys) >= 4 or i >= 512:
+                break
+        gap = max(b - a for a, b in zip(keys, keys[1:])) if len(keys) >= 2 else 1 << 30
+        _keyframe_interval_cache[video_path] = gap
+    return gap
+
+
+def decode_frames_at(container, stream, video_path: str, frame_indices: List[int], convert) -> Optional[Dict[int, object]]:
+    """Decode only what the requested frames need: {index: convert(frame)}, or None if a target was missed.
+
+    A frame between keyframes can only be decoded from the keyframe before it, so for each target (in order) this
+    either keeps decoding forward from the last decoded frame, when the target is at most one keyframe interval
+    ahead, or seeks to the keyframe before the target. With short keyframe intervals this skips the frames between
+    targets (the Sharpa videos have a keyframe every 2 frames, so a 5-frame window spread over 33 frames decodes about
+    5-10 frames instead of 33); with long intervals it decodes forward, as a single seek would.
+    Returns None (caller falls back to decoding from frame 0) when the stream has no usable pts metadata or a target
+    is not found where its pts says it should be.
+    """
+    set_decoder_threads(stream)
+    if not (stream.frames and stream.duration and stream.frames > 0):
+        return None
+    pts_per_frame = stream.duration / stream.frames
+    gap = _keyframe_interval(container, stream, video_path, pts_per_frame)
+    step = gap if gap < 1 << 30 else 2
+    want = set(frame_indices)
+    got: Dict[int, object] = {}
+    frames = None  # decode generator positioned after frame `pos`
+    pos = -1
+    for t in sorted(want):
+        if t in got:
+            continue
+        # Some streams (the HEVC depth videos) start output one frame after the keyframe a seek lands on, so when
+        # the target is not reached, seek again 1, 2, 3 keyframe intervals earlier.
+        for back in range(4):
+            if back or frames is None or t <= pos or t - pos > gap:
+                container.seek(int(max(0, t - back * step) * pts_per_frame), stream=stream, backward=True, any_frame=False)
+                frames = container.decode(stream)
+            for frame in frames:
+                if frame.pts is None:
+                    continue
+                pos = int(round(frame.pts / pts_per_frame))
+                if pos in want and pos not in got:
+                    got[pos] = convert(frame)
+                if pos >= t:
+                    break
+            else:
+                frames = None  # end of stream
+            if t in got:
+                break
+        else:
+            return None
+    return got
+
+
 def decode_video_frames(video_path: str, frame_indices: List[int], height: int, width: int) -> List[Image.Image]:
-    """Decode requested frames via PyAV with seek-to-keyframe optimization.
+    """Decode requested frames via PyAV, seeking to the keyframe before each target (see ``decode_frames_at``).
 
     Repacked file-NNN.mp4 can hold many episodes, so decoding sequentially from
-    frame zero can dominate worker time. Seek to the keyframe immediately
-    before ``min(frame_indices)`` and decode forward, bounding the usual work to
-    roughly one GOP rather than the full prefix.
+    frame zero can dominate worker time.
 
     Falls back to seek(0) + sequential when PTS rounding misses a target.
 
@@ -77,55 +157,17 @@ def decode_video_frames(video_path: str, frame_indices: List[int], height: int, 
     container = av.open(video_path, options={"hwaccel": "none"})
     try:
         stream = container.streams.video[0]
-
-        pts_per_frame = None
-        if stream.frames and stream.duration and stream.frames > 0:
-            pts_per_frame = stream.duration / stream.frames
-
-        seeked = False
-        seek_err: Optional[BaseException] = None
-        if pts_per_frame and min_idx > 0:
-            try:
-                container.seek(
-                    max(0, int((min_idx - 2) * pts_per_frame)),
-                    stream=stream,
-                    backward=True,
-                    any_frame=False,
-                )
-                seeked = True
-            except av.AVError as e:
-                seek_err = e
-
-        idx_map: Dict[int, Image.Image] = {}
-        if seeked and pts_per_frame:
-            for frame in container.decode(stream):
-                if frame.pts is None:
-                    continue
-                abs_idx = int(round(frame.pts / pts_per_frame))
-                if abs_idx in target:
-                    idx_map[abs_idx] = frame.to_image()
-                if abs_idx >= max_idx:
-                    break
-            # PTS rounding can drift ±1; if any target missed, fall back to
-            # seek(0) + sequential. Rare (<1% legacy observation).
-            if not all(i in idx_map for i in target):
-                _warn_seek_fallback(
-                    video_path,
-                    min_idx,
-                    max_idx,
-                    reason=f"missed_targets (got {sorted(idx_map.keys())} of {sorted(target)})",
-                )
-                idx_map.clear()
-                container.seek(0, stream=stream, backward=True, any_frame=False)
-                seeked = False
-        elif seek_err is not None:
-            _warn_seek_fallback(
-                video_path,
-                min_idx,
-                max_idx,
-                reason=f"seek_raised: {type(seek_err).__name__}: {seek_err}",
-            )
-        if not seeked:
+        idx_map: Optional[Dict[int, Image.Image]] = None
+        try:
+            idx_map = decode_frames_at(container, stream, video_path, frame_indices, lambda f: f.to_image())
+            reason = "missed_targets"
+        except av.AVError as e:
+            reason = f"seek_raised: {type(e).__name__}: {e}"
+        if idx_map is None:
+            # PTS rounding can drift ±1 or metadata is missing; decode sequentially from frame 0.
+            _warn_seek_fallback(video_path, min_idx, max_idx, reason=reason)
+            idx_map = {}
+            container.seek(0, stream=stream, backward=True, any_frame=False)
             for i, frame in enumerate(container.decode(stream)):
                 if i in target:
                     idx_map[i] = frame.to_image()
@@ -139,4 +181,4 @@ def decode_video_frames(video_path: str, frame_indices: List[int], height: int, 
     return [idx_map[i].resize((width, height), Image.LANCZOS) for i in frame_indices]
 
 
-__all__ = ["decode_video_frames"]
+__all__ = ["decode_frames_at", "decode_video_frames", "set_decoder_threads"]
