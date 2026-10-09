@@ -6,6 +6,10 @@ Signals (generic, every free-floating or articulated scene object; thresholds pr
   grasp  : hand-object contact sustained >= 0.5 s while the object is lifted >= 2 cm or carried >= 3 cm
   move   : object displaced >= 5 cm from its initial position, or an object hinge/slide joint moved >= 20 deg / 3 cm
   fallen : object below the table top by > 10 cm
+Everything is computed on the first limits.limit(scene) steps (min(1.5 x p90, 20 s)), so rollouts recorded with a
+longer limit score exactly like capped ones (override with --max-steps).
+Judge frames (--judge-frames K, or --frames-only): K evenly spaced full-resolution frames per camera, saved as
+judge_frames/t<sec>_<view>.jpg for score.py.
 For close_laptop / box_lid scenes the benchmarks/sharpa/verifiers.py rule check also runs (success_any: passed at
 any time; success_final: passed at the end), same as RoboTwin's "done on first success" semantics.
 """
@@ -21,7 +25,8 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[1]))
-from env import SharpaWebXREnv  # noqa: E402
+from env import IMAGE_HW, SharpaWebXREnv  # noqa: E402
+from limits import limit  # noqa: E402
 
 import mujoco  # noqa: E402
 
@@ -126,10 +131,35 @@ def snapshot(m, d, t, pairs):
     return Snapshot(t, pos, quat, joints, pairs)
 
 
-def analyze(rollout_dir: Path, env: SharpaWebXREnv, video: bool = True, keyframes: int = 16) -> dict:
+VIEWS = ("ego_view", "chest_view")
+
+
+def load_qpos(rollout_dir: Path, max_steps: int | None = None):
     meta = json.loads((rollout_dir / "rollout.json").read_text())
-    tr = np.load(rollout_dir / "trajectory.npz")
-    qpos = tr["qpos"]
+    n = max_steps if max_steps is not None else limit(meta["scene_id"])
+    return meta, np.load(rollout_dir / "trajectory.npz")["qpos"][: n + 1]  # row 0 = reset state
+
+
+def judge_frames(rollout_dir: Path, env: SharpaWebXREnv, k: int = 24, max_steps: int | None = None) -> int:
+    """K evenly spaced frames per camera at the native 480x640 -> judge_frames/t<sec>_<view>.jpg."""
+    import imageio.v2 as imageio
+
+    _, qpos = load_qpos(rollout_dir, max_steps)
+    out = rollout_dir / "judge_frames"
+    out.mkdir(exist_ok=True)
+    for old in out.glob("*.jpg"):
+        old.unlink()
+    for t in sorted(set(np.linspace(0, len(qpos) - 1, k).round().astype(int).tolist())):
+        env.sim.data.qpos[:] = qpos[t]
+        mujoco.mj_forward(env.sim.model, env.sim.data)
+        for v in VIEWS:
+            imageio.imwrite(out / f"t{t * DT:07.2f}_{v}.jpg", env.render(v, IMAGE_HW), quality=90)
+    return len(qpos) - 1
+
+
+def analyze(rollout_dir: Path, env: SharpaWebXREnv, video: bool = True, keyframes: int = 16,
+            max_steps: int | None = None) -> dict:
+    meta, qpos = load_qpos(rollout_dir, max_steps)
     an = Analyzer(env)
     from benchmarks.sharpa.verifiers import SCENES, Verifier
 
@@ -181,7 +211,8 @@ def analyze(rollout_dir: Path, env: SharpaWebXREnv, video: bool = True, keyframe
     any_ = lambda k: any(v[k] for v in sig.values())  # noqa: E731
     out = {"scene_id": meta["scene_id"], "seed": meta["seed"], "objects": sig,
            "stage": {"reach": any_("reach"), "grasp": any_("grasp"), "move": any_("move")},
-           "fallen_any": any_("fallen"), "ik_converged_frac": meta.get("ik_converged_frac")}
+           "fallen_any": any_("fallen"), "ik_converged_frac": meta.get("ik_converged_frac"),
+           "analyzed_steps": len(qpos) - 1, "recorded_steps": meta["steps"]}
     if ver is not None:
         fin = ver.finalize()
         out["verifier"] = {"task": vtask, "success_any": bool(ver_any), "success_final": bool(fin["success"]),
@@ -192,6 +223,8 @@ def analyze(rollout_dir: Path, env: SharpaWebXREnv, video: bool = True, keyframe
 
         kd = rollout_dir / "keyframes"
         kd.mkdir(exist_ok=True)
+        for old in kd.glob("*.jpg"):
+            old.unlink()
         for t, img in keys.items():
             imageio.imwrite(kd / f"t{t * DT:07.2f}.jpg", img, quality=88)
     if video:
@@ -207,17 +240,28 @@ def main():
     p.add_argument("--no-video", action="store_true")
     p.add_argument("--keyframes", type=int, default=16, help="evenly spaced JPEG frames for the judge (0 = off)")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--max-steps", type=int, default=None, help="analyze the first N steps (default: limits.limit)")
+    p.add_argument("--judge-frames", type=int, default=0, help="also write K full-res frames per camera for score.py")
+    p.add_argument("--frames-only", action="store_true", help="only (re)write judge frames (implies --judge-frames 24)")
     a = p.parse_args()
+    if a.frames_only and not a.judge_frames:
+        a.judge_frames = 24
     env_cache = {}
     for d in a.dirs:
-        if (d / "signals.json").exists() and not a.force:
+        need_frames = a.judge_frames and (a.force or not any((d / "judge_frames").glob("*.jpg")))
+        need_signals = not a.frames_only and (a.force or not (d / "signals.json").exists())
+        if not (need_frames or need_signals):
             continue
         scene = json.loads((d / "rollout.json").read_text())["scene_id"]
         if scene not in env_cache:
             env_cache.clear()
             env_cache[scene] = SharpaWebXREnv(SCENES_ROOT / scene)
-        r = analyze(d, env_cache[scene], video=not a.no_video, keyframes=a.keyframes)
-        print(d, r["stage"], r.get("verifier", {}).get("success_any"), flush=True)
+        if need_signals:
+            r = analyze(d, env_cache[scene], video=not a.no_video, keyframes=a.keyframes, max_steps=a.max_steps)
+            print(d, r["stage"], r.get("verifier", {}).get("success_any"), f"steps {r['analyzed_steps']}", flush=True)
+        if need_frames:
+            n = judge_frames(d, env_cache[scene], a.judge_frames, a.max_steps)
+            print(d, f"judge frames over {n} steps", flush=True)
 
 
 if __name__ == "__main__":

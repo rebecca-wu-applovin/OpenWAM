@@ -1,7 +1,7 @@
 """Generic closed-loop rollout: a policy adapter (policies/) drives the env; runs in .venv_webxr.
 
 Loop: obs = env.reset(seed); repeat { actions = policy.act(obs); step each action, observing only after the last }
-until max_steps. Everything model-specific (inputs, chunking, replanning, decoding) lives in the adapter; the env
+until the scene's step limit (limits.py: min(1.5 x p90 demo length, 20 s)). Everything model-specific (inputs, chunking, replanning, decoding) lives in the adapter; the env
 only takes actions and returns the observations the adapter declared. Saves the full qpos trajectory, so videos
 and stage signals are computed offline (postprocess.py, render_video.py).
 
@@ -24,10 +24,10 @@ REPO = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import policies  # noqa: E402
 from env import SharpaWebXREnv  # noqa: E402
+from limits import limit  # noqa: E402
 
 TASKS = json.loads((HERE / "tasks.json").read_text())
 SCENES_ROOT = REPO / "data/webxr_scenes"
-MAX_STEPS_CAP = 1200  # 60 s; only the coin-toss scene's 1.5 x p90 (5718) exceeds it
 
 
 def seed_for(scene_id: str, seed: int) -> int:
@@ -43,7 +43,7 @@ def make_env(policy: policies.Policy, scene_id: str) -> SharpaWebXREnv:
 def run_episode(env: SharpaWebXREnv, policy: policies.Policy, scene_id: str, seed: int, out_dir: Path,
                 max_steps: int | None = None) -> dict:
     task = TASKS[scene_id]["task"]
-    max_steps = max_steps or min(TASKS[scene_id]["max_steps"], MAX_STEPS_CAP)
+    max_steps = max_steps or limit(scene_id)  # min(1.5 x p90, 20 s)
     t0 = time.time()
     obs = env.reset(seed_for(scene_id, seed))
     policy.reset(task, seed_for(scene_id, seed))

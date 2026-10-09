@@ -22,8 +22,10 @@ sees the same initial states. Each rollout gets automatic stage signals, 16 keyf
   strategy: `act` returns the actions to run open loop before the next observation, whether that is a full chunk,
   its first k steps, or one step. To add a model, write `policies/<name>.py` and register it in `policies.REGISTRY`.
 - **`rollout.py` (generic runner):** runs `obs = env.reset()`, then repeats `actions = policy.act(obs)` and steps each
-  action, observing only after the last one. Episode length is `ceil(1.5 × p90)` of the scene's demo lengths
-  (`tasks.json`), capped at 1200 steps. It saves `trajectory.npz` and `rollout.json`. Use
+  action, observing only after the last one. Episode length is `limits.limit(scene)`, which is
+  min(`ceil(1.5 × p90)` of the scene's demo lengths, 20 s). Signals, judge frames and videos use the same span.
+  The policy only reacts to what it has seen so far, so a rollout recorded with a longer limit is cut to this one
+  offline: its first N steps are exactly what a run capped at N would have produced. It saves `trajectory.npz` and `rollout.json`. Use
   `--policy <name> --policy-kw k=v` to choose and configure the adapter.
 
 `policies/gwp05.py` follows the GWP-0.5 closed loop in wam.cpp (`eval/sim/run_robotwin_client.py` with
@@ -117,7 +119,9 @@ RUN=<run> benchmarks/sharpa_webxr/run_suite.sh <tag> 11500 0 9 10
 .venv_webxr/bin/python benchmarks/sharpa_webxr/postprocess.py <dir>/<scene_id>/seed_0
 # checkpoint parity on val windows
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python benchmarks/sharpa_webxr/check_policy_parity.py --ckpt <ckpt> --n 24 --out g3.json
-# score a folder with a VLM judge -> <folder>/scores_<model>.json + .tsv (per task, per seed)
+# score a folder with a VLM judge -> <folder>/scores_<model>_r2.json + .tsv (per task, per seed)
+# rubric r2 needs full-res judge frames: 24 times x (head, chest) at 480x640
+.venv_webxr/bin/python benchmarks/sharpa_webxr/postprocess.py --frames-only .sharpa_sim_eval/<run>/<tag>/*/seed_*
 .venv_webxr/bin/python benchmarks/sharpa_webxr/score.py .sharpa_sim_eval/<run>/<tag> --model gpt-6-luna   # OPENAI_API_KEY or ~/.config/openai/key
 .venv_webxr/bin/python benchmarks/sharpa_webxr/judge.py .sharpa_sim_eval/<run>/<tag>/*/seed_*   # Claude judge, ANTHROPIC_API_KEY
 ```
