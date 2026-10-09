@@ -1,0 +1,51 @@
+type: yam_sharpa
+
+# YAM-duo arms + Sharpa hands, LeRobot v3 (20 fps), ego + chest cameras.
+# Plan / design: docs/1008_our_dataset_support/plan.md
+
+# ── Sources + sampling probability ───────────────────────────────────────────
+# Each draw picks a source with probability weight / sum(weights), then a
+# uniformly random window of that source.
+sources:
+  simteleop:
+    dataset_dir: /root/projects/2610_policy_model/datasets/simteleop_1004/dataset
+    weight: 0.5
+  gpt_rollout:
+    dataset_dir: /root/projects/2610_policy_model/datasets/gpt_rollout/dataset
+    weight: 0.5
+seed: 42
+
+# ── Action / proprio representation (ablation switch) ────────────────────────
+#   fingertips_abs | fingertips_rel  → 48-D:  model.architecture.action_dim=48 state_dim=48
+#   unify_abs      | unify_rel       → 80-D:  model.architecture.action_dim=80 state_dim=80
+# unify_action / unify_action_map are derived from action_mode (do not set them).
+action_mode: fingertips_abs
+
+# ── Normalization ────────────────────────────────────────────────────────────
+# One pooled min-max file per action_mode, shared by all sources; built on
+# first use (rank 0 scans, other ranks wait) and copied into checkpoints.
+normalize_mode: min-max
+normalization_stats_path: /root/projects/2610_policy_model/norm_stats/yam_sharpa_${.action_mode}.npy
+
+# ── Frame sampling (OpenWAM contract) ────────────────────────────────────────
+# 33 raw rows → 32 actions; video every 4th row → 9 frames.
+num_frames: 33
+video_stride: 4
+window_stride: 1
+split: train
+
+# ── Rendering: cameras stacked top-to-bottom ─────────────────────────────────
+# 2 x (240x320) → 480x320 canvas (150 tokens per latent).
+height: 480
+width: 320
+multiview: true
+multiview_layout: vstack
+camera_layout: [observation.images.ego_view, observation.images.chest_view]
+
+# ── Video augmentation ───────────────────────────────────────────────────────
+color_jitter:
+  enabled: true
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.0

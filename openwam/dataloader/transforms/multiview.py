@@ -113,6 +113,50 @@ def assemble_multiview_layout(
     return canvas
 
 
+def assemble_vstack_layout(
+    frames_by_camera: dict,
+    camera_layout: list,
+    out_h: int,
+    out_w: int,
+    return_missing_mask: bool = False,
+) -> Union[Image.Image, Tuple[Image.Image, Image.Image]]:
+    """Stack N cameras top-to-bottom, each resized to ``(out_h / N, out_w)``.
+
+    Each camera is BILINEAR-resized directly to its tile (e.g. 480x640 → 240x320
+    keeps the 4:3 aspect for two views on a 480x320 canvas).
+
+    Args:
+        frames_by_camera: dict ``{camera_name: PIL.Image}`` (any size); a missing key → black tile.
+        camera_layout: list of N camera names, ``camera_layout[0]`` is the top tile.
+        out_h, out_w: int, canvas size in pixels; ``out_h`` must be divisible by N.
+        return_missing_mask: bool, also return an ``L`` mask (255 = black-filled tile),
+            same contract as :func:`assemble_multiview_layout`.
+
+    Returns:
+        PIL.Image of size ``(out_w, out_h)``, or ``(image, missing_mask)``.
+    """
+    n = len(camera_layout)
+    if n < 1:
+        raise ValueError("vstack layout expects at least one camera")
+    if out_h % n:
+        raise ValueError(f"vstack layout: out_h={out_h} must be divisible by the camera count {n}")
+    tile_h = out_h // n
+
+    canvas = Image.new("RGB", (out_w, out_h), (0, 0, 0))
+    missing_mask = Image.new("L", (out_w, out_h), 0) if return_missing_mask else None
+    for i, cam in enumerate(camera_layout):
+        frame = frames_by_camera.get(cam)
+        top = i * tile_h  # y offset of tile i
+        if frame is not None:
+            canvas.paste(_stretch_resize(frame, tile_h, out_w), (0, top))
+        elif missing_mask is not None:
+            missing_mask.paste(255, (0, top, out_w, top + tile_h))
+
+    if missing_mask is not None:
+        return canvas, missing_mask
+    return canvas
+
+
 def format_prompt_for_inference(base_prompt: str) -> str:
     """RoboTwin training-time prompt template.
 
@@ -129,5 +173,6 @@ __all__ = [
     "DEFAULT_MULTIVIEW_CAMERA_LAYOUT",
     "crop_and_resize",
     "assemble_multiview_layout",
+    "assemble_vstack_layout",
     "format_prompt_for_inference",
 ]
