@@ -219,3 +219,8 @@ assets/*
 
 # Local Labtasker state and attempt journals
 .labtasker/
+
+# Sharpa WebXR sim eval outputs and venv
+.sharpa_sim_eval/
+.venv_webxr/
+MUJOCO_LOG.TXT
