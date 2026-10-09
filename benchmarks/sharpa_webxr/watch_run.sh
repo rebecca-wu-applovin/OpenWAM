@@ -7,6 +7,7 @@
 #   VIDEO_P=32       parallel renderers (each holds ~2.3 GB RAM; CPU OSMesa, nice 19)
 #   PORT_BASE=11600  EMA server on PORT_BASE, raw on PORT_BASE+1 (use a different base for a second watcher)
 #   PREP_DIR=...     training prep dir passed to policy_server.py --prep-dir (default prep_eef_full_v1)
+#   MAX_ATTEMPTS=2   attempts per checkpoint x seed range before it is marked FAILED_<seeds> and skipped
 #
 # - Copier (background): copies each new checkpoint_stepN/transformer_bf16.pt (rotated away by --keep-checkpoints)
 #   to .gwp_runs/<run>_eval_ckpts/stepN_bf16.pt as soon as its meta.json exists (save is atomic).
@@ -17,15 +18,17 @@
 #   seed 0 first, at nice 19 with VIDEO_P processes, so a backlog never multiplies memory use.
 # - After training exits: top up the last step with seeds_final, evaluate the final best_val (EMA + raw, all seeds),
 #   wait for the low-priority videos, write summary.tsv, print WATCH_ALL_DONE.
-# Resumable: DONE markers in .sharpa_sim_eval/<run>/<tag>/DONE_<seeds>; run_suite.sh skips finished seeds.
+# Resumable: DONE markers in .sharpa_sim_eval/<run>/<tag>/DONE_<seeds> (written only when the suite exited 0 and every
+# scene x seed has signals.json); run_suite.sh skips finished seeds. Delete FAILED_<seeds> to retry a failed tag.
 set -u
 cd "$(dirname "$(readlink -f "$0")")/../.."  # repo root
 RUN=$1; GA=$2; GB=$3; SI=${4:-0-4}; SF=${5:-5-9}
 VIDEO=${VIDEO:-1}; VIDEO_SEEDS=${VIDEO_SEEDS:-all}; VIDEO_P=${VIDEO_P:-32}; PORT_BASE=${PORT_BASE:-11600}
-PE=$PORT_BASE; PB=$((PORT_BASE + 1))
+PE=$PORT_BASE; PB=$((PORT_BASE + 1)); MAX_ATTEMPTS=${MAX_ATTEMPTS:-2}
 SRC=.gwp_runs/$RUN; C=.gwp_runs/${RUN}_eval_ckpts; E=.sharpa_sim_eval/$RUN; L=.sharpa_sim_eval/logs/$RUN
 mkdir -p $C $E $L
 export RUN
+NSCENES=$(.venv_webxr/bin/python -c "import json;print(len(json.load(open('benchmarks/sharpa_webxr/tasks.json'))))")
 ts() { date -u +%FT%TZ; }
 alive() { pgrep -f "run_giga_sharpa_train_job.py.*--out-dir [^ ]*/$RUN( |$)" >/dev/null; }
 
@@ -54,18 +57,42 @@ serve() {
 }
 
 # evaluate <tag> <ckpt> <gpu> <port> <seeds>: one suite against one server (blocking)
+# rollouts with signals for <tag> and seed range a-b (expected: NSCENES per seed)
+count_done() {
+  local tag=$1 a=${2%-*} b=${2#*-} n=0 s
+  for s in $(seq $a $b); do n=$((n + $(find $E/$tag -path "*/seed_$s/signals.json" 2>/dev/null | wc -l))); done
+  echo $n
+}
+
+# evaluate <tag> <ckpt> <gpu> <port> <seeds>: one suite against one server (blocking).
+# DONE_<seeds> is written only when the suite succeeded AND every scene x seed has signals; a failed attempt is
+# retried on the next pass, and after MAX_ATTEMPTS failures the tag is marked FAILED_<seeds> and skipped.
 evaluate() {
   local tag=$1 ck=$2 gpu=$3 port=$4 seeds=$5
-  [ -f $E/$tag/DONE_$seeds ] && return 0
-  echo "[eval] $tag seeds $seeds ckpt $ck gpu $gpu $(ts)"
-  serve $gpu $port $ck $L/server_$tag.log || return 1
-  local spid=$SPID
-  benchmarks/sharpa_webxr/run_suite.sh $tag $port ${seeds%-*} ${seeds#*-} 10 1 > $L/suite_${tag}_$seeds.log 2>&1
-  kill $spid; wait $spid 2>/dev/null
-  local n; n=$(ls $E/$tag/*/seed_*/signals.json 2>/dev/null | wc -l)
-  local fails; fails=$(cat $L/$tag/*.log 2>/dev/null | grep -c '^\[FAIL')
-  touch $E/$tag/DONE_$seeds
-  echo "[eval done] $tag seeds $seeds: $n rollouts with signals, $fails FAIL lines $(ts)"
+  [ -f $E/$tag/DONE_$seeds ] || [ -f $E/$tag/FAILED_$seeds ] && return 0
+  mkdir -p $E/$tag
+  local att=$(( $(cat $E/$tag/ATTEMPTS_$seeds 2>/dev/null || echo 0) + 1 ))
+  echo $att > $E/$tag/ATTEMPTS_$seeds
+  echo "[eval] $tag seeds $seeds ckpt $ck gpu $gpu attempt $att $(ts)"
+  local rc=0
+  if serve $gpu $port $ck $L/server_$tag.log; then
+    local spid=$SPID
+    benchmarks/sharpa_webxr/run_suite.sh $tag $port ${seeds%-*} ${seeds#*-} 10 1 > $L/suite_${tag}_$seeds.log 2>&1 || rc=$?
+    kill $spid; wait $spid 2>/dev/null
+  else
+    rc=1
+  fi
+  local n want=$(( NSCENES * (${seeds#*-} - ${seeds%-*} + 1) ))
+  n=$(count_done $tag $seeds)
+  if [ $rc -eq 0 ] && [ $n -eq $want ]; then
+    touch $E/$tag/DONE_$seeds
+    echo "[eval done] $tag seeds $seeds: $n/$want rollouts with signals $(ts)"
+  elif [ $att -ge $MAX_ATTEMPTS ]; then
+    touch $E/$tag/FAILED_$seeds
+    echo "[FAIL eval] $tag seeds $seeds: $n/$want rollouts, suite rc=$rc after $att attempts; marked FAILED $(ts)"
+  else
+    echo "[FAIL eval] $tag seeds $seeds: $n/$want rollouts, suite rc=$rc (attempt $att/$MAX_ATTEMPTS, will retry) $(ts)"
+  fi
 }
 
 # eval_pair <tag_prefix> <ema_ckpt|-> <bf16_ckpt|-> <seeds>: EMA and raw suites in parallel
@@ -82,8 +109,10 @@ steps() { { ls -d $SRC/ema_step[0-9]* 2>/dev/null | sed 's/.*ema_step//'; ls $C/
 pending() {
   for n in $(steps); do
     ema=-; raw=-
-    [ -f $SRC/ema_step$n/meta.json ] && [ ! -f $E/step${n}_ema/DONE_$SI ] && ema=$SRC/ema_step$n/transformer_ema.pt
-    [ -f $C/step${n}_bf16.pt ] && [ ! -f $E/step${n}_bf16/DONE_$SI ] && raw=$C/step${n}_bf16.pt
+    [ -f $SRC/ema_step$n/meta.json ] && [ ! -f $E/step${n}_ema/DONE_$SI ] && [ ! -f $E/step${n}_ema/FAILED_$SI ] \
+      && ema=$SRC/ema_step$n/transformer_ema.pt
+    [ -f $C/step${n}_bf16.pt ] && [ ! -f $E/step${n}_bf16/DONE_$SI ] && [ ! -f $E/step${n}_bf16/FAILED_$SI ] \
+      && raw=$C/step${n}_bf16.pt
     [ $ema != - ] || [ $raw != - ] && { echo "$n $ema $raw"; return; }
   done
 }

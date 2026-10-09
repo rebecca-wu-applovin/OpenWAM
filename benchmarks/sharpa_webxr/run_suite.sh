@@ -21,11 +21,20 @@ for sc in sorted(t, key=lambda k: -min(t[k]["max_steps"], 1200)):
 PY
 )
 export OUT LOG PORT MUJOCO_GL=osmesa LP_NUM_THREADS=4
+# Each worker exits 1 if its rollout or postprocess failed; xargs then exits nonzero (123) and so does this script.
 echo "$JOBS" | xargs -P "$W" -L 1 bash -c '
-  sc=$0; seeds=$1; tag=${sc:0:5}_${seeds}
-  .venv_webxr/bin/python -u benchmarks/sharpa_webxr/rollout.py --port $PORT --scene $sc --seeds $seeds --out $OUT >> $LOG/$tag.log 2>&1 || echo "[FAIL rollout] $sc $seeds" >> $LOG/$tag.log
+  sc=$0; seeds=$1; tag=${sc:0:5}_${seeds}; rc=0
+  .venv_webxr/bin/python -u benchmarks/sharpa_webxr/rollout.py --port $PORT --scene $sc --seeds $seeds --out $OUT >> $LOG/$tag.log 2>&1 \
+    || { echo "[FAIL rollout] $sc $seeds" | tee -a $LOG/$tag.log; rc=1; }
   a=${seeds%-*}; b=${seeds#*-}; dirs=$(for s in $(seq $a $b); do echo $OUT/$sc/seed_$s; done)
-  .venv_webxr/bin/python -u benchmarks/sharpa_webxr/postprocess.py $dirs --no-video --keyframes 16 >> $LOG/$tag.log 2>&1 || echo "[FAIL post] $sc $seeds" >> $LOG/$tag.log
-  echo "[job done] $sc $seeds $(date -u +%T)"
+  .venv_webxr/bin/python -u benchmarks/sharpa_webxr/postprocess.py $dirs --no-video --keyframes 16 >> $LOG/$tag.log 2>&1 \
+    || { echo "[FAIL post] $sc $seeds" | tee -a $LOG/$tag.log; rc=1; }
+  echo "[job done] $sc $seeds rc=$rc $(date -u +%T)"
+  exit $rc
 '
+rc=$?
+if [ $rc -ne 0 ]; then
+  echo "[suite $TAG] FAILED (xargs exit $rc): see [FAIL ...] lines above and $LOG/ $(date -u +%FT%TZ)"
+  exit 1
+fi
 echo "[suite $TAG] ALL_DONE $(date -u +%FT%TZ)"
