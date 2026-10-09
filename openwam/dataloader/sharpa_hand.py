@@ -182,7 +182,9 @@ class SharpaHandDataset(LeRobotV3Reader):
             if not self._stats_contract_matches(stats_path):
                 raise FileNotFoundError(
                     f"normalize_mode={self._normalize_mode!r} but no matching stats at {stats_path}. "
-                    "Run sharpa_hand_stats_computation.py first, or set normalize_mode=null."
+                    "Generate them with `python -m openwam.dataloader.utils.stats_computation.sharpa_hand_stats_computation "
+                    "--config configs/dataloader/pretrain_data/sharpa_hand.yaml --output <dataset_dir>/meta/"
+                    f"{NORMALIZATION_STATS_FILENAME}`, or set normalize_mode=null."
                 )
         metadata = self._check_stats_contract(stats_path)
         source_hint = f"{stats_path}:{self.action_mode}"
