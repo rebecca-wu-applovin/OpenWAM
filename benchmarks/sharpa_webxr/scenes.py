@@ -28,6 +28,19 @@ def list_scenes() -> list[str]:
     return sorted(line.rstrip("/").split("/")[-1] for line in out.split())
 
 
+def _within(base: Path, rel: str) -> Path:
+    """``base / rel`` resolved, or ValueError if it escapes ``base`` (absolute paths, ``..``, symlinks)."""
+    target = (base / rel).resolve()
+    if not target.is_relative_to(base.resolve()):
+        raise ValueError(f"unsafe path {rel!r}: resolves outside {base}")
+    return target
+
+
+def _check_sha(data: bytes, want: str, what: str) -> None:
+    if hashlib.sha256(data).hexdigest() != want:
+        raise ValueError(f"{what}: sha256 mismatch")
+
+
 def fetch_scene(scene_id: str, root: Path = DEFAULT_ROOT) -> Path:
     """Download one scene (idempotent: a complete folder with a matching revision is reused)."""
     folder = root / scene_id
@@ -37,24 +50,24 @@ def fetch_scene(scene_id: str, root: Path = DEFAULT_ROOT) -> Path:
         return folder
     rev = f"{LIVE}/scenes/{scene_id}/revisions/{current['revision']}"
     manifest_bytes = _cat(f"{rev}/manifest.json")
-    assert hashlib.sha256(manifest_bytes).hexdigest() == current["manifest_sha256"], "manifest hash mismatch"
+    _check_sha(manifest_bytes, current["manifest_sha256"], f"{scene_id} manifest")
     manifest = json.loads(manifest_bytes)
     folder.mkdir(parents=True, exist_ok=True)
     for name, ref in manifest["files"].items():
+        target = _within(folder, name)  # manifest names come from the store: never write outside the scene dir
         data = _cat(f"{rev}/{name}")
-        assert hashlib.sha256(data).hexdigest() == ref["sha256"], f"{scene_id}/{name} hash mismatch"
-        (folder / name).parent.mkdir(parents=True, exist_ok=True)
-        (folder / name).write_bytes(data)
+        _check_sha(data, ref["sha256"], f"{scene_id}/{name}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
     for ref in manifest.get("asset_packages", []):
         blob = _cat(f"{LIVE}/{ref['key']}")
-        assert hashlib.sha256(blob).hexdigest() == ref["sha256"], f"{ref['key']} hash mismatch"
-        dest = folder / "assets" / Path(ref["key"]).stem
+        _check_sha(blob, ref["sha256"], ref["key"])
+        dest = _within(folder / "assets", Path(ref["key"]).stem)
         with zipfile.ZipFile(io.BytesIO(blob)) as z:
             for member in z.infolist():
                 if member.is_dir():
                     continue
-                target = (dest / member.filename).resolve()
-                assert target.is_relative_to(dest.resolve()), f"unsafe zip member {member.filename}"
+                target = _within(dest, member.filename)  # zip-slip: unconditional check (not an assert)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(z.read(member))
     if manifest.get("layout") is not None:
