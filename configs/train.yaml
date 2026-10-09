@@ -68,4 +68,5 @@ project:
   wandb:
     project: openwam
     run_name: null
+    group: null
     entity: null

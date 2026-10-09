@@ -101,12 +101,14 @@ def init_wandb(cfg):
 
     run_name = getattr(wandb_cfg, "run_name", None)
     entity = getattr(wandb_cfg, "entity", None)
+    group = getattr(wandb_cfg, "group", None)  # groups runs of one ablation in the wandb UI
     from omegaconf import OmegaConf
 
     run = wandb.init(
         project=project,
         name=run_name,
         entity=entity,
+        group=group,
         config=OmegaConf.to_container(cfg, resolve=True),
         resume="allow",
     )
