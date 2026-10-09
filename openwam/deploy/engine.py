@@ -326,6 +326,7 @@ class JointInferenceEngine(BaseInferenceEngine):
         if proprio is None:
             observation = conditions.get("observation") or {}
             proprio = observation.get("state") if isinstance(observation, dict) else None
+        raw_proprio = proprio  # kept for action_decoder (relative → absolute)
         if proprio is not None:
             proprio = self.architecture.normalize_deploy_proprio(proprio)
 
@@ -363,6 +364,10 @@ class JointInferenceEngine(BaseInferenceEngine):
             }
         )
         result = self.architecture.generate(**generate_kwargs)
+        # Optional raw-space post-processing (set by model_loader, e.g. yam_sharpa *_rel).
+        decoder = getattr(self.architecture, "action_decoder", None)
+        if decoder is not None and result.get("actions") is not None:
+            result["actions"] = decoder(result["actions"], raw_proprio)
 
         # Attach optimization stats if profiling
         if self._profile and self._dit_cache is not None:

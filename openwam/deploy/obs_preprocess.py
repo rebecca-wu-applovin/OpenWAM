@@ -75,7 +75,13 @@ class ObsPreprocessor:
       wrist fields are ignored.
     - ``multiview=True``: black-fill missing/None wrists, then compose the L-shape
       layout keyed by ``camera_layout``.
+    - ``multiview_layout="vstack"``: every camera in ``camera_layout`` is required
+      and stacked top-to-bottom (``assemble_vstack_layout``). Each image is looked
+      up under its camera name, falling back to the fixed key at the same
+      position (``head_camera``, ``left_wrist_camera``, ``right_wrist_camera``).
     """
+
+    _POSITIONAL_KEYS = ("head_camera", "left_wrist_camera", "right_wrist_camera")
 
     def __init__(
         self,
@@ -85,8 +91,12 @@ class ObsPreprocessor:
         img_height: int,
         img_width: int,
         requires_proprio: bool = False,
+        multiview_layout: str = "l_shape",
     ):
         self.multiview = bool(multiview)
+        self.multiview_layout = str(multiview_layout)
+        if self.multiview_layout not in ("l_shape", "vstack"):
+            raise ValueError(f"multiview_layout must be 'l_shape' or 'vstack', got {multiview_layout!r}")
         self.camera_layout = list(camera_layout)
         self.img_height = int(img_height)
         self.img_width = int(img_width)
@@ -115,6 +125,7 @@ class ObsPreprocessor:
             img_height=int(_h if _h is not None else 384),
             img_width=int(_w if _w is not None else 320),
             requires_proprio=_resolve_requires_proprio(cfg, engine),
+            multiview_layout=str(getattr(dl, "multiview_layout", None) or "l_shape") if dl is not None else "l_shape",
         )
 
     def preprocess(self, obs: dict) -> dict:
@@ -131,6 +142,7 @@ class ObsPreprocessor:
 
         from openwam.dataloader.transforms.multiview import (
             assemble_multiview_layout,
+            assemble_vstack_layout,
             crop_and_resize,
         )
 
@@ -161,6 +173,25 @@ class ObsPreprocessor:
             )
 
         imgs = obs["images"]
+        if self.multiview and self.multiview_layout == "vstack":
+            # Every layout camera is required (no black fill), keyed by name or position.
+            frames = {}
+            for i, cam in enumerate(self.camera_layout):
+                raw = imgs.get(cam)
+                if raw is None and i < len(self._POSITIONAL_KEYS):
+                    raw = imgs.get(self._POSITIONAL_KEYS[i])
+                if raw is None:
+                    pos = f" (or positional key {self._POSITIONAL_KEYS[i]!r})" if i < len(self._POSITIONAL_KEYS) else ""
+                    raise ObsValidationError(
+                        f"vstack server requires every camera in camera_layout={self.camera_layout}; missing {cam!r}{pos}."
+                    )
+                frames[cam] = _as_pil(raw, ctx=f"images[{cam!r}]")
+            # Same composer as training, so the canvas matches byte-for-byte.
+            obs["image"] = assemble_vstack_layout(
+                frames, self.camera_layout, out_h=self.img_height, out_w=self.img_width
+            )
+            return self._finish(obs)
+
         head_raw = imgs.get("head_camera")
         if head_raw is None:
             raise ObsValidationError(
@@ -205,6 +236,17 @@ class ObsPreprocessor:
                 out_w=self.img_width,
             )
 
+        return self._finish(obs)
+
+    def _finish(self, obs: dict) -> dict:
+        """Prompt + proprio handling shared by every view mode.
+
+        Args:
+            obs: dict, client payload with ``obs['image']`` already composed.
+
+        Returns:
+            the same dict with ``prompt`` (str) and ``state`` ((S,) float32, if sent) normalized.
+        """
         # --- Prompt passthrough (server is prompt-agnostic; normalize missing to "") ---
         obs["prompt"] = obs.get("prompt", "") or ""
 

@@ -216,6 +216,8 @@ def load_from_checkpoint_dir(
 
     # 6. Attach the action normalizer built from saved normalization_stats.npy + config.
     architecture.attach_normalizer(_build_normalizer(cfg, ckpt_dir))
+    # 6b. Optional raw-space action decoder (relative → absolute) applied after unnormalize.
+    architecture.action_decoder = _build_action_decoder(cfg)
 
     # 7. Binary command dims for the final legality projection at WAMPolicy.predict_action.
     # Authoritative source is the CKPT's dataloader config, never the deploy yaml: the training data
@@ -493,6 +495,37 @@ class _UnifyAwareNormalizer:
         return getattr(self._inner, "stats", {}) if self._inner is not None else {}
 
 
+def _build_action_decoder(cfg: DictConfig):
+    """Raw-space post-unnormalize hook for relative action representations.
+
+    Only ``yam_sharpa`` ``*_rel`` checkpoints need one: the model predicts deltas
+    w.r.t. the anchor proprio, composed back into absolute targets (frame-t ego
+    camera) with the RAW proprio the client sent.
+
+    Args:
+        cfg: DictConfig, the checkpoint's saved config (reads ``dataloader.type`` / ``action_mode``).
+
+    Returns:
+        callable ``(actions (K, D), raw_proprio (D,)) -> (K, D) absolute actions``, or None.
+    """
+    if OmegaConf.select(cfg, "dataloader.type", default=None) != "yam_sharpa":
+        return None
+    from openwam.dataloader.utils.yam_sharpa_repr import decode_action, is_relative
+
+    mode = OmegaConf.select(cfg, "dataloader.action_mode")
+    if not is_relative(mode):
+        return None
+    logger.info("[action_decoder] yam_sharpa %s: relative chunk -> absolute using the request proprio", mode)
+
+    def _decode(actions, raw_proprio):
+        # actions: (K, D) unnormalized raw chunk; raw_proprio: (D,) as sent by the client.
+        if raw_proprio is None:
+            raise ValueError(f"yam_sharpa {mode}: decoding a relative action chunk needs obs['state']")
+        return decode_action(mode, actions, raw_proprio)
+
+    return _decode
+
+
 def _infer_raw_dim(inner) -> Optional[int]:
     """Best-effort raw action width from an inner Normalizer's stats (for identity maps)."""
     if inner is None:
@@ -519,6 +552,14 @@ def _build_normalizer(cfg: DictConfig, ckpt_dir: str):
     inner = _build_inner_normalizer(cfg, ckpt_dir)
 
     unify_on = bool(OmegaConf.select(cfg, "dataloader.unify_action", default=False))
+    spec = OmegaConf.select(cfg, "dataloader.unify_action_map", default=None)
+    if OmegaConf.select(cfg, "dataloader.type", default=None) == "yam_sharpa":
+        # The yam_sharpa reader derives the unify switch + map from action_mode
+        # (they are not in its config), so mirror that derivation here.
+        from openwam.dataloader.utils.yam_sharpa_repr import is_unify, unify_action_map
+
+        _mode = OmegaConf.select(cfg, "dataloader.action_mode")
+        unify_on, spec = is_unify(_mode), unify_action_map(_mode)
     if not unify_on:
         return inner
 
@@ -528,7 +569,6 @@ def _build_normalizer(cfg: DictConfig, ckpt_dir: str):
     # reads a `dataloader.unify_dim` key, so deploy must not either (a config-only value would
     # silently diverge from train's hardcoded width).
     unify_dim = UNIFY_DIM
-    spec = OmegaConf.select(cfg, "dataloader.unify_action_map", default=None)
     if spec is None:
         raw_dim = _infer_raw_dim(inner)
         if raw_dim is None:
