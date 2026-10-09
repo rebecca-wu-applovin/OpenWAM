@@ -219,3 +219,4 @@ assets/*
 
 # Local Labtasker state and attempt journals
 .labtasker/
+/docs/
