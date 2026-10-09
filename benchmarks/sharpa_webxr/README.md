@@ -4,21 +4,38 @@ This harness runs the GWP-0.5 Sharpa EEF policy (`run_giga_sharpa_train_job.py -
 WebXR-Teleop MuJoCo sim. It uses the training scenes from the live WebXR store and seeded resets, so every checkpoint
 sees the same initial states. Each rollout gets automatic stage signals, 16 keyframes for a VLM judge, and a video.
 
-## Recipe
+## Layout: env, policy adapter, runner
 
-The recipe follows the GWP-0.5 closed loop in wam.cpp (`eval/sim/run_robotwin_client.py` with `ActionChunkExecutor`).
+- **`env.py` (model-agnostic):** `SharpaWebXREnv(scene, obs=ObsConfig(...), action_space=..., eef_frame=...)`.
+  - `reset(seed) -> obs` and `step(action, observe=True|False|keys) -> (obs, info)`. One action is one 50 ms control
+    step (20 Hz). The env does not know about chunks, replanning or any model encoding.
+  - Action spaces: `joint` (56 absolute joint targets in `env.joint_names` order, or a `{joint: value}` dict) or
+    `eef` (wrist pose per arm in `eef_frame` plus hand joints). For `eef`, the env solves arm joints with IK, each
+    solve seeded from the previous one, and returns the IK residuals in `info`.
+  - Observations are configurable. Cameras are chosen by name and resolution: `ego_view` and `chest_view` match the
+    dataset, and others can be added with `cameras=`. State keys come from `joints`, `eef`, `object_poses` and `time`.
+    Images render only when the step asks to observe.
+  - Physics: TacoSim with the teleop app defaults (2400 Hz physics, 60 Hz tick, each target held for 3 ticks).
+  - Reset: `teleop_app.prepare_scene` with a seeded RNG (arm jitter 0.08, object xy ±5 cm, yaw ±180°, 1 s settle).
+- **`policies/` (one adapter per model):** an adapter declares `obs`, `action_space` and `eef_frame`, and implements
+  `reset(task, seed)` and `act(obs) -> [actions]`. It owns the input encoding, the model call and the execution
+  strategy: `act` returns the actions to run open loop before the next observation, whether that is a full chunk,
+  its first k steps, or one step. To add a model, write `policies/<name>.py` and register it in `policies.REGISTRY`.
+- **`rollout.py` (generic runner):** runs `obs = env.reset()`, then repeats `actions = policy.act(obs)` and steps each
+  action, observing only after the last one. Episode length is `ceil(1.5 × p90)` of the scene's demo lengths
+  (`tasks.json`), capped at 1200 steps. It saves `trajectory.npz` and `rollout.json`. Use
+  `--policy <name> --policy-kw k=v` to choose and configure the adapter.
 
-- **Control loop:** a synchronous observe → predict → execute loop. The policy predicts a 32-step chunk at 20 Hz, all
-  32 steps are executed, and then the policy re-observes. There is no ensembling.
-- **Sampling:** 10 flow-matching steps, shift 5, no CFG, current frame only.
-- **Policy inputs:** `ego_view` and `chest_view` in a T-layout at 320x384, identical to training (`_compose_views`).
-  The state is the measured wrist pose plus the hand joints. Norm stats and T5 prompts come from the training prep dir.
-- **Action decoding:** actions are decoded with `CODECS['giga']`, anchored at the measured state. The wrist poses are
-  then converted to arm joints with `scripts/sharpa_eef/eef_kinematics.ik`; hand joints pass through unchanged.
-- **Physics:** TacoSim with the teleop app defaults: 2400 Hz physics, 60 Hz tick, and each 20 Hz target held for 3 ticks.
-- **Cameras:** dataset `camera_pose.<view>` extrinsics with fovy 60 (ego) and 90 (chest), at 640x480.
-- **Reset:** `teleop_app.prepare_scene` with a seeded RNG: arm jitter 0.08, object xy ±5 cm, yaw ±180°, 1 s settle.
-- **Episode length:** `ceil(1.5 × p90)` of the scene's demo lengths (`tasks.json`), capped at 1200 steps.
+`policies/gwp05.py` follows the GWP-0.5 closed loop in wam.cpp (`eval/sim/run_robotwin_client.py` with
+`ActionChunkExecutor`).
+
+- **Control loop:** predict a 32-step chunk, execute the first `execute_steps` (default 32, the full chunk), then
+  re-observe. There is no ensembling.
+- **Model side (`policy_server.py`):** 10 flow-matching steps, shift 5, no CFG. `ego_view` and `chest_view` are
+  composed into the training T-layout at 320x384. The state and actions use the giga codec in the ego-camera frame,
+  and the noise is seeded per (scene, seed, chunk).
+- **Refactor check:** this adapter reproduces the previous monolithic rollout bit for bit. qpos, IK results and
+  signals were identical on the same seed.
 
 Stage signals, computed in `postprocess.py`:
 
@@ -47,7 +64,7 @@ git submodule update --init third_party/WebXR-Teleop third_party/giga-world-poli
 uv venv .venv_webxr --python 3.12
 uv pip install --python .venv_webxr/bin/python -r third_party/WebXR-Teleop/requirements.txt \
     torch --index-url https://download.pytorch.org/whl/cpu
-uv pip install --python .venv_webxr/bin/python pyzmq imageio imageio-ffmpeg av anthropic
+uv pip install --python .venv_webxr/bin/python pyzmq imageio imageio-ffmpeg av anthropic openai
 
 # scenes from the live store (needs gsutil access) -> data/webxr_scenes/<scene_id>/
 .venv_webxr/bin/python benchmarks/sharpa_webxr/scenes.py $(.venv_webxr/bin/python -c \
@@ -95,13 +112,14 @@ Assumptions:
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python -u benchmarks/sharpa_webxr/policy_server.py --ckpt <transformer_*.pt> --port 11500
 # one checkpoint: 58 scenes x seeds 0-9, 10 workers
 RUN=<run> benchmarks/sharpa_webxr/run_suite.sh <tag> 11500 0 9 10
-# one scene
-.venv_webxr/bin/python benchmarks/sharpa_webxr/rollout.py --port 11500 --scene <scene_id> --seeds 0-2 --out <dir>
+# one scene (gwp05 adapter; --execute-steps 16 replans every 16 steps)
+.venv_webxr/bin/python benchmarks/sharpa_webxr/rollout.py --policy gwp05 --port 11500 --scene <scene_id> --seeds 0-2 --out <dir>
 .venv_webxr/bin/python benchmarks/sharpa_webxr/postprocess.py <dir>/<scene_id>/seed_0
 # checkpoint parity on val windows
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python benchmarks/sharpa_webxr/check_policy_parity.py --ckpt <ckpt> --n 24 --out g3.json
-# VLM judge over keyframes (needs ANTHROPIC_API_KEY)
-.venv_webxr/bin/python benchmarks/sharpa_webxr/judge.py .sharpa_sim_eval/<run>/<tag>/*/seed_*
+# score a folder with a VLM judge -> <folder>/scores_<model>.json + .tsv (per task, per seed)
+.venv_webxr/bin/python benchmarks/sharpa_webxr/score.py .sharpa_sim_eval/<run>/<tag> --model gpt-6-luna   # OPENAI_API_KEY or ~/.config/openai/key
+.venv_webxr/bin/python benchmarks/sharpa_webxr/judge.py .sharpa_sim_eval/<run>/<tag>/*/seed_*   # Claude judge, ANTHROPIC_API_KEY
 ```
 
 ## Results
