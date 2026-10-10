@@ -88,6 +88,8 @@ benchmarks/sharpa_webxr/watch_run.sh <run> <gpu_ema> <gpu_bf16> [seeds_intermedi
 - It evaluates the EMA (`ema_stepN/`) and the raw weights of every checkpoint, oldest first. Each is served by
   `$SERVER` (default `policies/gwp_server.py`) on its own GPU, using about 15 GB next to training.
 - It renders videos from one shared low-priority queue, seed 0 first.
+- It rates every finished EMA tag with the VLM judge (`score.py`, rubric r2) and writes
+  `<tag>/scores_<model>_r2.json` and `.tsv`.
 - After training exits, it adds the final seeds for the last step and evaluates the final `best_val`.
 
 The watcher is resumable: rerunning the same command skips finished work. It prints `WATCH_ALL_DONE` when done.
@@ -100,6 +102,9 @@ The watcher is resumable: rerunning the same command skips finished work. It pri
 | `PORT_BASE` | `11600` | EMA server port; raw uses `PORT_BASE+1`. Change it to run two watchers at once. |
 | `SERVER` | `policies/gwp_server.py` | Policy server script; any `policies/common.py` server works. |
 | `EXECUTE_STEPS` | server meta | Override actions per replan, e.g. `32` for the full chunk. |
+| `JUDGE` | `1` | `0` skips the judge. It is also skipped, with a log line, when no OpenAI key is set. |
+| `JUDGE_WEIGHTS` | `ema` | Tags to rate: `ema`, `bf16` or `all`. |
+| `JUDGE_MODEL` | `gpt-6-luna` | Judge model; `JUDGE_WORKERS` (default 8) sets parallel requests. |
 | `PREP_DIR` | `prep_eef_full_v1` | Training prep dir with norm stats and prompts. Must match the run's `--prep-dir`. |
 
 Assumptions:

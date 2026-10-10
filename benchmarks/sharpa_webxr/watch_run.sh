@@ -10,6 +10,9 @@
 #   EXECUTE_STEPS=   override the server's upstream-matched execute_steps (e.g. 32 = full chunk)
 #   PREP_DIR=...     training prep dir passed to the server's --prep-dir (default prep_eef_full_v1)
 #   MAX_ATTEMPTS=2   attempts per checkpoint x seed range before it is marked FAILED_<seeds> and skipped
+#   JUDGE=1          rate finished tags with the VLM judge (score.py, rubric r2); 0 skips it
+#   JUDGE_WEIGHTS=ema  which tags to rate: ema, bf16 or all
+#   JUDGE_MODEL=gpt-6-luna  JUDGE_WORKERS=8  (key: OPENAI_API_KEY or ~/.config/openai/key)
 #
 # - Copier (background): copies each new checkpoint_stepN/transformer_bf16.pt (rotated away by --keep-checkpoints)
 #   to .gwp_runs/<run>_eval_ckpts/stepN_bf16.pt as soon as its meta.json exists (save is atomic).
@@ -18,8 +21,11 @@
 #   (seeds_intermediate, 10 workers each), stop the servers, mark DONE.
 # - Renderer (background, one queue for the whole run): renders video.mp4 for every finished rollout without one,
 #   seed 0 first, at nice 19 with VIDEO_P processes, so a backlog never multiplies memory use.
+# - Judge (background): for every tag with a new DONE_<seeds> marker, write judge frames (postprocess --frames-only)
+#   and run score.py on the tag folder -> <tag>/scores_<model>_r2.{json,tsv}. Verdicts are cached per rollout, so a
+#   seeds_final top-up only judges the new rollouts. Marker: <tag>/JUDGED_<model>_<seeds>.
 # - After training exits: top up the last step with seeds_final, evaluate the final best_val (EMA + raw, all seeds),
-#   wait for the low-priority videos, write summary.tsv, print WATCH_ALL_DONE.
+#   wait for the low-priority videos and the judge, write summary.tsv, print WATCH_ALL_DONE.
 # Resumable: DONE markers in .sharpa_sim_eval/<run>/<tag>/DONE_<seeds> (written only when the suite exited 0 and every
 # scene x seed has signals.json); run_suite.sh skips finished seeds. Delete FAILED_<seeds> to retry a failed tag.
 set -u
@@ -28,6 +34,7 @@ RUN=$1; GA=$2; GB=$3; SI=${4:-0-4}; SF=${5:-5-9}
 VIDEO=${VIDEO:-1}; VIDEO_SEEDS=${VIDEO_SEEDS:-all}; VIDEO_P=${VIDEO_P:-32}; PORT_BASE=${PORT_BASE:-11600}
 PE=$PORT_BASE; PB=$((PORT_BASE + 1)); MAX_ATTEMPTS=${MAX_ATTEMPTS:-2}
 SERVER=${SERVER:-policies/gwp_server.py}; export EXECUTE_STEPS=${EXECUTE_STEPS:-}
+JUDGE=${JUDGE:-1}; JUDGE_WEIGHTS=${JUDGE_WEIGHTS:-ema}; JUDGE_MODEL=${JUDGE_MODEL:-gpt-6-luna}; JUDGE_WORKERS=${JUDGE_WORKERS:-8}
 SRC=.gwp_runs/$RUN; C=.gwp_runs/${RUN}_eval_ckpts; E=.sharpa_sim_eval/$RUN; L=.sharpa_sim_eval/logs/$RUN
 mkdir -p $C $E $L
 export RUN
@@ -137,11 +144,48 @@ render_loop() {
     echo "[videos] $(find $E -name video.mp4 | wc -l) rendered $(ts)"
   done
 }
-rm -f $E/.evals_done
-RENDER=
-[ "$VIDEO" = 1 ] && { render_loop & RENDER=$!; }
 
-echo "[watch $RUN] start $(ts): server $SERVER${EXECUTE_STEPS:+ execute_steps=$EXECUTE_STEPS}, gpus ema=$GA bf16=$GB, ports $PE/$PB, seeds $SI intermediate, +$SF final, video=$VIDEO seeds=$VIDEO_SEEDS P=$VIDEO_P"
+# judge_pass: rate every finished tag (DONE_<seeds>) of the selected weights that has not been rated for those seeds
+judge_pass() {
+  local d t m k
+  for d in $E/*_ema $E/*_bf16; do
+    [ -d $d ] || continue
+    t=$(basename $d)
+    [ "$JUDGE_WEIGHTS" = all ] || [[ $t == *_$JUDGE_WEIGHTS ]] || continue
+    for m in $d/DONE_*; do
+      [ -f "$m" ] || continue
+      k=${m##*/DONE_}
+      [ -f $d/JUDGED_${JUDGE_MODEL}_$k ] && continue
+      echo "[judge] $t seeds $k: frames $(ts)"
+      find $d -name rollout.json -printf '%h\n' | sort | MUJOCO_GL=osmesa LP_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+        nice -n 10 xargs -n 4 -P 16 .venv_webxr/bin/python benchmarks/sharpa_webxr/postprocess.py --frames-only \
+        >> $L/judge_frames_$t.log 2>&1
+      if .venv_webxr/bin/python benchmarks/sharpa_webxr/score.py $d --model $JUDGE_MODEL --rubric r2 \
+           --workers $JUDGE_WORKERS > $L/judge_${t}_$k.log 2>&1 && ! grep -q 'errors=[1-9]' $L/judge_${t}_$k.log; then
+        touch $d/JUDGED_${JUDGE_MODEL}_$k
+        tail -1 $L/judge_${t}_$k.log | sed "s/^/[judge] $t: /"
+      else
+        echo "[FAIL judge] $t seeds $k, see $L/judge_${t}_$k.log (retried next pass) $(ts)"
+      fi
+    done
+  done
+}
+judge_loop() {
+  while true; do
+    judge_pass
+    [ -f $E/.evals_done ] && { judge_pass; break; }
+    sleep 300
+  done
+}
+rm -f $E/.evals_done
+RENDER=; JUDGER=
+[ "$VIDEO" = 1 ] && { render_loop & RENDER=$!; }
+if [ "$JUDGE" = 1 ]; then
+  if [ -n "${OPENAI_API_KEY:-}" ] || [ -s ~/.config/openai/key ]; then judge_loop & JUDGER=$!
+  else echo "[judge] disabled: no OPENAI_API_KEY and no ~/.config/openai/key"; fi
+fi
+
+echo "[watch $RUN] start $(ts): server $SERVER${EXECUTE_STEPS:+ execute_steps=$EXECUTE_STEPS}, gpus ema=$GA bf16=$GB, ports $PE/$PB, seeds $SI intermediate, +$SF final, video=$VIDEO seeds=$VIDEO_SEEDS P=$VIDEO_P, judge=${JUDGER:+$JUDGE_MODEL on $JUDGE_WEIGHTS}${JUDGER:-off}"
 while true; do
   job=$(pending)
   if [ -n "$job" ]; then
@@ -171,6 +215,7 @@ if [ -f $SRC/best_val/meta.json ]; then
   for s in $SI $SF; do eval_pair best_val_step$b $C/best_val_step$b/transformer_ema.pt $C/best_val_step$b/transformer_bf16.pt $s; done
 fi
 touch $E/.evals_done
+if [ -n "$JUDGER" ]; then wait $JUDGER; echo "[judge] all rated $(ts)"; fi
 if [ -n "$RENDER" ]; then wait $RENDER; echo "[videos] all rendered $(ts)"; fi
 .venv/bin/python benchmarks/sharpa_webxr/aggregate.py $RUN --tsv $E/summary.tsv | sed 's/^/[final] /'
 echo "WATCH_ALL_DONE $(ts)"
