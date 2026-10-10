@@ -1,0 +1,31 @@
+type: sharpa_hand
+
+# YAM Ultra (6-DOF arm) x2 + Sharpa Wave (22-DOF fully-actuated dexterous hand) x2,
+# bimanual. LeRobot v3, joint angles direct (radians) — NOT converted to EEF
+# pose/rot6d. robot_type must be "yam_ultra_sharpa_bimanual" in meta/info.json,
+# and meta/sharpa_hand_schema.json must declare the matching source contract
+# (see openwam/dataloader/sharpa_hand.py _EXPECTED_SOURCE_SCHEMA).
+dataset_dir: /path/to/sharpa_hand_lerobot_v3
+normalize_mode: min-max
+
+# unify_action is intentionally left off: ACTION_DIM=56 does not fit the 12
+# unify slots MukaFranka/RoboCOIN leave free ([68:80)) — this bucket trains in
+# its own raw 56-D joint space unless/until a disjoint slot allocation is
+# designed for it.
+unify_action: false
+
+num_frames: 33
+video_stride: 4
+window_stride: 1
+height: 384
+width: 320
+multiview: true
+
+split: train
+enable_action_supervision: true
+
+# color_jitter:
+#   brightness: 0.2
+#   contrast: 0.2
+#   saturation: 0.2
+#   hue: 0.0

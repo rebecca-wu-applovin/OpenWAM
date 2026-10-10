@@ -1,0 +1,660 @@
+{
+ "00001_GigaHands_p032-sandwich_028_seg000": {
+  "task": "Add the sandwich to the pan on the stove",
+  "manifest_task": "Add the sandwich to the pan on the stove",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 185,
+   "simteleop_1004_fleet": 58
+  },
+  "p50": 194,
+  "p90": 210,
+  "max_steps": 316
+ },
+ "00005_GigaHands_p005-laptop_007_seg000": {
+  "task": "Adjust the angle of the laptop screen for better viewing",
+  "manifest_task": "Adjust the angle of the laptop screen for better viewing",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 580,
+   "simteleop_1004_fleet": 50
+  },
+  "p50": 302,
+  "p90": 302,
+  "max_steps": 453
+ },
+ "00019_OakInk-v2_scene_01__O001_seq__7415df221fded77cf598__2023-04-": {
+  "task": "stack the bread on the stand to another bread",
+  "manifest_task": "stack the bread on the stand to another bread",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 38
+  },
+  "p50": 255,
+  "p90": 411,
+  "max_steps": 618
+ },
+ "00023_OakInk-v2_scene_02__A001_seq__4330d8d30c1293560d96__2023-04-": {
+  "task": "Put on the box lid.",
+  "manifest_task": "Put on the box lid.",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 59,
+   "simteleop_1004_fleet": 46
+  },
+  "p50": 296,
+  "p90": 611,
+  "max_steps": 917
+ },
+ "00051_TACO_brush__eraser__plate__20231027_045": {
+  "task": "use eraser to brush plate",
+  "manifest_task": "use eraser to brush plate",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 40
+  },
+  "p50": 411,
+  "p90": 578,
+  "max_steps": 869
+ },
+ "00075_OakInk-v2_scene_02__A001_seq__e6d2be38fe14846654b2__2023-04-": {
+  "task": "Cap the pen.",
+  "manifest_task": "Cap the pen.",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 29
+  },
+  "p50": 407,
+  "p90": 613,
+  "max_steps": 921
+ },
+ "00077_OakInk-v2_scene_01__A007_seq__183cec0dfbabf5b6eeb7__2023-04-": {
+  "task": "Cap the porcelain teapot.",
+  "manifest_task": "Cap the porcelain teapot.",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 46
+  },
+  "p50": 237,
+  "p90": 430,
+  "max_steps": 646
+ },
+ "00079_OakInk-v2_scene_01__A001_seq__ac79435402cf22f24550__2023-04-": {
+  "task": "Close the gate of the microwave oven.",
+  "manifest_task": "Close the gate of the microwave oven.",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 38
+  },
+  "p50": 152,
+  "p90": 222,
+  "max_steps": 335
+ },
+ "00082_GigaHands_p007-laptop_043_seg000": {
+  "task": "Close the laptop lid gently",
+  "manifest_task": "Close the laptop lid gently",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 584,
+   "simteleop_1004_fleet": 50
+  },
+  "p50": 660,
+  "p90": 660,
+  "max_steps": 990
+ },
+ "00175_HOI4D_ZY20210800001_H1_C2_N25_S213_s02_T4": {
+  "task": "Fill with water by a kettle (mug)",
+  "manifest_task": "Fill with water by a kettle (mug)",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 52
+  },
+  "p50": 314,
+  "p90": 491,
+  "max_steps": 737
+ },
+ "00177_GigaHands_p054-instrument-folder_028_seg000": {
+  "task": "Grasp the body of the ukulele firmly to hold it securely",
+  "manifest_task": "Grasp the body of the ukulele firmly to hold it securely",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 184,
+   "simteleop_1004_fleet": 50
+  },
+  "p50": 148,
+  "p90": 200,
+  "max_steps": 301
+ },
+ "00178_ARCTIC_s01_ketchup_grab_01": {
+  "task": "grab the ketchup bottle",
+  "manifest_task": "grab the ketchup bottle",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 163,
+   "simteleop_1004_fleet": 46
+  },
+  "p50": 180,
+  "p90": 180,
+  "max_steps": 270
+ },
+ "00286_OakInk-v2_scene_01__A003_seq__263ad4d9bbcceec34ac5__2023-04-": {
+  "task": "Place the bread inside the plate.",
+  "manifest_task": "Place the bread inside the plate.",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 40
+  },
+  "p50": 235,
+  "p90": 480,
+  "max_steps": 721
+ },
+ "00337_GigaHands_p007-laptop_005_seg000": {
+  "task": "Flip open the laptop screen",
+  "manifest_task": "Flip open the laptop screen",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 39
+  },
+  "p50": 347,
+  "p90": 526,
+  "max_steps": 790
+ },
+ "00375_GigaHands_p011-noodle_002_seg000": {
+  "task": "Pick up the veggie bag from the table",
+  "manifest_task": "Pick up the veggie bag from the table",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 48
+  },
+  "p50": 140,
+  "p90": 257,
+  "max_steps": 387
+ },
+ "00381_OakInk-v2_scene_02__A001_seq__a3323f998334c09c8f2f__2023-04-": {
+  "task": "Take the flower outside the box.",
+  "manifest_task": "Take the flower outside the box.",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 23
+  },
+  "p50": 244,
+  "p90": 437,
+  "max_steps": 657
+ },
+ "00391_OakInk-v2_scene_01__A001_seq__ac79435402cf22f24550__2023-04-": {
+  "task": "Take the plate outside the microwave oven.",
+  "manifest_task": "Take the plate outside the microwave oven.",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 43
+  },
+  "p50": 333,
+  "p90": 447,
+  "max_steps": 672
+ },
+ "00457_OakInk-v2_scene_03__A001_seq__1be0ede087e0ca11e442__2023-04-": {
+  "task": "Place the test tube on the rack.",
+  "manifest_task": "Place the test tube on the rack.",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 15
+  },
+  "p50": 421,
+  "p90": 562,
+  "max_steps": 845
+ },
+ "00475_OakInk-v2_scene_03__A007_seq__1c03f4a45689cf1478c5__2023-04-": {
+  "task": "Pour the experiment substance B from the beaker to the conical flask.",
+  "manifest_task": "Pour the experiment substance B from the beaker to the conical flask.",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 22
+  },
+  "p50": 380,
+  "p90": 533,
+  "max_steps": 801
+ },
+ "00487_OakInk-v2_scene_01__A003_seq__e76b290b0440c2db3e27__2023-04-": {
+  "task": "Pour the tea from the blue striped bottle to the bowl.",
+  "manifest_task": "Pour the tea from the blue striped bottle to the bowl.",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 657,
+   "simteleop_1004_fleet": 51
+  },
+  "p50": 537,
+  "p90": 537,
+  "max_steps": 806
+ },
+ "00626_OakInk-v2_scene_02__A001_seq__a2b162144bebd1c592b2__2023-04-": {
+  "task": "Pull out the drawer.",
+  "manifest_task": "Pull out the drawer.",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 19
+  },
+  "p50": 253,
+  "p90": 337,
+  "max_steps": 507
+ },
+ "00636_GigaHands_p041-tea_001_seg001": {
+  "task": "Take the lid off the teapot and put it on the board.",
+  "manifest_task": "Take the lid off the teapot and put it on the board.",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 20
+  },
+  "p50": 153,
+  "p90": 214,
+  "max_steps": 323
+ },
+ "00646_GigaHands_p005-knitting-tablet_113_seg000": {
+  "task": "Take out the phone from the case",
+  "manifest_task": "Take out the phone from the case",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 157,
+   "simteleop_1004_fleet": 47
+  },
+  "p50": 178,
+  "p90": 228,
+  "max_steps": 344
+ },
+ "00749_TACO_scrape_off__spoon__pan__20230926_026": {
+  "task": "use spoon to stir the pot.",
+  "manifest_task": "use spoon to stir the pot.",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 259,
+   "simteleop_1004_fleet": 51
+  },
+  "p50": 538,
+  "p90": 538,
+  "max_steps": 807
+ },
+ "00779_OakInk-v2_scene_03__A004_seq__751fb66f8f9b436a99b4__2023-04-": {
+  "task": "Shake the bottle firmly.",
+  "manifest_task": "Shake the bottle firmly.",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 500,
+   "simteleop_1004_fleet": 50
+  },
+  "p50": 226,
+  "p90": 226,
+  "max_steps": 339
+ },
+ "00787_GigaHands_p048-sandwich_047_seg000": {
+  "task": "Scramble the egg in the pan by moving the spatula around",
+  "manifest_task": "Scramble the egg in the pan by moving the spatula around",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 384,
+   "simteleop_1004_fleet": 47
+  },
+  "p50": 420,
+  "p90": 420,
+  "max_steps": 630
+ },
+ "00807_GigaHands_p034-sandwich_050_seg000": {
+  "task": "put cooked egg in the pan",
+  "manifest_task": "put cooked egg in the pan",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 441,
+   "simteleop_1004_fleet": 49
+  },
+  "p50": 322,
+  "p90": 342,
+  "max_steps": 513
+ },
+ "00863_TACO_hit__hammer__box__20231002_057": {
+  "task": "use hammer to hit box",
+  "manifest_task": "use hammer to hit box",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 338,
+   "simteleop_1004_fleet": 50
+  },
+  "p50": 142,
+  "p90": 193,
+  "max_steps": 290
+ },
+ "00894_OakInk-v2_scene_01__A003_seq__24cffaeaadf8a022f376__2023-04-": {
+  "task": "Cap the large white bottle.",
+  "manifest_task": "Cap the large white bottle.",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 20
+  },
+  "p50": 410,
+  "p90": 532,
+  "max_steps": 800
+ },
+ "00921_GigaHands_p017-sandwich_025_seg000": {
+  "task": "Add the sliced butter to the pan",
+  "manifest_task": "Add the sliced butter to the pan",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 34
+  },
+  "p50": 306,
+  "p90": 497,
+  "max_steps": 747
+ },
+ "01000_GigaHands_p051-fastfood_053_seg000": {
+  "task": "Open the box",
+  "manifest_task": "Open the box",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 40
+  },
+  "p50": 303,
+  "p90": 520,
+  "max_steps": 781
+ },
+ "01012_GigaHands_p027-makeup_024_seg002": {
+  "task": "Put the brush into the box",
+  "manifest_task": "Put the brush into the box",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 22
+  },
+  "p50": 207,
+  "p90": 423,
+  "max_steps": 635
+ },
+ "01018_GigaHands_p005-present_010_seg000": {
+  "task": "Close the empty box, and rotate the box to face towards you",
+  "manifest_task": "Close the empty box, and rotate the box to face towards you",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 30
+  },
+  "p50": 313,
+  "p90": 476,
+  "max_steps": 715
+ },
+ "01032_GigaHands_p047-gopro-present_069_seg000": {
+  "task": "Upturn the box on the work surface",
+  "manifest_task": "Upturn the box on the work surface",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 30
+  },
+  "p50": 169,
+  "p90": 252,
+  "max_steps": 379
+ },
+ "01041_GigaHands_p005-sandwich-salad-baking-monoply-boxing_196_seg0": {
+  "task": "Flip the game board over to access the other side for additional game components",
+  "manifest_task": "Flip the game board over to access the other side for additional game components",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 25
+  },
+  "p50": 232,
+  "p90": 434,
+  "max_steps": 652
+ },
+ "01083_GigaHands_p011-monopoly_057_seg000": {
+  "task": "Grip a fake coin and put into of the game box",
+  "manifest_task": "Grip a fake coin and put into of the game box",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 390,
+   "simteleop_1004_fleet": 43
+  },
+  "p50": 270,
+  "p90": 270,
+  "max_steps": 405
+ },
+ "01085_GigaHands_p034-monopoly_059_seg000": {
+  "task": "Put coin into the game box",
+  "manifest_task": "Put coin into the game box",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 20
+  },
+  "p50": 172,
+  "p90": 274,
+  "max_steps": 412
+ },
+ "01089_GigaHands_p005-sandwich-salad-baking-monoply-boxing_182_seg0": {
+  "task": "Grab the dice and put it on the game board",
+  "manifest_task": "Grab the dice and put it on the game board",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 41
+  },
+  "p50": 165,
+  "p90": 329,
+  "max_steps": 494
+ },
+ "01116_GigaHands_p005-instrument-makeup-dog-packing-massage-firstai": {
+  "task": "Grip the drill handle firmly in preparation for use",
+  "manifest_task": "Grip the drill handle firmly in preparation for use",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 21
+  },
+  "p50": 221,
+  "p90": 461,
+  "max_steps": 692
+ },
+ "01174_GigaHands_p005-folder_032_seg000": {
+  "task": "Grab the stamp from the table",
+  "manifest_task": "Grab the stamp from the table",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 483,
+   "simteleop_1004_fleet": 45
+  },
+  "p50": 184,
+  "p90": 184,
+  "max_steps": 276
+ },
+ "01242_GigaHands_p005-sandwich-salad-baking-monoply-boxing_077_seg0": {
+  "task": "Transfer the banana pieces into the salad bowl",
+  "manifest_task": "Transfer the banana into the salad bowl",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 20
+  },
+  "p50": 213,
+  "p90": 289,
+  "max_steps": 435
+ },
+ "01246_GigaHands_p013-fastfood-sandwich_097_seg000": {
+  "task": "upturn the empty bowl",
+  "manifest_task": "upturn the empty bowl",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 36
+  },
+  "p50": 180,
+  "p90": 255,
+  "max_steps": 384
+ },
+ "01304_GigaHands_p010-tea_002_seg000": {
+  "task": "Pick up the kettle from the table",
+  "manifest_task": "Pick up the kettle from the table",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 54
+  },
+  "p50": 203,
+  "p90": 328,
+  "max_steps": 493
+ },
+ "01337_GigaHands_p026-present_031_seg000": {
+  "task": "Pick up the scissors from the table with two fingers in both holes",
+  "manifest_task": "Pick up the scissors from the table with two fingers in both holes",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 500,
+   "simteleop_1004_fleet": 46
+  },
+  "p50": 381,
+  "p90": 381,
+  "max_steps": 572
+ },
+ "01440_GigaHands_p022-plant-noodle_007_seg000": {
+  "task": "Put the shovel into the pot",
+  "manifest_task": "Put the shovel into the pot",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 7
+  },
+  "p50": 248,
+  "p90": 270,
+  "max_steps": 407
+ },
+ "01477_GigaHands_p006-gopro_045_seg000": {
+  "task": "pick up the camera and click the botton",
+  "manifest_task": "pick up the camera and click the botton",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 48
+  },
+  "p50": 268,
+  "p90": 482,
+  "max_steps": 724
+ },
+ "01480_GigaHands_p013-fastfood-sandwich_104_seg000": {
+  "task": "Pour from the bowl into the heated pan",
+  "manifest_task": "Pour from the bowl into the heated pan",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 42
+  },
+  "p50": 313,
+  "p90": 489,
+  "max_steps": 734
+ },
+ "01498_GigaHands_p050-tea_001_seg003": {
+  "task": "Pour hot water from the kettle into the teapot",
+  "manifest_task": "Pour hot water from the kettle into the teapot",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 26
+  },
+  "p50": 327,
+  "p90": 528,
+  "max_steps": 792
+ },
+ "01541_GigaHands_p018-present_033_seg000": {
+  "task": "Rotate the wrapped box to a different side",
+  "manifest_task": "Rotate the wrapped box to a different side",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 7
+  },
+  "p50": 257,
+  "p90": 340,
+  "max_steps": 511
+ },
+ "01542_GigaHands_p034-tea_025_seg000": {
+  "task": "Rotate the handle of the teacup until it faces towards you",
+  "manifest_task": "Rotate the handle of the teacup until it faces towards you",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 445,
+   "simteleop_1004_fleet": 50
+  },
+  "p50": 220,
+  "p90": 220,
+  "max_steps": 330
+ },
+ "01564_GigaHands_p054-tablet_031_seg000": {
+  "task": "Rotate the tablet from landscape to portrait mode, keeping it steady",
+  "manifest_task": "Rotate the tablet from landscape to portrait mode, keeping it steady",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 45
+  },
+  "p50": 250,
+  "p90": 385,
+  "max_steps": 579
+ },
+ "01587_GigaHands_p051-fastfood_041_seg000": {
+  "task": "Scoop a piece of pudding from the plate with the pudding spoon",
+  "manifest_task": "Scoop a piece of pudding from the plate with the pudding spoon",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 310,
+   "simteleop_1004_fleet": 49
+  },
+  "p50": 358,
+  "p90": 358,
+  "max_steps": 537
+ },
+ "01592_GigaHands_p015-monopoly_010_seg000": {
+  "task": "Shake the dice in your hand briskly",
+  "manifest_task": "Shake the dice in your hand briskly",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 4
+  },
+  "p50": 345,
+  "p90": 711,
+  "max_steps": 1068
+ },
+ "01605_GigaHands_p042-makeup_040_seg000": {
+  "task": "Shake the bottle to mix the contents thoroughly",
+  "manifest_task": "Shake the bottle to mix the contents thoroughly",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 62,
+   "simteleop_1004_fleet": 49
+  },
+  "p50": 292,
+  "p90": 306,
+  "max_steps": 459
+ },
+ "01640_GigaHands_p029-instrument_019_seg000": {
+  "task": "Hit the drumhead with a drum stick",
+  "manifest_task": "Hit the drumhead with a drum stick",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 20
+  },
+  "p50": 238,
+  "p90": 376,
+  "max_steps": 566
+ },
+ "01652_GigaHands_p034-monopoly_061_seg000": {
+  "task": "Toss the coin into the air and let it fall into the hand",
+  "manifest_task": "Toss the coin into the air and let it fall into the hand",
+  "in_prompts": true,
+  "n_eps": {
+   "gpt_fleet_depth": 308,
+   "simteleop_1004_fleet": 17
+  },
+  "p50": 3812,
+  "p90": 3812,
+  "max_steps": 5718
+ },
+ "01747_GigaHands_p034-mindmap-boxing_064_seg000": {
+  "task": "Open the pencil case",
+  "manifest_task": "Open the pencil case",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 29
+  },
+  "p50": 418,
+  "p90": 605,
+  "max_steps": 909
+ },
+ "self-gen-scene-20260924-191346-jiangwei": {
+  "task": "put the cup on the cup rack",
+  "manifest_task": "put the cup on the cup rack",
+  "in_prompts": true,
+  "n_eps": {
+   "simteleop_1004_fleet": 20
+  },
+  "p50": 269,
+  "p90": 414,
+  "max_steps": 622
+ }
+}

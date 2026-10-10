@@ -1,0 +1,1 @@
+Copied from github.com/chengyuan-qian-applovin/WebXR-Teleop assets/{sharpa,yam_ultra} @ ecc0468c591366f865ed4babd8085267b7fc8fec; reference_rollout_gpt_dataset.npz is one MuJoCo rollout from gs://foundational-research/yjw/gpt_dataset (used to validate FK + joint order).
