@@ -4,40 +4,40 @@ This harness runs the GWP-0.5 Sharpa EEF policy (`run_giga_sharpa_train_job.py -
 WebXR-Teleop MuJoCo sim. It uses the training scenes from the live WebXR store and seeded resets, so every checkpoint
 sees the same initial states. Each rollout gets automatic stage signals, 16 keyframes for a VLM judge, and a video.
 
-## Layout: env, policy adapter, runner
+## Layout: env, policy server, runner
 
-- **`env.py` (model-agnostic):** `SharpaWebXREnv(scene, obs=ObsConfig(...), action_space=..., eef_frame=...)`.
+- **`env.py` (model-agnostic sim):** `SharpaWebXREnv(scene, obs=ObsConfig(...), action_space=..., eef_frame=...)`.
   - `reset(seed) -> obs` and `step(action, observe=True|False|keys) -> (obs, info)`. One action is one 50 ms control
-    step (20 Hz). The env does not know about chunks, replanning or any model encoding.
-  - Action spaces: `joint` (56 absolute joint targets in `env.joint_names` order, or a `{joint: value}` dict) or
-    `eef` (wrist pose per arm in `eef_frame` plus hand joints). For `eef`, the env solves arm joints with IK, each
-    solve seeded from the previous one, and returns the IK residuals in `info`.
-  - Observations are configurable. Cameras are chosen by name and resolution: `ego_view` and `chest_view` match the
-    dataset, and others can be added with `cameras=`. State keys come from `joints`, `eef`, `object_poses` and `time`.
-    Images render only when the step asks to observe.
+    step (20 Hz).
+  - Action spaces: `joint` (56 joint targets) or `eef` (wrist pose per arm plus hand joints). For `eef`, the env runs
+    IK, each solve seeded from the previous one, and returns the residuals in `info`.
+  - Observations are configurable: cameras by name and resolution, plus state keys (`joints`, `eef`, `object_poses`,
+    `time`). Images render only when a step asks to observe.
   - Physics: TacoSim with the teleop app defaults (2400 Hz physics, 60 Hz tick, each target held for 3 ticks).
   - Reset: `teleop_app.prepare_scene` with a seeded RNG (arm jitter 0.08, object xy ±5 cm, yaw ±180°, 1 s settle).
-- **`policies/` (one adapter per model):** an adapter declares `obs`, `action_space` and `eef_frame`, and implements
-  `reset(task, seed)` and `act(obs) -> [actions]`. It owns the input encoding, the model call and the execution
-  strategy: `act` returns the actions to run open loop before the next observation, whether that is a full chunk,
-  its first k steps, or one step. To add a model, write `policies/<name>.py` and register it in `policies.REGISTRY`.
-- **`rollout.py` (generic runner):** runs `obs = env.reset()`, then repeats `actions = policy.act(obs)` and steps each
-  action, observing only after the last one. Episode length is `limits.limit(scene)`, which is
-  min(`ceil(1.5 × p90)` of the scene's demo lengths, 20 s). Signals, judge frames and videos use the same span.
-  The policy only reacts to what it has seen so far, so a rollout recorded with a longer limit is cut to this one
-  offline: its first N steps are exactly what a run capped at N would have produced. It saves `trajectory.npz` and `rollout.json`. Use
-  `--policy <name> --policy-kw k=v` to choose and configure the adapter.
+- **`policies/<model>_server.py` (one per model, in the training `.venv` on a GPU)** follows the
+  `policies/common.py` contract. The server owns everything model-specific: image layout, state encoding,
+  normalization, sampler and action decode. It returns absolute wrist poses plus hand joints in the ego-camera frame.
+  Its `meta` endpoint publishes how the model is deployed upstream:
+  - `execute_steps`: actions to run before replanning;
+  - `obs_offsets`: past rows the model needs, e.g. LDA-1B's t−5;
+  - optionally `cameras`.
+  To add a model, write a `BasePolicy` subclass with `act()` and `serve()` it.
+- **`rollout.py` (one runner for every model):** reads the server's `meta`, observes only at the rows the next request
+  needs, executes the first `execute_steps` of each chunk, then re-observes; there is no ensembling.
+  `--execute-steps` overrides the server's value. Episode length is `limits.limit(scene)` = min(`ceil(1.5 × p90)`,
+  20 s); signals, judge frames and videos use the same span. The policy only reacts to what it has seen so far, so
+  longer recordings are truncated offline: their first N steps are exactly what a run capped at N would have produced.
 
-`policies/gwp05.py` follows the GWP-0.5 closed loop in wam.cpp (`eval/sim/run_robotwin_client.py` with
-`ActionChunkExecutor`).
+`policies/gwp_server.py` (GWP-0.5):
 
-- **Control loop:** predict a 32-step chunk, execute the first `execute_steps` (default 32, the full chunk), then
-  re-observe. There is no ensembling.
-- **Model side (`policy_server.py`):** 10 flow-matching steps, shift 5, no CFG. `ego_view` and `chest_view` are
-  composed into the training T-layout at 320x384. The state and actions use the giga codec in the ego-camera frame,
-  and the noise is seeded per (scene, seed, chunk).
-- **Refactor check:** this adapter reproduces the previous monolithic rollout bit for bit. qpos, IK results and
-  signals were identical on the same seed.
+- **Sampling:** 10 flow-matching steps, shift 5, no CFG. `ego_view` and `chest_view` are composed into the training
+  T-layout at 320x384. The state and actions use the giga codec in the ego-camera frame, and the noise is seeded
+  per (scene, seed, chunk).
+- **Execution:** `execute_steps` = 20 of 32, the same 62.5% / 1.0 s as upstream's 30 of 48 at 30 Hz
+  (`run_inference_openloop.sh` REPLAN_STEPS).
+- **Parity:** the runner reproduces both earlier paths bit for bit. qpos and IK results were identical against the
+  old `policy_server.py` client-decode path at `--execute-steps 32`, and against `rollout_v2.py` at 20.
 
 Stage signals, computed in `postprocess.py`:
 
@@ -85,8 +85,8 @@ benchmarks/sharpa_webxr/watch_run.sh <run> <gpu_ema> <gpu_bf16> [seeds_intermedi
 `<run>` is the folder under `.gwp_runs/`. The watcher works like this:
 
 - It copies each `checkpoint_stepN/transformer_bf16.pt` before training's rotation deletes it.
-- It evaluates the EMA (`ema_stepN/`) and the raw weights of every checkpoint, oldest first. Each is served on its own
-  GPU, using about 15 GB next to training.
+- It evaluates the EMA (`ema_stepN/`) and the raw weights of every checkpoint, oldest first. Each is served by
+  `$SERVER` (default `policies/gwp_server.py`) on its own GPU, using about 15 GB next to training.
 - It renders videos from one shared low-priority queue, seed 0 first.
 - After training exits, it adds the final seeds for the last step and evaluates the final `best_val`.
 
@@ -98,6 +98,8 @@ The watcher is resumable: rerunning the same command skips finished work. It pri
 | `VIDEO_SEEDS` | `all` | Comma list of seeds to render, e.g. `0`. |
 | `VIDEO_P` | `32` | Parallel renderers. Each holds about 2.3 GB RAM and renders on the CPU with OSMesa at nice 19. |
 | `PORT_BASE` | `11600` | EMA server port; raw uses `PORT_BASE+1`. Change it to run two watchers at once. |
+| `SERVER` | `policies/gwp_server.py` | Policy server script; any `policies/common.py` server works. |
+| `EXECUTE_STEPS` | server meta | Override actions per replan, e.g. `32` for the full chunk. |
 | `PREP_DIR` | `prep_eef_full_v1` | Training prep dir with norm stats and prompts. Must match the run's `--prep-dir`. |
 
 Assumptions:
@@ -111,11 +113,11 @@ Assumptions:
 
 ```bash
 # policy server (training venv)
-CUDA_VISIBLE_DEVICES=0 .venv/bin/python -u benchmarks/sharpa_webxr/policy_server.py --ckpt <transformer_*.pt> --port 11500
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -u benchmarks/sharpa_webxr/policies/gwp_server.py --ckpt <transformer_*.pt> --port 11500
 # one checkpoint: 58 scenes x seeds 0-9, 10 workers
 RUN=<run> benchmarks/sharpa_webxr/run_suite.sh <tag> 11500 0 9 10
-# one scene (gwp05 adapter; --execute-steps 16 replans every 16 steps)
-.venv_webxr/bin/python benchmarks/sharpa_webxr/rollout.py --policy gwp05 --port 11500 --scene <scene_id> --seeds 0-2 --out <dir>
+# one scene (server's execute_steps; --execute-steps 32 executes the full chunk)
+.venv_webxr/bin/python benchmarks/sharpa_webxr/rollout.py --port 11500 --scene <scene_id> --seeds 0-2 --out <dir>
 .venv_webxr/bin/python benchmarks/sharpa_webxr/postprocess.py <dir>/<scene_id>/seed_0
 # checkpoint parity on val windows
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python benchmarks/sharpa_webxr/check_policy_parity.py --ckpt <ckpt> --n 24 --out g3.json

@@ -6,13 +6,15 @@
 #   VIDEO_SEEDS=0    render only these seeds (comma list, or "all"); seed 0 is always rendered first
 #   VIDEO_P=32       parallel renderers (each holds ~2.3 GB RAM; CPU OSMesa, nice 19)
 #   PORT_BASE=11600  EMA server on PORT_BASE, raw on PORT_BASE+1 (use a different base for a second watcher)
-#   PREP_DIR=...     training prep dir passed to policy_server.py --prep-dir (default prep_eef_full_v1)
+#   SERVER=policies/gwp_server.py  policy server script (policies/common.py contract) started per checkpoint
+#   EXECUTE_STEPS=   override the server's upstream-matched execute_steps (e.g. 32 = full chunk)
+#   PREP_DIR=...     training prep dir passed to the server's --prep-dir (default prep_eef_full_v1)
 #   MAX_ATTEMPTS=2   attempts per checkpoint x seed range before it is marked FAILED_<seeds> and skipped
 #
 # - Copier (background): copies each new checkpoint_stepN/transformer_bf16.pt (rotated away by --keep-checkpoints)
 #   to .gwp_runs/<run>_eval_ckpts/stepN_bf16.pt as soon as its meta.json exists (save is atomic).
 # - Main loop, oldest step first: for each step with ema_stepN/meta.json (kept by training) and/or a copied raw
-#   checkpoint, serve EMA on <gpu_ema>:PORT_BASE and raw on <gpu_bf16>:PORT_BASE+1, run run_suite.sh for both in parallel
+#   checkpoint, serve EMA on <gpu_ema>:PORT_BASE and raw on <gpu_bf16>:PORT_BASE+1 ($SERVER), run run_suite.sh for both in parallel
 #   (seeds_intermediate, 10 workers each), stop the servers, mark DONE.
 # - Renderer (background, one queue for the whole run): renders video.mp4 for every finished rollout without one,
 #   seed 0 first, at nice 19 with VIDEO_P processes, so a backlog never multiplies memory use.
@@ -25,6 +27,7 @@ cd "$(dirname "$(readlink -f "$0")")/../.."  # repo root
 RUN=$1; GA=$2; GB=$3; SI=${4:-0-4}; SF=${5:-5-9}
 VIDEO=${VIDEO:-1}; VIDEO_SEEDS=${VIDEO_SEEDS:-all}; VIDEO_P=${VIDEO_P:-32}; PORT_BASE=${PORT_BASE:-11600}
 PE=$PORT_BASE; PB=$((PORT_BASE + 1)); MAX_ATTEMPTS=${MAX_ATTEMPTS:-2}
+SERVER=${SERVER:-policies/gwp_server.py}; export EXECUTE_STEPS=${EXECUTE_STEPS:-}
 SRC=.gwp_runs/$RUN; C=.gwp_runs/${RUN}_eval_ckpts; E=.sharpa_sim_eval/$RUN; L=.sharpa_sim_eval/logs/$RUN
 mkdir -p $C $E $L
 export RUN
@@ -46,7 +49,7 @@ COPIER=$!
 
 # serve <gpu> <port> <ckpt> <log>: start a policy server, wait until it accepts connections; returns its pid in SPID
 serve() {
-  CUDA_VISIBLE_DEVICES=$1 .venv/bin/python -u benchmarks/sharpa_webxr/policy_server.py --ckpt $3 --port $2 --num-steps 10 ${PREP_DIR:+--prep-dir $PREP_DIR} > $4 2>&1 &
+  CUDA_VISIBLE_DEVICES=$1 .venv/bin/python -u benchmarks/sharpa_webxr/$SERVER --ckpt $3 --port $2 --num-steps 10 ${PREP_DIR:+--prep-dir $PREP_DIR} > $4 2>&1 &
   SPID=$!
   for _ in $(seq 120); do
     .venv_webxr/bin/python -c "import socket;socket.create_connection(('localhost',$2),2)" 2>/dev/null && return 0
@@ -138,7 +141,7 @@ rm -f $E/.evals_done
 RENDER=
 [ "$VIDEO" = 1 ] && { render_loop & RENDER=$!; }
 
-echo "[watch $RUN] start $(ts): gpus ema=$GA bf16=$GB, ports $PE/$PB, seeds $SI intermediate, +$SF final, video=$VIDEO seeds=$VIDEO_SEEDS P=$VIDEO_P"
+echo "[watch $RUN] start $(ts): server $SERVER${EXECUTE_STEPS:+ execute_steps=$EXECUTE_STEPS}, gpus ema=$GA bf16=$GB, ports $PE/$PB, seeds $SI intermediate, +$SF final, video=$VIDEO seeds=$VIDEO_SEEDS P=$VIDEO_P"
 while true; do
   job=$(pending)
   if [ -n "$job" ]; then

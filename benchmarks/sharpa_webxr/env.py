@@ -2,7 +2,7 @@
 
 The env knows nothing about any policy. It takes one action per control step, holds it for 50 ms, and returns the
 observation keys it was configured with. How often to observe, how many actions to execute per prediction, and how
-to encode inputs belong to the policy adapter (see policies/).
+to encode inputs belong to the policy server (policies/<model>_server.py), driven by rollout.py.
 
 Physics, gains, action smoothing, layout sidecar and reset randomization are the teleop app's own
 (``mujoco_webxr_teleop.app`` defaults == the settings recorded with simteleop_1004_fleet episodes:

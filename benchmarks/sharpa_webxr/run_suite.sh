@@ -1,6 +1,6 @@
 #!/bin/bash
 # Closed-loop sweep of one checkpoint: 58 training scenes x seeds, longest scenes first.
-# usage: RUN=<run> run_suite.sh <tag> <port> <seed_first> <seed_last> <workers> [seeds_per_job]
+# usage: RUN=<run> [EXECUTE_STEPS=N] run_suite.sh <tag> <port> <seed_first> <seed_last> <workers> [seeds_per_job]
 # Each job: rollout.py (closed loop vs the policy server on <port>) then postprocess.py (stage signals, rule
 # verifier, 16 judge keyframes; no full video). Resumable: finished seeds (rollout.json / signals.json) are skipped.
 set -u
@@ -20,11 +20,12 @@ for sc in sorted(t, key=lambda k: -min(t[k]["max_steps"], 1200)):
         print(f"{sc} {a}-{min(a + per - 1, s1)}")
 PY
 )
-export OUT LOG PORT MUJOCO_GL=osmesa LP_NUM_THREADS=4
+EXECUTE_STEPS=${EXECUTE_STEPS:-}  # empty: the server's upstream-matched value
+export OUT LOG PORT EXECUTE_STEPS MUJOCO_GL=osmesa LP_NUM_THREADS=4
 # Each worker exits 1 if its rollout or postprocess failed; xargs then exits nonzero (123) and so does this script.
 echo "$JOBS" | xargs -P "$W" -L 1 bash -c '
   sc=$0; seeds=$1; tag=${sc:0:5}_${seeds}; rc=0
-  .venv_webxr/bin/python -u benchmarks/sharpa_webxr/rollout.py --port $PORT --scene $sc --seeds $seeds --out $OUT >> $LOG/$tag.log 2>&1 \
+  .venv_webxr/bin/python -u benchmarks/sharpa_webxr/rollout.py --port $PORT --scene $sc --seeds $seeds --out $OUT ${EXECUTE_STEPS:+--execute-steps $EXECUTE_STEPS} >> $LOG/$tag.log 2>&1 \
     || { echo "[FAIL rollout] $sc $seeds" | tee -a $LOG/$tag.log; rc=1; }
   a=${seeds%-*}; b=${seeds#*-}; dirs=$(for s in $(seq $a $b); do echo $OUT/$sc/seed_$s; done)
   .venv_webxr/bin/python -u benchmarks/sharpa_webxr/postprocess.py $dirs --no-video --keyframes 16 >> $LOG/$tag.log 2>&1 \
