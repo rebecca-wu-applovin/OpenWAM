@@ -275,7 +275,7 @@ def build_holder(source, *, skip_native_vae: bool = False, **kw):
     path / ``dict`` with ``model_path`` (lightweight build via loader), else
     an already-built component holder. ``__init__`` drains the holder.
     """
-    from omegaconf import DictConfig
+    from omegaconf import DictConfig, OmegaConf
 
     if isinstance(source, DictConfig):
         from openwam.model.video_backbone.wan.pipeline_builder import build_training_pipeline
@@ -287,6 +287,9 @@ def build_holder(source, *, skip_native_vae: bool = False, **kw):
         raise ValueError(f"from_pretrained(str) expects a directory path, got: {source!r}.")
     if isinstance(source, dict):
         vb_cfg = source.get("video_backbone", source)
+        # Training passes a plain dict whose video_backbone is still a DictConfig.
+        if isinstance(vb_cfg, DictConfig):
+            vb_cfg = OmegaConf.to_container(vb_cfg, resolve=True)
         if isinstance(vb_cfg, dict) and "components" in vb_cfg:
             return build_holder_from_components(
                 vb_cfg["components"],
