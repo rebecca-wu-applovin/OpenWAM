@@ -51,6 +51,7 @@ from openwam.train.utils.training_utils import (
     reduce_step_metrics,
     write_debug_loss_row,
 )
+from openwam.train.utils.visualization import TrainVisualizer
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +254,20 @@ class OpenWAMTrainer:
         is_main = self.accelerator is None or self.accelerator.is_main_process
         wandb_run = None if (debug or not is_main) else init_wandb(self.cfg)
 
+        # Periodic world-model rollouts (GT | pred clips to wandb). Every rank holds one
+        # fixed sample, picked before epoch 0 so the clips are comparable across vis steps.
+        vis_steps = int(cfg_get(t, "vis_steps", 0) or 0)
+        visualizer = None
+        if vis_steps > 0 and self.dataset is not None:
+            visualizer = TrainVisualizer(
+                self.dataset,
+                rank=self._rank,
+                num_samples=int(cfg_get(t, "vis_num_samples", 4)),
+                denoise_steps=int(cfg_get(t, "vis_denoise_steps", 10)),
+                fps=int(cfg_get(t, "vis_fps", 5)),
+                seed=self._run_seed if self._run_seed is not None else 42,
+            )
+
         from tqdm import tqdm
 
         if num_epochs is not None:
@@ -365,6 +380,10 @@ class OpenWAMTrainer:
                         save_full_state(self.accelerator, output_path, global_step, opt_step, epoch)
                     if is_main:
                         manage_checkpoints(output_path, keep_last_k)
+
+                # Step 1 too: an early clip shows the hook works long before the first vis_steps.
+                if visualizer is not None and (global_step % vis_steps == 0 or global_step == 1):
+                    visualizer.run(self.accelerator, self.architecture, global_step, wandb_run, output_path)
 
                 if max_steps and global_step >= max_steps:
                     pbar.close()
