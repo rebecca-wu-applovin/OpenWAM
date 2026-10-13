@@ -177,6 +177,17 @@ class TrainVisualizer:
         # generate() flips the whole model to eval; remember each module's own flag
         # (frozen T5/VAE may be in eval while DiTs train) and restore exactly.
         modes = {m: m.training for m in arch.modules()}
+        # The rollout's set_timesteps(denoise_steps) overwrites the live training schedulers in place
+        # (1000 -> 10 timesteps; Cosmos also drops its loss weights). Snapshot and restore them, or every
+        # later step trains on only those 10 noise levels. Shallow copy is enough: set_timesteps rebinds.
+        sched_states = []
+        for name in ("video_scheduler", "action_scheduler"):
+            try:  # the properties raise RuntimeError (not AttributeError) when a backbone is missing
+                s = getattr(arch, name)
+            except (AttributeError, RuntimeError):
+                continue
+            if all(s is not t for t, _ in sched_states):
+                sched_states.append((s, dict(vars(s))))
         torch.cuda.empty_cache()
         try:
             result = self._rollout(arch)
@@ -184,6 +195,8 @@ class TrainVisualizer:
             logger.warning("[vis] rank %d step %d rollout failed: %r", self.rank, global_step, e)
             result = None
         finally:
+            for s, saved in sched_states:
+                s.__dict__.update(saved) # rewrite the scheduler's state back to the original state
             for m, was_training in modes.items():
                 m.train(was_training)
             torch.cuda.empty_cache()
