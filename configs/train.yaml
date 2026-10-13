@@ -49,6 +49,7 @@ training:
 
   # --- Checkpoint ---
   output_path: outputs/openwam_checkpoints            # Base directory for checkpoint output (relative to the launch cwd)
+  run_dir_name: null              # Run dir under output_path (null = launch timestamp); must not already hold a run
   save_steps: 2000                # Save checkpoint every N steps (0 or null = disable saving)
   save_full_states_for_resume: false  # Also save resumable full state (optimizer/scheduler/RNG) at each save;
                                       # required for training.resume_ckpt_path, costs extra disk per checkpoint

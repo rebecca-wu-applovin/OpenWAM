@@ -483,10 +483,21 @@ class OpenWAMTrainer:
                 verify_resume_normalization_stats(output_path, self.dataset)
             return output_path, resume_state_dir
 
+        # Fixed run dir name (e.g. wandb run name) if configured; else the launch timestamp.
+        fixed_name = getattr(self.cfg.training, "run_dir_name", None)
+        if fixed_name:
+            # Checked on every rank (shared FS) so a clash raises everywhere instead of deadlocking the broadcast.
+            existing = os.path.join(base_output_path, str(fixed_name), "config.yaml")
+            if os.path.exists(existing):
+                raise FileExistsError(
+                    f"training.run_dir_name={fixed_name}: {existing} already exists; pick a new run name "
+                    f"(or use training.resume_ckpt_path to continue that run)."
+                )
+
         if is_main:
             from datetime import datetime
 
-            run_dir_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            run_dir_name = str(fixed_name) if fixed_name else datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             if debug:
                 run_dir_name += "_debug"
             output_path = os.path.join(base_output_path, run_dir_name)
