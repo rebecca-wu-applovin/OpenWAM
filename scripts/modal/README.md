@@ -17,7 +17,7 @@ Everything else is already on Modal:
 | `/data` | `openwam-sharpa-data` | `simteleop_1004_fleet/`, `gpt_fleet_depth/` (same episodes/frames/features as local `simteleop_1004` / `gpt_rollout`, checked against `meta/info.json` on 2026-10-12) |
 | `/assets` | `openwam-assets` | `video_backbone_ckpt/Wan2.2-TI2V-5B` |
 | `/runs` | `openwam-runs` | writes go **only** under `/runs/yjw/`: `norm_stats_modal/`, `outputs/` |
-| secret | `wandb-yjw` | own **public wandb.ai** `WANDB_API_KEY` → runs land in `wandb.ai/jiangwei-yu-applovin/1008_wam_training`, NOT the company server `cbf-wandb.alcfd.com` that local runs use (it resolves to the internal IP 10.132.0.109 and Modal can't reach it). The teammate's `wandb-secret` gets "permission denied" on `1008_wam_training`. |
+| secret | `wandb-yjw` | own **public wandb.ai** `WANDB_API_KEY` → runs land in `wandb.ai/jiangwei-yu-applovin/1008_wam_training`, NOT the company server `cbf-wandb.alcfd.com` (it resolves to the internal IP 10.132.0.109 and Modal can't reach it). Local runs via `run_dual.sh` also log to wandb.ai (it sets `WANDB_BASE_URL=https://api.wandb.ai`; key from `~/.netrc`, same entity), so local and Modal arms share one project. The teammate's `wandb-secret` gets "permission denied" on `1008_wam_training`. |
 
 Inside the container `/opt/openwam/outputs` is a symlink to `/runs/yjw/outputs`. Relative
 `outputs/...` paths in `configs/train.yaml` (run dirs, checkpoints, wandb) end up on the Volume.

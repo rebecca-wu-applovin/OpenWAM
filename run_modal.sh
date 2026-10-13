@@ -7,6 +7,7 @@
 #   bash run_modal.sh training.max_steps=50   # extra Hydra overrides are appended
 #   GPU_TYPE=B200 bash run_modal.sh           # 8xB200 instead of 8xH100
 #   ACTION_MODE=unify_abs bash run_modal.sh   # action-repr ablation arm (dim set automatically)
+#   BACKBONE=cosmos3_nano bash run_modal.sh   # video-backbone ablation arm: wan22_ti2v_5b | cosmos3_edge | cosmos3_nano
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -14,12 +15,25 @@ cd "$(dirname "$0")"
 WANDB_PROJECT="${WANDB_PROJECT:-1008_wam_training}"
 WANDB_GROUP="${WANDB_GROUP:-1012_action_repr_ablation}"
 ACTION_MODE="${ACTION_MODE:-fingertips_rel}"   # fingertips_abs | fingertips_rel (dim 48); unify_abs | unify_rel (dim 80)
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-${ACTION_MODE}_b64}"   # env vars override all of these
+BACKBONE="${BACKBONE:-wan22_ti2v_5b}"           # wan22_ti2v_5b | cosmos3_edge | cosmos3_nano
+# Non-default backbones get a name prefix so arms of one group stay distinguishable.
+if [[ "${BACKBONE}" == "wan22_ti2v_5b" ]]; then NAME_PREFIX=""; else NAME_PREFIX="${BACKBONE}_"; fi
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-${NAME_PREFIX}${ACTION_MODE}_b64}"   # env vars override all of these
 # action/state dim follows the action mode.
 case "${ACTION_MODE}" in
     fingertips_abs|fingertips_rel) ACTION_DIM=48 ;;
     unify_abs|unify_rel)           ACTION_DIM=80 ;;
     *) echo "[run_modal] unknown ACTION_MODE=${ACTION_MODE}" >&2; exit 1 ;;
+esac
+# Backbone -> weights dir on the openwam-assets Volume (mounted at /assets) + per-backbone extras.
+# cosmos3_nano: bs 8/GPU OOMs on H100 without gradient checkpointing (verified locally,
+# 06_video_backbone_ablation); with it on, bs 8 fits. Math is unchanged, only speed.
+BACKBONE_EXTRA=""
+case "${BACKBONE}" in
+    wan22_ti2v_5b) BACKBONE_DIR=Wan2.2-TI2V-5B ;;
+    cosmos3_edge)  BACKBONE_DIR=Cosmos3-Edge ;;
+    cosmos3_nano)  BACKBONE_DIR=Cosmos3-Nano; BACKBONE_EXTRA="training.use_gradient_checkpointing=true" ;;
+    *) echo "[run_modal] unknown BACKBONE=${BACKBONE}" >&2; exit 1 ;;
 esac
 # One launch timestamp (MM_DD_HH_MM_SS) shared by the run dir, Hydra log dir and Modal run name.
 LAUNCH_TS="$(date +%m_%d_%H_%M_%S)"
@@ -63,7 +77,8 @@ fi
 # (relaunch with training.resume_ckpt_path=outputs/<group>/<run_name>_<MM_DD_HH_MM_SS>).
 OVERRIDES="dataloader=yam_sharpa \
   dataloader.action_mode=${ACTION_MODE} \
-  model=dual_system model/video_backbone=wan22_ti2v_5b \
+  model=dual_system model/video_backbone=${BACKBONE} \
+  model.video_backbone.model_path=/assets/video_backbone_ckpt/${BACKBONE_DIR} \
   model.architecture.variant=joint_self_attn model.architecture.attention_mask_mode=mutual \
   model.architecture.action_dim=${ACTION_DIM} model.architecture.state_dim=${ACTION_DIM} \
   project.wandb.project=${WANDB_PROJECT} \
@@ -71,11 +86,12 @@ OVERRIDES="dataloader=yam_sharpa \
   project.wandb.run_name=${WANDB_RUN_NAME} \
   training.save_full_states_for_resume=true \
   training.dataset_num_workers=${NUM_WORKERS} \
+  ${BACKBONE_EXTRA} \
   ${RUN_DIR_OVERRIDE} \
   hydra.run.dir=${RUN_DIR}/hydra/\${now:%Y-%m-%d_%H-%M-%S} \
   $*"
 
-echo "[run_modal] ${GPU_TYPE}:8, ${CPU} CPU, ${MEMORY_GB} GB, ${NUM_WORKERS} workers/rank  |  Modal run name: ${MODAL_RUN_NAME}  |  run dir: openwam-runs:/yjw/${RUN_DIR}"
+echo "[run_modal] backbone ${BACKBONE} (/assets/video_backbone_ckpt/${BACKBONE_DIR})  |  ${GPU_TYPE}:8, ${CPU} CPU, ${MEMORY_GB} GB, ${NUM_WORKERS} workers/rank  |  Modal run name: ${MODAL_RUN_NAME}  |  run dir: openwam-runs:/yjw/${RUN_DIR}"
 # GPU spec goes in via env: Modal fixes it when train.py defines the function.
 export OPENWAM_GPU_TYPE="${GPU_TYPE}" OPENWAM_GPU_COUNT=8 OPENWAM_CPU="${CPU}" OPENWAM_MEMORY_GB="${MEMORY_GB}"
 exec "${MODAL}" run --detach --name "${MODAL_RUN_NAME}" scripts/modal/train.py --overrides "${OVERRIDES}"
