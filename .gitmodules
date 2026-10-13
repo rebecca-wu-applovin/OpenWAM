@@ -1,3 +1,9 @@
 [submodule "third_party/cosmos-predict2.5"]
 	path = third_party/cosmos-predict2.5
 	url = https://github.com/nvidia-cosmos/cosmos-predict2.5.git
+[submodule "third_party/giga-world-policy"]
+	path = third_party/giga-world-policy
+	url = https://github.com/open-gigaai/giga-world-policy.git
+[submodule "third_party/WebXR-Teleop"]
+	path = third_party/WebXR-Teleop
+	url = git@github.com:chengyuan-qian-applovin/WebXR-Teleop.git
