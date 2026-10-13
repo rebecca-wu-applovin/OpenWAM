@@ -133,7 +133,7 @@ def _auto_resume(overrides: list[str]) -> tuple[list[str], Path | None]:
     """Turn a (Modal-retried) fixed-name launch into a resume of its own run dir.
 
     A retry re-runs this call with the SAME overrides, so `training.run_dir_name`
-    (name + launch timestamp, fixed by run_modal.sh) points at the dir the earlier
+    (<index>_<run_name>, fixed by run_modal.sh) points at the dir the earlier
     attempt created. No name matching across launches is involved.
 
     overrides: Hydra CLI tokens as sent by the caller.

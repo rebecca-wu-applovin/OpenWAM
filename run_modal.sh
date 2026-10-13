@@ -10,6 +10,7 @@
 #   BACKBONE=cosmos3_nano bash run_modal.sh   # video-backbone ablation arm: wan22_ti2v_5b | cosmos3_edge | cosmos3_nano
 set -euo pipefail
 cd "$(dirname "$0")"
+source ./base.sh   # next_run_index
 
 # wandb naming: one group per ablation sweep, run name = action representation.
 WANDB_PROJECT="${WANDB_PROJECT:-1008_wam_training}"
@@ -35,12 +36,6 @@ case "${BACKBONE}" in
     cosmos3_nano)  BACKBONE_DIR=Cosmos3-Nano; BACKBONE_EXTRA="training.use_gradient_checkpointing=true" ;;
     *) echo "[run_modal] unknown BACKBONE=${BACKBONE}" >&2; exit 1 ;;
 esac
-# One launch timestamp (MM_DD_HH_MM_SS) shared by the run dir, Hydra log dir and Modal run name.
-LAUNCH_TS="$(date +%m_%d_%H_%M_%S)"
-RUN_DIR_NAME="${WANDB_RUN_NAME}_${LAUNCH_TS}"
-# Name shown for this run in the Modal UI / `modal app list`.
-MODAL_RUN_NAME="${MODAL_RUN_NAME:-${RUN_DIR_NAME//_/-}}"
-
 GPU_TYPE="${GPU_TYPE:-H100}"   # H100 | B200
 # Video decode is CPU-bound, but Modal caps one container at 64 cores (request > 64 is rejected).
 CPU="${CPU:-64}"
@@ -54,27 +49,36 @@ if [[ "${1:-}" == "--debug" ]]; then
     exec "${MODAL}" run --name "debug-$(date +%m%d-%H%M)" scripts/modal/train.py --debug
 fi
 
-# Run layout on the Volume: openwam-runs:/yjw/outputs/<group>/<run_name>_<MM_DD_HH_MM_SS>/
+# Run layout on the Volume: openwam-runs:/yjw/outputs/<group>/<index>_<run_name>/
 #   checkpoints, vis/, config.yaml, normalization_stats.npy, hydra/<launch time>/ (.hydra + train.log)
-RUN_DIR="outputs/${WANDB_GROUP}/${RUN_DIR_NAME}"
-RUN_DIR_OVERRIDE="training.output_path=outputs/${WANDB_GROUP} training.run_dir_name=${RUN_DIR_NAME}"
-
-# Resuming: the trainer reuses the given run dir, so its Hydra logs go there too.
+# <index>_<run_name> (index from base.sh) is the wandb run name, the run dir name, the wandb run ID
+# (set from the dir in train.py) and, with hyphens, the Modal run name.
+RESUME_DIR=""
 for arg in "$@"; do
-    if [[ "${arg}" == training.resume_ckpt_path=* ]]; then
-        RUN_DIR="${arg#training.resume_ckpt_path=}"
-        RUN_DIR_OVERRIDE=""
-    fi
+    [[ "${arg}" == training.resume_ckpt_path=* ]] && RESUME_DIR="${arg#training.resume_ckpt_path=}"
 done
+if [[ -z "${RESUME_DIR}" ]]; then
+    WANDB_RUN_NAME="$(next_run_index)_${WANDB_RUN_NAME}"
+    RUN_DIR="outputs/${WANDB_GROUP}/${WANDB_RUN_NAME}"
+    RUN_DIR_OVERRIDE="training.output_path=outputs/${WANDB_GROUP} training.run_dir_name=${WANDB_RUN_NAME}"
+else
+    # Resuming: the trainer reuses the given run dir (Hydra logs go there too); no new index,
+    # the wandb name is that dir's name again.
+    RUN_DIR="${RESUME_DIR%/}"
+    WANDB_RUN_NAME="${RUN_DIR##*/}"
+    RUN_DIR_OVERRIDE=""
+fi
+# Name shown for this run in the Modal UI / `modal app list`.
+MODAL_RUN_NAME="${MODAL_RUN_NAME:-${WANDB_RUN_NAME//_/-}}"
 
-# Fail fast (before paying for 8 GPUs) if a new run's dir is already taken.
+# Fail fast (before paying for 8 GPUs) if a new run's dir is already taken (e.g. the index file was reset).
 if [[ -n "${RUN_DIR_OVERRIDE}" ]] && "${MODAL}" volume ls openwam-runs "/yjw/${RUN_DIR}" 2>/dev/null | grep -q "/config.yaml$"; then
-    echo "[run_modal] openwam-runs:/yjw/${RUN_DIR} already holds a run; relaunch for a new timestamp" >&2
+    echo "[run_modal] openwam-runs:/yjw/${RUN_DIR} already holds a run; relaunch for a new index" >&2
     exit 1
 fi
 
 # save_full_states_for_resume: Modal calls cap at 24h, so keep resumable state
-# (relaunch with training.resume_ckpt_path=outputs/<group>/<run_name>_<MM_DD_HH_MM_SS>).
+# (relaunch with training.resume_ckpt_path=outputs/<group>/<index>_<run_name>).
 OVERRIDES="dataloader=yam_sharpa \
   dataloader.action_mode=${ACTION_MODE} \
   model=dual_system model/video_backbone=${BACKBONE} \
@@ -91,7 +95,7 @@ OVERRIDES="dataloader=yam_sharpa \
   hydra.run.dir=${RUN_DIR}/hydra/\${now:%Y-%m-%d_%H-%M-%S} \
   $*"
 
-echo "[run_modal] backbone ${BACKBONE} (/assets/video_backbone_ckpt/${BACKBONE_DIR})  |  ${GPU_TYPE}:8, ${CPU} CPU, ${MEMORY_GB} GB, ${NUM_WORKERS} workers/rank  |  Modal run name: ${MODAL_RUN_NAME}  |  run dir: openwam-runs:/yjw/${RUN_DIR}"
+echo "[run_modal] run ${WANDB_RUN_NAME}  |  backbone ${BACKBONE} (/assets/video_backbone_ckpt/${BACKBONE_DIR})  |  ${GPU_TYPE}:8, ${CPU} CPU, ${MEMORY_GB} GB, ${NUM_WORKERS} workers/rank  |  Modal run name: ${MODAL_RUN_NAME}  |  run dir: openwam-runs:/yjw/${RUN_DIR}"
 # GPU spec goes in via env: Modal fixes it when train.py defines the function.
 export OPENWAM_GPU_TYPE="${GPU_TYPE}" OPENWAM_GPU_COUNT=8 OPENWAM_CPU="${CPU}" OPENWAM_MEMORY_GB="${MEMORY_GB}"
 exec "${MODAL}" run --detach --name "${MODAL_RUN_NAME}" scripts/modal/train.py --overrides "${OVERRIDES}"

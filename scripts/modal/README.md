@@ -38,26 +38,27 @@ OPENWAM_GPU_TYPE=B200 OPENWAM_GPU_COUNT=1 modal run scripts/modal/train.py --deb
 OPENWAM_GPU_TYPE=B200 OPENWAM_GPU_COUNT=8 modal run --detach scripts/modal/train.py --overrides "..."
 ```
 
-Runs launched with `run_modal.sh` land in `openwam-runs:/yjw/outputs/<WANDB_GROUP>/<WANDB_RUN_NAME>_<MM_DD_HH_MM_SS>/`
-(launch time, e.g. `fingertips_rel_10_12_23_19_02`). The same timestamp, with hyphens, is the Modal run name
-(`fingertips-rel-10-12-23-19-02`):
+Runs launched with `run_modal.sh` land in `openwam-runs:/yjw/outputs/<WANDB_GROUP>/<index>_<WANDB_RUN_NAME>/`
+(e.g. `82_fingertips_rel_b64`). `<index>` is a global counter in `/root/.core/index`, bumped once per
+launch by `base.sh` (shared with `run_dual.sh`). The same name is the wandb run name and run ID, and,
+with hyphens, the Modal run name (`82-fingertips-rel-b64`):
 
 ```
-<group>/<run_name>_<MM_DD_HH_MM_SS>/
+<group>/<index>_<run_name>/
   checkpoint_step_*.safetensors   accel_state_step_*/ (resume state, periodic saves only)
   vis/step_<N>_<i>.mp4            config.yaml  normalization_stats.npy  tokenizer/
   hydra/<launch time>/            .hydra/ (composed config + overrides) and train.log, one per launch
 ```
 
-This layout comes from `training.output_path=outputs/<group>` plus `training.run_dir_name=<run_name>_<ts>`.
-`run_dir_name` defaults to null (a launch timestamp, which is the old behaviour). A run name that
+This layout comes from `training.output_path=outputs/<group>` plus `training.run_dir_name=<index>_<run_name>`.
+`run_dir_name` defaults to null (a launch timestamp, which is the old behaviour). A run dir that
 already holds a `config.yaml` is refused twice: once by `run_modal.sh` before launch, and once
-by the trainer. Resume with `bash run_modal.sh training.resume_ckpt_path=outputs/<group>/<run_name>_<ts>`. This reuses that dir, and its
+by the trainer. Resume with `bash run_modal.sh training.resume_ckpt_path=outputs/<group>/<index>_<run_name>`. This takes no new index, reuses that dir, and its
 Hydra logs get a new `hydra/<time>/` entry.
 `--debug` runs still go to `outputs/debug_checkpoints/` and Hydra's default `outputs/<date>/<time>/`.
 
 Logs: `modal app logs <app id>` (find it in `modal app list` by the Modal run name), or the web UI.
-Pull a run with `modal volume get openwam-runs /yjw/outputs/<group>/<run_name>_<ts> ./outputs/<group>/`.
+Pull a run with `modal volume get openwam-runs /yjw/outputs/<group>/<index>_<run_name> ./outputs/<group>/`.
 
 ## Gotchas
 
@@ -69,7 +70,7 @@ Pull a run with `modal volume get openwam-runs /yjw/outputs/<group>/<run_name>_<
 
 - **Auto-resume (24h limit, preemption, crashes).** Functions use `retries=modal.Retries(max_retries=10)`.
   Each retry gets a fresh 24h. A retry runs the *same call with the same arguments*, so its
-  `training.run_dir_name` (run name + launch timestamp, fixed once by `run_modal.sh`) points at the dir the
+  `training.run_dir_name` (`<index>_<run_name>`, fixed once by `run_modal.sh`) points at the dir the
   failed attempt created. No name matching across launches is done; a new `run_modal.sh` launch is always a
   new run. On each attempt, `_auto_resume` in `train.py` does the following:
   - the dir has a complete `accel_state_step_*` → adds `training.resume_ckpt_path=<that dir>`;
@@ -85,7 +86,7 @@ Pull a run with `modal volume get openwam-runs /yjw/outputs/<group>/<run_name>_<
   manual resumes append to one wandb run. Steps between the last save and the kill were already logged,
   so wandb drops their re-run copies (step must increase). A SIGKILL also loses the last few seconds that
   wandb had not uploaded yet.
-- **Manual resume** (e.g. after all retries are used up): `bash run_modal.sh training.resume_ckpt_path=outputs/<group>/<run_name>_<ts>`.
+- **Manual resume** (e.g. after all retries are used up): `bash run_modal.sh training.resume_ckpt_path=outputs/<group>/<index>_<run_name>`.
 - **Datasets are staged to local disk** (default for non-debug runs). Before training, `_stage_data` copies
   every `*.dataset_dir=/data/...` source to `/local_data/...` (32 parallel copies, `ephemeral_disk=512 GiB`, the Modal minimum)
   and points the overrides at the copy. The log line `[modal] staged ... GB in ... min` reports the

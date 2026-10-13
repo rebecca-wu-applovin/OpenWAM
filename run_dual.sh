@@ -7,6 +7,7 @@
 #   bash run_dual.sh training.save_full_states_for_resume=true   # extra Hydra overrides are appended
 set -euo pipefail
 cd "$(dirname "$0")"
+source ./base.sh   # next_run_index
 
 # wandb backend: public wandb.ai, same as run_modal.sh (Modal can't reach the company server
 # cbf-wandb.alcfd.com). Overrides base_url in ~/.config/wandb/settings; the api.wandb.ai key
@@ -35,6 +36,12 @@ case "${BACKBONE}" in
     *) echo "[run_dual] unknown BACKBONE=${BACKBONE}" >&2; exit 1 ;;
 esac
 
+# <index>_<run_name> (index from base.sh, taken once per launch) is both the wandb run name and the
+# run dir outputs/openwam_checkpoints/<index>_<run_name>/. A resume (training.resume_ckpt_path=...)
+# reuses its old dir; the trainer ignores run_dir_name then.
+WANDB_RUN_NAME="$(next_run_index)_${WANDB_RUN_NAME}"
+echo "[run_dual] run ${WANDB_RUN_NAME}"
+
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}" bash scripts/train.sh dataloader=yam_sharpa \
   dataloader.action_mode="${ACTION_MODE}" \
   model=dual_system model/video_backbone="${BACKBONE}" \
@@ -43,5 +50,6 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}" bash scripts/train.sh dataloader=yam_sharp
   project.wandb.project="${WANDB_PROJECT}" \
   project.wandb.group="${WANDB_GROUP}" \
   project.wandb.run_name="${WANDB_RUN_NAME}" \
+  training.run_dir_name="${WANDB_RUN_NAME}" \
   "${BACKBONE_EXTRA[@]}" \
   "$@"
