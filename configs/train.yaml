@@ -14,9 +14,9 @@ training:
   max_grad_norm: 1.0              # Gradient clipping max norm
 
   # --- Schedule ---
-  num_epochs: 5                   # Total training epochs (null = step-only, driven solely by max_steps)
+  num_epochs: 2                   # Total training epochs (null = step-only, driven solely by max_steps)
   max_steps: null                 # Early stop after N steps (null = no limit; required when num_epochs is null)
-  batch_size: 16                   # Per-GPU batch size
+  batch_size: 8                   # Per-GPU batch size
   gradient_accumulation_steps: 1  # Accumulate N micro-batches before optimizer step
 
   # --- LR scheduler ---
@@ -33,7 +33,7 @@ training:
   zero_stage: 2                   # DeepSpeed ZeRO stage: 1 or 2 (CLI override: training.zero_stage=1)
 
   # --- Memory optimization ---
-  use_gradient_checkpointing: true       # Recompute activations in backward instead of storing them: saves memory
+  use_gradient_checkpointing: false       # Recompute activations in backward instead of storing them: saves memory
                                          # costs ~1 extra forward (standard term; cf. PyTorch/HF)
   use_gradient_checkpointing_offload: false  # Offload checkpointed activations to CPU
   initialize_model_on_cpu: false         # Load model on CPU, let DeepSpeed move to GPU
@@ -50,13 +50,13 @@ training:
   # --- Checkpoint ---
   output_path: outputs/openwam_checkpoints            # Base directory for checkpoint output (relative to the launch cwd)
   run_dir_name: null              # Run dir under output_path (null = launch timestamp); must not already hold a run
-  save_steps: 2000                # Save checkpoint every N steps (0 or null = disable saving)
+  save_steps: 5000                # Save checkpoint every N steps (0 or null = disable saving)
   save_full_states_for_resume: false  # Also save resumable full state (optimizer/scheduler/RNG) at each save;
                                       # required for training.resume_ckpt_path, costs extra disk per checkpoint
-  keep_last_k_ckpts: 1           # Rolling window: keep only the last K checkpoints
+  keep_last_k_ckpts: 2         # Rolling window: keep only the last K checkpoints
 
   # --- Training-time world-model rollouts (wandb vis/*; clips also in <run>/vis/) ---
-  vis_steps: 2000                 # Render every N steps (+ once at step 1); 0 or null = off
+  vis_steps: 5000                 # Render every N steps (+ once at step 1); 0 or null = off
   vis_num_samples: 4              # Rollouts logged per vis step (one fixed training sample per rank)
   vis_denoise_steps: 10           # Euler steps per rollout (deploy default)
   vis_fps: 5                      # Clip playback fps (dataset fps / video_stride: 20 / 4)

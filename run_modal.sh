@@ -14,7 +14,7 @@ source ./base.sh   # next_run_index
 
 # wandb naming: one group per ablation sweep, run name = action representation.
 WANDB_PROJECT="${WANDB_PROJECT:-1008_wam_training}"
-WANDB_GROUP="${WANDB_GROUP:-1012_action_repr_ablation}"
+WANDB_GROUP="${WANDB_GROUP:-1013_action_repr_ablation}"
 ACTION_MODE="${ACTION_MODE:-fingertips_rel}"   # fingertips_abs | fingertips_rel (dim 48); unify_abs | unify_rel (dim 80)
 BACKBONE="${BACKBONE:-wan22_ti2v_5b}"           # wan22_ti2v_5b | cosmos3_edge | cosmos3_nano
 # Non-default backbones get a name prefix so arms of one group stay distinguishable.
