@@ -43,6 +43,7 @@ from openwam.train.utils.checkpointing import (
 )
 from openwam.train.utils.optimizer_groups import build_trainable_parameters
 from openwam.train.utils.seeding import per_step_seed, seed_process, wire_sampler_seed
+from openwam.train.utils.step_timer import StepTimer
 from openwam.train.utils.training_utils import (
     build_cosine_scheduler,
     cfg_get,
@@ -306,6 +307,10 @@ class OpenWAMTrainer:
                 )
 
         _step_t0 = _time.monotonic()
+        # Per-phase step timing (wandb timing/*); DeepSpeed's engine.step is hooked so
+        # backward and optimizer time are billed separately.
+        self._timer = StepTimer(bool(cfg_get(t, "log_step_timing", True)))
+        self._timer.wrap_engine_step(getattr(self.accelerator.deepspeed_engine_wrapped, "engine", None))
         pbar = tqdm(total=total_steps, desc="Training", unit="step", initial=min(global_step, total_steps))
 
         assert self.accelerator is not None, "OpenWAMTrainer requires an Accelerator"
@@ -328,6 +333,7 @@ class OpenWAMTrainer:
             else:
                 epoch_iter = dataloader
             for batch in epoch_iter:
+                self._timer.mark("data")
                 if self._run_seed is not None:
                     step_seed = per_step_seed(self._run_seed, rank=self._rank, step=global_step)
                     torch.manual_seed(step_seed)
@@ -335,8 +341,10 @@ class OpenWAMTrainer:
                         torch.cuda.manual_seed_all(step_seed)
                 with self.accelerator.accumulate(self.architecture):
                     losses = self.compute_loss(batch)
+                    self._timer.mark("forward")
                     loss = losses["total"]
                     self.accelerator.backward(loss)
+                    self._timer.mark("backward")  # ~0 under DeepSpeed: the engine.step hook already closed backward/optim
 
                     grad_norm = torch.tensor(0.0, device=loss.device)
                     if self.accelerator.sync_gradients:
@@ -348,6 +356,7 @@ class OpenWAMTrainer:
                             scheduler.step()
                         optimizer.zero_grad()
                         opt_step += 1
+                    self._timer.mark("optim")
 
                 global_step += 1
 
@@ -370,6 +379,7 @@ class OpenWAMTrainer:
                     wandb_run=wandb_run,
                     debug=debug,
                     output_path=output_path,
+                    timing=self._timer.snapshot(self.accelerator),
                 )
 
                 # save_steps: write the weights line (+ the resumable full state when
@@ -384,6 +394,8 @@ class OpenWAMTrainer:
                 # Step 1 too: an early clip shows the hook works long before the first vis_steps.
                 if visualizer is not None and (global_step % vis_steps == 0 or global_step == 1):
                     visualizer.run(self.accelerator, self.architecture, global_step, wandb_run, output_path)
+
+                self._timer.end_step()  # bills metric reduce / logging / save / vis to "other"
 
                 if max_steps and global_step >= max_steps:
                     pbar.close()
@@ -588,6 +600,9 @@ class OpenWAMTrainer:
             batch = [batch]
 
         inputs = self.architecture.prepare_inputs(batch)
+        timer = getattr(self, "_timer", None)
+        if timer is not None:
+            timer.mark("encode")  # frozen VAE/T5 encode, split from the trainable forward
         if self.lambda_action > 0 and inputs.get("actions") is None:
             raise ValueError("lambda_action > 0 but no action in data.")
 
@@ -618,8 +633,13 @@ class OpenWAMTrainer:
         wandb_run,
         debug,
         output_path,
+        timing=None,
     ) -> None:
-        """Update progress bar, log to wandb, and (debug) write the loss-history CSV row."""
+        """Update progress bar, log to wandb, and (debug) write the loss-history CSV row.
+
+        timing: dict from StepTimer.snapshot (timing/<phase>[_max] seconds) or None/{}.
+        """
+        timing = timing or {}
         labels = [("action", "loss_action")]
         loss_total = metrics["loss_total"]
         loss_video = metrics["loss_video"]
@@ -631,6 +651,10 @@ class OpenWAMTrainer:
                 postfix[name] = f"{metrics[key]:.4f}"
             postfix["lr"] = f"{lr:.2e}"
             postfix["epoch"] = epoch
+            # Rank-mean phase seconds, so plain stdout logs (local / Modal) show the split too.
+            for short, key in (("data", "data"), ("enc", "encode"), ("fwd", "forward"), ("bwd", "backward"), ("opt", "optim"), ("oth", "other")):
+                if f"timing/{key}" in timing:
+                    postfix[short] = f"{timing[f'timing/{key}']:.2f}"
             pbar.set_postfix(postfix)
             pbar.update(1)
 
@@ -646,7 +670,17 @@ class OpenWAMTrainer:
             }
             for name, key in labels:
                 log_dict[f"train/loss_{name}"] = metrics[key]
+            log_dict.update(timing)
             wandb_run.log(log_dict, step=global_step)
+
+        # Same phase times as a file (<run>/timing.jsonl) so runs on different wandb servers
+        # (local vs Modal) can be compared offline; main rank only, values are rank-reduced.
+        is_main = self.accelerator is None or self.accelerator.is_main_process
+        if timing and is_main and output_path:
+            import json
+
+            with open(os.path.join(output_path, "timing.jsonl"), "a") as f:
+                f.write(json.dumps({"step": global_step, **timing}) + "\n")
 
         if not debug:
             return

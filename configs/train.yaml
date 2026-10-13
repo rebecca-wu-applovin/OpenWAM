@@ -68,6 +68,9 @@ training:
   # --- Data loading ---
   dataset_num_workers: 8          # DataLoader num_workers (0 = main process)
 
+  # --- Profiling ---
+  log_step_timing: true           # wandb timing/*: data/encode/forward/backward/optim/other s per step (adds cuda syncs)
+
 project:
   name: openwam
   output_dir: outputs/${now:%Y-%m-%d_%H-%M-%S}
