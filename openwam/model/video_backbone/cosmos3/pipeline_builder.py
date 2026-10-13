@@ -1,4 +1,4 @@
-"""Component construction for the Cosmos3-Edge backbone.
+"""Component construction for the Cosmos3 (Edge / Nano) backbone.
 
 Builds the vendored ``Cosmos3OmniTransformer`` (weights from the diffusers-style
 bundle's ``transformer/`` sharded safetensors), the ``AutoencoderKLWan`` VAE
@@ -77,6 +77,51 @@ _COSMOS3_EDGE_NET_KWARGS: dict = dict(
     use_und_k_norm_for_gen=True,
     rope_axes_dim=[24, 20, 20],
 )
+
+# Cosmos3-Nano (16B; Qwen3-VL-text MoT, SiLU + RMSNorm, und QK-norm, no
+# k_norm_und_for_gen). Same diffusers class / two_way attention as Edge; the
+# vendored defaults are in fact Nano's. Keys the class does not take
+# (qk_norm_for_diffusion, use_moe, joint_attn_implementation, ...) are dropped:
+# each restates a behavior the class already hardwires.
+_COSMOS3_NANO_GEOMETRY = dict(dim=4096, num_layers=36, num_heads=32, head_dim=128, context_dim=4096)
+_COSMOS3_NANO_NET_KWARGS: dict = dict(
+    attention_bias=False,
+    attention_dropout=0.0,
+    head_dim=128,
+    hidden_size=4096,
+    intermediate_size=12288,
+    base_fps=24,
+    enable_fps_modulation=True,
+    latent_channel=48,
+    unified_3d_mrope_reset_spatial_ids=True,
+    unified_3d_mrope_temporal_modality_margin=15000,
+    latent_patch_size=2,
+    num_attention_heads=32,
+    num_hidden_layers=36,
+    num_key_value_heads=8,
+    patch_latent_dim=192,
+    rms_norm_eps=1e-6,
+    rope_theta=5000000.0,
+    action_dim=64,
+    action_gen=True,
+    num_embodiment_domains=32,
+    sound_dim=64,
+    sound_gen=True,
+    sound_latent_fps=25,
+    timestep_scale=0.001,
+    vocab_size=151936,
+    hidden_act="silu",
+    qk_norm_for_text=True,
+    use_und_k_norm_for_gen=False,
+    rope_axes_dim=[24, 20, 20],  # = rope_scaling.mrope_section in the bundle config
+)
+
+# Registry name -> (geometry, full init kwargs). Everything else in this package
+# reads net.config, so a variant is fully described by these two dicts.
+_COSMOS3_VARIANTS: dict = {
+    "cosmos3_edge": (_COSMOS3_EDGE_GEOMETRY, _COSMOS3_EDGE_NET_KWARGS),
+    "cosmos3_nano": (_COSMOS3_NANO_GEOMETRY, _COSMOS3_NANO_NET_KWARGS),
+}
 
 # Wan2.2-TI2V VAE config from the bundle's vae/config.json (deploy meta shell +
 # the latents_mean/std normalization constants used by encode/decode).
@@ -346,7 +391,7 @@ def build_cosmos3_pipeline(
     materialize_weights: bool = False,
     **_unused,
 ) -> types.SimpleNamespace:
-    """Build the Cosmos3-Edge components.
+    """Build the Cosmos3 components for the variant named by ``cfg.name`` (see ``_COSMOS3_VARIANTS``).
 
     Train path loads real weights from ``model_path``. A ``ckpt_dir`` build
     produces an empty shell that something else fills: deploy and finetune both
@@ -364,11 +409,12 @@ def build_cosmos3_pipeline(
 
     # --- Phase A: pure-Python validation before any heavy import -------------
     name = str(_cfg_get(cfg, "name", "cosmos3_edge"))
-    if name != "cosmos3_edge":
+    if name not in _COSMOS3_VARIANTS:
         raise NotImplementedError(
-            f"cosmos3 backbone supports name='cosmos3_edge' only (got {name!r}); "
-            "Nano/Super need their own geometry entries."
+            f"cosmos3 backbone supports names {sorted(_COSMOS3_VARIANTS)} (got {name!r}); "
+            "other sizes (e.g. Super) need their own _COSMOS3_VARIANTS entry."
         )
+    geometry, net_kwargs = _COSMOS3_VARIANTS[name]
     model_path_raw = _cfg_get(cfg, "model_path")
     if model_path_raw is None and ckpt_dir is None:
         raise ValueError("cosmos3_edge needs `model_path` (bundle root) unless deploying from a ckpt_dir.")
@@ -415,7 +461,7 @@ def build_cosmos3_pipeline(
         from accelerate import init_empty_weights
 
         with init_empty_weights():
-            net = vendor.Cosmos3OmniTransformer(**_COSMOS3_EDGE_NET_KWARGS)
+            net = vendor.Cosmos3OmniTransformer(**net_kwargs)
         if materialize_weights:
             # Cast while still on meta (free) so materializing allocates bf16 —
             # matching the finetune path's footprint instead of an fp32 peak.
@@ -428,7 +474,7 @@ def build_cosmos3_pipeline(
         from openwam.model.video_backbone.cosmos3.dit_forward import rotary_inv_freq
 
         inv_freq = rotary_inv_freq(
-            int(_COSMOS3_EDGE_NET_KWARGS["head_dim"]), float(_COSMOS3_EDGE_NET_KWARGS["rope_theta"])
+            int(net_kwargs["head_dim"]), float(net_kwargs["rope_theta"])
         )
         net.rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
         leftover = [n for n, b in net.named_buffers() if b.is_meta]
@@ -439,7 +485,7 @@ def build_cosmos3_pipeline(
         if not (model_path / "transformer").is_dir():
             raise FileNotFoundError(
                 f"cosmos3_edge model_path has no transformer/ subfolder: {model_path} "
-                "(expected a diffusers-style Cosmos3-Edge bundle)."
+                "(expected a diffusers-style Cosmos3 bundle)."
             )
         net = vendor.Cosmos3OmniTransformer.from_pretrained(
             str(model_path), subfolder="transformer", torch_dtype=torch.bfloat16
@@ -447,14 +493,14 @@ def build_cosmos3_pipeline(
     _drop_lm_head(net)
     net_cfg = net.config
     geometry_ok = (
-        int(net_cfg.hidden_size) == _COSMOS3_EDGE_GEOMETRY["dim"]
-        and int(net_cfg.num_hidden_layers) == _COSMOS3_EDGE_GEOMETRY["num_layers"]
-        and int(net_cfg.num_attention_heads) == _COSMOS3_EDGE_GEOMETRY["num_heads"]
-        and int(net_cfg.head_dim) == _COSMOS3_EDGE_GEOMETRY["head_dim"]
+        int(net_cfg.hidden_size) == geometry["dim"]
+        and int(net_cfg.num_hidden_layers) == geometry["num_layers"]
+        and int(net_cfg.num_attention_heads) == geometry["num_heads"]
+        and int(net_cfg.head_dim) == geometry["head_dim"]
     )
     if not geometry_ok:
         raise ValueError(
-            "Loaded Cosmos3 transformer geometry does not match the cosmos3_edge entry "
+            f"Loaded Cosmos3 transformer geometry does not match the {name} entry "
             f"(hidden={net_cfg.hidden_size}, layers={net_cfg.num_hidden_layers}, "
             f"heads={net_cfg.num_attention_heads}, head_dim={net_cfg.head_dim})."
         )
@@ -462,14 +508,14 @@ def build_cosmos3_pipeline(
     # catch (rotary phases, timestep scale, mRoPE margins, norm eps, ...). A
     # revised bundle changing any of them must fail loudly, not train wrong.
     mismatches = {
-        key: (getattr(net_cfg, key, None), _COSMOS3_EDGE_NET_KWARGS[key])
+        key: (getattr(net_cfg, key, None), net_kwargs[key])
         for key in _WEIGHTLESS_CONFIG_KEYS
-        if _norm_cfg_value(getattr(net_cfg, key, None)) != _norm_cfg_value(_COSMOS3_EDGE_NET_KWARGS[key])
+        if _norm_cfg_value(getattr(net_cfg, key, None)) != _norm_cfg_value(net_kwargs[key])
     }
     if mismatches:
         raise ValueError(
-            "Cosmos3 bundle config diverges from the cosmos3_edge entry on weightless "
-            f"fields {mismatches} (got, expected). Update _COSMOS3_EDGE_NET_KWARGS and port "
+            f"Cosmos3 bundle config diverges from the {name} entry on weightless "
+            f"fields {mismatches} (got, expected). Update its _COSMOS3_VARIANTS entry and port "
             "any behavioral change (text_pack positions / dit_forward) before training."
         )
     # Freeze unconditionally. Gating this on ``deploy`` would be wrong: the
@@ -531,5 +577,5 @@ def build_cosmos3_pipeline(
         max_text_tokens=max_text_tokens,
         text_dropout_p=text_dropout,
         text_dropout_seed=dropout_seed,
-        **_COSMOS3_EDGE_GEOMETRY,
+        **geometry,
     )

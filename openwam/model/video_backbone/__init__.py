@@ -50,8 +50,10 @@ from openwam.model.video_backbone.cosmos_predict25_backbone import CosmosPredict
 
 register_video_backbone("cosmos_predict25_2b")(CosmosPredict25VideoBackbone)
 
-# Cosmos3-Edge backbone. CPU-only-CI safe — the vendored transformer (which
-# pulls ``diffusers``) is deferred to ``from_pretrained``.
+# Cosmos3 backbones (Edge 4B / Nano 16B share one class; the variant is picked
+# by cfg.name in cosmos3/pipeline_builder._COSMOS3_VARIANTS). CPU-only-CI safe —
+# the vendored transformer (which pulls ``diffusers``) is deferred to ``from_pretrained``.
 from openwam.model.video_backbone.cosmos3_backbone import Cosmos3EdgeVideoBackbone  # noqa: E402
 
 register_video_backbone("cosmos3_edge")(Cosmos3EdgeVideoBackbone)
+register_video_backbone("cosmos3_nano")(Cosmos3EdgeVideoBackbone)

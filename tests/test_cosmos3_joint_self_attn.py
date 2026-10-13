@@ -47,6 +47,9 @@ MINI = dict(
     vocab_size=32,
 )
 
+# Nano-flavoured twin (SiLU + RMSNorm, und QK-norm, no k_norm_und_for_gen).
+NANO_MINI = dict(MINI, qk_norm_for_text=True, use_und_k_norm_for_gen=False, hidden_act="silu", rms_norm_eps=1e-6)
+
 
 def _build_state(net, ids, lat, ncp=0, *, padded_und: bool = True):
     """``padded_und=False`` reproduces the unpadded production shape, where the
@@ -73,12 +76,13 @@ def _build_state(net, ids, lat, ncp=0, *, padded_und: bool = True):
     return state
 
 
+@pytest.mark.parametrize("cfg", [MINI, NANO_MINI], ids=["edge", "nano"])
 @pytest.mark.parametrize("padded_und", [True, False], ids=["und_mask_tensor", "und_mask_none"])
-def test_split_parity_matches_run_block(padded_und):
+def test_split_parity_matches_run_block(padded_und, cfg):
     torch.manual_seed(0)
-    net = Cosmos3OmniTransformer(**MINI).eval()
+    net = Cosmos3OmniTransformer(**cfg).eval()
     ids = torch.tensor([1, 2, 3, 4])
-    lat = torch.randn(1, MINI["latent_channel"], 3, 2, 2)
+    lat = torch.randn(1, cfg["latent_channel"], 3, 2, 2)
 
     with torch.no_grad():
         ref = _build_state(net, ids, lat, padded_und=padded_und)

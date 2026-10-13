@@ -38,6 +38,10 @@ MINI = dict(
     vocab_size=32,
 )
 
+# Nano-flavoured twin: the Qwen3 code path (SiLU gated MLP + plain RMSNorm, und
+# QK-norm on, no k_norm_und_for_gen) that the Edge MINI never exercises.
+NANO_MINI = dict(MINI, qk_norm_for_text=True, use_und_k_norm_for_gen=False, hidden_act="silu", rms_norm_eps=1e-6)
+
 
 def _build(cfg):
     torch.manual_seed(0)
@@ -103,10 +107,11 @@ def _positions(net, und_len, latent_grid):
     return text_pos, vis_pos, grid
 
 
-def test_engine_matches_native_forward_p1():
-    net = _build(MINI)
+@pytest.mark.parametrize("base", [MINI, NANO_MINI], ids=["edge", "nano"])
+def test_engine_matches_native_forward_p1(base):
+    net = _build(base)
     ids = torch.tensor([1, 2, 3, 4])
-    lat = torch.randn(1, MINI["latent_channel"], 3, 2, 2)
+    lat = torch.randn(1, base["latent_channel"], 3, 2, 2)
     text_pos, vis_pos, grid = _positions(net, ids.numel(), (3, 2, 2))
 
     native = _native_velocity(net, ids, lat, text_pos, vis_pos, grid, ncp=1, t_val=500.0)
@@ -117,8 +122,9 @@ def test_engine_matches_native_forward_p1():
     assert torch.allclose(mine[:, :, 1:], native[:, :, 1:], atol=1e-5), f"max diff {diff}"
 
 
-def test_engine_matches_native_forward_p2_with_padding():
-    cfg = dict(MINI, latent_patch_size=2, patch_latent_dim=2 * 2 * MINI["latent_channel"])
+@pytest.mark.parametrize("base", [MINI, NANO_MINI], ids=["edge", "nano"])
+def test_engine_matches_native_forward_p2_with_padding(base):
+    cfg = dict(base, latent_patch_size=2, patch_latent_dim=2 * 2 * base["latent_channel"])
     net = _build(cfg)
     ids = torch.tensor([5, 6, 7])
     lat = torch.randn(1, cfg["latent_channel"], 2, 3, 5)  # odd H/W → zero-pad path

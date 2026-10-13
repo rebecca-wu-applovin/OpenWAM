@@ -1,8 +1,9 @@
-"""GPU real-weights load test for cosmos3_edge (predict2.5 real_load parity).
+"""GPU real-weights load test for the cosmos3 backbones (predict2.5 real_load parity).
 
-Gated on CUDA + the Cosmos3-Edge bundle + diffusers. Asserts the released
-geometry, runs preprocess_input_for_train end-to-end on synthetic PIL frames,
-drives the full 28-block loop shape-conservingly, and round-trips the VAE.
+Gated on CUDA + the bundle + diffusers; parametrized over Edge and Nano (each
+skips on its own when its bundle is absent). Asserts the released geometry,
+runs preprocess_input_for_train end-to-end on synthetic PIL frames, drives the
+full block loop shape-conservingly, and round-trips the VAE.
 """
 
 from pathlib import Path
@@ -14,40 +15,48 @@ from tests._assets import asset_path
 
 pytestmark = pytest.mark.gpu
 
-ASSET_PATH = Path(asset_path("OPENWAM_COSMOS3_EDGE"))
+# registry name -> (asset key, expected (dim, num_layers, num_heads, text_dim))
+VARIANTS = {
+    "cosmos3_edge": ("OPENWAM_COSMOS3_EDGE", (2048, 28, 16, 2048)),
+    "cosmos3_nano": ("OPENWAM_COSMOS3_NANO", (4096, 36, 32, 4096)),
+}
 
 
-def _skip_unless_runnable():
+@pytest.fixture(scope="module", params=sorted(VARIANTS))
+def variant(request):
+    """Yields (name, backbone, expected geometry); builds one variant at a time on GPU."""
+    name = request.param
+    asset_key, geometry = VARIANTS[name]
+    asset = Path(asset_path(asset_key))
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available.")
-    if not ASSET_PATH.exists():
-        pytest.skip(f"Cosmos3-Edge bundle missing at {ASSET_PATH}.")
+    if not asset.exists():
+        pytest.skip(f"{name} bundle missing at {asset}.")
     pytest.importorskip("diffusers")
-
-
-@pytest.fixture(scope="module")
-def vb():
-    _skip_unless_runnable()
     from openwam.model.video_backbone import build_video_backbone
 
-    cfg = {"model": {"video_backbone": {"name": "cosmos3_edge", "model_path": str(ASSET_PATH)}}}
-    backbone = build_video_backbone("cosmos3_edge", cfg)
+    cfg = {"model": {"video_backbone": {"name": name, "model_path": str(asset)}}}
+    backbone = build_video_backbone(name, cfg)
     backbone.set_dtype_device(torch.bfloat16, torch.device("cuda"))
-    return backbone
+    yield name, backbone, geometry
+    del backbone  # free the GPU before the next variant builds
+    torch.cuda.empty_cache()
 
 
-def test_released_geometry(vb):
-    assert vb.dim == 2048
-    assert vb.num_layers == 28
-    assert vb.num_heads == 16
+def test_released_geometry(variant):
+    _, vb, (dim, layers, heads, text_dim) = variant
+    assert vb.dim == dim
+    assert vb.num_layers == layers
+    assert vb.num_heads == heads
     assert vb.head_dim == 128
-    assert vb.text_dim == 2048
+    assert vb.text_dim == text_dim
     assert vb.temporal_compression == 4
     assert vb.causal_temporal is True
     assert getattr(vb.dit, "lm_head", None) is None
 
 
-def test_preprocess_and_block_loop_shapes(vb):
+def test_preprocess_and_block_loop_shapes(variant):
+    _, vb, (_, layers, _, text_dim) = variant
     import numpy as np
     from PIL import Image
 
@@ -59,8 +68,8 @@ def test_preprocess_and_block_loop_shapes(vb):
         assert lat.shape[0] == 1 and lat.shape[1] == 48
         assert lat.shape[2] == 1 + (9 - 1) // 4  # 3 latent frames
         assert lat.shape[3] == 96 // 16 and lat.shape[4] == 160 // 16
-        assert inputs["context"].shape[-1] == 2048
-        assert len(inputs["und_kv"]) == 28
+        assert inputs["context"].shape[-1] == text_dim
+        assert len(inputs["und_kv"]) == layers
         assert inputs["num_clean_prefix_frames"] == 1
 
         state = vb.prepare(
@@ -80,7 +89,8 @@ def test_preprocess_and_block_loop_shapes(vb):
     assert torch.isfinite(out.float()).all()
 
 
-def test_vae_roundtrip(vb):
+def test_vae_roundtrip(variant):
+    vb = variant[1]
     import numpy as np
     from PIL import Image
 

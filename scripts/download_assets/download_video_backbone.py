@@ -120,6 +120,21 @@ MODELS: dict[str, Model] = {
         downloads=(Download("nvidia/Cosmos3-Edge", "Cosmos3-Edge", approx_gb=9.2, ms_id="nv-community/Cosmos3-Edge"),),
         config_fields=("model_path",),
     ),
+    "6": Model(
+        name="Cosmos3-Nano",
+        config="cosmos3_nano.yaml",
+        downloads=(
+            Download(
+                "nvidia/Cosmos3-Nano",
+                "Cosmos3-Nano",
+                approx_gb=30.4,
+                # only what the cosmos3 builder reads (skips sound_tokenizer / vision_encoder / sample media)
+                allow_patterns=("transformer/*", "vae/*", "text_tokenizer/*", "scheduler/*", "*.json", "*.jinja"),
+            ),
+        ),
+        config_fields=("model_path",),
+        hf_only=True,
+    ),
 }
 
 

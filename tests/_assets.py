@@ -26,6 +26,7 @@ _ASSETS: dict[str, tuple[tuple[str, ...], Path]] = {
     "OPENWAM_COSMOS25_2B": (("COSMOS25_ASSET_PATH",), _VIDEO_BACKBONES / "Cosmos-Predict2.5-2B"),
     "OPENWAM_COSMOS_REASON1_7B": (("REASON1_ASSET_PATH",), _VIDEO_BACKBONES / "Cosmos-Reason1-7B"),
     "OPENWAM_COSMOS3_EDGE": (("COSMOS3_EDGE_ASSET_PATH",), _VIDEO_BACKBONES / "Cosmos3-Edge"),
+    "OPENWAM_COSMOS3_NANO": (("COSMOS3_NANO_ASSET_PATH",), _VIDEO_BACKBONES / "Cosmos3-Nano"),
 }
 
 

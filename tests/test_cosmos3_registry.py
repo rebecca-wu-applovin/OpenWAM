@@ -18,6 +18,11 @@ def test_cosmos3_edge_registered():
     assert _VIDEO_BACKBONE_REGISTRY["cosmos3_edge"] is Cosmos3EdgeVideoBackbone
 
 
+def test_cosmos3_nano_registered():
+    # Nano shares the class; the variant is selected by cfg.name at build time.
+    assert _VIDEO_BACKBONE_REGISTRY["cosmos3_nano"] is Cosmos3EdgeVideoBackbone
+
+
 def test_double_registration_raises():
     with pytest.raises(ValueError, match="already registered"):
         register_video_backbone("cosmos3_edge")(Cosmos3EdgeVideoBackbone)
@@ -28,8 +33,8 @@ def _cfg(**vb):
 
 
 def test_unknown_name_raises_not_implemented():
-    with pytest.raises(NotImplementedError, match="cosmos3_edge"):
-        build_video_backbone("cosmos3_edge", _cfg(name="cosmos3_nano", model_path="/tmp/x"))
+    with pytest.raises(NotImplementedError, match="cosmos3_nano"):
+        build_video_backbone("cosmos3_edge", _cfg(name="cosmos3_super", model_path="/tmp/x"))
 
 
 def test_missing_model_path_raises():

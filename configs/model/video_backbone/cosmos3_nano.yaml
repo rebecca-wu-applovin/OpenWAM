@@ -1,0 +1,30 @@
+# Cosmos3-Nano (16B) video backbone — same dual-stream unified transformer and
+# code path as cosmos3_edge (shared class; geometry picked by `name` in
+# openwam/model/video_backbone/cosmos3/pipeline_builder._COSMOS3_VARIANTS).
+# Qwen3-VL-text MoT: 36 layers x 4096, 32 heads (8 KV), SiLU. VAE = Wan2.2-TI2V
+# (same config as Edge). Trainable gen pathway ~7.0B; the und pathway (~7.6B,
+# acts as the text encoder) is frozen at build. Action-side context width
+# (text_dim=4096) and ActionDiT geometry auto-derive.
+
+name: cosmos3_nano
+model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Cosmos3-Nano  # [Required] diffusers-style bundle root (transformer/ + vae/ + text_tokenizer/)
+
+# Flow-matching α-shift for the video scheduler (train + deploy single source of
+# truth). Same 480p regime value as cosmos3_edge.
+shift_video: 5.0
+
+# Prompt handling — mirrors the native pipeline defaults. Unlike Edge (whose
+# model_index.json sets default_use_system_prompt=false), the Nano bundle leaves
+# it unset, so Cosmos3OmniPipeline falls back to its default of true.
+use_system_prompt: true
+prompt_templates: true    # duration + resolution metadata sentences in the prompt
+max_text_tokens: 512
+
+# Assumed clip frame rate for the duration sentence + vision mRoPE temporal
+# scaling (inert while it equals the model's base_fps of 24).
+fps: 24.0
+prompt_duration_template: true
+
+text_encoder_dropout: 0.0  # CFG dropout: prob of substituting "" for prompts (training only); seed via +model.video_backbone.text_encoder_dropout_seed=<int>
+
+freeze_und: true   # freeze the und (text) pathway + token embedding at build

@@ -8,7 +8,7 @@
 # build (freeze_und below); the gen pathway is trainable by default.
 
 name: cosmos3_edge
-model_path: /path/to/assets/Cosmos3-Edge  # [Required] diffusers-style bundle root (transformer/ + vae/ + text_tokenizer/)
+model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Cosmos3-Edge  # [Required] diffusers-style bundle root (transformer/ + vae/ + text_tokenizer/)
 
 # Flow-matching α-shift for the video scheduler (train + deploy single source of
 # truth). NVIDIA's resolution-keyed train shifts are {256: 3, 480: 5, 720: 10};
