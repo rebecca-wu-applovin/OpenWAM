@@ -38,6 +38,7 @@ training:
   use_gradient_checkpointing_offload: false  # Offload checkpointed activations to CPU
   initialize_model_on_cpu: false         # Load model on CPU, let DeepSpeed move to GPU
   offload_optimizer_device: none         # DeepSpeed ZeRO optimizer-state offload: none / cpu
+  cache_text_embeddings: true            # encode the dataset's prompt set once at start, frozen T5 then on CPU (bitwise-same inputs, ~10 GB/GPU less)
 
   # --- Loss weights ---
   lambda_video: 1.0               # Video flow-matching loss weight

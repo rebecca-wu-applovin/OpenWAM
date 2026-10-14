@@ -382,6 +382,10 @@ class MultiYamSharpaDataset(BaseDataset):
     def datasets(self) -> List[YamSharpaDataset]:
         return list(self._datasets)
 
+    def all_prompts(self) -> List[str]:
+        """Returns: sorted list[str], union of every source's prompts (text-embedding cache)."""
+        return sorted({p for ds in self._datasets for p in ds.all_prompts()})
+
     # ----- config -------------------------------------------------------------
 
     @classmethod

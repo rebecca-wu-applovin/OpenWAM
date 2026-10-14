@@ -238,6 +238,9 @@ class OpenWAMTrainer:
 
         output_path, resume_state_dir = self.setup_output_dir(debug, resume_path)
         optimizer, dataloader, scheduler = self.prepare_accelerate(optimizer, dataloader, scheduler)
+        # After prepare (DeepSpeed moves the whole module to the GPU): encode prompts once, park T5 on CPU.
+        if bool(cfg_get(t, "cache_text_embeddings", False)):
+            self.cache_text_embeddings()
 
         if self._run_seed is not None:
             from openwam.dataloader.mixture import MixtureDataset
@@ -566,6 +569,26 @@ class OpenWAMTrainer:
             self.accelerator.device,
         )
         return optimizer, dataloader, scheduler
+
+    # (7b) Called by train() after prepare when training.cache_text_embeddings is on.
+    def cache_text_embeddings(self) -> None:
+        """Pre-encode the dataset's full prompt set; the frozen text encoder then sits on CPU.
+
+        Input: none (uses self.dataset.all_prompts() and the unwrapped architecture's video backbone).
+        Returns: None. Logs and keeps online encoding when the backbone or dataset can't support it.
+        """
+        arch = self.architecture if self.accelerator is None else self.accelerator.unwrap_model(self.architecture)
+        bb = arch.video_backbone
+        prompts = self.dataset.all_prompts() if hasattr(self.dataset, "all_prompts") else None
+        if not hasattr(bb, "build_text_cache") or not prompts:
+            logger.warning(
+                "cache_text_embeddings: unsupported here (backbone %s, dataset %s); encoding text online",
+                type(bb).__name__,
+                type(self.dataset).__name__,
+            )
+            return
+        bb.build_text_cache(prompts)
+        logger.info("cache_text_embeddings: cached %d prompts; text encoder moved to CPU", len(prompts))
 
     # (8) Called by train() on the resume path — restore full state, map step -> (start_epoch, skip).
     def resume_if_configured(self, resume_state_dir: str, dataloader, grad_accum: int) -> tuple[int, int, int, int]:

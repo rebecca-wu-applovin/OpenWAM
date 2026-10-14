@@ -114,6 +114,8 @@ class WanBase(VideoBackbone):
         self._wan_blocks_compile_enabled = False
         self._wan_blocks_compile_kwargs: dict | None = None
         self._compiled_wan_blocks: dict[int, Callable[..., Tensor]] = {}
+        # prompt -> (context (1, 512, D), seq_lens (1,)) once build_text_cache ran; None = encode online.
+        self._text_cache: Optional[dict] = None
 
     # ================================================================
     # Internal properties
@@ -749,6 +751,55 @@ class WanBase(VideoBackbone):
         return noisy, cond
 
     # ================================================================
+    # Text-embedding cache (training: fixed prompt set, frozen T5)
+    # ================================================================
+
+    @torch.no_grad()
+    def build_text_cache(self, prompts: list, *, batch_size: int = 8, offload_device: str = "cpu") -> None:
+        """Encode every training prompt once, then park the text encoder off the GPU.
+
+        Args:
+            prompts: list[str], every prompt training can draw (dataset ``all_prompts()``).
+            batch_size: int, prompts per T5 forward while building.
+            offload_device: where the frozen T5 lives afterwards. It stays a registered
+                child, so ``state_dict`` / checkpoints keep the same ``text_encoder.*`` keys.
+
+        Returns: None. Sets ``self._text_cache`` = {prompt: (context (1, 512, D), seq_lens (1,))}
+            on the GPU; ``_encode_text`` then reads it and raises on unknown prompts.
+        """
+        cache = {}
+        for i in range(0, len(prompts), batch_size):
+            chunk = list(prompts[i : i + batch_size])
+            context, seq_lens = wan_encode.encode_text(
+                chunk, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
+            )
+            # Per-prompt (1, ...) slices; clone so each entry owns its storage.
+            for j, p in enumerate(chunk):
+                cache[p] = (context[j : j + 1].clone(), seq_lens[j : j + 1].clone())
+        self._text_cache = cache
+        self.text_encoder.to(offload_device)
+        torch.cuda.empty_cache()
+
+    def _encode_text(self, prompts: list) -> Tuple[Tensor, Tensor]:
+        """Text context for a batch: cache lookup if built, else online T5.
+
+        Args: prompts: list[str] of length B.
+        Returns: context (B, 512, D) on self.device, seq_lens (B,) long.
+        """
+        if self._text_cache is None:
+            return wan_encode.encode_text(
+                prompts, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
+            )
+        missing = [p for p in prompts if p not in self._text_cache]
+        if missing:
+            # The encoder is on CPU now; a new prompt means all_prompts() missed a source.
+            raise KeyError(f"text cache has no entry for prompts {missing[:3]} (cache size {len(self._text_cache)})")
+        # torch.cat copies, so callers may modify the batch in place.
+        context = torch.cat([self._text_cache[p][0] for p in prompts], dim=0)
+        seq_lens = torch.cat([self._text_cache[p][1] for p in prompts], dim=0)
+        return context, seq_lens
+
+    # ================================================================
     # ABC: Unified preprocessing (1)
     # ================================================================
 
@@ -770,9 +821,7 @@ class WanBase(VideoBackbone):
         )
 
         batch_size = len(frames)
-        context, seq_lens = wan_encode.encode_text(
-            text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
-        )
+        context, seq_lens = self._encode_text(text)
 
         all_input_videos = []
         for clip_frames in frames:
@@ -898,14 +947,18 @@ class WanBase(VideoBackbone):
             time_division_remainder=self._time_division_remainder,
         )
 
-        context, seq_lens = wan_encode.encode_text_for_inference(
-            prompt,
-            vace_cache=vace_cache,
-            prompt_embed_cache=prompt_embed_cache,
-            tokenizer=self._tokenizer,
-            text_encoder=self.text_encoder,
-            device=self.device,
-        )
+        if self._text_cache is not None:
+            # Training-time rollout (vis): the text encoder is parked on CPU, use the cache.
+            context, seq_lens = self._encode_text([prompt])
+        else:
+            context, seq_lens = wan_encode.encode_text_for_inference(
+                prompt,
+                vace_cache=vace_cache,
+                prompt_embed_cache=prompt_embed_cache,
+                tokenizer=self._tokenizer,
+                text_encoder=self.text_encoder,
+                device=self.device,
+            )
 
         _DEFAULT_CAMERA_ORIGIN = (
             0,

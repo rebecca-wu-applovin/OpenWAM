@@ -646,6 +646,17 @@ class LeRobotV3Reader(BaseDataset):
         task_str = tasks_df.index.to_numpy()
         self._task_idx_to_text = dict(zip(task_idx.tolist(), task_str.tolist()))
 
+    def all_prompts(self) -> Optional[List[str]]:
+        """Every prompt string ``_resolve_prompt`` can return (for text-embedding caching).
+
+        Returns: sorted list[str] of unique prompts (stripped, as ``_resolve_prompt`` returns
+            them; a superset of the split's prompts), or None for ``episode_annotated``
+            sources (not supported; the caller must then encode online).
+        """
+        if self.PROMPT_SOURCE != "task_index":
+            return None
+        return sorted({t.strip() for t in self._task_idx_to_text.values() if t.strip()})
+
     def _resolve_prompt(self, row, win: pd.DataFrame) -> str:
         """Resolve this window's prompt text according to ``PROMPT_SOURCE``.
 
