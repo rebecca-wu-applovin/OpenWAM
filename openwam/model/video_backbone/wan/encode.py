@@ -16,12 +16,12 @@ from openwam.model.video_backbone.wan.preprocess import preprocess_video as _pre
 from openwam.model.video_backbone.wan.preprocess import vae_output_to_video
 
 
-def encode_text(prompts: list, *, tokenizer, text_encoder, device) -> Tuple[Tensor, Tensor]:
+def encode_text(prompts: list, *, tokenizer, text_encoder, device, max_length: int = 512) -> Tuple[Tensor, Tensor]:
     ids, mask = tokenizer(
         prompts,
         return_mask=True,
         add_special_tokens=True,
-        max_length=512,
+        max_length=max_length,
         padding="max_length",
         truncation=True,
     )
@@ -35,14 +35,16 @@ def encode_text(prompts: list, *, tokenizer, text_encoder, device) -> Tuple[Tens
 
 
 def encode_text_for_inference(
-    prompt, *, vace_cache, prompt_embed_cache, tokenizer, text_encoder, device
+    prompt, *, vace_cache, prompt_embed_cache, tokenizer, text_encoder, device, max_length: int = 512
 ) -> Tuple[Tensor, Tensor]:
     """Deploy ``(context, seq_lens)``, reusing a prompt-keyed cached embed."""
     if vace_cache and vace_cache.get("populated") and vace_cache.get("prompt_key") == prompt:
         return vace_cache["context"], vace_cache["seq_lens"]
     if prompt_embed_cache is not None and prompt in prompt_embed_cache:
         return prompt_embed_cache[prompt]
-    context, seq_lens = encode_text([prompt], tokenizer=tokenizer, text_encoder=text_encoder, device=device)
+    context, seq_lens = encode_text(
+        [prompt], tokenizer=tokenizer, text_encoder=text_encoder, device=device, max_length=max_length
+    )
     if prompt_embed_cache is not None:
         prompt_embed_cache[prompt] = (context, seq_lens)
     return context, seq_lens

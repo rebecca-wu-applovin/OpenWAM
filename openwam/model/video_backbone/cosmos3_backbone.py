@@ -291,6 +291,23 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         std = self._latents_std.to(raw.device)
         return ((raw.float() - mean) / std).to(raw.dtype)
 
+    def _encode_sparse_frames(self, frames: Tensor, num_history_frames: int) -> Tensor:
+        """Sparse-history encode: each history frame alone, the future frames as one causal clip.
+
+        Args:
+            frames: (B, 3, H + F, H_px, W_px) pixels in [-1, 1], history first.
+            num_history_frames: int, H.
+
+        Returns:
+            (B, 48, H + T_fut, h, w) normalized latents.
+        """
+        b, h = frames.shape[0], int(num_history_frames)
+        # (B*H, 3, 1, H_px, W_px): every history frame is its own 1-frame clip.
+        hist = frames[:, :, :h].transpose(1, 2).flatten(0, 1).unsqueeze(2)
+        hist_lat = self._encode_frames(hist).unflatten(0, (b, h)).squeeze(3).transpose(1, 2)
+        fut_lat = self._encode_frames(frames[:, :, h:])
+        return torch.cat([hist_lat, fut_lat], dim=2)
+
     def _unnormalize_latents(self, latents: Tensor) -> Tensor:
         mean = self._latents_mean.to(latents.device)
         std = self._latents_std.to(latents.device)
@@ -378,8 +395,14 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             prompts = [p if self._text_dropout_rng.random() >= self._text_dropout_p else "" for p in prompts]
 
         fps = float(kw.get("fps", self._clip_fps))
+        n_hist = int(kw.get("num_history_frames", 0) or 0)
         with torch.no_grad():
-            latents = self._encode_frames(frames_t)
+            if n_hist > 0:
+                latents = self._encode_sparse_frames(frames_t, n_hist)
+                # Prompt metadata describes the equivalent contiguous clip of these latents (scheme (a)).
+                t_pix = 1 + self._temporal_compression * (latents.shape[2] - 1)
+            else:
+                latents = self._encode_frames(frames_t)
             enc = self._encode_prompts(prompts, num_frames=t_pix, height=h_pix, width=w_pix, fps=fps)
 
         vision_pos = self._vision_positions(enc["und_len_padded"], tuple(latents.shape[2:]), fps)
@@ -394,8 +417,8 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             "seq_lens": enc["seq_lens"],
             "und_kv": enc["und_kv"],
             "vision_positions": vision_pos,
-            "first_frame_latents": latents[:, :, :1].clone(),
-            "num_clean_prefix_frames": 1,
+            "first_frame_latents": latents[:, :, : max(n_hist, 1)].clone(),
+            "num_clean_prefix_frames": max(n_hist, 1),
             "num_frames": t_pix,
             "height": h_pix,
             "width": w_pix,

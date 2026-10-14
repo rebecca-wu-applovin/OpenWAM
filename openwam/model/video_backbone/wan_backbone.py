@@ -178,6 +178,9 @@ class WanBase(VideoBackbone):
     def text_dim(self) -> Optional[int]:
         return getattr(self, "_text_dim", None)
 
+    # umT5 token budget per prompt (Wan native 512; LongLive / Long-WAM uses 128).
+    text_max_length: int = 512
+
     @property
     def video_attention_mask_mode(self) -> str:
         """Video self-attention mask mode for joint MoT mask construction.
@@ -771,7 +774,11 @@ class WanBase(VideoBackbone):
         for i in range(0, len(prompts), batch_size):
             chunk = list(prompts[i : i + batch_size])
             context, seq_lens = wan_encode.encode_text(
-                chunk, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
+                chunk,
+                tokenizer=self._tokenizer,
+                text_encoder=self.text_encoder,
+                device=self.device,
+                max_length=self.text_max_length,
             )
             # Per-prompt (1, ...) slices; clone so each entry owns its storage.
             for j, p in enumerate(chunk):
@@ -788,7 +795,11 @@ class WanBase(VideoBackbone):
         """
         if self._text_cache is None:
             return wan_encode.encode_text(
-                prompts, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
+                prompts,
+                tokenizer=self._tokenizer,
+                text_encoder=self.text_encoder,
+                device=self.device,
+                max_length=self.text_max_length,
             )
         missing = [p for p in prompts if p not in self._text_cache]
         if missing:
@@ -803,10 +814,81 @@ class WanBase(VideoBackbone):
     # ABC: Unified preprocessing (1)
     # ================================================================
 
+    def _encode_sparse_clips(self, frames, num_history_frames: int) -> Tensor:
+        """Sparse-history encode: each history frame alone, the future frames as one causal clip.
+
+        Args:
+            frames: list of B clips, each H + F PIL frames (history first).
+            num_history_frames: int, H.
+
+        Returns:
+            (B, z, H + T_fut, h, w) latents; T_fut = 1 + (F - 1) // 4.
+        """
+        h = int(num_history_frames)
+
+        def _pixels(clip):
+            # (1, 3, T, H_px, W_px) in [-1, 1].
+            return wan_encode.preprocess_video(clip, encoder=self.video_encoder, dtype=self.dtype, device=self.device)
+
+        # History: (B*H, 3, 1, H_px, W_px) → B*H single-frame latents.
+        hist = torch.cat([_pixels(clip[:h]).transpose(1, 2).flatten(0, 1).unsqueeze(2) for clip in frames], dim=0)
+        hist_lat = wan_encode.encode_video(hist, vae=self.vae, encoder=self.video_encoder)
+        hist_lat = hist_lat.unflatten(0, (len(frames), h)).squeeze(3).transpose(1, 2)  # (B, z, H, h, w)
+        # Future: one causal clip per sample.
+        fut = torch.cat([_pixels(clip[h:]) for clip in frames], dim=0)
+        fut_lat = wan_encode.encode_video(fut, vae=self.vae, encoder=self.video_encoder)
+        return torch.cat([hist_lat.to(fut_lat.dtype), fut_lat], dim=2)
+
+    def _preprocess_sparse_history(self, frames, text, num_history_frames: int) -> dict:
+        """Train inputs for the sparse-history layout (TI2V only).
+
+        Args:
+            frames: list of B clips of H + F PIL frames.
+            text: list of B prompts.
+            num_history_frames: int, H.
+
+        Returns:
+            preprocess dict; ``first_frame_latents`` holds the H clean history latents
+            and ``num_clean_prefix_frames`` = H (per-token t=0 on them, loss skips them).
+        """
+        if not self._is_ti2v:
+            raise NotImplementedError("sparse history is implemented for the TI2V variant only")
+        h = int(num_history_frames)
+        height, width, _ = check_resize_height_width(
+            frames[0][0].size[1],
+            frames[0][0].size[0],
+            len(frames[0]) - h,
+            height_division_factor=self._height_division_factor,
+            width_division_factor=self._width_division_factor,
+            time_division_factor=self._time_division_factor,
+            time_division_remainder=self._time_division_remainder,
+        )
+        if (len(frames[0]) - h - 1) % self._time_division_factor:
+            raise ValueError(f"future frames must be 1 + {self._time_division_factor}k, got {len(frames[0]) - h}")
+        context, seq_lens = self._encode_text(text)
+        input_latents = self._encode_sparse_clips(frames, h).to(dtype=self.dtype, device=self.device)
+        return {
+            "input_latents": input_latents,
+            "context": context,
+            "seq_lens": seq_lens,
+            "height": height,
+            "width": width,
+            "num_frames": len(frames[0]),
+            "vace_context": None,
+            "fuse_vae_embedding_in_latents": True,
+            "num_clean_prefix_frames": h,
+            "first_frame_latents": input_latents[:, :, :h].clone(),
+            "clip_feature": None,
+            "y": None,
+        }
+
     def preprocess_input_for_train(self, *, frames=None, text=None, **kw) -> dict:
         """Unified train preprocessing: raw data (``frames``/``text``, optional
         ``vace_videos``/``ref_images`` in kw) → the denoising-loop input dict.
+        ``num_history_frames`` > 0 switches to the sparse-history layout.
         """
+        if int(kw.get("num_history_frames", 0) or 0) > 0:
+            return self._preprocess_sparse_history(frames, text, kw["num_history_frames"])
         device = self.device
         dtype = self.dtype
 
@@ -958,6 +1040,7 @@ class WanBase(VideoBackbone):
                 tokenizer=self._tokenizer,
                 text_encoder=self.text_encoder,
                 device=self.device,
+                max_length=self.text_max_length,
             )
 
         _DEFAULT_CAMERA_ORIGIN = (
