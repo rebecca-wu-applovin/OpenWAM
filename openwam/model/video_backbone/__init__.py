@@ -68,3 +68,9 @@ register_video_backbone("longlive2_robot_s")(LongLiveRobotS)
 from openwam.model.video_backbone.ge_backbone import GEBaseFastVideoBackbone  # noqa: E402
 
 register_video_backbone("ge_base_fast")(GEBaseFastVideoBackbone)
+
+# flux-3-action-base video trunk (07). CPU-only-CI safe — NATTEN (VAE) and transformers (Qwen)
+# are imported inside from_pretrained.
+from openwam.model.video_backbone.flux_action import FluxActionVideoBackbone  # noqa: E402
+
+register_video_backbone("flux3_action_base")(FluxActionVideoBackbone)

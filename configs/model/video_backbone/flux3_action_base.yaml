@@ -1,0 +1,12 @@
+# flux-3-action-base video trunk (cfg.model.video_backbone.*), 07_sparse_history_backbones.
+# Only the video side of FLUX 3 Action: 5 mode blocks + 28 single-stream blocks (hidden 3072, 24 heads),
+# ViTNorm video VAE (4x / 32x, 96 ch, needs NATTEN), Qwen3-VL-4B text (8 stacked layers, 20480 ch).
+# OpenWAM's ActionDiT replaces flux's action stream; proprio rides flux's x_action_cond stream.
+
+name: flux3_action_base
+model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/flux-3-action-base  # [Required] flux-3-action-base.safetensors + video_vae.safetensors + text_encoder/
+
+shift_video: 5.0             # inference sampler shift (flux DROID_INFERENCE_SETTINGS); training uses the native law below
+train_timestep_width: 0.75   # PolicyConfig.train_timestep_width: logit(t) ~ Logistic(0, 0.75)
+train_timestep_shift: 42.0   # PolicyConfig.train_timestep_shift: rational shift
+text_dropout_p: 0.1          # PolicyConfig.caption_dropout ("" through the chat template)
