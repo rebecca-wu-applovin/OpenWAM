@@ -507,7 +507,7 @@ class LeRobotV3Reader(BaseDataset):
             if col in self._eps_df.columns:
                 self._ep_video_frame_offsets[cam] = self._eps_df[col].to_numpy().astype(np.int64)
 
-        min_window_len = self._num_frames if self._split == "val" else self._train_min_window_len()
+        min_window_len = self._min_window_len()
         n_starts = np.where(
             effective_length >= min_window_len,
             (effective_length - min_window_len) // self._window_stride + 1,
@@ -519,7 +519,7 @@ class LeRobotV3Reader(BaseDataset):
     def _sampleable_episode_frames(self, eps_df: pd.DataFrame) -> np.ndarray:
         """Effective frames, with non-window-producing episodes charged as zero."""
         frames = effective_episode_frames(eps_df)
-        min_window_len = self._num_frames if self._split == "val" else self._train_min_window_len()
+        min_window_len = self._min_window_len()
         return np.where(frames >= min_window_len, frames, 0).astype(np.int64)
 
     def _apply_effective_hour_budget(self, target_hours: float, seed: int) -> None:
@@ -592,6 +592,10 @@ class LeRobotV3Reader(BaseDataset):
 
         with open(path) as f:
             return set(json.load(f)["episode_indices"])
+
+    def _min_window_len(self) -> int:
+        """Min episode length that yields a window: full ``num_frames`` for val, the train hook otherwise."""
+        return self._num_frames if self._split == "val" else self._train_min_window_len()
 
     def _train_min_window_len(self) -> int:
         """Min episode length to yield a train window. 1 = any single labeled step."""

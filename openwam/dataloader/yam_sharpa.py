@@ -14,6 +14,12 @@ Per sample (anchor = first window frame t, OpenWAM temporal contract):
 * proprio: representation of ``state[t]`` (1, D).
 * action: representation of targets ``t .. t+num_frames-2`` w.r.t. frame t.
 
+Sparse-history layout (``history_offsets`` + ``future_offsets`` set; used by
+07_sparse_history_backbones): video = the history rows ``t + history_offsets``
+(clamped to the episode start, i.e. the first frame repeats) followed by the
+future rows ``t + future_offsets``; proprio = the history rows (H, D); action is
+unchanged. A window is only drawn where every future / action row exists.
+
 Width D is 48 for ``fingertips_*`` (``unify_action`` off) and 80 for
 ``unify_*`` (raw 62 scattered by ``UNIFY_ACTION_MAP``). The unify switch is
 derived from ``action_mode``; do not set ``unify_action`` in the config.
@@ -28,6 +34,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import torch
 
 from openwam.dataloader.bases import BaseDataset, LeRobotV3Reader
 from openwam.dataloader.transforms.multiview import assemble_vstack_layout
@@ -94,6 +101,31 @@ def _read_stats_meta(path: Path) -> Optional[dict]:
     return payload.get("yam_sharpa_meta") if isinstance(payload, dict) else None
 
 
+def _validate_sparse_offsets(
+    history_offsets: Optional[Sequence[int]], future_offsets: Optional[Sequence[int]]
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Check the sparse-history row offsets.
+
+    Args:
+        history_offsets: H ints, increasing, <= 0, last one 0 (frame t); or None.
+        future_offsets: F ints, increasing, > 0; or None.
+
+    Returns:
+        ``(history (H,), future (F,))`` int64 arrays, or ``(None, None)`` when the layout is off.
+    """
+    if history_offsets is None and future_offsets is None:
+        return None, None
+    if history_offsets is None or future_offsets is None:
+        raise ValueError("yam_sharpa: history_offsets and future_offsets must be set together")
+    h = np.asarray(list(history_offsets), dtype=np.int64)
+    f = np.asarray(list(future_offsets), dtype=np.int64)
+    if h.size == 0 or h[-1] != 0 or (np.diff(h) <= 0).any():
+        raise ValueError(f"yam_sharpa: history_offsets must increase and end at 0, got {h.tolist()}")
+    if f.size == 0 or f[0] <= 0 or (np.diff(f) <= 0).any():
+        raise ValueError(f"yam_sharpa: future_offsets must be positive and increasing, got {f.tolist()}")
+    return h, f
+
+
 class YamSharpaDataset(LeRobotV3Reader):
     """Single-source reader; built by :class:`MultiYamSharpaDataset`.
 
@@ -108,7 +140,7 @@ class YamSharpaDataset(LeRobotV3Reader):
     # unify_* keys are derived from action_mode, so they are not accepted from config.
     CONFIG_KEYS: ClassVar[Tuple[str, ...]] = tuple(
         k for k in LeRobotV3Reader.CONFIG_KEYS if k not in ("unify_action", "unify_action_map", "unify_state_map")
-    ) + ("action_mode", "normalization_stats_path")
+    ) + ("action_mode", "normalization_stats_path", "history_offsets", "future_offsets", "min_rows_ahead")
 
     def __init__(
         self,
@@ -117,6 +149,9 @@ class YamSharpaDataset(LeRobotV3Reader):
         action_mode: str,
         normalization_stats_path: Optional[str] = None,
         camera_layout: Optional[Sequence[str]] = None,
+        history_offsets: Optional[Sequence[int]] = None,
+        future_offsets: Optional[Sequence[int]] = None,
+        min_rows_ahead: int = 0,
         **kwargs: Any,
     ):
         """
@@ -125,6 +160,11 @@ class YamSharpaDataset(LeRobotV3Reader):
             action_mode: str, one of ``ACTION_REPRS``.
             normalization_stats_path: str, pooled stats file (required when normalization is on).
             camera_layout: list[str] of camera feature keys, top-to-bottom; default ego over chest.
+            history_offsets: list[int] of H row offsets <= 0 ending at 0 (e.g. [-80,-60,-40,-20,0]); enables the
+                sparse-history layout together with ``future_offsets``. None = legacy contiguous window.
+            future_offsets: list[int] of F increasing row offsets > 0 (e.g. [5,10,...,25]).
+            min_rows_ahead: int, sparse layout only: row t + min_rows_ahead must exist too, so backbones with
+                shorter futures can share one sampling range (07: 45 for every backbone).
             **kwargs: forwarded to :class:`LeRobotV3Reader` (num_frames, video_stride, height, width, ...).
         """
         for key in ("unify_action", "unify_action_map", "unify_state_map"):
@@ -134,6 +174,8 @@ class YamSharpaDataset(LeRobotV3Reader):
         self._source_stats_path = str(normalization_stats_path) if normalization_stats_path else None
         self._state_normalization_stats: Optional[dict] = None  # filled by _load_stats
         self._layout_cams = [str(c) for c in (camera_layout or DEFAULT_CAMERA_LAYOUT)]
+        self._history_offsets, self._future_offsets = _validate_sparse_offsets(history_offsets, future_offsets)
+        self._min_rows_ahead = int(min_rows_ahead or 0)
 
         # Raw (pre-unify) width; the base class scatters it to 80 when unify is on.
         self.ACTION_DIM = raw_dim(self.action_mode)
@@ -145,8 +187,23 @@ class YamSharpaDataset(LeRobotV3Reader):
             unify_action_map=unify_action_map(self.action_mode),
             **kwargs,
         )
+        if self.sparse_history:
+            # The sampled video is history + future frames, not the video_stride grid.
+            self._num_video_frames = len(self._history_offsets) + len(self._future_offsets)
+
+    @property
+    def sparse_history(self) -> bool:
+        """True when the sparse-history layout (history_offsets + future_offsets) is on."""
+        return self._history_offsets is not None
 
     # ----- hooks ------------------------------------------------------------
+
+    def _min_window_len(self) -> int:
+        """Sparse layout: every future frame and every action row must exist (train and val alike)."""
+        if not self.sparse_history:
+            return super()._min_window_len()
+        # Rows t .. t + max_ahead must all lie inside the episode.
+        return max(int(self._future_offsets[-1]), self._num_frames - 1, self._min_rows_ahead) + 1
 
     def _resolve_cameras(self, info: dict):
         """Map the layout onto the base (head, left, right) slots so every camera gets video offsets."""
@@ -239,6 +296,76 @@ class YamSharpaDataset(LeRobotV3Reader):
             (1, D) float32, normalized with the ``_state`` stats block.
         """
         raw = encode_proprio(self.action_mode, win[STATE_COL].values[0], win[JOINT_COL].values[0])
+        return apply_normalization(raw, self._state_normalization_stats, self._normalize_mode)
+
+    # ----- sparse-history sample ----------------------------------------------
+
+    def _getitem_impl(self, idx: int) -> dict:
+        """Sparse layout sample; defers to the base contiguous window when the layout is off.
+
+        Args:
+            idx: int in [0, len).
+
+        Returns:
+            dict with ``video`` (H+F PIL images: history then future), ``proprio`` (H, D),
+            ``action`` (num_frames-1, D) + masks, ``prompt``, ``num_history_frames`` = H and
+            ``video_mask`` = None (every frame is real by construction).
+        """
+        if not self.sparse_history:
+            return super()._getitem_impl(idx)
+        ep_local = int(np.searchsorted(self._cum_n_starts, idx, side="right") - 1)
+        valid_start = int(self._ep_valid_start[ep_local])
+        offset = valid_start + (idx - int(self._cum_n_starts[ep_local])) * self._window_stride
+        row = self._eps_df.iloc[ep_local]
+        table = self._load_data_table(int(row["data/chunk_index"]), int(row["data/file_index"]))
+        ep_row0 = int(self._ep_data_row_offset[ep_local])
+
+        # Action rows t .. t+num_frames-1 always exist (see _min_window_len).
+        win = table.slice(ep_row0 + offset, self._num_frames).to_pandas()
+        prompt = self._resolve_prompt(row, win)
+        action, action_mask = self._finalize_action(self._action_20d(win), self._num_frames)
+
+        # History rows clamp to the episode start (repeat the first frame).
+        hist_rows = np.maximum(offset + self._history_offsets, valid_start)
+        lo = int(hist_rows.min())
+        hist_tab = table.slice(ep_row0 + lo, offset - lo + 1).to_pandas()
+        hist = hist_tab.iloc[hist_rows - lo]
+        proprio, proprio_mask = self._finalize_proprio(self._proprio_history(hist))
+
+        # Video indices are relative to the window start ``offset`` (history ones are <= 0).
+        rel = np.concatenate([hist_rows - offset, self._future_offsets]).astype(np.int64)
+        if self._color_jitter is not None:
+            # Same jitter factors across all H+F frames.
+            video, _ = self._decode_window_video(row, ep_local, offset, rel, idx, return_missing_masks=True)
+            video = self._color_jitter.apply({"video": video})["video"]
+        else:
+            video = self._decode_window_video(row, ep_local, offset, rel, idx)
+
+        return {
+            "video": video,
+            "vace_video": None,
+            "first_frame_image": [video[0]] if video else [],
+            "action": torch.from_numpy(action),
+            "action_mask": torch.from_numpy(action_mask),
+            "video_mask": None,
+            "proprio": torch.from_numpy(proprio).float(),
+            "proprio_mask": torch.from_numpy(proprio_mask),
+            "prompt": prompt,
+            "num_history_frames": int(len(self._history_offsets)),
+        }
+
+    def _proprio_history(self, hist) -> np.ndarray:
+        """Normalized raw proprio of every history row.
+
+        Args:
+            hist: DataFrame, the H history rows (oldest first).
+
+        Returns:
+            (H, D) float32, normalized with the ``_state`` stats block.
+        """
+        raw = encode_proprio(
+            self.action_mode, np.stack(hist[STATE_COL].values), np.stack(hist[JOINT_COL].values)
+        )
         return apply_normalization(raw, self._state_normalization_stats, self._normalize_mode)
 
     # ----- video: cameras stacked top-to-bottom ------------------------------
