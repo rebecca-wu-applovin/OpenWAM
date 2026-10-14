@@ -57,3 +57,8 @@ from openwam.model.video_backbone.cosmos3_backbone import Cosmos3EdgeVideoBackbo
 
 register_video_backbone("cosmos3_edge")(Cosmos3EdgeVideoBackbone)
 register_video_backbone("cosmos3_nano")(Cosmos3EdgeVideoBackbone)
+
+# LongLive2.0-Robot-S: Wan2.2-TI2V-5B structure with the LongLive DiT weights (07).
+from openwam.model.video_backbone.longlive_backbone import LongLiveRobotS  # noqa: E402
+
+register_video_backbone("longlive2_robot_s")(LongLiveRobotS)

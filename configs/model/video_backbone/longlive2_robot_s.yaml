@@ -1,0 +1,15 @@
+# LongLive2.0-Robot-S video backbone (cfg.model.video_backbone.*): Wan2.2-TI2V-5B
+# structure (VAE, umT5, DiT code from model_path) with the LongLive robot-video DiT
+# weights from dit_weights_path. Follows Long-WAM: 128-token prompts and a per-frame
+# causal history mask (required_video_attention_mask_mode below).
+
+name: longlive2_robot_s
+model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Wan2.2-TI2V-5B  # [Required] Wan2.2 bundle (VAE / umT5 / DiT skeleton)
+dit_weights_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/LongLive2.0-Robot-S/model.pt  # [Required] Robot-S generator weights
+
+from_scratch: false
+shift_video: 5.0       # LongLive2.0 timestep_shift (configs/inference.yaml) = Wan2.2's
+text_max_length: 128   # Long-WAM tokenizer_max_len
+# Long-WAM history mask (history row i sees history 0..i). from_pretrained raises unless
+# model.architecture.video_attention_mask_mode equals this, so a wrong launch fails fast.
+required_video_attention_mask_mode: history_per_frame_causal
