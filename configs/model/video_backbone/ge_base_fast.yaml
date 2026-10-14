@@ -1,0 +1,19 @@
+# GE-Base-fast video backbone (Genie Envisioner, AgiBot; cfg.model.video_backbone.*).
+# GE multi-view LTX DiT + LTX-Video VAE (8x temporal, 32x spatial) + LTX-Video T5.
+# Views: the vstacked canvas is split into n_view tiles (ego = GE "head" slot 0, chest = slot 1).
+# Video noise schedule is GE-native (ge_base_fast.sample_training_noise); shift_video only
+# shapes the deploy grid (GE trains on the shift-1 FlowMatchEuler grid).
+
+name: ge_base_fast
+model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/GE-Base-fast   # [Required] GE_base_fast_v0.1.safetensors
+weights_file: GE_base_fast_v0.1.safetensors
+ltx_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/LTX-Video        # [Required] vae/ text_encoder/ tokenizer/
+
+from_scratch: false
+temporal_compression: 8   # LTX VAE (yaml contract checked against the backbone at build)
+causal_temporal: true
+shift_video: 1.0
+n_view: 2                 # cameras stacked top-to-bottom in the dataloader canvas
+text_max_length: 128      # GE get_text_conditions max_sequence_length
+caption_dropout_p: 0.06   # GE configs/ltx_model/video_model.yaml
+vae_sample: true          # GE get_latents samples the VAE posterior

@@ -62,3 +62,9 @@ register_video_backbone("cosmos3_nano")(Cosmos3EdgeVideoBackbone)
 from openwam.model.video_backbone.longlive_backbone import LongLiveRobotS  # noqa: E402
 
 register_video_backbone("longlive2_robot_s")(LongLiveRobotS)
+
+# GE-Base-fast (Genie Envisioner): multi-view LTX DiT + LTX VAE / T5 (07). CPU-only-CI safe —
+# diffusers / transformers are imported inside from_pretrained.
+from openwam.model.video_backbone.ge_backbone import GEBaseFastVideoBackbone  # noqa: E402
+
+register_video_backbone("ge_base_fast")(GEBaseFastVideoBackbone)
