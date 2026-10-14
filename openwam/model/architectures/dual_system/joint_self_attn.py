@@ -96,6 +96,7 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
             "mot_checkpoint_mixed_attn": bool(cfg.get("mot_checkpoint_mixed_attn", True)),
             "attention_mask_mode": str(cfg.get("attention_mask_mode", ACTION_SEES_VIDEO)),
             "video_attention_mask_mode": str(cfg.get("video_attention_mask_mode", "first_frame_causal")),
+            "num_history_frames": int(cfg.get("num_history_frames", 0) or 0),
         }
         if self.video_backbone is not None:
             self.build_mot_driver()
@@ -185,6 +186,9 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
             )
 
         pipeline_inputs = self._append_proprio_context_token(dict(pipeline_inputs), proprio)
+        if getattr(vb, "consumes_raw_proprio", False):
+            # Backbones that embed proprio in their own sequence (flux's x_action_cond stream).
+            pipeline_inputs["raw_proprio"] = proprio
         action_context = pipeline_inputs.get("context")
         action_context_mask = pipeline_inputs.get("context_mask")
         if action_context is not None and action_context_mask is None and pipeline_inputs.get("seq_lens") is not None:

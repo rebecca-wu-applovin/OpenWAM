@@ -65,6 +65,7 @@ class DualSystemMoTDriver:
         mot_checkpoint_mixed_attn: bool = True,
         attention_mask_mode: str = ACTION_SEES_VIDEO,
         video_attention_mask_mode: Optional[str] = None,
+        num_history_frames: int = 0,
     ) -> None:
         if vb.num_layers != ab.num_layers:
             raise ValueError(
@@ -90,6 +91,8 @@ class DualSystemMoTDriver:
         self.head_dim = vb.head_dim
         self.mot_checkpoint_mixed_attn = bool(mot_checkpoint_mixed_attn)
         self.attention_mask_mode = attention_mask_mode
+        # H > 1 leading clean latent frames (sparse history); 0/1 = legacy single first frame.
+        self.num_history_frames = int(num_history_frames or 0)
 
         # Allow the architecture / config to override the video v↔v sub-mode.
         # When None we defer to whatever ``vb.video_attention_mask_mode`` reports.
@@ -120,6 +123,7 @@ class DualSystemMoTDriver:
             video_tokens_per_frame=video_tokens_per_frame,
             mode=self.attention_mask_mode,
             device=device,
+            num_clean_frames=max(self.num_history_frames, 1),
         )
 
     def _mixed_attention(
@@ -335,25 +339,41 @@ class DualSystemMoTDriver:
             )
         s_action = payload.x_action.shape[1]
 
-        attn_mask = self._build_attention_mask(
-            s_video=s_video,
-            s_action=s_action,
-            video_tokens_per_frame=self._video_tokens_per_frame(vstate),
-            device=vstate.hidden_states.device,
-        )
+        # Backbones whose attention pattern changes per layer (GE per-view vs
+        # cross-view blocks, flux mode vs single blocks) or whose video stream
+        # carries extra tokens build the per-layer masks themselves.
+        custom = getattr(self.vb, "build_joint_attention_masks", None)
+        layer_masks = None
+        if custom is not None:
+            layer_masks = custom(
+                vstate,
+                s_action=s_action,
+                attention_mask_mode=self.attention_mask_mode,
+                num_clean_frames=max(self.num_history_frames, 1),
+            )
+        if layer_masks is None:
+            attn_mask = self._build_attention_mask(
+                s_video=s_video,
+                s_action=s_action,
+                video_tokens_per_frame=self._video_tokens_per_frame(vstate),
+                device=vstate.hidden_states.device,
+            )
 
-        # Backbones may prepend prefix K/V tokens (keys without matching query
-        # rows — e.g. Cosmos3's cached und text stream). ``_step_impl`` needs no
-        # change: it splits the attention output by query lengths, and SDPA
-        # handles the resulting rectangular mask.
-        attn_mask = widen_mask_for_prefix_kv(attn_mask, vstate)
+            # Backbones may prepend prefix K/V tokens (keys without matching query
+            # rows — e.g. Cosmos3's cached und text stream). ``_step_impl`` needs no
+            # change: it splits the attention output by query lengths, and SDPA
+            # handles the resulting rectangular mask.
+            attn_mask = widen_mask_for_prefix_kv(attn_mask, vstate)
+            layer_masks = [attn_mask] * self.num_layers
+        if len(layer_masks) != self.num_layers:
+            raise ValueError(f"build_joint_attention_masks returned {len(layer_masks)} masks for {self.num_layers} layers")
 
         for layer_id in range(self.num_layers):
             vstate, astate = self.step(
                 layer_id,
                 vstate,
                 astate,
-                attn_mask=attn_mask,
+                attn_mask=layer_masks[layer_id],
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             )

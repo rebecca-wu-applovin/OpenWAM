@@ -12,6 +12,13 @@ see each other:
 
 In the two modes where video sees action, the first video frame (the clean
 conditioning frame) does not attend to action.
+
+Sparse history (``num_clean_frames = H > 1``, 07_sparse_history_backbones):
+the first H latent frames are all clean conditioning frames. "First frame"
+above generalizes to "the H clean frames": they never attend to action or to
+the noisy frames, while noisy frames and action see everything. The v<->v
+block then comes from :func:`build_history_video_mask` instead of the
+backbone's ``build_video_to_video_mask``.
 """
 
 from __future__ import annotations
@@ -54,6 +61,49 @@ def set_video_attention_mask_mode(video_backbone, mode: Optional[str]) -> None:
         )
 
 
+# v<->v sub-modes understood by build_history_video_mask (H clean frames).
+HISTORY_VIDEO_MASK_MODES = ("bidirectional", "first_frame_causal", "history_per_frame_causal")
+
+
+def build_history_video_mask(
+    *,
+    video_seq_len: int,
+    video_tokens_per_frame: int,
+    num_clean_frames: int,
+    mode: str,
+    device: torch.device,
+) -> torch.Tensor:
+    """v<->v block when the first ``num_clean_frames`` latent frames are clean history.
+
+    Args:
+        video_seq_len: int, S_v = T * tokens_per_frame (frame-major token order).
+        video_tokens_per_frame: int, tokens per latent frame.
+        num_clean_frames: int, H leading clean frames.
+        mode: ``bidirectional`` (all see all), ``first_frame_causal`` (history rows see
+            only history, bidirectionally; noisy rows see every frame) or
+            ``history_per_frame_causal`` (Long-WAM: history row i sees history 0..i;
+            noisy rows see every frame).
+        device: torch.device.
+
+    Returns:
+        (S_v, S_v) bool mask, True = attend.
+    """
+    if mode not in HISTORY_VIDEO_MASK_MODES:
+        raise ValueError(f"history video mask mode must be one of {HISTORY_VIDEO_MASK_MODES}, got {mode!r}")
+    mask = torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
+    if mode == "bidirectional":
+        return mask
+    n_hist = min(num_clean_frames * video_tokens_per_frame, video_seq_len)
+    # History rows never read the noisy frames.
+    mask[:n_hist, n_hist:] = False
+    if mode == "history_per_frame_causal":
+        frame_causal = torch.tril(torch.ones((num_clean_frames, num_clean_frames), dtype=torch.bool, device=device))
+        mask[:n_hist, :n_hist] = frame_causal.repeat_interleave(video_tokens_per_frame, 0).repeat_interleave(
+            video_tokens_per_frame, 1
+        )
+    return mask
+
+
 def fill_cross_modal_va_blocks(
     mask: torch.Tensor,
     *,
@@ -63,14 +113,16 @@ def fill_cross_modal_va_blocks(
     a_end: int,
     mode: str,
     video_tokens_per_frame: int,
+    num_clean_frames: int = 1,
 ) -> None:
     """Fill the v->a and a->v blocks in place.
 
     Both directions are assigned explicitly (nothing relies on the initial
     fill), so masks starting from zeros and from ones are equally correct.
+    ``num_clean_frames`` > 1 widens the clean "first frame" to the H history frames.
     """
     s_video = v_end - v_start
-    ff = min(video_tokens_per_frame, s_video)  # tokens in the first frame
+    ff = min(video_tokens_per_frame * max(int(num_clean_frames), 1), s_video)  # tokens in the clean frames
 
     # a->v: does action see video?
     if mode in (ACTION_SEES_VIDEO, MUTUAL):
@@ -96,6 +148,7 @@ def build_cross_modal_attention_mask(
     mode: str,
     device: torch.device,
     n_readonly_tail: int = 0,
+    num_clean_frames: int = 1,
 ) -> torch.Tensor:
     """Build the ``[video, action, tail]`` bool attention mask (True = visible).
 
@@ -111,11 +164,21 @@ def build_cross_modal_attention_mask(
     total = s_video + s_action + int(n_readonly_tail)
     mask = torch.zeros((total, total), dtype=torch.bool, device=device)
 
-    mask[:s_video, :s_video] = video_backbone.build_video_to_video_mask(
-        video_seq_len=s_video,
-        video_tokens_per_frame=video_tokens_per_frame,
-        device=device,
-    )
+    if num_clean_frames > 1:
+        # Sparse history: the v<->v rule is shared by every backbone.
+        mask[:s_video, :s_video] = build_history_video_mask(
+            video_seq_len=s_video,
+            video_tokens_per_frame=video_tokens_per_frame,
+            num_clean_frames=num_clean_frames,
+            mode=video_backbone.video_attention_mask_mode,
+            device=device,
+        )
+    else:
+        mask[:s_video, :s_video] = video_backbone.build_video_to_video_mask(
+            video_seq_len=s_video,
+            video_tokens_per_frame=video_tokens_per_frame,
+            device=device,
+        )
     a_start, a_end = s_video, s_video + s_action
     mask[a_start:a_end, a_start:a_end] = True
     fill_cross_modal_va_blocks(
@@ -126,6 +189,7 @@ def build_cross_modal_attention_mask(
         a_end=a_end,
         mode=mode,
         video_tokens_per_frame=video_tokens_per_frame,
+        num_clean_frames=num_clean_frames,
     )
 
     if n_readonly_tail:
@@ -179,6 +243,8 @@ __all__ = [
     "ISOLATED",
     "VALID_ATTENTION_MASK_MODES",
     "validate_attention_mask_mode",
+    "build_history_video_mask",
+    "HISTORY_VIDEO_MASK_MODES",
     "set_video_attention_mask_mode",
     "fill_cross_modal_va_blocks",
     "build_cross_modal_attention_mask",

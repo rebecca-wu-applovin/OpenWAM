@@ -508,8 +508,11 @@ class BaseWAMArchitecture(ABC, nn.Module):
         enabled = bool(self._cfg_get(cfg, "use_proprioception", False))
         self._use_proprioception_context = enabled
         self.proprio_encoder: Optional[nn.Module] = None
+        self.proprio_slot_emb: Optional[nn.Embedding] = None
         self.proprio_dim = 0
         self.context_dim = int(text_dim)
+        # N > 1 proprio tokens (one per history frame, oldest first; sparse history).
+        self.num_proprio_tokens = int(self._cfg_get(cfg, "num_proprio_tokens", 1) or 1)
         if not enabled:
             return
         state_dim = int(self._cfg_get(cfg, "state_dim", 0) or 0)
@@ -517,6 +520,13 @@ class BaseWAMArchitecture(ABC, nn.Module):
             raise ValueError("use_proprioception=True requires explicit state_dim for context-token proprio.")
         self.proprio_dim = state_dim
         self.proprio_encoder = nn.Linear(state_dim, self.context_dim)
+        if self.num_proprio_tokens > 1:
+            # Learned absolute slot PE: proprio is only read through cross-attn /
+            # prefix KV, which carry no RoPE. Zero-init = starts as N plain tokens.
+            # A child module (not a bare Parameter) so the optimizer's top-level
+            # module scan picks it up.
+            self.proprio_slot_emb = nn.Embedding(self.num_proprio_tokens, self.context_dim)
+            nn.init.zeros_(self.proprio_slot_emb.weight)
 
     def _append_proprio_context_token(self, pipeline_inputs: dict, proprio: Optional[Tensor]) -> dict:
         """Append one proprio token to raw text context and extend context_mask.
@@ -537,19 +547,25 @@ class BaseWAMArchitecture(ABC, nn.Module):
             raise RuntimeError("proprio context is enabled but proprio_encoder is not initialized.")
         if proprio is None:
             raise ValueError("use_proprioception=True requires `proprio` from sample['proprio'] or obs['state'].")
+        n_tok = int(getattr(self, "num_proprio_tokens", 1) or 1)
         if proprio.ndim == 1:
             proprio = proprio.unsqueeze(0)
         elif proprio.ndim == 3 and proprio.shape[1] == 1:
             proprio = proprio[:, 0, :]
-        if proprio.ndim != 2:
-            raise ValueError(f"proprio must be [B, D] or [B, 1, D], got shape {tuple(proprio.shape)}")
-        if proprio.shape[1] != self.proprio_dim:
-            raise ValueError(f"proprio last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
+        if proprio.ndim == 2:
+            proprio = proprio.unsqueeze(1)  # (B, 1, D)
+        if proprio.ndim != 3 or proprio.shape[1] != n_tok:
+            raise ValueError(
+                f"proprio must be [B, D] / [B, 1, D] (1 token) or [B, {n_tok}, D] ({n_tok} tokens), "
+                f"got shape {tuple(proprio.shape)}"
+            )
+        if proprio.shape[-1] != self.proprio_dim:
+            raise ValueError(f"proprio last dim must be {self.proprio_dim}, got {proprio.shape[-1]}")
 
         context = pipeline_inputs["context"]
         if context.shape[0] != proprio.shape[0]:
             if proprio.shape[0] == 1 and context.shape[0] > 1:
-                proprio = proprio.expand(context.shape[0], -1)
+                proprio = proprio.expand(context.shape[0], -1, -1)
             else:
                 raise ValueError(
                     f"Batch mismatch between context and proprio: {context.shape[0]} vs {proprio.shape[0]}"
@@ -581,15 +597,18 @@ class BaseWAMArchitecture(ABC, nn.Module):
                     f"_proprio_sample_mask shape {tuple(sample_mask.shape)} must be ({proprio.shape[0]}, 1)"
                 )
 
-        proprio_token = (
-            self.proprio_encoder(proprio.to(device=context.device, dtype=self.proprio_encoder.weight.dtype))
-            .to(dtype=context.dtype)
-            .unsqueeze(1)
+        # (B, N, context_dim): one token per proprio frame.
+        proprio_token = self.proprio_encoder(
+            proprio.to(device=context.device, dtype=self.proprio_encoder.weight.dtype)
         )
+        if getattr(self, "proprio_slot_emb", None) is not None:
+            proprio_token = proprio_token + self.proprio_slot_emb.weight.to(proprio_token.dtype)
+        proprio_token = proprio_token.to(dtype=context.dtype)
         # Token * mask cuts the weight grad for mask=False samples
         # (input goes to zero so the encoder weight gradient contribution is zero).
         sample_mask_f = sample_mask.to(proprio_token.dtype).unsqueeze(-1)  # (B, 1, 1)
         proprio_token = proprio_token * sample_mask_f
+        sample_mask = sample_mask.expand(-1, proprio_token.shape[1])  # (B, N)
 
         context_mask = pipeline_inputs.get("context_mask")
         if context_mask is None:
@@ -628,6 +647,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
         proprio_encoder = getattr(self, "proprio_encoder", None)
         if proprio_encoder is not None:
             proprio_encoder.to(dtype=dtype, device=device)
+        slot_emb = getattr(self, "proprio_slot_emb", None)
+        if slot_emb is not None:
+            slot_emb.to(dtype=dtype, device=device)
         for bb in self.backbones.values():
             bb.set_dtype_device(dtype, device)
 
@@ -927,8 +949,12 @@ class BaseWAMArchitecture(ABC, nn.Module):
                     pass
                 elif proprio.ndim == 2 and proprio.shape[0] == 1:
                     proprio = proprio[0]
+                elif proprio.ndim == 2:
+                    pass  # (N, D): one proprio per history frame (sparse history)
                 else:
-                    raise ValueError(f"sample['proprio'] must be [D] or [1, D], got shape {tuple(proprio.shape)}")
+                    raise ValueError(
+                        f"sample['proprio'] must be [D], [1, D] or [N, D], got shape {tuple(proprio.shape)}"
+                    )
             all_proprios.append(proprio)
 
             # Collect per-sample proprio_mask. Two accepted shapes:
@@ -963,11 +989,19 @@ class BaseWAMArchitecture(ABC, nn.Module):
         if any(ref_flags) and not all(ref_flags):
             raise ValueError("Mixed reference images in batch: all samples must be consistent.")
 
+        # Sparse history: the first H frames of every clip are single-frame history.
+        n_hist = {int(s.get("num_history_frames", 0) or 0) for s in samples}
+        if len(n_hist) != 1:
+            raise ValueError(f"Mixed num_history_frames in batch: {sorted(n_hist)}")
+        n_hist = n_hist.pop()
+        extra = {"num_history_frames": n_hist} if n_hist > 0 else {}
+
         preprocessed = self.preprocess(
             frames=all_frames,
             text=all_prompts,
             vace_videos=all_vace_videos,
             ref_images=all_ref_images if ref_flags[0] else None,
+            **extra,
         )
 
         action_data = torch.cat(all_actions, dim=0) if all_actions[0] is not None else None
@@ -1086,10 +1120,17 @@ class BaseWAMArchitecture(ABC, nn.Module):
         B = inputs["input_latents"].shape[0]
 
         # --- Sample video timesteps ---
-        video_timestep_ids = torch.randint(min_tb, max_tb, (B,))
-
-        video_timesteps = vb.scheduler.timesteps[video_timestep_ids].to(dtype=_dtype, device=_device)
-        video_sigmas = vb.scheduler.sigmas[video_timestep_ids].to(dtype=_dtype, device=_device)
+        # Backbones with a native training noise distribution (07: GE / flux)
+        # expose ``sample_training_noise``; the rest use the shared scheduler grid.
+        native_sampler = getattr(vb, "sample_training_noise", None)
+        video_loss_weights = None
+        if native_sampler is not None:
+            video_timesteps, video_sigmas, video_loss_weights = native_sampler(B, device=_device, dtype=_dtype)
+            video_timestep_ids = None
+        else:
+            video_timestep_ids = torch.randint(min_tb, max_tb, (B,))
+            video_timesteps = vb.scheduler.timesteps[video_timestep_ids].to(dtype=_dtype, device=_device)
+            video_sigmas = vb.scheduler.sigmas[video_timestep_ids].to(dtype=_dtype, device=_device)
 
         # --- Add video noise (flow-matching: linear interp + velocity target) ---
         video_noise = torch.randn_like(inputs["input_latents"])
@@ -1098,7 +1139,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
         video_target = video_noise - inputs["input_latents"]
 
         if inputs.get("first_frame_latents") is not None:
-            inputs["latents"][:, :, 0:1] = inputs["first_frame_latents"]
+            # 1 clean first frame (TI2V) or H clean history frames (sparse history).
+            n_clean = inputs["first_frame_latents"].shape[2]
+            inputs["latents"][:, :, :n_clean] = inputs["first_frame_latents"]
 
         # --- Prepare action noise ---
         noisy_actions, action_target, action_timesteps, action_timestep_ids, action_sigmas, a_sigma_bc = (
@@ -1163,6 +1206,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
             video_timestep_ids,
             inputs,
             _device,
+            timestep_weights=video_loss_weights,
         )
 
         if lambda_action == 0 or action_noise_pred is None:
@@ -1195,8 +1239,12 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         return result
 
-    def _compute_video_loss(self, noise_pred, target, timestep_ids, inputs, device):
-        """Per-sample weighted video MSE loss."""
+    def _compute_video_loss(self, noise_pred, target, timestep_ids, inputs, device, timestep_weights=None):
+        """Per-sample weighted video MSE loss.
+
+        ``timestep_weights`` (B,) overrides the scheduler's per-timestep weights
+        (backbones with a native noise sampler, see ``compute_loss``).
+        """
         import torch.nn.functional as F
 
         num_clean_prefix = int(inputs.get("num_clean_prefix_frames", 0) or 0)
@@ -1229,7 +1277,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
             target = target[:, :, n_skip:]
 
         vb = self.video_backbone
-        tw = vb.scheduler.linear_timesteps_weights[timestep_ids].to(dtype=torch.float32, device=device)
+        if timestep_weights is not None:
+            tw = timestep_weights.to(dtype=torch.float32, device=device)
+        else:
+            tw = vb.scheduler.linear_timesteps_weights[timestep_ids].to(dtype=torch.float32, device=device)
 
         per_element = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
         per_frame = per_element.mean(dim=(1, 3, 4))
