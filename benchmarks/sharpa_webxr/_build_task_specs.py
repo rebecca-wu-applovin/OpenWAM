@@ -87,9 +87,10 @@ S = {
     "00178": ["world_sauce_01", None, [reach("world_sauce_01"), pick("world_sauce_01", final=True)]],
     "00375": ["world_bag_02", None, [reach("world_bag_02"), pick("world_bag_02", final=True)]],
     "01116": ["world_drill", None, [reach("world_drill"), pick("world_drill", final=True)]],
-    "01174": ["world_stamp", None, [reach("world_stamp"), pick("world_stamp")]],
-    "01304": ["world_kettle", None, [reach("world_kettle"), pick("world_kettle")]],
-    "01337": ["world_scissors", None, [reach("world_scissors"), pick("world_scissors")]],
+    # every pick task graded on the end state: a drop after the grab is a failure (user review of 01174 videos)
+    "01174": ["world_stamp", None, [reach("world_stamp"), pick("world_stamp", final=True)]],
+    "01304": ["world_kettle", None, [reach("world_kettle"), pick("world_kettle", final=True)]],
+    "01337": ["world_scissors", None, [reach("world_scissors"), pick("world_scissors", final=True)]],
     # ---- reorient / flip / rotate -------------------------------------------------------------------------
     "01032": ["world_box", None, [reach("world_box"), {"name": "upturned", "check": "orientation", "obj": "world_box", "mode": "flip", "tol_deg": 35, "final": True, "release": False, "rest": False}]],
     "01041": ["world_game_board", None, [reach("world_game_board"), {"name": "flipped", "check": "orientation", "obj": "world_game_board", "mode": "flip", "tol_deg": 35, "final": True, "release": False, "rest": False}]],

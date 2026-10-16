@@ -1081,7 +1081,8 @@
     "check": "hold_lifted",
     "obj": "world_stamp",
     "lift_m": 0.05,
-    "hold_s": 1.0
+    "hold_s": 1.0,
+    "end_rule": "not_dropped"
    }
   ],
   "needs_judge": false
@@ -1106,7 +1107,8 @@
     "check": "hold_lifted",
     "obj": "world_kettle",
     "lift_m": 0.05,
-    "hold_s": 1.0
+    "hold_s": 1.0,
+    "end_rule": "not_dropped"
    }
   ],
   "needs_judge": false
@@ -1131,7 +1133,8 @@
     "check": "hold_lifted",
     "obj": "world_scissors",
     "lift_m": 0.05,
-    "hold_s": 1.0
+    "hold_s": 1.0,
+    "end_rule": "not_dropped"
    }
   ],
   "needs_judge": false
