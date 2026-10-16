@@ -59,7 +59,9 @@ S = {
     "01440": ["world_shovel", "world_pot", [reach("world_shovel"), grasp("world_shovel"), place("world_shovel", "world_pot", z_above_m=0.12, contact="world_pot")]],
     "self-": ["synthesis_cup_cup_005_5e43862263a34727", None, [reach("synthesis_cup_cup_005_5e43862263a34727"), grasp("synthesis_cup_cup_005_5e43862263a34727"), judge("cup placed on the cup rack (rack not simulated)")]],
     # ---- articulated open/close ----------------------------------------------------------------------------
-    "00005": ["world_laptop_03", None, [reach("world_laptop_03"), {"name": "adjusted", "check": "joint_goal", "obj": "world_laptop_03", "delta": -0.15, "min": -0.6, "max": 0.12, "release": True, "hold_s": 1.0, "final": True}]],
+    # "adjust for better viewing": screen faces the robot (laptop front = local -y), lid open ~92-146 deg (hinge q in
+    # [-0.6, 0.35]; closed is q~2.0, start is q=0.32 ~ 94 deg), laptop upright, hands off, and something changed
+    "00005": ["world_laptop_03", None, [reach("world_laptop_03"), {"name": "adjusted", "check": "joint_goal", "obj": "world_laptop_03", "min": -0.6, "max": 0.35, "front_axis": [0, -1, 0], "toward": [-1, 0], "face_tol_deg": 45, "min_change": {"joint": 0.1, "face_deg": 10}, "keep_upright_deg": 25, "release": True, "hold_s": 1.0, "final": True}]],
     "00079": ["world_gate_01", None, [reach("world_gate_01"), {"name": "closed", "check": "joint_goal", "obj": "world_gate_01", "joint": "articraft_rec_microwave_oven_0002_joints_root_to_door", "max": 0.06, "hold_s": 0.5, "final": True}]],
     "00082": ["world_laptop_03", None, [reach("world_laptop_03"), {"name": "closed", "check": "joint_goal", "obj": "world_laptop_03", "min": 1.85, "hold_s": 0.5, "max_speed": 4.6, "final": True}]],
     "00337": ["world_laptop_03", None, [reach("world_laptop_03"), {"name": "opened", "check": "joint_goal", "obj": "world_laptop_03", "max": 1.25, "hold_s": 1.0, "final": True}]],

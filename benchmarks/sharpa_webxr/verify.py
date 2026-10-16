@@ -294,8 +294,24 @@ def c_joint_goal(r: Replay, s):
     peak = float(np.maximum.accumulate(speed).max())
     if s.get("max_speed"):  # gentle: the joint never moved faster than this before the goal was reached
         ok = ok & (np.maximum.accumulate(speed) <= s["max_speed"])
+    metrics = {"q0": float(q[0]), "q_min": float(q.min()), "q_max": float(q.max()), "q_final": float(q[-1]), "peak_speed": peak}
+    o = s["obj"]
+    if s.get("front_axis"):  # the body's front (object-local) must point within face_tol_deg of base direction `toward`
+        Rb = r.base[:3, :3]
+        ab = (Rb.T @ r.axis(o, s["front_axis"]).T).T[:, :2]
+        tw = np.asarray(s.get("toward", [-1, 0]), float)
+        face = np.degrees(np.arccos(np.clip((ab @ tw) / (np.linalg.norm(ab, axis=1) * np.linalg.norm(tw) + 1e-9), -1, 1)))
+        ok = ok & (face <= s.get("face_tol_deg", 25))
+        metrics.update({"face0_deg": float(face[0]), "final_face_deg": float(face[-1])})
+        if s.get("min_change"):  # something must have changed: the joint moved, or the facing improved
+            ch = s["min_change"]
+            ok = ok & ((np.abs(q - q[0]) >= ch.get("joint", 0.1)) | ((face[0] - face) >= ch.get("face_deg", 10)))
+    if s.get("keep_upright_deg"):  # not knocked over or flipped at the end
+        up = r.axis(o, [0, 0, 1])[:, 2]
+        ok = ok & (up >= np.cos(np.deg2rad(s["keep_upright_deg"])))
+        metrics.update({"final_up": float(up[-1]), "min_up": float(up.min())})
     ok = held(ok, s.get("hold_s", DEFAULTS["hold_s"]))
-    return ok, {"q0": float(q[0]), "q_min": float(q.min()), "q_max": float(q.max()), "q_final": float(q[-1]), "peak_speed": peak}
+    return ok, metrics
 
 
 def c_relative_pose(r: Replay, s):

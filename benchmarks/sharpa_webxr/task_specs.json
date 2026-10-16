@@ -563,9 +563,23 @@
     "name": "adjusted",
     "check": "joint_goal",
     "obj": "world_laptop_03",
-    "delta": -0.15,
     "min": -0.6,
-    "max": 0.12,
+    "max": 0.35,
+    "front_axis": [
+     0,
+     -1,
+     0
+    ],
+    "toward": [
+     -1,
+     0
+    ],
+    "face_tol_deg": 45,
+    "min_change": {
+     "joint": 0.1,
+     "face_deg": 10
+    },
+    "keep_upright_deg": 25,
     "release": true,
     "hold_s": 1.0,
     "final": true
