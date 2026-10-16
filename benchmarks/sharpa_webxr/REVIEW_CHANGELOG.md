@@ -88,7 +88,10 @@ Judge = gpt-6-luna, called only when the state prefix passed, with the simulator
 | xwam 95k | 23.6% (65/275) | 19.0 to 29.0 | 205 | 36 (4 yes) | 34 | 32.1% |
 | motus 80k | 20.4% (56/275) | 16.0 to 25.5 | 205 | 27 (6 yes) | 43 | 29.0% |
 | cosmos3 80k | 5.1% (14/275) | 3.1 to 8.4 | 205 | 11 (4 yes) | 59 | 11.7% |
+| gwp 40k EMA | 18.2% (50/275) | 14.1 to 23.2 | 205 | 28 (3 yes) | 42 | 24.1% |
 
-74 judge calls in total. The drop against the old judge-only numbers comes from the articulated and grasp-only
+102 judge calls in total. Published viewer (all four models, hybrid verdicts, old judge verdict shown per seed):
+https://storage.cloud.google.com/foundational-research/rebecca/sharpa_b64_best/viewer/index_auth.html
+The previous judge-only pages are kept as index_judge_only.html and index_auth_judge_only.html in the same folder. The drop against the old judge-only numbers comes from the articulated and grasp-only
 tasks the judge used to over-accept (lids moved a few degrees, laptops left closed, objects dropped after the grab)
 and from the gate: 136 of the 210 pour and tool-use rollouts never reached the pouring or scrubbing step.
