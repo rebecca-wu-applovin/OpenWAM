@@ -219,13 +219,28 @@ def c_hold_lifted(r: Replay, s):
     vz = np.concatenate([[0.0], np.diff(r.obj[o]["pos"][:, 2]) / DT])
     after = vz[last_c + 1:] if 0 <= last_c < r.n - 1 else np.zeros(1)
     fall = float(-after.min())
+    drop_info = {}
     if s.get("end_rule") == "not_dropped":
-        # labelled on the end state: still held, or set down gently (no fast fall after the hand let go)
-        keep = bool(C[-1]) or fall <= s.get("max_drop_speed_m_s", 0.3)
+        # labelled on the end state: still in hand, or set back steadily. A drop is the last release from a lifted
+        # state (hand contact lost while the object was >= drop_lift_m up) followed by a fast fall, or any fall
+        # >= 1 m/s; an object that ends lower than it started (fell off its perch) also counts as dropped.
+        Cf = fill_gaps(C)
+        held_end = bool(Cf[-1] and z[-1] >= s.get("held_end_lift_m", 0.02))
+        rel = [i for i in range(1, r.n) if Cf[i - 1] and not Cf[i] and z[i - 1] >= 0.03]
+        drop = False
+        if rel:
+            i = rel[-1]
+            j = min(r.n, i + int(round(0.75 / DT)))
+            fall_r, lift_at = float(-vz[i:j].min()), float(z[i - 1])
+            drop = (lift_at >= s.get("drop_lift_m", 0.08) and fall_r >= s.get("drop_speed_m_s", 0.5)) or fall_r >= 1.0
+            drop_info = {"last_release_lift_m": lift_at, "last_release_fall_m_s": fall_r}
+        lower = bool(z[-1] < -s.get("end_lift_tol_m", 0.03))
+        keep = held_end or (not drop and not lower)
+        drop_info.update({"held_at_end": held_end, "dropped": bool(drop), "ended_lower": lower})
         ok = ok if keep else np.zeros(r.n, bool)
     return ok, {"max_lift_m": float(z.max()), "held_any": bool(ok.any()), "max_hold_s": max_hold, "final_lift_m": float(z[-1]), "final_contact": bool(C[-1]),
                 "lift_at_release_m": float(z[last_c]) if last_c >= 0 else 0.0, "max_fall_speed_after_release": fall,
-                "release_to_end_s": float((r.n - 1 - last_c) * DT) if last_c >= 0 else None}
+                "release_to_end_s": float((r.n - 1 - last_c) * DT) if last_c >= 0 else None, **drop_info}
 
 
 def _rest(r: Replay, o, s):

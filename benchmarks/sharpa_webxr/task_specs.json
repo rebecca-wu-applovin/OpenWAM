@@ -976,7 +976,7 @@
     "check": "hold_lifted",
     "obj": "world_ukelele_01",
     "lift_m": 0.05,
-    "hold_s": 1.0,
+    "hold_s": 1.5,
     "end_rule": "not_dropped"
    }
   ],
@@ -1028,7 +1028,8 @@
     "check": "hold_lifted",
     "obj": "world_bag_02",
     "lift_m": 0.05,
-    "hold_s": 1.0
+    "hold_s": 1.0,
+    "end_rule": "not_dropped"
    }
   ],
   "needs_judge": false
