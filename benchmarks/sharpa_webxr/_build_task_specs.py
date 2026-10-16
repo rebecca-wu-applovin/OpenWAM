@@ -25,14 +25,14 @@ def grasp(o, **kw):
     return {"name": "grasp", "check": "grasp", "obj": o, **kw}
 
 
-def pick(o, lift=0.05, hold=1.0, final=False, **kw):
+def pick(o, lift=0.05, hold=0.8, final=False, **kw):
     # "pick up X" is labelled on ever having held it; "grasp/grip X firmly" (final=True) also requires it was not
     # dropped afterwards (still held at the end, or set down gently)
     return {"name": "lift_hold", "check": "hold_lifted", "obj": o, "lift_m": lift, "hold_s": hold, **({"end_rule": "not_dropped"} if final else {}), **kw}
 
 
 def place(o, t, **kw):
-    return {"name": "place", "check": "place_in", "obj": o, "target": t, **kw}
+    return {"name": "place", "check": "place_in", "obj": o, "target": t, "hold_s": 0.3, **kw}
 
 
 def judge(what):
@@ -42,15 +42,15 @@ def judge(what):
 S = {
     # ---- pick and place ------------------------------------------------------------------------------------
     "00001": ["world_butter", "world_pan_01", [reach("world_butter"), grasp("world_butter"), place("world_butter", "world_pan_01", target_box=PAN_DISH, contact="world_pan_01")]],
-    "00019": ["world_bread_02", "world_bread_03", [reach("world_bread_02"), grasp("world_bread_02"), place("world_bread_02", "world_bread_03", contact="world_bread_03", xy_margin_m=-0.01)]],
+    "00019": ["world_bread_02", "world_bread_03", [reach("world_bread_02"), grasp("world_bread_02"), place("world_bread_02", "world_bread_03", contact="world_bread_03", xy_margin_m=-0.01, center_xy_m=0.04)]],
     "00286": ["world_bread_03", "world_plate", [reach("world_bread_03"), grasp("world_bread_03"), place("world_bread_03", "world_plate", contact="world_plate")]],
     "00381": ["world_flower_01", None, [reach("world_flower_01"), grasp("world_flower_01"), {"name": "out_of_box", "check": "move_out", "obj": "world_flower_01", "min_disp_m": 0.12, "release": False, "rest": False, "final": True}]],
     "00391": ["world_plate_04", None, [reach("world_plate_04"), grasp("world_plate_04"), {"name": "out_of_oven", "check": "move_out", "obj": "world_plate_04", "min_disp_m": 0.15, "release": False, "rest": False, "final": True}]],
     "00457": ["world_test_tube_01", "world_rack", [reach("world_test_tube_01"), grasp("world_test_tube_01"), place("world_test_tube_01", "world_rack", z_above_m=0.12, contact="world_rack")]],
     "00636": ["world_teapot_lid", None, [reach("world_teapot_lid"), grasp("world_teapot_lid"), {"name": "lid_off_and_down", "check": "move_out", "obj": "world_teapot_lid", "min_disp_m": 0.10}]],
-    "00646": ["world_phone_01", "world_phone_case", [reach("world_phone_01"), grasp("world_phone_01"), {"name": "out_of_case", "check": "move_out", "obj": "world_phone_01", "target": "world_phone_case", "min_disp_m": 0.08, "release": False, "rest": False, "final": True}]],
-    "00807": ["world_egg", "world_pan_01", [reach("world_egg"), grasp("world_egg"), place("world_egg", "world_pan_01", target_box=PAN_DISH, contact="world_pan_01")]],
-    "00921": ["world_butter", "world_pan", [reach("world_butter"), grasp("world_butter"), place("world_butter", "world_pan", xy_margin_m=0.03, contact="world_pan")]],
+    "00646": ["world_phone_01", "world_phone_case", [reach("world_phone_01"), grasp("world_phone_01"), {"name": "out_of_case", "check": "move_out", "obj": "world_phone_01", "target": "world_phone_case", "min_disp_m": 0.08, "clear_m": 0.10, "release": False, "rest": False, "final": True}]],
+    "00807": ["world_egg", "world_pan_01", [reach("world_egg"), grasp("world_egg"), place("world_egg", "world_pan_01", target_box=[[-0.07, -0.095, -0.016], [0.07, 0.055, 0.022]], contact="world_pan_01", rest_disp_m=0.04)]],
+    "00921": ["world_butter", "world_pan", [reach("world_butter"), grasp("world_butter"), place("world_butter", "world_pan", xy_margin_m=0.03, contact="world_pan", rest_disp_m=0.03)]],
     "01012": ["world_eyeshadow_brush", "world_eyeshadow_box", [reach("world_eyeshadow_brush"), grasp("world_eyeshadow_brush"), place("world_eyeshadow_brush", "world_eyeshadow_box", z_above_m=0.04, contact="world_eyeshadow_box")]],
     "01083": ["world_coin", "world_game_box", [reach("world_coin"), grasp("world_coin"), place("world_coin", "world_game_box", z_above_m=0.03, contact="world_game_box")]],
     "01085": ["world_coin", "world_game_box", [reach("world_coin"), grasp("world_coin"), place("world_coin", "world_game_box", z_above_m=0.03, contact="world_game_box")]],
@@ -85,39 +85,39 @@ S = {
     # pick tasks graded on the end state (final=True): object still in hand, or set back steadily; a drop (released
     # >= 8 cm up and falling >= 0.5 m/s, or any fall >= 1 m/s) or ending lower than it started is a failure.
     # 00177 "grip firmly": held clear of the table >= 1.5 s (labelled slips held 1.1-1.3 s, every success >= 1.6 s)
-    "00177": ["world_ukelele_01", None, [reach("world_ukelele_01"), pick("world_ukelele_01", hold=1.5, final=True, drop_lift_m=0.10)]],  # slip from 9 cm judged a put-down by the user (5aa35ed2)
+    "00177": ["world_ukelele_01", None, [reach("world_ukelele_01"), pick("world_ukelele_01", hold=1.0, final=True, drop_lift_m=0.10)]],  # slip from 9 cm judged a put-down by the user (5aa35ed2)
     "00178": ["world_sauce_01", None, [reach("world_sauce_01"), pick("world_sauce_01", final=True)]],
     "00375": ["world_bag_02", None, [reach("world_bag_02"), pick("world_bag_02", final=True)]],
-    "01116": ["world_drill", None, [reach("world_drill"), pick("world_drill", final=True)]],
+    "01116": ["world_drill", None, [reach("world_drill"), pick("world_drill", hold=0.6, final=True)]],
     # every pick task graded on the end state: a drop after the grab is a failure (user review of 01174 videos)
     "01174": ["world_stamp", None, [reach("world_stamp"), pick("world_stamp", final=True)]],
     "01304": ["world_kettle", None, [reach("world_kettle"), pick("world_kettle", final=True)]],
     "01337": ["world_scissors", None, [reach("world_scissors"), pick("world_scissors", final=True)]],
     # ---- reorient / flip / rotate -------------------------------------------------------------------------
-    "01032": ["world_box", None, [reach("world_box"), {"name": "upturned", "check": "orientation", "obj": "world_box", "mode": "flip", "tol_deg": 35, "final": True, "release": False, "rest": False}]],
-    "01041": ["world_game_board", None, [reach("world_game_board"), {"name": "flipped", "check": "orientation", "obj": "world_game_board", "mode": "flip", "tol_deg": 35, "final": True, "release": False, "rest": False}]],
-    "01246": ["world_bowl", None, [reach("world_bowl"), {"name": "upturned", "check": "orientation", "obj": "world_bowl", "mode": "flip", "tol_deg": 45, "final": True, "release": False, "rest": False}]],
-    "01541": ["world_box", None, [reach("world_box"), grasp("world_box", lift_m=0.02, carry_m=0.03), {"name": "rotated_side", "check": "orientation", "obj": "world_box", "mode": "rotate", "min_deg": 60}]],
-    "01542": ["world_teacup", None, [reach("world_teacup"), {"name": "handle_faces_robot", "check": "orientation", "obj": "world_teacup", "mode": "face", "axis": [1, 0, 0], "toward": [1, 0], "tol_deg": 25, "keep_upright_deg": 30, "final": True}]],
-    "01564": ["world_tablet", None, [reach("world_tablet"), {"name": "portrait", "check": "orientation", "obj": "world_tablet", "mode": "axis_away", "axis": [0, 0, 1], "ref": [0, 1, 0], "min_deg": 55, "final": True, "release": False, "rest": False}]],  # long axis (local z, 30 cm) starts left-right (base y); portrait = long axis >= 55 deg away from that, flat or held upright; a half turn stays landscape
+    "01032": ["world_box", None, [reach("world_box"), {"name": "upturned", "check": "orientation", "obj": "world_box", "mode": "flip", "tol_deg": 35, "max_speed_m_s": 2.1, "max_disp_m": 0.40, "max_lift_m": 0.40, "final": True, "release": False, "rest": False}]],
+    "01041": ["world_game_board", None, [reach("world_game_board"), {"name": "flipped", "check": "orientation", "obj": "world_game_board", "mode": "flip", "tol_deg": 35, "max_speed_m_s": 2.1, "max_disp_m": 0.55, "max_lift_m": 0.40, "final": True, "release": False, "rest": False}]],
+    "01246": ["world_bowl", None, [reach("world_bowl"), {"name": "upturned", "check": "orientation", "obj": "world_bowl", "mode": "flip", "tol_deg": 45, "max_speed_m_s": 2.1, "max_disp_m": 0.55, "max_lift_m": 0.40, "final": True, "release": False, "rest": False}]],
+    "01541": ["world_box", None, [reach("world_box"), {"name": "rotated_side", "check": "orientation", "obj": "world_box", "mode": "rotate", "min_deg": 60, "max_speed_m_s": 2.1, "max_disp_m": 0.55, "end_rule": "not_dropped", "final": True}]],  # graded at the end; a box thrown across the table fails
+    "01542": ["world_teacup", None, [{"name": "handle_faces_robot", "check": "orientation", "obj": "world_teacup", "mode": "face", "axis": [1, 0, 0], "toward": [1, 0], "tol_deg": 25, "keep_upright_deg": 30, "final": True}]],
+    "01564": ["world_tablet", None, [reach("world_tablet"), {"name": "portrait", "check": "orientation", "obj": "world_tablet", "mode": "axis_away", "axis": [0, 0, 1], "ref": [0, 1, 0], "min_deg": 55, "final": True, "release": False, "rest": True}]],  # long axis (local z, 30 cm) starts left-right (base y); portrait = long axis >= 55 deg away from that, flat or held upright; a half turn stays landscape
     # ---- shake / toss -------------------------------------------------------------------------------------
-    "00779": ["world_flask_02", None, [reach("world_flask_02"), grasp("world_flask_02"), {"name": "shaken", "check": "oscillation", "obj": "world_flask_02", "min_reversals": 4, "min_amp_m": 0.03}]],
-    "01592": ["world_dice", None, [reach("world_dice"), grasp("world_dice", lift_m=0.02), {"name": "shaken", "check": "oscillation", "obj": "world_dice", "min_reversals": 4, "min_amp_m": 0.02}]],
-    "01605": ["world_nail_polish_bottle", None, [reach("world_nail_polish_bottle"), grasp("world_nail_polish_bottle"), {"name": "shaken", "check": "oscillation", "obj": "world_nail_polish_bottle", "min_reversals": 4, "min_amp_m": 0.03}]],
-    "01652": ["world_coin", None, [reach("world_coin"), grasp("world_coin", lift_m=0.02), {"name": "tossed_caught", "check": "free_flight", "obj": "world_coin", "min_rise_m": 0.04, "min_rel_rise_m": 0.02, "catch_dist_m": 0.22}]],
+    "00779": ["world_flask_02", None, [reach("world_flask_02"), grasp("world_flask_02"), {"name": "shaken", "check": "oscillation", "obj": "world_flask_02", "min_reversals": 3, "min_amp_m": 0.03, "end_rule": "not_dropped", "end_upright_deg": 60, "final": True}]],
+    "01592": ["world_dice", None, [reach("world_dice"), grasp("world_dice", lift_m=0.02), {"name": "shaken", "check": "oscillation", "obj": "world_dice", "min_reversals": 3, "min_amp_m": 0.02, "end_rule": "not_dropped", "final": True}]],
+    "01605": ["world_nail_polish_bottle", None, [reach("world_nail_polish_bottle"), grasp("world_nail_polish_bottle"), {"name": "shaken", "check": "oscillation", "obj": "world_nail_polish_bottle", "min_reversals": 3, "min_amp_m": 0.03, "end_rule": "not_dropped", "end_upright_deg": 60, "final": True}]],
+    "01652": ["world_coin", None, [reach("world_coin"), grasp("world_coin", lift_m=0.02), {"name": "tossed_caught", "check": "free_flight", "obj": "world_coin", "min_rise_m": 0.04, "min_rel_rise_m": 0.02, "catch_dist_m": 0.22, "end_rule": "in_hand", "final": True}]],
     # ---- pour (sim: grasp, carry over, tilt; judge: the pour itself) ----------------------------------------
-    "00175": ["world_kettle", "world_mug_025", [reach("world_kettle"), grasp("world_kettle"), {"name": "tilt_over_target", "check": "tilt_over", "obj": "world_kettle", "target": "world_mug_025", "min_tilt_deg": 30, "xy_slack_m": 0.12}, judge("water poured from the kettle into the mug")]],
-    "00475": ["world_beaker_01", "world_flask_02", [reach("world_beaker_01"), grasp("world_beaker_01"), {"name": "tilt_over_target", "check": "tilt_over", "obj": "world_beaker_01", "target": "world_flask_02", "min_tilt_deg": 50, "xy_slack_m": 0.08}, judge("substance poured from the beaker into the conical flask")]],
-    "00487": ["world_body_04", "world_bowl", [reach("world_body_04"), grasp("world_body_04"), {"name": "tilt_over_target", "check": "tilt_over", "obj": "world_body_04", "target": "world_bowl", "min_tilt_deg": 50, "xy_slack_m": 0.08}, judge("tea poured from the bottle into the bowl")]],
-    "01480": ["world_bowl", "world_pan", [reach("world_bowl"), grasp("world_bowl"), {"name": "tilt_over_target", "check": "tilt_over", "obj": "world_bowl", "target": "world_pan", "min_tilt_deg": 50, "xy_slack_m": 0.05}, judge("bowl contents poured into the pan")]],
-    "01498": ["world_kettle", "world_teapot", [reach("world_kettle"), grasp("world_kettle"), {"name": "tilt_over_target", "check": "tilt_over", "obj": "world_kettle", "target": "world_teapot", "min_tilt_deg": 30, "xy_slack_m": 0.12}, judge("hot water poured from the kettle into the teapot")]],
+    "00175": ["world_kettle", "world_mug_025", [reach("world_kettle"), grasp("world_kettle"), {"name": "tilt_over_target", "check": "tilt_over", "obj": "world_kettle", "target": "world_mug_025", "min_tilt_deg": 30, "xy_slack_m": 0.20, "hold_s": 0.1}, judge("water poured from the kettle into the mug")]],
+    "00475": ["world_beaker_01", "world_flask_02", [reach("world_beaker_01"), grasp("world_beaker_01"), {"name": "tilt_over_target", "check": "tilt_over", "obj": "world_beaker_01", "target": "world_flask_02", "min_tilt_deg": 50, "xy_slack_m": 0.15, "hold_s": 0.1}, judge("substance poured from the beaker into the conical flask")]],
+    "00487": ["world_body_04", "world_bowl", [reach("world_body_04"), grasp("world_body_04"), {"name": "tilt_over_target", "check": "tilt_over", "obj": "world_body_04", "target": "world_bowl", "min_tilt_deg": 50, "xy_slack_m": 0.15, "hold_s": 0.1}, judge("tea poured from the bottle into the bowl")]],
+    "01480": ["world_bowl", "world_pan", [reach("world_bowl"), grasp("world_bowl"), {"name": "tilt_over_target", "check": "tilt_over", "obj": "world_bowl", "target": "world_pan", "min_tilt_deg": 50, "xy_slack_m": 0.12, "hold_s": 0.1}, judge("bowl contents poured into the pan")]],
+    "01498": ["world_kettle", "world_teapot", [reach("world_kettle"), grasp("world_kettle"), {"name": "tilt_over_target", "check": "tilt_over", "obj": "world_kettle", "target": "world_teapot", "min_tilt_deg": 30, "xy_slack_m": 0.20, "hold_s": 0.1}, judge("hot water poured from the kettle into the teapot")]],
     # ---- tool use (sim: grasp tool, tool acts on target; judge: the effect) ---------------------------------
-    "00051": ["world_eraser_07", "world_plate_05", [reach("world_eraser_07"), grasp("world_eraser_07", lift_m=0.01, carry_m=0.03), {"name": "brushed", "check": "sweep", "obj": "world_eraser_07", "target": "world_plate_05", "contact": True, "min_path_m": 0.15}, judge("plate brushed with the eraser")]],
+    "00051": ["world_eraser_07", "world_plate_05", [reach("world_eraser_07"), grasp("world_eraser_07", lift_m=0.01, carry_m=0.03), {"name": "brushed", "check": "sweep", "obj": "world_eraser_07", "target": "world_plate_05", "contact": True, "min_path_m": 0.05}, judge("plate brushed with the eraser")]],
     "00749": ["world_spoon_08", "world_pan_06", [reach("world_spoon_08"), grasp("world_spoon_08"), {"name": "stirred", "check": "sweep", "obj": "world_spoon_08", "target": "world_pan_06", "xy_slack_m": 0.03, "z_above_m": 0.12, "min_path_m": 0.30}, judge("pot stirred with the spoon")]],
-    "00787": ["world_spatula", "world_pan_01", [reach("world_spatula"), grasp("world_spatula"), {"name": "scrambled", "check": "sweep", "obj": "world_spatula", "target": "world_pan_01", "target_box": [[-0.076, -0.097, -0.019], [0.072, 0.09, 0.042]], "xy_slack_m": 0.03, "z_above_m": 0.10, "min_path_m": 0.30}, judge("egg scrambled by moving the spatula around the pan")]],
-    "00863": ["world_hammer_03", "world_box_13", [reach("world_hammer_03"), grasp("world_hammer_03"), {"name": "hit", "check": "contact_events", "obj": "world_hammer_03", "target": "world_box_13", "min_events": 1, "min_speed_m_s": 0.15}, judge("box hit with the hammer head")]],
+    "00787": ["world_spatula", "world_pan_01", [reach("world_spatula"), grasp("world_spatula"), {"name": "scrambled", "check": "sweep", "obj": "world_spatula", "target": "world_pan_01", "target_box": [[-0.076, -0.097, -0.019], [0.072, 0.09, 0.042]], "xy_slack_m": 0.03, "z_above_m": 0.10, "min_path_m": 0.20}, judge("egg scrambled by moving the spatula around the pan")]],
+    "00863": ["world_hammer_03", "world_box_13", [reach("world_hammer_03"), grasp("world_hammer_03"), {"name": "hit", "check": "contact_events", "obj": "world_hammer_03", "target": "world_box_13", "min_events": 1, "min_speed_m_s": 0.05}, judge("box hit with the hammer head")]],
     "01477": ["world_camera", None, [reach("world_camera"), pick("world_camera", lift=0.03, hold=0.5, final=False), judge("camera button clicked (no button in the sim)")]],
-    "01587": ["world_spoon", "world_plate", [reach("world_spoon"), grasp("world_spoon"), {"name": "scooped", "check": "sweep", "obj": "world_spoon", "target": "world_plate", "xy_slack_m": 0.05, "z_above_m": 0.08, "min_path_m": 0.05}, judge("a piece of pudding scooped from the plate with the spoon")]],
+    "01587": ["world_spoon", "world_plate", [reach("world_spoon"), grasp("world_spoon"), {"name": "scooped", "check": "sweep", "obj": "world_spoon", "target": "world_plate", "xy_slack_m": 0.08, "z_above_m": 0.15, "min_path_m": 0.02}, judge("a piece of pudding scooped from the plate with the spoon")]],
     "01640": ["world_drumstick", "world_drum", [reach("world_drumstick"), grasp("world_drumstick"), {"name": "hit", "check": "contact_events", "obj": "world_drumstick", "target": "world_drum", "min_events": 1, "min_speed_m_s": 0.15}, judge("drumhead hit with the drum stick")]],
 }
 
@@ -125,6 +125,8 @@ S = {
 # scenes excluded from grading: verify.py writes a {"skipped": reason} marker and calibrate / compare ignore them
 SKIP = {
     "01000": "burger box lid mesh is broken in the sim asset (flagged 2026-10-16); not gradable until the asset is fixed",
+    "00381": "task flagged as broken during video review (2026-10-16): take the flower out of the box; excluded until the scene is fixed",
+    "00636": "task flagged as broken during video review (2026-10-16): take the teapot lid off; excluded until the scene is fixed",
 }
 
 

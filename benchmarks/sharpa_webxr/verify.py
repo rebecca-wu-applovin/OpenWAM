@@ -150,6 +150,22 @@ class Replay:
     def lift(self, o: str) -> np.ndarray:
         return self.obj[o]["pos"][:, 2] - self.obj[o]["pos"][0, 2]
 
+    def bottom_z(self, o: str) -> np.ndarray:
+        """World height of the object's lowest collision-box corner per frame (what actually rests on the table)."""
+        if not hasattr(self, "_bottom"):
+            self._bottom = {}
+        if o not in self._bottom:
+            lo, hi = self.local_aabb[o]
+            corners = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+            self._bottom[o] = np.array([((rot(q) @ corners.T).T + p)[:, 2].min() for q, p in zip(self.obj[o]["quat"], self.obj[o]["pos"])])
+        return self._bottom[o]
+
+    def lift_bottom(self, o: str) -> np.ndarray:
+        """Rise of the object's lowest point above where it started. Unlike lift() this does not credit tipping an
+        object up on one end, or the origin dropping when a standing object falls over."""
+        b = self.bottom_z(o)
+        return b - b[0]
+
     def disp(self, o: str) -> np.ndarray:
         return np.linalg.norm(self.obj[o]["pos"] - self.obj[o]["pos"][0], axis=1)
 
@@ -241,7 +257,7 @@ def c_reach(r: Replay, s):
 def c_grasp(r: Replay, s):
     """Hand contact sustained hold_s while the object is lifted >= lift_m or carried >= carry_m."""
     o = s["obj"]
-    lift_m, carry_m, hold_s = s.get("lift_m", DEFAULTS["lift_m"]), s.get("carry_m", DEFAULTS["carry_m"]), s.get("hold_s", DEFAULTS["hold_s"])
+    lift_m, carry_m, hold_s = s.get("lift_m", DEFAULTS["lift_m"]), s.get("carry_m", DEFAULTS["carry_m"]), s.get("hold_s", 0.4)
     z, dsp, Cf = r.lift(o), r.disp(o), fill_gaps(r.hand_contact(o))
     c = Conds()
     c.add(f"lifted >= {lift_m} m or carried >= {carry_m} m (max lift {z.max():.3f} m, max carry {dsp.max():.3f} m)", (z >= lift_m) | (dsp >= carry_m))
@@ -249,48 +265,59 @@ def c_grasp(r: Replay, s):
     return c.all(r.n), {"max_lift_m": float(z.max()), "contact_s": float(r.hand_contact(o).sum() * DT)}, c
 
 
+def _not_dropped(r: Replay, o: str, s, c: Conds) -> dict:
+    """End-state rule shared by pick, shake and rotate tasks: the object is still in hand at the end (contact and its
+    lowest point >= held_end_lift_m up), or it was set back steadily. A drop is the last release from a lifted state
+    (hand contact lost while the lowest point was >= drop_lift_m up) followed by a fall >= drop_speed_m_s, or any fall
+    >= 1 m/s; ending > end_lift_tol_m below the start height (fell off its perch) or off the table also counts.
+    Heights use the object's lowest point, so a standing object tipping over is not a 'fall'. Adds conditions to c."""
+    zb, zo, Cf = r.lift_bottom(o), r.lift(o), fill_gaps(r.hand_contact(o))
+    # fall speed = the slower of origin and lowest-point descent: a true drop shows in both, a standing object
+    # tipping over only in the origin, an object rotating in the hand only in the lowest point
+    vz = np.minimum(np.concatenate([[0.0], np.diff(r.obj[o]["pos"][:, 2]) / DT]) * -1, np.concatenate([[0.0], np.diff(r.bottom_z(o)) / DT]) * -1)
+    held_end = bool(Cf[-1] and zb[-1] >= s.get("held_end_lift_m", 0.02))
+    rel = [i for i in range(1, r.n) if Cf[i - 1] and not Cf[i] and zo[i - 1] >= 0.03]
+    drop, dl, ds = False, s.get("drop_lift_m", 0.08), s.get("drop_speed_m_s", 0.5)
+    rel_txt, info = "never released from a lifted state", {}
+    if rel:
+        i = rel[-1]
+        j = min(r.n, i + int(round(0.75 / DT)))
+        fall_r, lift_at = float(vz[i:j].max()), float(zo[i - 1])
+        drop = (lift_at >= dl and fall_r >= ds) or fall_r >= 1.0
+        info = {"last_release_lift_m": lift_at, "last_release_fall_m_s": fall_r}
+        rel_txt = f"last release at {lift_at:.3f} m up, fell {fall_r:.2f} m/s"
+    tol = s.get("end_lift_tol_m", 0.03)
+    lower = bool(zb[-1] < -tol)
+    fell = bool(r.fallen(o)[-1])
+    info.update({"held_at_end": held_end, "dropped": bool(drop), "ended_lower": lower})
+    if not held_end:  # not still in hand: must have been set back steadily
+        c.add(f"not dropped: drop = released >= {dl} m up and falling >= {ds} m/s, or any fall >= 1 m/s ({rel_txt})", np.full(r.n, not drop))
+        c.add(f"not ended > {tol} m below its start height or off the table (final {zb[-1]:+.3f} m)", np.full(r.n, not (lower or fell)))
+        if s.get("end_upright_deg"):  # a bottle set down must be standing, not lying on its side
+            upz = r.axis(o, [0, 0, 1])[:, 2]
+            c.add(f"standing upright within {s['end_upright_deg']} deg at the end (final tilt {np.degrees(np.arccos(np.clip(upz[-1], -1, 1))):.0f} deg)", upz >= np.cos(np.deg2rad(s["end_upright_deg"])))
+    return info
+
+
 def c_hold_lifted(r: Replay, s):
-    """Object lifted >= lift_m with hand contact for hold_s continuously (pick / grasp-only tasks)."""
+    """Object lifted >= lift_m with hand contact for hold_s continuously (pick / grasp-only tasks). Lift is measured
+    at the object's lowest point, so tipping one end up does not count as lifting."""
     o = s["obj"]
     lift_m, hold_s = s.get("lift_m", DEFAULTS["lift_m"]), s.get("hold_s", DEFAULTS["hold_s"])
-    C, z = r.hand_contact(o), r.lift(o)
+    C = r.hand_contact(o)
+    z = r.lift(o) if s.get("lift_from") == "origin" else r.lift_bottom(o)
     Cf = fill_gaps(C)
     up = Cf & (z >= lift_m)
     max_hold = float(run_length(up).max() * DT)
     c = Conds()
     c.add(f"hand contact (gaps <= 0.15 s bridged; final {bool(Cf[-1])})", Cf)
-    c.add(f"lifted >= {lift_m} m (max {z.max():.3f} m, final {z[-1]:.3f} m)", z >= lift_m)
+    c.add(f"lowest point lifted >= {lift_m} m (max {z.max():.3f} m, final {z[-1]:.3f} m)", z >= lift_m)
     c.add(f"held lifted for {hold_s} s continuously (longest {max_hold:.2f} s)", held(up, hold_s))
-    # end-state diagnostics: was it put down gently (released while low/slow) or dropped?
     last_c = int(np.flatnonzero(C)[-1]) if C.any() else -1
-    vz = np.concatenate([[0.0], np.diff(r.obj[o]["pos"][:, 2]) / DT])
-    after = vz[last_c + 1:] if 0 <= last_c < r.n - 1 else np.zeros(1)
-    fall = float(-after.min())
-    drop_info = {}
-    if s.get("end_rule") == "not_dropped":
-        # labelled on the end state: still in hand, or set back steadily. A drop is the last release from a lifted
-        # state (hand contact lost while the object was >= drop_lift_m up) followed by a fast fall, or any fall
-        # >= 1 m/s; an object that ends lower than it started (fell off its perch) also counts as dropped.
-        held_end = bool(Cf[-1] and z[-1] >= s.get("held_end_lift_m", 0.02))
-        rel = [i for i in range(1, r.n) if Cf[i - 1] and not Cf[i] and z[i - 1] >= 0.03]
-        drop, dl, ds = False, s.get("drop_lift_m", 0.08), s.get("drop_speed_m_s", 0.5)
-        rel_txt = "never released from a lifted state"
-        if rel:
-            i = rel[-1]
-            j = min(r.n, i + int(round(0.75 / DT)))
-            fall_r, lift_at = float(-vz[i:j].min()), float(z[i - 1])
-            drop = (lift_at >= dl and fall_r >= ds) or fall_r >= 1.0
-            drop_info = {"last_release_lift_m": lift_at, "last_release_fall_m_s": fall_r}
-            rel_txt = f"last release at {lift_at:.3f} m up, fell {fall_r:.2f} m/s"
-        tol = s.get("end_lift_tol_m", 0.03)
-        lower = bool(z[-1] < -tol)
-        drop_info.update({"held_at_end": held_end, "dropped": bool(drop), "ended_lower": lower})
-        if not held_end:  # not still in hand: must have been set back steadily
-            c.add(f"not dropped: drop = released >= {dl} m up and falling >= {ds} m/s, or any fall >= 1 m/s ({rel_txt})", np.full(r.n, not drop))
-            c.add(f"not ended > {tol} m below its start height (final {z[-1]:+.3f} m)", np.full(r.n, not lower))
+    drop_info = _not_dropped(r, o, s, c) if s.get("end_rule") == "not_dropped" else {}
     ok = c.all(r.n)
-    return ok, {"max_lift_m": float(z.max()), "held_any": bool(ok.any()), "max_hold_s": max_hold, "final_lift_m": float(z[-1]), "final_contact": bool(C[-1]),
-                "lift_at_release_m": float(z[last_c]) if last_c >= 0 else 0.0, "max_fall_speed_after_release": fall,
+    return ok, {"max_lift_m": float(z.max()), "max_origin_lift_m": float(r.lift(o).max()), "held_any": bool(ok.any()), "max_hold_s": max_hold,
+                "final_lift_m": float(z[-1]), "final_contact": bool(C[-1]),
                 "release_to_end_s": float((r.n - 1 - last_c) * DT) if last_c >= 0 else None, **drop_info}, c
 
 
@@ -318,7 +345,7 @@ def _placed_common(r: Replay, s, c: Conds):
         c.add(f"level within {s['level_deg']} deg (final tilt {np.degrees(np.arccos(np.clip(upz[-1], -1, 1))):.0f} deg)", upz >= np.cos(np.deg2rad(s["level_deg"])))
     if s.get("rest", True):
         c.add(f"at rest: <= {s.get('rest_speed_m_s', DEFAULTS['rest_speed_m_s'])} m/s or moved <= {s.get('rest_disp_m', 0.02)} m over {hold_s} s (final speed {r.speed(o)[-1]:.2f} m/s)", _rest(r, o, s))
-    pre = c.all(r.n)
+    pre = fill_gaps(c.all(r.n), 5)  # dropouts up to 0.25 s (contact flicker, settling jitter) must not restart the hold
     c.add(f"all of the above for {hold_s} s continuously (longest {run_length(pre).max() * DT:.2f} s)", held(pre, hold_s))
     return c.all(r.n)
 
@@ -329,6 +356,10 @@ def c_place_in(r: Replay, s):
                          s.get("z_lo"), s.get("z_hi"), s.get("target_box"), s.get("z_above_m", 0.05))
     c = Conds()
     c.add(f"{s['obj']} inside the {s['target']} footprint (inside {inside.sum() * DT:.1f} s total; final {bool(inside[-1])})", inside)
+    if s.get("center_xy_m"):  # stacked on top: object centre within center_xy_m of the target centre (bread on bread)
+        pw = r.point(s["obj"], s.get("point"))
+        d = np.array([np.linalg.norm(pw[i, :2] - (sum(r.target_box(s["target"], i, s.get("target_box"))) / 2)[:2]) for i in range(r.n)])
+        c.add(f"centred on {s['target']} within {s['center_xy_m']} m (final offset {d[-1]:.3f} m)", d <= s["center_xy_m"])
     return _placed_common(r, s, c), {"inside_s": float(inside.sum() * DT)}, c
 
 
@@ -343,9 +374,9 @@ def c_move_out(r: Replay, s):
     """Object taken out of a container: point outside target footprint (or region) and displaced >= min_disp_m."""
     o = s["obj"]
     md = s.get("min_disp_m", 0.05)
-    if "target" in s:
-        inside = r.in_target(o, s["target"], s.get("point"), -s.get("xy_margin_m", 0.02), -1.0, 1.0, s.get("target_box"))
-        where = f"outside the {s['target']} footprint"
+    if "target" in s:  # inside = within the container's footprint and no higher than clear_m above its top
+        inside = r.in_target(o, s["target"], s.get("point"), -s.get("xy_margin_m", 0.02), -1.0, s.get("clear_m", 0.03), s.get("target_box"))
+        where = f"out of the {s['target']} (outside its footprint or lifted > {s.get('clear_m', 0.03)} m above it)"
     elif "region" in s:
         inside = r.in_region(o, s["region"], s.get("point"))
         where = "outside the region"
@@ -522,6 +553,19 @@ def c_orientation(r: Replay, s):
         c.add(f"released (final hand contact {bool(r.hand_contact(o)[-1])})", ~r.hand_contact(o))
     if s.get("rest", True):
         c.add(f"at rest (final speed {r.speed(o)[-1]:.2f} m/s)", _rest(r, o, s))
+    # "not too brutal": the object was never thrown. Limits on peak speed, travel from the start and height of its
+    # lowest point, each enforced from the moment it is exceeded onwards (a violent flip cannot pass later).
+    if s.get("max_speed_m_s"):
+        c.add(f"never faster than {s['max_speed_m_s']} m/s (peak {r.speed(o).max():.2f})", ~np.maximum.accumulate(r.speed(o) > s["max_speed_m_s"]))
+    if s.get("max_disp_m"):
+        c.add(f"never moved > {s['max_disp_m']} m from where it started (max {r.disp(o).max():.2f} m)", ~np.maximum.accumulate(r.disp(o) > s["max_disp_m"]))
+    if s.get("max_lift_m"):
+        c.add(f"never lifted > {s['max_lift_m']} m (max {r.lift_bottom(o).max():.2f} m)", ~np.maximum.accumulate(r.lift_bottom(o) > s["max_lift_m"]))
+    if s.get("end_rule") == "not_dropped":  # rotate / flip tasks graded at the end: goal reached at some point, object not dropped afterwards
+        goal = c.all(r.n)
+        c.clear()
+        c.add("goal orientation reached at some point (see metrics)", np.maximum.accumulate(goal))
+        metric.update(_not_dropped(r, o, s, c))
     hold_s = s.get("hold_s", DEFAULTS["hold_s"])
     pre = c.all(r.n)
     c.add(f"all of the above for {hold_s} s continuously (longest {run_length(pre).max() * DT:.2f} s)", held(pre, hold_s))
@@ -578,12 +622,17 @@ def c_oscillation(r: Replay, s):
     win = int(round(s.get("window_s", 3.0) / DT))
     ext = _reversals(x, s.get("min_amp_m", 0.03), segments)
     counts = _windowed_counts(ext, r.n, win)
-    c.add(f">= {s.get('min_reversals', 4)} direction reversals of >= {s.get('min_amp_m', 0.03)} m within {s.get('window_s', 3.0)} s while held (best window {counts.max()})", counts >= s.get("min_reversals", 4))
+    shaken = counts >= s.get("min_reversals", 4)
     if while_held:
-        c.add("hand contact at that time (gaps <= 0.5 s bridged)", C)
+        shaken &= C
     metrics = {"max_reversals_in_window": int(counts.max()), "n_reversals": int(len(ext))}
     for a2 in (0.02, 0.03, 0.05, 0.08):  # diagnostics at other amplitudes, for threshold calibration (same rule)
         metrics[f"rev{int(a2 * 100)}cm"] = int(_windowed_counts(_reversals(x, a2, segments), r.n, win).max())
+    if s.get("end_rule") == "not_dropped":  # graded at the end: shaken at some point, and not dropped afterwards
+        c.add(f"shaken: >= {s.get('min_reversals', 4)} direction reversals of >= {s.get('min_amp_m', 0.03)} m within {s.get('window_s', 3.0)} s while held (best window {counts.max()})", np.maximum.accumulate(shaken))
+        metrics.update(_not_dropped(r, o, s, c))
+    else:
+        c.add(f">= {s.get('min_reversals', 4)} direction reversals of >= {s.get('min_amp_m', 0.03)} m within {s.get('window_s', 3.0)} s while held (best window {counts.max()})", shaken)
     return c.all(r.n), metrics, c
 
 
@@ -619,10 +668,25 @@ def c_free_flight(r: Replay, s):
             ok[k + hold_n - 1:] = True
             break
     c = Conds()
-    c.add(f"toss detected: rose >= {min_rise} m and >= {s.get('min_rel_rise_m', 0.02)} m away from the wrist within {s.get('rise_s', 0.6)} s, came down, "
-          f"then stayed within {s.get('catch_dist_m', 0.22)} m of a wrist and >= {s.get('min_catch_lift_m', 0.02)} m up for {s.get('catch_hold_s', 0.3)} s "
-          f"(best rise away from wrist {best:.3f} m, final distance to wrist {near[-1]:.2f} m)", ok)
-    return ok, {"best_rel_rise_m": float(best), "final_near_wrist_m": float(near[-1])}, c
+    if s.get("end_rule") == "in_hand":
+        # Toss = the coin left the hand (rose >= min_rise and >= min_rel_rise away from the wrist within rise_s);
+        # caught = it is in a hand at the end, well above the table. The descent/catch window is not required:
+        # a quick catch 5 cm below the apex is a catch, a coin on the table at the end is not.
+        apex = np.zeros(r.n, bool)
+        for i in range(1, r.n):
+            j0 = max(0, i - rise_n)
+            if z[i] - z[j0:i + 1].min() >= min_rise and rel[i] - rel[j0:i + 1].min() >= s.get("min_rel_rise_m", 0.02):
+                apex[i] = True
+        c.add(f"tossed: rose >= {min_rise} m and >= {s.get('min_rel_rise_m', 0.02)} m away from the wrist within {s.get('rise_s', 0.6)} s (best rise away from wrist {best:.3f} m)", np.maximum.accumulate(apex))
+        d_end, lift_end = s.get("end_dist_m", 0.20), s.get("end_lift_m", 0.05)
+        in_hand = (fill_gaps(r.hand_contact(o)) | (near <= d_end)) & (r.lift_bottom(o) >= lift_end) & ~r.fallen(o)
+        c.add(f"in a hand at the end: hand contact or within {d_end} m of a wrist, and >= {lift_end} m above the table "
+              f"(final: contact {bool(r.hand_contact(o)[-1])}, {near[-1]:.2f} m from the nearest wrist, {r.lift_bottom(o)[-1]:.3f} m up)", in_hand)
+    else:
+        c.add(f"toss detected: rose >= {min_rise} m and >= {s.get('min_rel_rise_m', 0.02)} m away from the wrist within {s.get('rise_s', 0.6)} s, came down, "
+              f"then stayed within {s.get('catch_dist_m', 0.22)} m of a wrist and >= {s.get('min_catch_lift_m', 0.02)} m up for {s.get('catch_hold_s', 0.3)} s "
+              f"(best rise away from wrist {best:.3f} m, final distance to wrist {near[-1]:.2f} m)", ok)
+    return c.all(r.n), {"best_rel_rise_m": float(best), "final_near_wrist_m": float(near[-1]), "final_lift_m": float(r.lift_bottom(o)[-1])}, c
 
 
 def c_tilt_over(r: Replay, s):

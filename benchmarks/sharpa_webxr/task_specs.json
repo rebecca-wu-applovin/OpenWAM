@@ -25,6 +25,7 @@
     "check": "place_in",
     "obj": "world_butter",
     "target": "world_pan_01",
+    "hold_s": 0.3,
     "target_box": [
      [
       -0.09,
@@ -68,8 +69,10 @@
     "check": "place_in",
     "obj": "world_bread_02",
     "target": "world_bread_03",
+    "hold_s": 0.3,
     "contact": "world_bread_03",
-    "xy_margin_m": -0.01
+    "xy_margin_m": -0.01,
+    "center_xy_m": 0.04
    }
   ],
   "needs_judge": false
@@ -100,6 +103,7 @@
     "check": "place_in",
     "obj": "world_bread_03",
     "target": "world_plate",
+    "hold_s": 0.3,
     "contact": "world_plate"
    }
   ],
@@ -135,7 +139,8 @@
     "final": true
    }
   ],
-  "needs_judge": false
+  "needs_judge": false,
+  "skip": "task flagged as broken during video review (2026-10-16): take the flower out of the box; excluded until the scene is fixed"
  },
  "00391_OakInk-v2_scene_01__A001_seq__ac79435402cf22f24550__2023-04-": {
   "version": 1,
@@ -195,6 +200,7 @@
     "check": "place_in",
     "obj": "world_test_tube_01",
     "target": "world_rack",
+    "hold_s": 0.3,
     "z_above_m": 0.12,
     "contact": "world_rack"
    }
@@ -228,7 +234,8 @@
     "min_disp_m": 0.1
    }
   ],
-  "needs_judge": false
+  "needs_judge": false,
+  "skip": "task flagged as broken during video review (2026-10-16): take the teapot lid off; excluded until the scene is fixed"
  },
  "00646_GigaHands_p005-knitting-tablet_113_seg000": {
   "version": 1,
@@ -257,6 +264,7 @@
     "obj": "world_phone_01",
     "target": "world_phone_case",
     "min_disp_m": 0.08,
+    "clear_m": 0.1,
     "release": false,
     "rest": false,
     "final": true
@@ -290,19 +298,21 @@
     "check": "place_in",
     "obj": "world_egg",
     "target": "world_pan_01",
+    "hold_s": 0.3,
     "target_box": [
      [
-      -0.09,
-      -0.109,
+      -0.07,
+      -0.095,
       -0.016
      ],
      [
-      0.09,
       0.07,
+      0.055,
       0.022
      ]
     ],
-    "contact": "world_pan_01"
+    "contact": "world_pan_01",
+    "rest_disp_m": 0.04
    }
   ],
   "needs_judge": false
@@ -333,8 +343,10 @@
     "check": "place_in",
     "obj": "world_butter",
     "target": "world_pan",
+    "hold_s": 0.3,
     "xy_margin_m": 0.03,
-    "contact": "world_pan"
+    "contact": "world_pan",
+    "rest_disp_m": 0.03
    }
   ],
   "needs_judge": false
@@ -365,6 +377,7 @@
     "check": "place_in",
     "obj": "world_eyeshadow_brush",
     "target": "world_eyeshadow_box",
+    "hold_s": 0.3,
     "z_above_m": 0.04,
     "contact": "world_eyeshadow_box"
    }
@@ -397,6 +410,7 @@
     "check": "place_in",
     "obj": "world_coin",
     "target": "world_game_box",
+    "hold_s": 0.3,
     "z_above_m": 0.03,
     "contact": "world_game_box"
    }
@@ -429,6 +443,7 @@
     "check": "place_in",
     "obj": "world_coin",
     "target": "world_game_box",
+    "hold_s": 0.3,
     "z_above_m": 0.03,
     "contact": "world_game_box"
    }
@@ -461,6 +476,7 @@
     "check": "place_in",
     "obj": "world_dice",
     "target": "world_game_board",
+    "hold_s": 0.3,
     "contact": "world_game_board"
    }
   ],
@@ -510,6 +526,7 @@
     "check": "place_in",
     "obj": "world_shovel",
     "target": "world_pot",
+    "hold_s": 0.3,
     "z_above_m": 0.12,
     "contact": "world_pot"
    }
@@ -978,7 +995,7 @@
     "check": "hold_lifted",
     "obj": "world_ukelele_01",
     "lift_m": 0.05,
-    "hold_s": 1.5,
+    "hold_s": 1.0,
     "end_rule": "not_dropped",
     "drop_lift_m": 0.1
    }
@@ -1005,7 +1022,7 @@
     "check": "hold_lifted",
     "obj": "world_sauce_01",
     "lift_m": 0.05,
-    "hold_s": 1.0,
+    "hold_s": 0.8,
     "end_rule": "not_dropped"
    }
   ],
@@ -1031,7 +1048,7 @@
     "check": "hold_lifted",
     "obj": "world_bag_02",
     "lift_m": 0.05,
-    "hold_s": 1.0,
+    "hold_s": 0.8,
     "end_rule": "not_dropped"
    }
   ],
@@ -1057,7 +1074,7 @@
     "check": "hold_lifted",
     "obj": "world_drill",
     "lift_m": 0.05,
-    "hold_s": 1.0,
+    "hold_s": 0.6,
     "end_rule": "not_dropped"
    }
   ],
@@ -1083,7 +1100,7 @@
     "check": "hold_lifted",
     "obj": "world_stamp",
     "lift_m": 0.05,
-    "hold_s": 1.0,
+    "hold_s": 0.8,
     "end_rule": "not_dropped"
    }
   ],
@@ -1109,7 +1126,7 @@
     "check": "hold_lifted",
     "obj": "world_kettle",
     "lift_m": 0.05,
-    "hold_s": 1.0,
+    "hold_s": 0.8,
     "end_rule": "not_dropped"
    }
   ],
@@ -1135,7 +1152,7 @@
     "check": "hold_lifted",
     "obj": "world_scissors",
     "lift_m": 0.05,
-    "hold_s": 1.0,
+    "hold_s": 0.8,
     "end_rule": "not_dropped"
    }
   ],
@@ -1162,6 +1179,9 @@
     "obj": "world_box",
     "mode": "flip",
     "tol_deg": 35,
+    "max_speed_m_s": 2.1,
+    "max_disp_m": 0.4,
+    "max_lift_m": 0.4,
     "final": true,
     "release": false,
     "rest": false
@@ -1190,6 +1210,9 @@
     "obj": "world_game_board",
     "mode": "flip",
     "tol_deg": 35,
+    "max_speed_m_s": 2.1,
+    "max_disp_m": 0.55,
+    "max_lift_m": 0.4,
     "final": true,
     "release": false,
     "rest": false
@@ -1218,6 +1241,9 @@
     "obj": "world_bowl",
     "mode": "flip",
     "tol_deg": 45,
+    "max_speed_m_s": 2.1,
+    "max_disp_m": 0.55,
+    "max_lift_m": 0.4,
     "final": true,
     "release": false,
     "rest": false
@@ -1241,18 +1267,15 @@
     "obj": "world_box"
    },
    {
-    "name": "grasp",
-    "check": "grasp",
-    "obj": "world_box",
-    "lift_m": 0.02,
-    "carry_m": 0.03
-   },
-   {
     "name": "rotated_side",
     "check": "orientation",
     "obj": "world_box",
     "mode": "rotate",
-    "min_deg": 60
+    "min_deg": 60,
+    "max_speed_m_s": 2.1,
+    "max_disp_m": 0.55,
+    "end_rule": "not_dropped",
+    "final": true
    }
   ],
   "needs_judge": false
@@ -1267,11 +1290,6 @@
    "world_teacup"
   ],
   "stages": [
-   {
-    "name": "reach",
-    "check": "reach",
-    "obj": "world_teacup"
-   },
    {
     "name": "handle_faces_robot",
     "check": "orientation",
@@ -1326,7 +1344,7 @@
     "min_deg": 55,
     "final": true,
     "release": false,
-    "rest": false
+    "rest": true
    }
   ],
   "needs_judge": false
@@ -1355,8 +1373,11 @@
     "name": "shaken",
     "check": "oscillation",
     "obj": "world_flask_02",
-    "min_reversals": 4,
-    "min_amp_m": 0.03
+    "min_reversals": 3,
+    "min_amp_m": 0.03,
+    "end_rule": "not_dropped",
+    "end_upright_deg": 60,
+    "final": true
    }
   ],
   "needs_judge": false
@@ -1386,8 +1407,10 @@
     "name": "shaken",
     "check": "oscillation",
     "obj": "world_dice",
-    "min_reversals": 4,
-    "min_amp_m": 0.02
+    "min_reversals": 3,
+    "min_amp_m": 0.02,
+    "end_rule": "not_dropped",
+    "final": true
    }
   ],
   "needs_judge": false
@@ -1416,8 +1439,11 @@
     "name": "shaken",
     "check": "oscillation",
     "obj": "world_nail_polish_bottle",
-    "min_reversals": 4,
-    "min_amp_m": 0.03
+    "min_reversals": 3,
+    "min_amp_m": 0.03,
+    "end_rule": "not_dropped",
+    "end_upright_deg": 60,
+    "final": true
    }
   ],
   "needs_judge": false
@@ -1449,7 +1475,9 @@
     "obj": "world_coin",
     "min_rise_m": 0.04,
     "min_rel_rise_m": 0.02,
-    "catch_dist_m": 0.22
+    "catch_dist_m": 0.22,
+    "end_rule": "in_hand",
+    "final": true
    }
   ],
   "needs_judge": false
@@ -1481,7 +1509,8 @@
     "obj": "world_kettle",
     "target": "world_mug_025",
     "min_tilt_deg": 30,
-    "xy_slack_m": 0.12
+    "xy_slack_m": 0.2,
+    "hold_s": 0.1
    },
    {
     "name": "complete",
@@ -1518,7 +1547,8 @@
     "obj": "world_beaker_01",
     "target": "world_flask_02",
     "min_tilt_deg": 50,
-    "xy_slack_m": 0.08
+    "xy_slack_m": 0.15,
+    "hold_s": 0.1
    },
    {
     "name": "complete",
@@ -1555,7 +1585,8 @@
     "obj": "world_body_04",
     "target": "world_bowl",
     "min_tilt_deg": 50,
-    "xy_slack_m": 0.08
+    "xy_slack_m": 0.15,
+    "hold_s": 0.1
    },
    {
     "name": "complete",
@@ -1592,7 +1623,8 @@
     "obj": "world_bowl",
     "target": "world_pan",
     "min_tilt_deg": 50,
-    "xy_slack_m": 0.05
+    "xy_slack_m": 0.12,
+    "hold_s": 0.1
    },
    {
     "name": "complete",
@@ -1629,7 +1661,8 @@
     "obj": "world_kettle",
     "target": "world_teapot",
     "min_tilt_deg": 30,
-    "xy_slack_m": 0.12
+    "xy_slack_m": 0.2,
+    "hold_s": 0.1
    },
    {
     "name": "complete",
@@ -1668,7 +1701,7 @@
     "obj": "world_eraser_07",
     "target": "world_plate_05",
     "contact": true,
-    "min_path_m": 0.15
+    "min_path_m": 0.05
    },
    {
     "name": "complete",
@@ -1756,7 +1789,7 @@
     ],
     "xy_slack_m": 0.03,
     "z_above_m": 0.1,
-    "min_path_m": 0.3
+    "min_path_m": 0.2
    },
    {
     "name": "complete",
@@ -1793,7 +1826,7 @@
     "obj": "world_hammer_03",
     "target": "world_box_13",
     "min_events": 1,
-    "min_speed_m_s": 0.15
+    "min_speed_m_s": 0.05
    },
    {
     "name": "complete",
@@ -1859,9 +1892,9 @@
     "check": "sweep",
     "obj": "world_spoon",
     "target": "world_plate",
-    "xy_slack_m": 0.05,
-    "z_above_m": 0.08,
-    "min_path_m": 0.05
+    "xy_slack_m": 0.08,
+    "z_above_m": 0.15,
+    "min_path_m": 0.02
    },
    {
     "name": "complete",

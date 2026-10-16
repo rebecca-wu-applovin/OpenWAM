@@ -15,8 +15,19 @@ ROOT = Path(__file__).resolve().parents[2]
 TASKS = json.loads((Path(__file__).resolve().parent / "tasks.json").read_text())
 
 
-def load(root: Path):
+def load_reviews(root: Path) -> dict:
+    """Human review decisions saved by serve_viewer.py (_viewer/reviews.json), keyed by '<scene>/<episode dir>'.
+    decision 'verifier' = the human label was wrong (use the verifier's verdict as the corrected label);
+    'human' = the verifier was wrong (keep the label); 'both_wrong' / 'unsure' = leave the episode out."""
+    try:
+        return json.loads((root / "_viewer/reviews.json").read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def load(root: Path, reviews: dict | None = None):
     rows = []
+    reviews = reviews or {}
     for f in root.glob("*/*/verifier.json"):
         v = json.loads(f.read_text())
         if "skipped" in v:
@@ -28,6 +39,14 @@ def load(root: Path):
         v["label"] = meta["outcome"]
         v["completed"] = meta["outcome"] != "failure"
         v["dir"] = str(f.parent)
+        rev = reviews.get(f"{f.parent.parent.name}/{f.parent.name}")
+        if rev:
+            v["review"] = rev["decision"]
+            if rev["decision"] == "verifier":  # label corrected to the verdict the reviewer confirmed
+                v["completed"] = rev["verifier"] == "PASS"
+                v["label"] = ("success" if v["completed"] else "failure") + "*"
+            elif rev["decision"] in ("both_wrong", "unsure"):
+                continue
         rows.append(v)
     return rows
 
@@ -42,8 +61,14 @@ def main():
     p.add_argument("--tsv", type=Path)
     p.add_argument("--show-errors", type=int, default=0, help="print N false negatives / positives per scene")
     p.add_argument("--scenes", nargs="*")
+    p.add_argument("--no-reviews", action="store_true", help="ignore _viewer/reviews.json label corrections")
     a = p.parse_args()
-    rows = load(a.root)
+    reviews = {} if a.no_reviews else load_reviews(a.root)
+    if reviews:
+        n_fix = sum(r["decision"] == "verifier" for r in reviews.values())
+        n_drop = sum(r["decision"] in ("both_wrong", "unsure") for r in reviews.values())
+        print(f"reviews: {len(reviews)} decisions, {n_fix} labels corrected, {n_drop} episodes left out")
+    rows = load(a.root, reviews)
     by = defaultdict(list)
     for r in rows:
         if not a.scenes or any(r["scene_id"].startswith(s) for s in a.scenes):
@@ -76,7 +101,7 @@ def main():
             ap = rate([r["stages"][i]["achieved"] for r in pos]); an = rate([r["stages"][i]["achieved"] for r in neg])
             fp_ = rate([bool(r["stages"][i]["end_state"]) for r in pos]); fn_ = rate([bool(r["stages"][i]["end_state"]) for r in neg])
             st.append(f"{name}:{ap}/{fp_}|{an}/{fn_}")
-        n_s = sum(r["label"] == "success" for r in rs); n_r = sum(r["label"] == "recover" for r in rs)
+        n_s = sum(r["label"].startswith("success") for r in rs); n_r = sum(r["label"] == "recover" for r in rs)
         rec = {"scene": sid[:8], "category": rs[0].get("category"), "n_success": n_s, "n_recover": n_r, "n_failure": len(neg),
                "recall": rate([r[key] for r in pos]), "specificity": rate([not r[key] for r in neg]),
                "recall_success": rate([r[key] for r in pos if r["label"] == "success"]),
