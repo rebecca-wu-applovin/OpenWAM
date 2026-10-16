@@ -310,6 +310,9 @@ def c_joint_goal(r: Replay, s):
         up = r.axis(o, [0, 0, 1])[:, 2]
         ok = ok & (up >= np.cos(np.deg2rad(s["keep_upright_deg"])))
         metrics.update({"final_up": float(up[-1]), "min_up": float(up.min())})
+    if s.get("max_lift_m") is not None:  # the body itself stays where it rests (keyboard on the table)
+        ok = ok & (r.lift(o) <= s["max_lift_m"])
+        metrics["final_lift_m"] = float(r.lift(o)[-1])
     ok = held(ok, s.get("hold_s", DEFAULTS["hold_s"]))
     return ok, metrics
 
@@ -641,6 +644,9 @@ def main():
             continue  # recorded on an older scene revision; qpos layout may not match the local scene
         if scene not in specs:
             print(d, "no spec", flush=True)
+            continue
+        if specs[scene].get("skip"):  # scene excluded from grading (broken asset); leave a marker, no verdict
+            (d / "verifier.json").write_text(json.dumps({"skipped": specs[scene]["skip"], "scene_id": scene, "seed": meta["seed"]}))
             continue
         if scene not in env_cache:
             env_cache.clear()

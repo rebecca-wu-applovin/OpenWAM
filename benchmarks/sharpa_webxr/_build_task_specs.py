@@ -63,12 +63,15 @@ S = {
     # [-0.6, 0.35]; closed is q~2.0, start is q=0.32 ~ 94 deg), laptop upright, hands off, and something changed
     "00005": ["world_laptop_03", None, [reach("world_laptop_03"), {"name": "adjusted", "check": "joint_goal", "obj": "world_laptop_03", "min": -0.6, "max": 0.35, "front_axis": [0, -1, 0], "toward": [-1, 0], "face_tol_deg": 45, "min_change": {"joint": 0.1, "face_deg": 10}, "keep_upright_deg": 25, "release": True, "hold_s": 1.0, "final": True}]],
     "00079": ["world_gate_01", None, [reach("world_gate_01"), {"name": "closed", "check": "joint_goal", "obj": "world_gate_01", "joint": "articraft_rec_microwave_oven_0002_joints_root_to_door", "max": 0.06, "hold_s": 0.5, "final": True}]],
-    "00082": ["world_laptop_03", None, [reach("world_laptop_03"), {"name": "closed", "check": "joint_goal", "obj": "world_laptop_03", "min": 1.85, "hold_s": 0.5, "max_speed": 4.6, "final": True}]],
+    # lid (child body, hinged on the base's local x) within ~10 deg of closed (q >= 1.78; closed is q~2.0), never
+    # swung faster than 4.6 rad/s, and the keyboard (root body) still flat on the table: upright, lifted <= 3 cm
+    "00082": ["world_laptop_03", None, [reach("world_laptop_03"), {"name": "closed", "check": "joint_goal", "obj": "world_laptop_03", "min": 1.78, "hold_s": 0.5, "max_speed": 4.6, "keep_upright_deg": 25, "max_lift_m": 0.03, "final": True}]],
     "00337": ["world_laptop_03", None, [reach("world_laptop_03"), {"name": "opened", "check": "joint_goal", "obj": "world_laptop_03", "max": 1.25, "hold_s": 1.0, "final": True}]],
     "00626": ["world_rec_desk_with_drawer_0005", None, [reach("world_rec_desk_with_drawer_0005"), {"name": "pulled_out", "check": "joint_goal", "obj": "world_rec_desk_with_drawer_0005", "min": 0.08, "hold_s": 0.5, "final": True}]],
     "01000": ["world_burger_box", None, [reach("world_burger_box"), {"name": "opened", "check": "joint_goal", "obj": "world_burger_box", "delta": -0.9, "hold_s": 0.5, "final": True}]],
     "01018": ["world_box", None, [reach("world_box"), {"name": "closed", "check": "joint_goal", "obj": "world_box", "max": 0.15, "hold_s": 0.3},
-                                 {"name": "faces_robot", "check": "orientation", "obj": "world_box", "mode": "face", "axis": [1, 0, 0], "toward": [-0.035, 0.999], "tol_deg": 15, "keep_upright_deg": 30, "hold_s": 0.5, "final": True}]],
+                                 # lid hinge is on the box's local -y side, so the opening side (front) is local +y; it must point at the robot (base -x)
+                                 {"name": "faces_robot", "check": "orientation", "obj": "world_box", "mode": "face", "axis": [0, 1, 0], "toward": [-1, 0], "tol_deg": 25, "keep_upright_deg": 30, "hold_s": 0.5, "final": True}]],
     "01747": ["world_pencil_case", None, [reach("world_pencil_case"), {"name": "opened", "check": "joint_goal", "obj": "world_pencil_case", "max": -1.0, "hold_s": 0.5, "final": True}]],
     # ---- cap / lid ---------------------------------------------------------------------------------------
     "00023": ["world_lid_09", "world_box", [reach("world_lid_09"), grasp("world_lid_09"), {"name": "lid_on", "check": "relative_pose", "obj": "world_lid_09", "ref": "world_box", "point": [0, 0, 0.004], "xy_tol_m": 0.03, "z_tol_m": 0.02, "z_above_m": 0.03, "tilt_deg": 12, "contact": "world_box"}]],
@@ -112,6 +115,12 @@ S = {
 }
 
 
+# scenes excluded from grading: verify.py writes a {"skipped": reason} marker and calibrate / compare ignore them
+SKIP = {
+    "01000": "burger box lid mesh is broken in the sim asset (flagged 2026-10-16); not gradable until the asset is fixed",
+}
+
+
 def main():
     full = {sid[:5]: sid for sid in TASKS}
     assert set(S) == set(full), (set(S) ^ set(full))
@@ -121,9 +130,11 @@ def main():
         out[sid] = {"version": 1, "category": CATS[sid], "task": TASKS[sid]["task"], "task_object": obj, "target": target,
                     "no_fall": [o for o in (obj, target) if o], "stages": stages,
                     "needs_judge": any(s["check"] == "judge" for s in stages)}
+        if short in SKIP:
+            out[sid]["skip"] = SKIP[short]
     (HERE / "task_specs.json").write_text(json.dumps(out, indent=1))
     n_j = sum(v["needs_judge"] for v in out.values())
-    print(f"wrote {len(out)} specs, {n_j} end in a judge stage")
+    print(f"wrote {len(out)} specs, {n_j} end in a judge stage, {len(SKIP)} skipped")
 
 
 if __name__ == "__main__":

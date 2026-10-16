@@ -19,6 +19,8 @@ def load(root: Path):
     rows = []
     for f in root.glob("*/*/verifier.json"):
         v = json.loads(f.read_text())
+        if "skipped" in v:
+            continue
         if "error" in v:
             rows.append({"scene_id": v["scene_id"], "dir": str(f.parent), "error": v["error"]})
             continue

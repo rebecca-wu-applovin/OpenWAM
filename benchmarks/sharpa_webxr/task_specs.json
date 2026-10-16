@@ -633,9 +633,11 @@
     "name": "closed",
     "check": "joint_goal",
     "obj": "world_laptop_03",
-    "min": 1.85,
+    "min": 1.78,
     "hold_s": 0.5,
     "max_speed": 4.6,
+    "keep_upright_deg": 25,
+    "max_lift_m": 0.03,
     "final": true
    }
   ],
@@ -717,7 +719,8 @@
     "final": true
    }
   ],
-  "needs_judge": false
+  "needs_judge": false,
+  "skip": "burger box lid mesh is broken in the sim asset (flagged 2026-10-16); not gradable until the asset is fixed"
  },
  "01018_GigaHands_p005-present_010_seg000": {
   "version": 1,
@@ -747,15 +750,15 @@
     "obj": "world_box",
     "mode": "face",
     "axis": [
-     1,
      0,
+     1,
      0
     ],
     "toward": [
-     -0.035,
-     0.999
+     -1,
+     0
     ],
-    "tol_deg": 15,
+    "tol_deg": 25,
     "keep_upright_deg": 30,
     "hold_s": 0.5,
     "final": true

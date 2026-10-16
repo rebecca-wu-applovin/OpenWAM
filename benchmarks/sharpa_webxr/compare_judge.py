@@ -28,7 +28,7 @@ def main():
         if not jf.exists():
             continue
         v, j = json.loads(vf.read_text()), json.loads(jf.read_text())
-        if "error" in v or "error" in j:
+        if "error" in v or "skipped" in v or "error" in j:
             continue
         rows.append({"dir": str(d), "scene": v["scene_id"], "cat": CATS.get(v["scene_id"], "?"), "needs_judge": v["needs_judge"],
                      "ver": bool(v["sim_prefix_ok"]), "ver_any": bool(v.get("sim_prefix_any_time", v["sim_prefix_ok"])),
