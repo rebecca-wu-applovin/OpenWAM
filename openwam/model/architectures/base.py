@@ -1461,8 +1461,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
         """
         import time
 
-        from tqdm import tqdm
-
         # Defensive: deploy/model_loader.py:161 already flips eval at load,
         # but ad-hoc callers (notebooks, mid-training eval callbacks) might
         # invoke `generate()` without going through that path. Idempotent
@@ -1550,13 +1548,72 @@ class BaseWAMArchitecture(ABC, nn.Module):
         # so their predicted flow is unconstrained.  Keep those dimensions on the
         # analytic forward-noise path instead of feeding unconstrained updates back
         # into the next denoising step.
-        inactive_action_noise = None
         inactive_action_dims = self._resolve_inactive_action_dims(active_action_mask, device)
+
+        t_loop = time.time()
+        action_latents = self._denoise_loop(
+            schedule,
+            inputs_shared,
+            action_latents,
+            inactive_action_dims=inactive_action_dims,
+            dit_cache=dit_cache,
+            cfg_scale=cfg_scale_f,
+            cfg_merge=bool(cfg_merge),
+        )
+
+        if profile:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            logger.info("[WAM_PROFILE] denoising_loop: %.3fs", time.time() - t_loop)
+
+        # VAE decode. Fail-fast when the backbone is wired to an irreversible
+        # external encoder — silently returning None would mask a config
+        # mismatch (caller asked for pixels but the encoder cannot produce them).
+        if decode_video:
+            _assert_decode_video_supported(vb)
+            video_frames = vb.decode_video(inputs_shared["latents"], tiled=tiled)
+        else:
+            video_frames = None
+
+        actions = action_latents.squeeze(0).float().cpu().numpy()
+        normalizer = getattr(self, "normalizer", None)
+        if normalizer is not None:
+            actions = normalizer.unnormalize(actions)
+
+        return {"video": video_frames, "actions": actions}
+
+    def _denoise_loop(
+        self,
+        schedule,
+        inputs_shared: dict,
+        action_latents: Tensor,
+        *,
+        inactive_action_dims: Optional[Tensor] = None,
+        dit_cache=None,
+        cfg_scale: float = 1.0,
+        cfg_merge: bool = False,
+    ) -> Tensor:
+        """Joint video-action Euler loop over a ``(t_video, t_action)`` schedule (shared by deploy and vis).
+
+        Args:
+            schedule: list of (t_video, t_action) pairs ending with the (0, 0) sentinel (``make_schedule``).
+            inputs_shared: forward kwargs; ``latents`` (B, C, T, h, w) start noisy and are updated in place
+                in the dict, the ``first_frame_latents`` clean prefix (B, C, H, h, w) is re-imposed each step.
+            action_latents: (B, K, A) initial action noise.
+            inactive_action_dims: (A,) index of unified-action dims kept on the analytic noise path, or None.
+            dit_cache / cfg_scale / cfg_merge: as in :meth:`generate`.
+
+        Returns: (B, K, A) denoised actions (normalized space); the final video latents are in
+            ``inputs_shared["latents"]``.
+        """
+        from tqdm import tqdm
+
+        dtype, device = self.dtype, self.device
+        cfg_scale_f = float(cfg_scale)
+        inactive_action_noise = None
 
         num_train_ts_v = float(self.video_scheduler.num_train_timesteps)
         num_train_ts_a = float(self.action_scheduler.num_train_timesteps)
-
-        t_loop = time.time()
 
         for i in tqdm(range(len(schedule) - 1), desc="Joint denoising"):
             t_v, t_a = schedule[i]
@@ -1633,26 +1690,60 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 if inactive_action_dims is not None:
                     action_latents[..., inactive_action_dims] = inactive_action_noise * float(sigma_a_next)
 
-        if profile:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            logger.info("[WAM_PROFILE] denoising_loop: %.3fs", time.time() - t_loop)
+        return action_latents
 
-        # VAE decode. Fail-fast when the backbone is wired to an irreversible
-        # external encoder — silently returning None would mask a config
-        # mismatch (caller asked for pixels but the encoder cannot produce them).
-        if decode_video:
-            _assert_decode_video_supported(vb)
-            video_frames = vb.decode_video(inputs_shared["latents"], tiled=tiled)
-        else:
-            video_frames = None
+    @torch.no_grad()
+    def rollout_from_sample(self, sample: dict, schedule, *, seed: int) -> dict:
+        """Denoise one training sample's future from the training-path inputs (training vis).
 
-        actions = action_latents.squeeze(0).float().cpu().numpy()
-        normalizer = getattr(self, "normalizer", None)
-        if normalizer is not None:
-            actions = normalizer.unnormalize(actions)
+        ``prepare_inputs`` builds the clean prefix (1 TI2V frame, or H sparse-history frames), text and
+        proprio exactly as training does, for every backbone. The GT video latents and actions are dropped;
+        the future latents and the action chunk start from seeded noise and run through ``_denoise_loop``.
 
-        return {"video": video_frames, "actions": actions}
+        Args:
+            sample: one dataset sample: ``video`` T PIL frames, ``prompt``, ``proprio``, ``action`` (K, A),
+                optional ``num_history_frames`` H (0 / absent = legacy contiguous clip).
+            schedule: (t_video, t_action) list from ``make_schedule``.
+            seed: int, seeds the video and action noise.
+
+        Returns: dict ``video``: decoded PIL frames, the F future frames when H > 0 (history is encoded frame
+            by frame, the future as its own clip), else all T frames (frame 0 = decoded condition);
+            ``actions``: (K, A) float32 numpy, normalized space (same space as ``sample["action"]``).
+        """
+        self.eval()
+        vb = self.video_backbone
+        device, dtype = self.device, self.dtype
+        inputs = self.prepare_inputs([sample])
+        n_hist = int(sample.get("num_history_frames", 0) or 0)
+
+        # Training-only and GT entries never reach the forward (same pops as compute_loss, plus GT).
+        gt_actions = inputs.pop("actions")
+        gt_latents = inputs.pop("input_latents")
+        for key in ("action_is_pad", "video_is_pad", "max_timestep_boundary", "min_timestep_boundary",
+                    "use_gradient_checkpointing", "use_gradient_checkpointing_offload"):
+            inputs.pop(key, None)
+        proprio_mask = inputs.pop("proprio_mask", None)
+        if proprio_mask is not None:
+            inputs["_proprio_sample_mask"] = proprio_mask
+
+        # Seeded noise for the whole clip; _denoise_loop re-imposes the clean prefix every step.
+        gen = torch.Generator(device=device).manual_seed(int(seed))
+        latents = torch.randn(gt_latents.shape, generator=gen, device=device, dtype=dtype)
+        clean = inputs.get("first_frame_latents")
+        if clean is not None:
+            latents[:, :, : clean.shape[2]] = clean
+        inputs["latents"] = latents
+        action_latents = torch.randn(gt_actions.shape, generator=gen, device=device, dtype=dtype)
+
+        action_latents = self._denoise_loop(
+            schedule,
+            inputs,
+            action_latents,
+            inactive_action_dims=self._resolve_inactive_action_dims(None, device),
+        )
+        _assert_decode_video_supported(vb)
+        video = vb.decode_video(inputs["latents"][:, :, n_hist:], tiled=True)
+        return {"video": video, "actions": action_latents.squeeze(0).float().cpu().numpy()}
 
     # --- §15: Classifier-Free Guidance helpers (inference-time) ---
 

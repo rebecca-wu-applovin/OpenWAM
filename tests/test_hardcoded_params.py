@@ -16,7 +16,7 @@ from openwam.model.architectures.single_system.vanilla import SingleSystemVanill
 
 
 def test_generate_sigma_uses_scheduler_num_train_timesteps():
-    """generate() should use self.action_scheduler.num_train_timesteps, not 1000.0."""
+    """The denoising loop behind generate() should use the schedulers' num_train_timesteps, not 1000.0."""
     from tests.test_openwam_trainer import _make_tiny_arch
 
     arch = _make_tiny_arch()
@@ -24,13 +24,13 @@ def test_generate_sigma_uses_scheduler_num_train_timesteps():
     assert hasattr(arch.action_scheduler, "num_train_timesteps")
     assert arch.action_scheduler.num_train_timesteps == 1000
 
-    # Check that the source code does NOT contain / 1000.0 in generate()
+    # The sigma math lives in _denoise_loop (shared by generate and the training vis rollout).
     import inspect
 
-    source = inspect.getsource(arch.generate)
+    source = inspect.getsource(arch.generate) + inspect.getsource(arch._denoise_loop)
     assert "/ 1000.0" not in source
     assert "/ 1000" not in source
-    assert "num_train_ts" in source or "num_train_timesteps" in source
+    assert "num_train_ts" in inspect.getsource(arch._denoise_loop)
 
 
 # ---------------------------------------------------------------------------
