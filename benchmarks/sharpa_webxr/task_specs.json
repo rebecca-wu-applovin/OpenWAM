@@ -977,7 +977,8 @@
     "obj": "world_ukelele_01",
     "lift_m": 0.05,
     "hold_s": 1.5,
-    "end_rule": "not_dropped"
+    "end_rule": "not_dropped",
+    "drop_lift_m": 0.1
    }
   ],
   "needs_judge": false

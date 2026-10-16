@@ -25,10 +25,10 @@ def grasp(o, **kw):
     return {"name": "grasp", "check": "grasp", "obj": o, **kw}
 
 
-def pick(o, lift=0.05, hold=1.0, final=False):
+def pick(o, lift=0.05, hold=1.0, final=False, **kw):
     # "pick up X" is labelled on ever having held it; "grasp/grip X firmly" (final=True) also requires it was not
     # dropped afterwards (still held at the end, or set down gently)
-    return {"name": "lift_hold", "check": "hold_lifted", "obj": o, "lift_m": lift, "hold_s": hold, **({"end_rule": "not_dropped"} if final else {})}
+    return {"name": "lift_hold", "check": "hold_lifted", "obj": o, "lift_m": lift, "hold_s": hold, **({"end_rule": "not_dropped"} if final else {}), **kw}
 
 
 def place(o, t, **kw):
@@ -83,7 +83,7 @@ S = {
     # pick tasks graded on the end state (final=True): object still in hand, or set back steadily; a drop (released
     # >= 8 cm up and falling >= 0.5 m/s, or any fall >= 1 m/s) or ending lower than it started is a failure.
     # 00177 "grip firmly": held clear of the table >= 1.5 s (labelled slips held 1.1-1.3 s, every success >= 1.6 s)
-    "00177": ["world_ukelele_01", None, [reach("world_ukelele_01"), pick("world_ukelele_01", hold=1.5, final=True)]],
+    "00177": ["world_ukelele_01", None, [reach("world_ukelele_01"), pick("world_ukelele_01", hold=1.5, final=True, drop_lift_m=0.10)]],  # slip from 9 cm judged a put-down by the user (5aa35ed2)
     "00178": ["world_sauce_01", None, [reach("world_sauce_01"), pick("world_sauce_01", final=True)]],
     "00375": ["world_bag_02", None, [reach("world_bag_02"), pick("world_bag_02", final=True)]],
     "01116": ["world_drill", None, [reach("world_drill"), pick("world_drill", final=True)]],
