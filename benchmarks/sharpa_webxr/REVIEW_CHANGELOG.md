@@ -95,3 +95,65 @@ https://storage.cloud.google.com/foundational-research/rebecca/sharpa_b64_best/v
 The previous judge-only pages are kept as index_judge_only.html and index_auth_judge_only.html in the same folder. The drop against the old judge-only numbers comes from the articulated and grasp-only
 tasks the judge used to over-accept (lids moved a few degrees, laptops left closed, objects dropped after the grab)
 and from the gate: 136 of the 210 pour and tool-use rollouts never reached the pouring or scrubbing step.
+
+# Pour tasks graded from state, judge rubric fixed (2026-10-16, second round)
+
+Reason: the judge failed pours for "no substance transfer visibly evident". The simulator has rigid bodies only, so
+that can never be seen; the judge must grade the motion, not the contents.
+
+## Pour check (`check: pour`, replaces tilt_over + judge for 00175, 00475, 00487, 01480, 01498)
+
+Poured = for 0.2 s continuously, while in hand, the container is tilted >= 30 degrees and its pouring lip is inside
+the target opening. The lip is the point of the container's collision hull furthest in the direction it leans
+(the rim on the low side of a cup or bowl, the spout tip of a kettle poured spout first); the opening is the top
+face of the target's bounding box, radius = half its smaller width, plus 2 cm of slack; the lip has to be between
+5 cm below and 25 cm above the opening. Graded at the end: afterwards the container must be in hand or set down on
+the table standing upright (<= 20 degrees) and not left inside the target, and the target must not be knocked
+over (<= 30 degrees) or pushed more than 0.5 m.
+
+Agreement with the human labels on the 381 labelled pour episodes (reviewer corrections applied):
+
+| scene | recall | specificity | before (tilt_over gate only) |
+|---|---|---|---|
+| 00175 kettle to mug | 0.949 | 0.943 | 1.00 / 0.26 |
+| 00475 beaker to flask | 1.000 | 0.950 | 1.00 / 0.40 |
+| 00487 bottle to bowl | 0.784 | 0.960 | 0.98 / 0.32 |
+| 01480 bowl to pan | 1.000 | 0.973 | 0.98 / 0.41 |
+| 01498 kettle to teapot | 0.980 | 0.800 | 1.00 / 0.20 |
+| all pours | 0.942 | 0.951 | 0.99 / 0.35 |
+
+What the new conditions catch: pouring beside the target (lip 3 to 17 cm outside the opening while the origin was
+within the old 12 to 20 cm slack), bowls dropped into the pan after pouring (7 of the 8 remaining 01480 false
+positives ended with the bowl inside the pan; every labelled success put it back on the table), the pan or mug
+knocked over or shoved off.
+
+Known cost: in 00487 the bottle topples after the pour in 10 labelled failures and in 11 labelled successes or
+recovers with identical state (same fall rate, same resting pose). The rule "set down upright, a fall is a failure"
+follows the standard agreed for pick tasks (a drop after the grab is a failure), so those 11 positives are now
+false negatives. Set `end_upright_deg: null` on that task to accept toppled bottles instead (recall 0.98,
+specificity 0.60).
+
+Sim-only scenes are now 45 of 58 (n = 2 420): recall 0.973, specificity 0.967. Judge-ending scenes left: 9
+(brush, stir, scramble, hammer, scoop, drum, camera button, banana transfer, cup rack).
+
+## Judge rubric r3 (score.py, default)
+
+Adds to r2: the simulator is rigid bodies only; no liquid, powder, food, deformables, moving buttons, lights or
+sound; never answer false because no substance or changed contents is visible; grade whether the motion a person
+would perform was performed with the right object in the right place (brushing, stirring, scooping, hitting,
+pressing defined in one line each); still false for wrong object, wrong place, grazing, drops, or an action merely
+begun. The simulator state block is declared ground truth. The task's open question (the spec's `question`) is
+now appended to that block. Verdicts are cached per rubric (`judge_<model>_r3.json`), so every judge-ending rollout
+was re-judged.
+
+## Policy rollouts after the pour change (score.py --grader hybrid, rubric r3)
+
+| model | hybrid SR (decided) | 95% CI | decided by state | judge asked | gated out | pours | tool use | previous hybrid | old judge-only SR |
+|---|---|---|---|---|---|---|---|---|---|
+| xwam 95k | 26.2% (72/275) | 21.3 to 31.7 | 230 | 18 (4 yes) | 27 | 7/25 | 4/35 | 23.6% | 32.1% |
+| motus 80k | 22.2% (61/275) | 17.7 to 27.5 | 230 | 19 (6 yes) | 26 | 5/25 | 6/35 | 20.4% | 29.0% |
+| gwp 40k EMA | 20.7% (57/275) | 16.4 to 25.9 | 230 | 15 (3 yes) | 30 | 7/25 | 3/35 | 18.2% | 24.1% |
+| cosmos3 80k | 4.4% (12/275) | 2.5 to 7.5 | 230 | 11 (2 yes) | 34 | 0/25 | 2/35 | 5.1% | 11.7% |
+
+63 judge calls in total (rubric r3, every judge-ending rollout re-judged). Pours moved from 0 to 19 successes across the
+four models once the state check replaced the judge's "no substance visible" verdicts.

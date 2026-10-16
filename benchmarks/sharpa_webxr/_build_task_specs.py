@@ -35,6 +35,12 @@ def place(o, t, **kw):
     return {"name": "place", "check": "place_in", "obj": o, "target": t, "hold_s": 0.3, **kw}
 
 
+def pour(o, t, **kw):
+    # judged from state only (no liquid in the sim): lip over the opening while tilted and in hand, then set down upright
+    return {"name": "poured", "check": "pour", "obj": o, "target": t, "min_tilt_deg": 30, "rim_slack_m": 0.02, "hold_s": 0.2,
+            "end_upright_deg": 20, "final": True, **kw}
+
+
 def judge(what):
     return {"name": "complete", "check": "judge", "question": what}
 
@@ -106,11 +112,11 @@ S = {
     "01605": ["world_nail_polish_bottle", None, [reach("world_nail_polish_bottle"), grasp("world_nail_polish_bottle"), {"name": "shaken", "check": "oscillation", "obj": "world_nail_polish_bottle", "min_reversals": 3, "min_amp_m": 0.03, "end_rule": "not_dropped", "end_upright_deg": 60, "final": True}]],
     "01652": ["world_coin", None, [reach("world_coin"), grasp("world_coin", lift_m=0.02), {"name": "tossed_caught", "check": "free_flight", "obj": "world_coin", "min_rise_m": 0.04, "min_rel_rise_m": 0.02, "catch_dist_m": 0.22, "end_rule": "in_hand", "final": True}]],
     # ---- pour (sim: grasp, carry over, tilt; judge: the pour itself) ----------------------------------------
-    "00175": ["world_kettle", "world_mug_025", [reach("world_kettle"), grasp("world_kettle"), {"name": "tilt_over_target", "check": "tilt_over", "obj": "world_kettle", "target": "world_mug_025", "min_tilt_deg": 30, "xy_slack_m": 0.20, "hold_s": 0.1}, judge("water poured from the kettle into the mug")]],
-    "00475": ["world_beaker_01", "world_flask_02", [reach("world_beaker_01"), grasp("world_beaker_01"), {"name": "tilt_over_target", "check": "tilt_over", "obj": "world_beaker_01", "target": "world_flask_02", "min_tilt_deg": 50, "xy_slack_m": 0.15, "hold_s": 0.1}, judge("substance poured from the beaker into the conical flask")]],
-    "00487": ["world_body_04", "world_bowl", [reach("world_body_04"), grasp("world_body_04"), {"name": "tilt_over_target", "check": "tilt_over", "obj": "world_body_04", "target": "world_bowl", "min_tilt_deg": 50, "xy_slack_m": 0.15, "hold_s": 0.1}, judge("tea poured from the bottle into the bowl")]],
-    "01480": ["world_bowl", "world_pan", [reach("world_bowl"), grasp("world_bowl"), {"name": "tilt_over_target", "check": "tilt_over", "obj": "world_bowl", "target": "world_pan", "min_tilt_deg": 50, "xy_slack_m": 0.12, "hold_s": 0.1}, judge("bowl contents poured into the pan")]],
-    "01498": ["world_kettle", "world_teapot", [reach("world_kettle"), grasp("world_kettle"), {"name": "tilt_over_target", "check": "tilt_over", "obj": "world_kettle", "target": "world_teapot", "min_tilt_deg": 30, "xy_slack_m": 0.20, "hold_s": 0.1}, judge("hot water poured from the kettle into the teapot")]],
+    "00175": ["world_kettle", "world_mug_025", [reach("world_kettle"), grasp("world_kettle"), pour("world_kettle", "world_mug_025")]],
+    "00475": ["world_beaker_01", "world_flask_02", [reach("world_beaker_01"), grasp("world_beaker_01"), pour("world_beaker_01", "world_flask_02")]],
+    "00487": ["world_body_04", "world_bowl", [reach("world_body_04"), grasp("world_body_04"), pour("world_body_04", "world_bowl")]],
+    "01480": ["world_bowl", "world_pan", [reach("world_bowl"), grasp("world_bowl"), pour("world_bowl", "world_pan")]],
+    "01498": ["world_kettle", "world_teapot", [reach("world_kettle"), grasp("world_kettle"), pour("world_kettle", "world_teapot")]],
     # ---- tool use (sim: grasp tool, tool acts on target; judge: the effect) ---------------------------------
     "00051": ["world_eraser_07", "world_plate_05", [reach("world_eraser_07"), grasp("world_eraser_07", lift_m=0.01, carry_m=0.03), {"name": "brushed", "check": "sweep", "obj": "world_eraser_07", "target": "world_plate_05", "contact": True, "min_path_m": 0.05}, judge("plate brushed with the eraser")]],
     "00749": ["world_spoon_08", "world_pan_06", [reach("world_spoon_08"), grasp("world_spoon_08"), {"name": "stirred", "check": "sweep", "obj": "world_spoon_08", "target": "world_pan_06", "xy_slack_m": 0.03, "z_above_m": 0.12, "min_path_m": 0.30}, judge("pot stirred with the spoon")]],

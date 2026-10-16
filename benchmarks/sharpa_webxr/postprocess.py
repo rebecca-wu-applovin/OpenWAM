@@ -152,7 +152,7 @@ def judge_frames(rollout_dir: Path, env: SharpaWebXREnv, k: int = 24, max_steps:
     (out / "COMPLETE").unlink(missing_ok=True)
     for old in out.glob("*.jpg"):
         old.unlink()
-    for verdict in rollout_dir.glob("judge_*_r2.json"):
+    for verdict in rollout_dir.glob("judge_*_r[0-9].json"):
         verdict.unlink()
     for t in sorted(set(np.linspace(0, len(qpos) - 1, k).round().astype(int).tolist())):
         env.sim.data.qpos[:] = qpos[t]

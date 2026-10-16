@@ -9,6 +9,8 @@ Per rollout:
 - r2 (default): the judge sees judge_frames/ (24 timesteps x 2 cameras at 480x640, written by
   `postprocess.py --frames-only`) over the scored span (limits.limit: min(1.5 x p90, 20 s)) and grades
   reach / grasp / move / complete / success with RUBRIC_R2 (grasp and move need visible lift or carry).
+- r3 (default): r2 plus a note that the simulator is rigid bodies only (no liquid, no deformables): the judge grades
+  whether the motion was performed the way a person would, never whether a substance visibly moved.
 - r1: the 16 combined 320x240 keyframes and judge.py's rubric (first version, kept for comparison).
 - The verdict is cached in <rollout>/judge_<model>[_r2].json; reruns skip it unless --force.
 
@@ -72,6 +74,29 @@ success = the full task was accomplished at some time in the rollout. Be strict:
 the object is too small to tell, answer false. A later stage normally requires the earlier ones; if not, say why in
 the rationale. In the rationale, name the object you judged and what happened to it."""
 
+RUBRIC_R3 = RUBRIC_R2.replace(
+    """4. complete: the task's goal state is visible: e.g. the object rests in/on the target, the lid is closed, the cap is
+   on. For tasks without a placement (shake, stir, toss, hit, grip and hold), the described action is clearly and
+   fully performed with the right object.""",
+    """4. complete: the task was carried out as far as a rigid-body simulator can show it: the described action was
+   clearly and fully performed with the right object, at the right place, in the way a person would do it (see the
+   note on the simulator below).""") + """
+
+About the simulator: it contains rigid bodies only. There is no liquid, powder, food, dough, paint or any deformable
+material, no button that moves, no light, no sound. Nothing can visibly transfer, fill, mix, break or change its
+surface. Never answer false because no substance, residue or changed contents is visible: that is impossible here by
+construction. Judge whether the robot performed the motion a person would perform for this task with the right object
+in the right place: brushing = the eraser is moved back and forth over the plate while held; stirring = the spoon is
+moved around inside the pot; scooping = the spoon is dragged along the plate and lifted; hitting = the hammer head
+strikes the box; pressing a button = a fingertip presses on the camera where its button is. Still answer false for the
+wrong object, the wrong place, a motion that only grazes or nudges, an object dropped or knocked over, or an action
+that was merely begun.
+
+When simulator state checks are given before the images, they are ground truth from the physics engine: a stage
+reported there as satisfied did happen even if the images are unclear. Use the images to judge the manner and the
+completeness of the motion, not to re-check those facts."""
+
+RUBRICS = {"r2": RUBRIC_R2, "r3": RUBRIC_R3}
 STAGES = ("reach", "grasp", "move", "complete")
 SIM_STAGES = ("reach", "grasp", "move")
 
@@ -116,7 +141,7 @@ def judge_one(c: openai.OpenAI, model: str, d: Path, force: bool, rubric: str = 
             content += [{"type": "input_text", "text": f"t = {t:.1f} s"},
                         {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"}]
     else:
-        instructions = RUBRIC_R2
+        instructions = RUBRICS[rubric]
         try:
             fr = frames_r2(d)
         except FileNotFoundError as e:
@@ -243,7 +268,7 @@ def grade_all(a, dirs: list[Path]) -> list[dict]:
             print(f"verified {i + 1}/{len(dirs)}", flush=True)
     judged = {}
     if todo:
-        out = lambda d: d / f"judge_{a.model}_r2.json"  # noqa: E731
+        out = lambda d: d / f"judge_{a.model}_{a.rubric}.json"  # noqa: E731
         cached = {d: out(d) for d, _, _ in todo if out(d).exists() and not a.force}
         calls = [d for d, _, _ in todo if d not in cached or not cached[d].exists()]
         if a.no_judge_calls:
@@ -256,7 +281,7 @@ def grade_all(a, dirs: list[Path]) -> list[dict]:
         print(f"hybrid: {len(todo)} rollouts need the judge, {len(calls)} API calls, {len(todo) - len(calls)} reused/ungraded", flush=True)
         ctx = {d: v["judge_context"] for d, _, v in todo}
         with ThreadPoolExecutor(a.workers) as ex:
-            res = dict(zip(calls, ex.map(lambda d: judge_one(c, a.model, d, True, "r2", ctx[d]), calls), strict=True)) if calls else {}
+            res = dict(zip(calls, ex.map(lambda d: judge_one(c, a.model, d, True, a.rubric, ctx[d]), calls), strict=True)) if calls else {}
         for d, meta, v in todo:
             j = res.get(d) or (json.loads(out(d).read_text()) if out(d).exists() and (a.no_judge_calls or d not in res) else None)
             if j is None or "error" in j:
@@ -300,6 +325,7 @@ def main_grade(a):
                 for sc, rs in sorted(tasks.items())}
     dec = [t["success_rate"] for t in per_task.values() if "success_rate" in t]
     out = {"folder": str(a.folder), "grader": a.grader, "model": a.model if a.grader == "hybrid" else None,
+           "rubric": a.rubric if a.grader == "hybrid" else None, "spec_version": "pour-v1",
            "scored_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
            "overall": summarize_grades(rows),
            "task_mean": {"success_rate": round(sum(dec) / len(dec), 4) if dec else None, "n_tasks": len(dec)},
@@ -324,7 +350,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("folder", type=Path)
     p.add_argument("--model", default="gpt-6-luna")
-    p.add_argument("--rubric", default="r2", choices=["r1", "r2"])
+    p.add_argument("--rubric", default="r3", choices=["r1", "r2", "r3"],
+                   help="r3 (default): r2 plus the rigid-body-only note; verdict cache is per rubric (judge_<model>_<rubric>.json)")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--limit", type=int, default=None, help="score only the first N rollouts (pilot / cost check)")
     p.add_argument("--force", action="store_true", help="re-judge rollouts that already have a verdict")
@@ -337,12 +364,12 @@ def main():
     if a.grader != "judge":
         return main_grade(a)
 
-    frames_dir = "judge_frames" if a.rubric == "r2" else "keyframes"
+    frames_dir = "keyframes" if a.rubric == "r1" else "judge_frames"
     dirs = sorted(f.parent for f in a.folder.rglob("rollout.json") if (f.parent / frames_dir).is_dir())
     if a.limit:
         dirs = dirs[: a.limit]
     if not dirs:
-        sys.exit(f"no rollouts with {frames_dir}/ under {a.folder}" + (" (run postprocess.py --frames-only)" if a.rubric == "r2" else ""))
+        sys.exit(f"no rollouts with {frames_dir}/ under {a.folder}" + (" (run postprocess.py --frames-only)" if a.rubric != "r1" else ""))
     c = client()
     print(f"judging {len(dirs)} rollouts under {a.folder} with {a.model}", flush=True)
 

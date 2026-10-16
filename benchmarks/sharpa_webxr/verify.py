@@ -42,6 +42,7 @@ class Replay:
         self.env, self.an = env, Analyzer(env)
         m, d = self.an.m, self.an.d
         self.n = len(qpos)
+        self.q0 = np.array(qpos[0], float)
         self.t = np.arange(self.n) * DT
         self.obj = {o: {"pos": np.zeros((self.n, 3)), "quat": np.zeros((self.n, 4)), "contact": np.zeros(self.n, bool),
                         "dist": np.zeros(self.n), "joints": np.zeros((self.n, len(v["joints"])))} for o, v in self.an.objects.items()}
@@ -159,6 +160,72 @@ class Replay:
             corners = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
             self._bottom[o] = np.array([((rot(q) @ corners.T).T + p)[:, 2].min() for q, p in zip(self.obj[o]["quat"], self.obj[o]["pos"])])
         return self._bottom[o]
+
+    def hull(self, o: str) -> np.ndarray:
+        """Convex-hull vertices of the object's collision geometry in the object frame (for extreme points such as a
+        pouring lip)."""
+        if not hasattr(self, "_hull"):
+            self._hull = {}
+        if o not in self._hull:
+            m, d = self.an.m, self.an.d
+            v = self.an.objects[o]
+            pts = []
+            for g in v["geoms"]:
+                if m.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH:
+                    mid = m.geom_dataid[g]
+                    vs = m.mesh_vert[m.mesh_vertadr[mid]: m.mesh_vertadr[mid] + m.mesh_vertnum[mid]]
+                else:
+                    t, sz = m.geom_type[g], m.geom_size[g]
+                    if t == mujoco.mjtGeom.mjGEOM_SPHERE:
+                        h = np.array([sz[0], sz[0], sz[0]])
+                    elif t == mujoco.mjtGeom.mjGEOM_CYLINDER:
+                        h = np.array([sz[0], sz[0], sz[1]])
+                    elif t == mujoco.mjtGeom.mjGEOM_CAPSULE:
+                        h = np.array([sz[0], sz[0], sz[1] + sz[0]])
+                    else:
+                        h = np.asarray(sz[:3], float)
+                    vs = np.array([[x, y, z] for x in (-h[0], h[0]) for y in (-h[1], h[1]) for z in (-h[2], h[2])])
+                pts.append((g, vs))
+            d.qpos[:] = self.q0
+            mujoco.mj_forward(m, d)
+            R, p = d.xmat[v["body"]].reshape(3, 3), d.xpos[v["body"]]
+            P = np.concatenate([(d.geom_xmat[g].reshape(3, 3) @ vs.T).T + d.geom_xpos[g] for g, vs in pts])
+            loc = (R.T @ (P - p).T).T
+            try:
+                from scipy.spatial import ConvexHull
+                loc = loc[ConvexHull(loc).vertices]
+            except Exception:  # noqa: BLE001  degenerate geometry: keep a subsample
+                loc = loc[:: max(1, len(loc) // 600)]
+            self._hull[o] = loc
+        return self._hull[o]
+
+    def lip(self, o: str, up_axis=(0, 0, 1), min_tilt_deg: float = 3.0) -> np.ndarray:
+        """World position of the pouring lip per frame: the hull point furthest along the horizontal direction the
+        container's up axis leans toward (the rim on the low side of a cup; the spout tip of a kettle poured spout-first).
+        While upright the lip is the centre of the top face."""
+        P = self.hull(o)
+        up = self.axis(o, up_axis)
+        lo, hi = self.local_aabb[o]
+        top = np.array([(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, hi[2]])
+        out = np.zeros((self.n, 3))
+        s_min = np.sin(np.radians(min_tilt_deg))
+        for i in range(self.n):
+            R, p = rot(self.obj[o]["quat"][i]), self.obj[o]["pos"][i]
+            h = up[i, :2]
+            if np.linalg.norm(h) < s_min:
+                out[i] = R @ top + p
+            else:
+                W = (R @ P.T).T + p
+                out[i] = W[np.argmax(W[:, :2] @ (h / np.linalg.norm(h)))]
+        return out
+
+    def opening(self, o: str, local=None, radius=None) -> tuple[np.ndarray, float]:
+        """World trajectory of a container's opening centre (top face centre of its local AABB unless given) and the
+        opening radius (half the smaller horizontal extent unless given)."""
+        lo, hi = self.local_aabb[o]
+        c = np.asarray(local, float) if local is not None else np.array([(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, hi[2]])
+        r = float(radius) if radius is not None else float(min(hi[0] - lo[0], hi[1] - lo[1]) / 2)
+        return self.point(o, c), r
 
     def lift_bottom(self, o: str) -> np.ndarray:
         """Rise of the object's lowest point above where it started. Unlike lift() this does not credit tipping an
@@ -707,6 +774,54 @@ def c_tilt_over(r: Replay, s):
                         "over_s": float(over.sum() * DT)}, c
 
 
+def c_pour(r: Replay, s):
+    """Pour, judged from rigid-body state only (the sim has no liquid). Poured = the container is tilted >= min_tilt_deg
+    with its pouring lip (rim on the low side, or spout tip) inside the target opening (+ rim_slack_m) and between
+    dz_lo and dz_hi above the opening, while in hand, for hold_s continuously. Graded at the end (use with final):
+    afterwards the container must be in hand or set down on the table upright (<= end_upright_deg) and not left
+    inside the target, and the target must not be knocked over or pushed away."""
+    o, tgt = s["obj"], s["target"]
+    up = r.axis(o, s.get("up_axis", [0, 0, 1]))
+    tilt = np.degrees(np.arccos(np.clip(up[:, 2], -1, 1)))
+    lip = r.lip(o, s.get("up_axis", [0, 0, 1]))
+    oc, rad = r.opening(tgt, s.get("opening"), s.get("opening_r"))
+    lip_dxy = np.linalg.norm(lip[:, :2] - oc[:, :2], axis=1)
+    lip_dz = lip[:, 2] - oc[:, 2]
+    slack, dz_lo, dz_hi = s.get("rim_slack_m", 0.02), s.get("dz_lo_m", -0.05), s.get("dz_hi_m", 0.25)
+    min_tilt, hold_s = s.get("min_tilt_deg", 30), s.get("hold_s", 0.2)
+    tilted = tilt >= min_tilt
+    over = (lip_dxy <= rad + slack) & (lip_dz >= dz_lo) & (lip_dz <= dz_hi)
+    hand = r.hand_contact(o)
+    pouring = fill_gaps(tilted & over & hand, 3)
+    poured_by = np.maximum.accumulate(held(pouring, hold_s))
+    off = (lip_dxy[tilted].min() - rad) if tilted.any() else float("nan")
+    c = Conds()
+    c.add(f"poured at some time: {o} tilted >= {min_tilt} deg with its lip inside the {tgt} opening (radius {rad:.2f} m + {slack} m), "
+          f"{dz_lo} to {dz_hi} m above it, while in hand, for {hold_s} s (max tilt {tilt.max():.0f} deg; lip {off:+.3f} m from the "
+          f"opening rim at best while tilted; over the opening while tilted {(tilted & over).sum() * DT:.1f} s, in hand "
+          f"{(tilted & over & hand).sum() * DT:.1f} s, longest run {run_length(pouring).max() * DT:.2f} s)", poured_by)
+    free = ~hand
+    end_up = s.get("end_upright_deg", 20)
+    if r.table_z is not None:
+        bt = r.bottom_z(o) - r.table_z
+        c.add(f"{o} in hand, or set down on the table (lowest point within -5 to +3 cm of table height; now {bt[-1]:+.3f} m)", hand | ((bt >= -0.05) & (bt <= 0.03)))
+    if end_up is not None:
+        c.add(f"{o} in hand, or standing upright <= {end_up} deg (now {tilt[-1]:.0f} deg)", hand | (tilt <= end_up))
+    if s.get("not_left_in_target", True):
+        odxy = np.linalg.norm(r.obj[o]["pos"][:, :2] - oc[:, :2], axis=1)
+        c.add(f"{o} in hand, or not left inside the {tgt} (origin {odxy[-1]:.2f} m from its centre, radius {rad:.2f} m)", hand | (odxy > rad))
+    t_up = r.axis(tgt, [0, 0, 1])
+    t_tilt = np.degrees(np.arccos(np.clip(t_up[:, 2], -1, 1)))
+    c.add(f"{tgt} not knocked over (tilt <= {s.get('target_tilt_deg', 30)} deg; now {t_tilt[-1]:.0f})", t_tilt <= s.get("target_tilt_deg", 30))
+    t_disp = r.disp(tgt)
+    c.add(f"{tgt} not pushed away (moved <= {s.get('target_disp_m', 0.5)} m; now {t_disp[-1]:.2f})", t_disp <= s.get("target_disp_m", 0.5))
+    i_p = first_true(poured_by)[0]
+    return c.all(r.n), {"max_tilt_deg": float(tilt.max()), "lip_rim_offset_m": float(off), "pour_s": float(pouring.sum() * DT),
+                        "longest_pour_s": float(run_length(pouring).max() * DT), "t_poured_s": (None if i_p is None else float(i_p * DT)),
+                        "end_tilt_deg": float(tilt[-1]), "held_end": bool(hand[-1]), "target_tilt_end_deg": float(t_tilt[-1]),
+                        "target_disp_end_m": float(t_disp[-1])}, c
+
+
 def c_contact_events(r: Replay, s):
     """Tool strikes: count onsets of tool-target contact while the tool is hand-held (hit, tap, drum)."""
     tool, tgt = s["obj"], s["target"]
@@ -752,7 +867,7 @@ def c_judge(r: Replay, s):
 CHECKS = {"reach": c_reach, "grasp": c_grasp, "hold_lifted": c_hold_lifted, "place_in": c_place_in,
           "place_region": c_place_region, "move_out": c_move_out, "joint_goal": c_joint_goal,
           "relative_pose": c_relative_pose, "attached": c_attached, "orientation": c_orientation, "oscillation": c_oscillation,
-          "free_flight": c_free_flight, "tilt_over": c_tilt_over, "contact_events": c_contact_events,
+          "free_flight": c_free_flight, "tilt_over": c_tilt_over, "pour": c_pour, "contact_events": c_contact_events,
           "sweep": c_sweep, "judge": c_judge}
 
 
@@ -814,7 +929,8 @@ def judge_context(stages, spec) -> str:
         why = "; ".join(s.get("why", []))
         parts.append(f"{s['name']}: {'yes' if s['achieved'] else 'no'}" + (f" (first at {s['t_first_s']:.1f} s)" if s["achieved"] else (f" because {why}" if why else ""))
                      + (f" [{m}]" if m else ""))
-    return "Simulator state checks: " + "; ".join(parts) + "."
+    q = next((s.get("question") for s in spec["stages"] if s["check"] == "judge" and s.get("question")), None)
+    return "Simulator state checks: " + "; ".join(parts) + "." + (f" Question left for you: {q}?" if q else "")
 
 
 def load_specs(path: Path = SPECS_PATH) -> dict:
