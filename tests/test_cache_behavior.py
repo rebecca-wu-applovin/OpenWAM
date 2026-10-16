@@ -77,6 +77,8 @@ class _MockWanVB:
         # free functions; provide the state they read explicitly.
         self._tokenizer = _MockTokenizer()
         self.text_encoder = _MockTextEncoder(self._encode_text_calls)
+        self._text_cache = None  # training text cache off (WanVideoBackbone.__init__ default): encode online
+        self.text_max_length = 512  # WanVideoBackbone class default (umT5 token budget)
         self._height_division_factor = 16
         self._width_division_factor = 16
         self._time_division_factor = 4
