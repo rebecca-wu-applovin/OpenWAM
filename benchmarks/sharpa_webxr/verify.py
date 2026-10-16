@@ -244,7 +244,12 @@ def c_hold_lifted(r: Replay, s):
 
 
 def _rest(r: Replay, o, s):
-    return r.speed(o) <= s.get("rest_speed_m_s", DEFAULTS["rest_speed_m_s"])
+    """At rest: frame speed <= rest_speed_m_s, or net displacement over the hold window <= rest_disp_m. The second
+    form tolerates contact jitter (an object settled in a pan shows 0.05-0.1 m/s frame-to-frame while going nowhere)."""
+    k = max(1, int(round(s.get("hold_s", DEFAULTS["hold_s"]) / DT)))
+    P = r.obj[o]["pos"]
+    win = np.linalg.norm(P - P[np.maximum(np.arange(r.n) - k, 0)], axis=1)
+    return (r.speed(o) <= s.get("rest_speed_m_s", DEFAULTS["rest_speed_m_s"])) | (win <= s.get("rest_disp_m", 0.02))
 
 
 def _placed_common(r: Replay, s, inside):
