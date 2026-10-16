@@ -26,6 +26,7 @@
     "obj": "world_butter",
     "target": "world_pan_01",
     "hold_s": 0.3,
+    "final": true,
     "target_box": [
      [
       -0.09,
@@ -70,6 +71,7 @@
     "obj": "world_bread_02",
     "target": "world_bread_03",
     "hold_s": 0.3,
+    "final": true,
     "contact": "world_bread_03",
     "xy_margin_m": -0.01,
     "center_xy_m": 0.04
@@ -104,6 +106,7 @@
     "obj": "world_bread_03",
     "target": "world_plate",
     "hold_s": 0.3,
+    "final": true,
     "contact": "world_plate"
    }
   ],
@@ -201,6 +204,7 @@
     "obj": "world_test_tube_01",
     "target": "world_rack",
     "hold_s": 0.3,
+    "final": true,
     "z_above_m": 0.12,
     "contact": "world_rack"
    }
@@ -267,6 +271,7 @@
     "clear_m": 0.1,
     "release": false,
     "rest": false,
+    "target_max_speed_m_s": 1.6,
     "final": true
    }
   ],
@@ -299,6 +304,7 @@
     "obj": "world_egg",
     "target": "world_pan_01",
     "hold_s": 0.3,
+    "final": true,
     "target_box": [
      [
       -0.07,
@@ -344,9 +350,11 @@
     "obj": "world_butter",
     "target": "world_pan",
     "hold_s": 0.3,
+    "final": true,
     "xy_margin_m": 0.03,
     "contact": "world_pan",
-    "rest_disp_m": 0.03
+    "rest_disp_m": 0.03,
+    "rest_z_m": 0.01
    }
   ],
   "needs_judge": false
@@ -378,6 +386,7 @@
     "obj": "world_eyeshadow_brush",
     "target": "world_eyeshadow_box",
     "hold_s": 0.3,
+    "final": true,
     "z_above_m": 0.04,
     "contact": "world_eyeshadow_box"
    }
@@ -411,6 +420,7 @@
     "obj": "world_coin",
     "target": "world_game_box",
     "hold_s": 0.3,
+    "final": true,
     "z_above_m": 0.03,
     "contact": "world_game_box"
    }
@@ -444,6 +454,7 @@
     "obj": "world_coin",
     "target": "world_game_box",
     "hold_s": 0.3,
+    "final": true,
     "z_above_m": 0.03,
     "contact": "world_game_box"
    }
@@ -477,6 +488,7 @@
     "obj": "world_dice",
     "target": "world_game_board",
     "hold_s": 0.3,
+    "final": true,
     "contact": "world_game_board"
    }
   ],
@@ -527,6 +539,7 @@
     "obj": "world_shovel",
     "target": "world_pot",
     "hold_s": 0.3,
+    "final": true,
     "z_above_m": 0.12,
     "contact": "world_pot"
    }
@@ -995,7 +1008,7 @@
     "check": "hold_lifted",
     "obj": "world_ukelele_01",
     "lift_m": 0.05,
-    "hold_s": 1.0,
+    "hold_s": 0.8,
     "end_rule": "not_dropped",
     "drop_lift_m": 0.1
    }
@@ -1075,7 +1088,19 @@
     "obj": "world_drill",
     "lift_m": 0.05,
     "hold_s": 0.6,
-    "end_rule": "not_dropped"
+    "end_rule": "not_dropped",
+    "grasp_box": [
+     [
+      -0.085,
+      -0.045,
+      -0.09
+     ],
+     [
+      -0.005,
+      0.045,
+      0.025
+     ]
+    ]
    }
   ],
   "needs_judge": false
@@ -1153,7 +1178,19 @@
     "obj": "world_scissors",
     "lift_m": 0.05,
     "hold_s": 0.8,
-    "end_rule": "not_dropped"
+    "end_rule": "not_dropped",
+    "grasp_box": [
+     [
+      -0.025,
+      -0.08,
+      -0.135
+     ],
+     [
+      0.025,
+      0.08,
+      -0.02
+     ]
+    ]
    }
   ],
   "needs_judge": false
@@ -1376,7 +1413,8 @@
     "min_reversals": 3,
     "min_amp_m": 0.03,
     "end_rule": "not_dropped",
-    "end_upright_deg": 60,
+    "allow_drop": true,
+    "end_upright_deg": 30,
     "final": true
    }
   ],
@@ -1442,7 +1480,8 @@
     "min_reversals": 3,
     "min_amp_m": 0.03,
     "end_rule": "not_dropped",
-    "end_upright_deg": 60,
+    "allow_drop": true,
+    "end_upright_deg": 30,
     "final": true
    }
   ],
@@ -1774,7 +1813,7 @@
     ],
     "xy_slack_m": 0.03,
     "z_above_m": 0.1,
-    "min_path_m": 0.2
+    "min_path_m": 0.15
    },
    {
     "name": "complete",

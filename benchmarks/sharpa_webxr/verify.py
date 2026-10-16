@@ -47,6 +47,7 @@ class Replay:
         self.obj = {o: {"pos": np.zeros((self.n, 3)), "quat": np.zeros((self.n, 4)), "contact": np.zeros(self.n, bool),
                         "dist": np.zeros(self.n), "joints": np.zeros((self.n, len(v["joints"])))} for o, v in self.an.objects.items()}
         self.pairs = []
+        self.cpts = {o: [None] * self.n for o in self.an.objects}  # hand contact points per frame, object frame
         self.wrist = np.zeros((self.n, 2, 3))
         self.base = None
         # local AABB of each object's collision geometry (object frame), for footprints / regions
@@ -76,12 +77,14 @@ class Replay:
             loc = (R.T @ (P - p).T).T
             self.local_aabb[o] = np.stack([loc.min(0), loc.max(0)])
         for i in range(self.n):
-            out, pairs, wrist = self.an.frame(qpos[i])
+            out, pairs, wrist, cpts = self.an.frame(qpos[i])
             for o, s in out.items():
                 r = self.obj[o]
                 r["pos"][i], r["quat"][i], r["contact"][i], r["dist"][i] = s["pos"], s["quat"], s["contact"], s["dist"]
                 if s["joints"].size:
                     r["joints"][i] = s["joints"]
+                if cpts[o]:
+                    self.cpts[o][i] = (rot(s["quat"]).T @ (np.stack(cpts[o]) - s["pos"]).T).T
             self.pairs.append(pairs)
             self.wrist[i] = wrist
             if i == 0:
@@ -147,6 +150,16 @@ class Replay:
 
     def hand_contact(self, o: str) -> np.ndarray:
         return self.obj[o]["contact"]
+
+    def hand_contact_in(self, o: str, box) -> np.ndarray:
+        """Per frame: some hand-object contact point lies inside `box` ([lo, hi] in the object frame): the object is
+        held by that part (a handle), not just touched anywhere."""
+        lo, hi = np.asarray(box, float)
+        ok = np.zeros(self.n, bool)
+        for i, P in enumerate(self.cpts[o]):
+            if P is not None:
+                ok[i] = bool(np.any(np.all((P >= lo) & (P <= hi), axis=1)))
+        return ok
 
     def lift(self, o: str) -> np.ndarray:
         return self.obj[o]["pos"][:, 2] - self.obj[o]["pos"][0, 2]
@@ -357,8 +370,9 @@ def _not_dropped(r: Replay, o: str, s, c: Conds) -> dict:
     lower = bool(zb[-1] < -tol)
     fell = bool(r.fallen(o)[-1])
     info.update({"held_at_end": held_end, "dropped": bool(drop), "ended_lower": lower})
-    if not held_end:  # not still in hand: must have been set back steadily
-        c.add(f"not dropped: drop = released >= {dl} m up and falling >= {ds} m/s, or any fall >= 1 m/s ({rel_txt})", np.full(r.n, not drop))
+    if not held_end:  # not still in hand: must have been set back steadily (unless allow_drop: only the end pose counts)
+        if not s.get("allow_drop"):
+            c.add(f"not dropped: drop = released >= {dl} m up and falling >= {ds} m/s, or any fall >= 1 m/s ({rel_txt})", np.full(r.n, not drop))
         c.add(f"not ended > {tol} m below its start height or off the table (final {zb[-1]:+.3f} m)", np.full(r.n, not (lower or fell)))
         if s.get("end_upright_deg"):  # a bottle set down must be standing, not lying on its side
             upz = r.axis(o, [0, 0, 1])[:, 2]
@@ -371,13 +385,17 @@ def c_hold_lifted(r: Replay, s):
     at the object's lowest point, so tipping one end up does not count as lifting."""
     o = s["obj"]
     lift_m, hold_s = s.get("lift_m", DEFAULTS["lift_m"]), s.get("hold_s", DEFAULTS["hold_s"])
-    C = r.hand_contact(o)
+    C = r.hand_contact_in(o, s["grasp_box"]) if s.get("grasp_box") else r.hand_contact(o)
     z = r.lift(o) if s.get("lift_from") == "origin" else r.lift_bottom(o)
     Cf = fill_gaps(C)
     up = Cf & (z >= lift_m)
     max_hold = float(run_length(up).max() * DT)
     c = Conds()
-    c.add(f"hand contact (gaps <= 0.15 s bridged; final {bool(Cf[-1])})", Cf)
+    if s.get("grasp_box"):
+        c.add(f"hand on the handle: a contact point inside the handle box {s['grasp_box']} in the object frame (gaps <= 0.15 s bridged; "
+              f"{C.sum() * DT:.1f} s on the handle, {r.hand_contact(o).sum() * DT:.1f} s touching anywhere; final {bool(Cf[-1])})", Cf)
+    else:
+        c.add(f"hand contact (gaps <= 0.15 s bridged; final {bool(Cf[-1])})", Cf)
     c.add(f"lowest point lifted >= {lift_m} m (max {z.max():.3f} m, final {z[-1]:.3f} m)", z >= lift_m)
     c.add(f"held lifted for {hold_s} s continuously (longest {max_hold:.2f} s)", held(up, hold_s))
     last_c = int(np.flatnonzero(C)[-1]) if C.any() else -1
@@ -394,7 +412,12 @@ def _rest(r: Replay, o, s):
     k = max(1, int(round(s.get("hold_s", DEFAULTS["hold_s"]) / DT)))
     P = r.obj[o]["pos"]
     win = np.linalg.norm(P - P[np.maximum(np.arange(r.n) - k, 0)], axis=1)
-    return (r.speed(o) <= s.get("rest_speed_m_s", DEFAULTS["rest_speed_m_s"])) | (win <= s.get("rest_disp_m", 0.02))
+    ok = (r.speed(o) <= s.get("rest_speed_m_s", DEFAULTS["rest_speed_m_s"])) | (win <= s.get("rest_disp_m", 0.02))
+    if s.get("rest_z_m"):  # settled = its lowest point stays at one height over the window (sliding sideways allowed)
+        b = r.bottom_z(o)
+        zr = np.array([np.ptp(b[max(0, i - k): i + 1]) for i in range(r.n)])
+        ok |= zr <= s["rest_z_m"]
+    return ok
 
 
 def _placed_common(r: Replay, s, c: Conds):
@@ -404,6 +427,11 @@ def _placed_common(r: Replay, s, c: Conds):
     if s.get("release", True):
         C = r.hand_contact(o)
         c.add(f"released (no hand contact; final contact {bool(C[-1])})", ~C)
+    # the hold applies to "released inside the target" (the conditions added so far); support contact, levelness and
+    # rest only have to hold at the graded frame, so a placement the recording cuts while the object is still settling
+    # on the pan floor counts (bounce height / flicker in the last frames must not restart the hold)
+    pre = fill_gaps(c.all(r.n), 5)
+    c.add(f"released inside for {hold_s} s continuously (longest {run_length(pre).max() * DT:.2f} s)", held(pre, hold_s))
     if s.get("contact"):
         T = fill_gaps(r.touching(o, s["contact"]))  # contact flicker must not break the hold
         c.add(f"touching {s['contact']} (gaps <= 0.15 s bridged; final {bool(T[-1])})", T)
@@ -411,9 +439,8 @@ def _placed_common(r: Replay, s, c: Conds):
         upz = r.axis(o, s.get("up_axis", [0, 0, 1]))[:, 2]
         c.add(f"level within {s['level_deg']} deg (final tilt {np.degrees(np.arccos(np.clip(upz[-1], -1, 1))):.0f} deg)", upz >= np.cos(np.deg2rad(s["level_deg"])))
     if s.get("rest", True):
-        c.add(f"at rest: <= {s.get('rest_speed_m_s', DEFAULTS['rest_speed_m_s'])} m/s or moved <= {s.get('rest_disp_m', 0.02)} m over {hold_s} s (final speed {r.speed(o)[-1]:.2f} m/s)", _rest(r, o, s))
-    pre = fill_gaps(c.all(r.n), 5)  # dropouts up to 0.25 s (contact flicker, settling jitter) must not restart the hold
-    c.add(f"all of the above for {hold_s} s continuously (longest {run_length(pre).max() * DT:.2f} s)", held(pre, hold_s))
+        c.add(f"at rest: <= {s.get('rest_speed_m_s', DEFAULTS['rest_speed_m_s'])} m/s or moved <= {s.get('rest_disp_m', 0.02)} m over {hold_s} s"
+              + (f" or bounce height <= {s['rest_z_m']} m" if s.get("rest_z_m") else "") + f" (final speed {r.speed(o)[-1]:.2f} m/s)", _rest(r, o, s))
     return c.all(r.n)
 
 
@@ -458,9 +485,17 @@ def c_move_out(r: Replay, s):
         c.add(f"released (final contact {bool(r.hand_contact(o)[-1])})", ~r.hand_contact(o))
     if s.get("rest", True):
         c.add(f"at rest (final speed {r.speed(o)[-1]:.2f} m/s)", _rest(r, o, s))
+    tm = {}
+    if "target" in s and s.get("target_max_speed_m_s"):  # the container must not be flung about while the object comes out
+        vt = np.maximum.accumulate(r.speed(s["target"]))
+        c.add(f"{s['target']} never moved faster than {s['target_max_speed_m_s']} m/s (peak so far {vt[-1]:.2f} m/s)", vt <= s["target_max_speed_m_s"])
+        tm["target_max_speed_m_s"] = float(vt[-1])
+    if "target" in s and s.get("target_disp_m"):
+        c.add(f"{s['target']} not pushed more than {s['target_disp_m']} m from its start (now {r.disp(s['target'])[-1]:.2f} m)", r.disp(s["target"]) <= s["target_disp_m"])
+        tm["target_disp_m"] = float(r.disp(s["target"])[-1])
     pre = c.all(r.n)
     c.add(f"all of the above for {hold_s} s continuously (longest {run_length(pre).max() * DT:.2f} s)", held(pre, hold_s))
-    return c.all(r.n), {"max_disp_m": float(r.disp(o).max()), "final_inside": bool(inside[-1])}, c
+    return c.all(r.n), {"max_disp_m": float(r.disp(o).max()), "final_inside": bool(inside[-1]), **tm}, c
 
 
 def c_joint_goal(r: Replay, s):

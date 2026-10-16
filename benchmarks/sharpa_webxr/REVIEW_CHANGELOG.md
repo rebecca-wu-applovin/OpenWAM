@@ -187,3 +187,30 @@ Consequence: for the tool tasks the judge is currently a pass-through; the polic
 are effectively "reached the gate". Next step: separate the labelled tool-task failures from successes in state (as
 done for pours) and move those tasks to state checks; where a judge is kept, name the gate stage for what it
 measures, not the outcome, and say in the prompt that the gate is a precondition.
+
+## Third review round (2026-10-16, evening): decisions discussed with the reviewer and applied
+
+- **00177 ukulele**: hold 0.8 s (was 1.0). 68 episodes: recall 0.98 / spec 1.00 (was 0.94 / 1.00).
+- **Placements graded at the end** (all 11 pick-and-place tasks): the object must still be in the target on the last
+  frame. No labelled success lost; the brush that sat on the box edge and fell out (01012) now fails.
+- **Placement hold reworked**: the 0.3 s hold applies to "released inside the target"; support contact, levelness and
+  rest only have to hold on the graded frame. A recording that stops 0.4 s after the butter lands, while it still
+  jitters on the pan floor, now passes (00921). New `rest_z_m`: settled = lowest point stays within 1 cm over the
+  window (sliding sideways allowed). Pick-and-place family: 1.00 / 1.00 on every task.
+- **00787 scramble**: stroke threshold 0.15 m (was 0.20). Recall 1.00, spec 0.52 (one more labelled failure passes).
+- **Shakes (00779 flask, 01605 nail polish)**: a drop after shaking no longer fails by itself; the bottle must end
+  standing (<= 30 degrees, was 60), on the table, not below its start height. 00779: 0.90 / 1.00 (was 0.88 / 1.00);
+  01605: 0.98 / 0.96 (was 0.92 / 1.00: three "fell but settled" recovers pass, one labelled failure that lands
+  upright passes too). Dice (01592) keep the drop rule: with it relaxed two dropped-dice failures passed.
+- **00646 phone out of case**: the case may not move faster than 1.6 m/s at any time (every labelled success stays
+  under 0.6 m/s, recovers under 1.6). Flung-case failures fail. 0.96 / 1.00.
+- **Held by the handle** (new `grasp_box`): MuJoCo contact points between hand and object are kept per frame in the
+  object frame; a grasp counts only while some contact point lies inside the handle box. Boxes read off the meshes:
+  drill / massage gun 01116 handle x -8.5..-0.5 cm, y +-4.5 cm, z -9..+2.5 cm; scissors 01337 rings z -13.5..-2 cm.
+  01116: 1.00 / 1.00 (was 1.00 / 0.57). 01337 unchanged (0.94 / 0.97): its two reviewed "wrong pose" cases hold
+  the rings.
+- **01652 toss**: requires a catch (reviewer decision); the two "unsure" successes that landed on the table are
+  label corrections. 0.93 / 1.00.
+- **00175 kettle**: hold kept at 0.2 s; 0.1 s would rescue one recover and pass labelled failure 6d4cf7d3.
+
+State-only tasks (45 with labels, n = 2 420): recall 0.979, specificity 0.977 (was 0.973 / 0.967).
