@@ -224,3 +224,15 @@ the kettle only counts as pouring while it leans toward the spout (lean directio
 direction). Kettles: spout tip inside the target opening with 1 cm slack (was 2 cm), hold 0.1 s (was 0.2; the
 reviewer: position matters, duration does not). 00175: recall 0.97 / spec 0.97 (was 0.95 / 0.94); 01498 unchanged
 (1.00 / 0.80, n_neg = 5). State-only tasks: 0.981 / 0.977.
+
+## Policy rollouts after the third round (score.py --grader hybrid, rubric r3, specs as of commit bd3fc0a)
+
+| model | hybrid SR (decided) | 95% CI | pours | pick and place | pick only | shake / toss | tool use |
+|---|---|---|---|---|---|---|---|
+| xwam 95k | 25.4% (70/275) | 20.7 to 30.9 | 6/25 | 26/75 | 14/35 | 1/20 | 3/35 |
+| motus 80k | 22.6% (62/275) | 18.0 to 27.8 | 4/25 | 17/75 | 8/35 | 1/20 | 8/35 |
+| gwp 40k EMA | 20.7% (57/275) | 16.4 to 25.9 | 7/25 | 21/75 | 9/35 | 0/20 | 3/35 |
+| cosmos3 80k | 4.7% (13/275) | 2.8 to 7.9 | 0/25 | 4/75 | 0/35 | 2/20 | 2/35 |
+
+Previous round (pour change only): xwam 26.2%, motus 22.2%, gwp 20.7%, cosmos3 4.4%. Judge verdicts reused from the
+cache (same sim facts), no new API calls. Viewer republished at the same links.
