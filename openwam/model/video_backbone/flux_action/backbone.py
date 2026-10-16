@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 _LATENT_CHANNELS = 96
 _TEMPORAL_COMPRESSION = 4
 _SPATIAL_COMPRESSION = 32
+_DECODER_TEMPORAL_KERNEL = 5  # decoder NATTEN kernel along latent time; shorter latents cannot decode
 _VIDEO_POSITION_FPS = 24.0  # PolicyConfig.video_position_fps: latent i sits at 4 i / 24 s
 _STATE_FPS = 1.0  # our 5 proprio frames are 1 s apart (07 layout)
 _VEC_DIM = 768  # pooled-vector width; flux feeds zeros
@@ -324,6 +325,29 @@ class FluxActionVideoBackbone(VideoBackbone):
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=video.device.type == "cuda"):
             lat = self.vae.encode(video.to(dtype), chunked_encode=video.shape[2] > self.vae.chunk_size_frames)
         return lat[:, :, : 1 + (t - 1) // _TEMPORAL_COMPRESSION].clone()
+
+    @torch.no_grad()
+    def decode_video(self, latents: Tensor, *, tiled: bool = True) -> list:
+        """Normalized latents ``(1, 96, T_lat, h, w)`` -> ``4 * T_lat - 3`` PIL frames (training vis).
+
+        The decoder's temporal NATTEN kernel spans 5 latents, so a shorter clip (our 1+4 future = 2 latents)
+        is padded by repeating its last latent and the extra frames are cropped. The kernel is not causal,
+        so the last decoded frames are approximate; fine for visualization, not a reconstruction metric.
+        ``tiled`` is unused: the VAE's own looped decode (``decoder_max_t``) bounds the memory.
+        """
+        from openwam.model.video_backbone.cosmos_predict25._vae_utils import _video_tensor_to_pil
+
+        _ = tiled
+        t = latents.shape[2]
+        if t < _DECODER_TEMPORAL_KERNEL:
+            pad = latents[:, :, -1:].expand(-1, -1, _DECODER_TEMPORAL_KERNEL - t, -1, -1)
+            latents = torch.cat([latents, pad], dim=2)
+        dtype = next(self.vae.parameters()).dtype
+        # Same autocast as _vae_encode; ViTNormInference.decode denormalizes and clamps to [-1, 1].
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=latents.device.type == "cuda"):
+            video = self.vae.decode(latents.to(dtype))
+        video = video[:, :, : _TEMPORAL_COMPRESSION * (t - 1) + 1]
+        return _video_tensor_to_pil(video.float().clamp(-1, 1))
 
     @staticmethod
     def _pixels(frames) -> Tensor:
