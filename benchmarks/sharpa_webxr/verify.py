@@ -295,6 +295,13 @@ def c_joint_goal(r: Replay, s):
     if s.get("max_speed"):  # gentle: the joint never moved faster than this before the goal was reached
         ok = ok & (np.maximum.accumulate(speed) <= s["max_speed"])
     metrics = {"q0": float(q[0]), "q_min": float(q.min()), "q_max": float(q.max()), "q_final": float(q[-1]), "peak_speed": peak}
+    if s.get("max_approach_speed"):  # gentle at the stop: joint speed while q is inside approach_band (the last few
+        # degrees before the lid meets the base) never exceeds this. A fast mid-swing is fine if it slows down before contact.
+        lo_b, hi_b = s["approach_band"]
+        in_band = (q >= lo_b) & (q <= hi_b)
+        approach = np.maximum.accumulate(np.where(in_band, speed, 0.0))
+        ok = ok & (approach <= s["max_approach_speed"])
+        metrics["peak_approach_speed"] = float(approach.max())
     o = s["obj"]
     if s.get("front_axis"):  # the body's front (object-local) must point within face_tol_deg of base direction `toward`
         Rb = r.base[:3, :3]

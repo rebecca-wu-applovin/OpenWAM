@@ -63,9 +63,10 @@ S = {
     # [-0.6, 0.35]; closed is q~2.0, start is q=0.32 ~ 94 deg), laptop upright, hands off, and something changed
     "00005": ["world_laptop_03", None, [reach("world_laptop_03"), {"name": "adjusted", "check": "joint_goal", "obj": "world_laptop_03", "min": -0.6, "max": 0.35, "front_axis": [0, -1, 0], "toward": [-1, 0], "face_tol_deg": 45, "min_change": {"joint": 0.1, "face_deg": 10}, "keep_upright_deg": 25, "release": True, "hold_s": 1.0, "final": True}]],
     "00079": ["world_gate_01", None, [reach("world_gate_01"), {"name": "closed", "check": "joint_goal", "obj": "world_gate_01", "joint": "articraft_rec_microwave_oven_0002_joints_root_to_door", "max": 0.06, "hold_s": 0.5, "final": True}]],
-    # lid (child body, hinged on the base's local x) within ~10 deg of closed (q >= 1.78; closed is q~2.0), never
-    # swung faster than 4.6 rad/s, and the keyboard (root body) still flat on the table: upright, lifted <= 3 cm
-    "00082": ["world_laptop_03", None, [reach("world_laptop_03"), {"name": "closed", "check": "joint_goal", "obj": "world_laptop_03", "min": 1.78, "hold_s": 0.5, "max_speed": 4.6, "keep_upright_deg": 25, "max_lift_m": 0.03, "final": True}]],
+    # lid (child body, hinged on the base's local x) within ~10 deg of closed (q >= 1.78; closed is q~2.0), arriving
+    # gently: hinge speed over the last ~20 deg before contact (q in [1.65, 1.95]) <= 3.3 rad/s (labelled successes
+    # <= 3.0, slams >= 3.6), and the keyboard (root body) still flat on the table: upright, lifted <= 3 cm
+    "00082": ["world_laptop_03", None, [reach("world_laptop_03"), {"name": "closed", "check": "joint_goal", "obj": "world_laptop_03", "min": 1.78, "hold_s": 0.5, "max_approach_speed": 3.3, "approach_band": [1.65, 1.95], "keep_upright_deg": 25, "max_lift_m": 0.03, "final": True}]],
     "00337": ["world_laptop_03", None, [reach("world_laptop_03"), {"name": "opened", "check": "joint_goal", "obj": "world_laptop_03", "max": 1.25, "hold_s": 1.0, "final": True}]],
     "00626": ["world_rec_desk_with_drawer_0005", None, [reach("world_rec_desk_with_drawer_0005"), {"name": "pulled_out", "check": "joint_goal", "obj": "world_rec_desk_with_drawer_0005", "min": 0.08, "hold_s": 0.5, "final": True}]],
     "01000": ["world_burger_box", None, [reach("world_burger_box"), {"name": "opened", "check": "joint_goal", "obj": "world_burger_box", "delta": -0.9, "hold_s": 0.5, "final": True}]],

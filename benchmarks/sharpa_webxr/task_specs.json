@@ -635,7 +635,11 @@
     "obj": "world_laptop_03",
     "min": 1.78,
     "hold_s": 0.5,
-    "max_speed": 4.6,
+    "max_approach_speed": 3.3,
+    "approach_band": [
+     1.65,
+     1.95
+    ],
     "keep_upright_deg": 25,
     "max_lift_m": 0.03,
     "final": true
