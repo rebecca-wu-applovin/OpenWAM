@@ -57,11 +57,16 @@ def main():
                "agree": round((both + ne) / n, 3), "both": both, "ver_only": vo, "judge_only": jo}
         out.append(rec)
         print(f"{cat:26s} {n:4d} {rec['ver_sr']:7.3f} {rec['judge_sr']:8.3f} {rec['agree']:6.3f} {both:5d} {vo:8d} {jo:10d}   any={rec['ver_any_sr']:.3f} end={rec['ver_end_sr']:.3f}")
-    n, both, vo, jo, ne = conf(rows)
-    print(f"{'ALL':26s} {n:4d} {sum(r['ver'] for r in rows) / n:7.3f} {sum(r['judge'] for r in rows) / n:8.3f} {(both + ne) / n:6.3f} {both:5d} {vo:8d} {jo:10d}")
+    if not rows:
+        print("no rollouts with both verifier.json and judge output under", a.folder)
+        return
     sim_rows = [r for r in rows if not r["needs_judge"]]
-    n, both, vo, jo, ne = conf(sim_rows)
-    print(f"{'SIM-ONLY scenes':26s} {n:4d} {sum(r['ver'] for r in sim_rows) / n:7.3f} {sum(r['judge'] for r in sim_rows) / n:8.3f} {(both + ne) / n:6.3f} {both:5d} {vo:8d} {jo:10d}")
+    for label, rs in (("ALL", rows), ("SIM-ONLY scenes", sim_rows)):
+        if not rs:
+            print(f"{label:26s}    0 (none)")
+            continue
+        n, both, vo, jo, ne = conf(rs)
+        print(f"{label:26s} {n:4d} {sum(r['ver'] for r in rs) / n:7.3f} {sum(r['judge'] for r in rs) / n:8.3f} {(both + ne) / n:6.3f} {both:5d} {vo:8d} {jo:10d}")
     # judge-ending scenes: how often the sim prefix gate would have skipped a judge call, and judge successes it would have blocked
     jr = [r for r in rows if r["needs_judge"]]
     if jr:

@@ -1284,7 +1284,17 @@
     "name": "portrait",
     "check": "orientation",
     "obj": "world_tablet",
-    "mode": "rotate",
+    "mode": "axis_away",
+    "axis": [
+     0,
+     0,
+     1
+    ],
+    "ref": [
+     0,
+     1,
+     0
+    ],
     "min_deg": 55,
     "final": true,
     "release": false,

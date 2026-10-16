@@ -57,8 +57,17 @@ class Replay:
                     mid = m.geom_dataid[g]
                     vs = m.mesh_vert[m.mesh_vertadr[mid]: m.mesh_vertadr[mid] + m.mesh_vertnum[mid]]
                     pts.append((g, vs))
-                else:
-                    pts.append((g, np.array([[-1, -1, -1], [1, 1, 1]]) * m.geom_size[g][:3]))
+                else:  # primitive: type-specific half extents, all 8 corners (geom may be rotated in the body frame)
+                    t, sz = m.geom_type[g], m.geom_size[g]
+                    if t == mujoco.mjtGeom.mjGEOM_SPHERE:
+                        h = np.array([sz[0], sz[0], sz[0]])
+                    elif t == mujoco.mjtGeom.mjGEOM_CYLINDER:
+                        h = np.array([sz[0], sz[0], sz[1]])
+                    elif t == mujoco.mjtGeom.mjGEOM_CAPSULE:
+                        h = np.array([sz[0], sz[0], sz[1] + sz[0]])
+                    else:  # box, ellipsoid
+                        h = np.asarray(sz[:3], float)
+                    pts.append((g, np.array([[x, y, z] for x in (-h[0], h[0]) for y in (-h[1], h[1]) for z in (-h[2], h[2])])))
             d.qpos[:] = qpos[0]
             mujoco.mj_forward(m, d)
             R, p = d.xmat[v["body"]].reshape(3, 3), d.xpos[v["body"]]
@@ -367,6 +376,13 @@ def c_orientation(r: Replay, s):
         cosang = (ab @ tw) / (np.linalg.norm(ab, axis=1) * np.linalg.norm(tw) + 1e-9)
         ok = cosang >= np.cos(np.deg2rad(s.get("tol_deg", 30)))
         metric = {"final_face_deg": float(np.degrees(np.arccos(np.clip(cosang[-1], -1, 1))))}
+    elif mode == "axis_away":  # local `axis` (sign-insensitive) at least min_deg away from base-frame direction `ref`
+        # e.g. portrait: the tablet's long axis no longer runs left-right, whether it lies flat or is held upright
+        a = r.axis(o, s["axis"])
+        ref = r.base[:3, :3] @ (np.asarray(s["ref"], float) / np.linalg.norm(s["ref"]))
+        ang = np.degrees(np.arccos(np.clip(np.abs(a @ ref) / (np.linalg.norm(a, axis=1) + 1e-9), 0, 1)))
+        ok = ang >= s["min_deg"]
+        metric = {"max_axis_away_deg": float(ang.max()), "final_axis_away_deg": float(ang[-1]), "axis_away0_deg": float(ang[0])}
     else:
         raise ValueError(mode)
     if s.get("keep_upright_deg"):
@@ -381,49 +397,58 @@ def c_orientation(r: Replay, s):
     return ok, metric
 
 
+def _segments(mask: np.ndarray):
+    """[start, end) index ranges of the true runs of mask."""
+    idx = np.flatnonzero(np.diff(np.concatenate([[0], mask.astype(int), [0]])))
+    return list(zip(idx[::2], idx[1::2]))
+
+
+def _reversals(x: np.ndarray, amp: float, segments) -> np.ndarray:
+    """Frame indices of confirmed direction reversals of the 1-D signal x, with hysteresis amp: a turning point counts
+    once the signal has travelled >= amp back from it. Tracking restarts in every segment, so legs never span a gap
+    (an object shaken before being grasped, or between two grasps, earns nothing)."""
+    ext = []
+    for a, b in segments:
+        direction, cand = 0, a
+        for i in range(a + 1, b):
+            if direction == 0:
+                if abs(x[i] - x[a]) >= amp:
+                    direction, cand = np.sign(x[i] - x[a]), i
+            elif (x[i] - x[cand]) * direction > 0:
+                cand = i  # still travelling the same way: extend the leg
+            elif abs(x[i] - x[cand]) >= amp:
+                ext.append(cand)  # reversal confirmed
+                direction, cand = -direction, i
+    return np.array(ext, int)
+
+
+def _windowed_counts(ext: np.ndarray, n: int, win: int) -> np.ndarray:
+    return np.array([int(((ext <= i) & (ext > i - win)).sum()) for i in range(n)])
+
+
 def c_oscillation(r: Replay, s):
     """Shake: while hand-held, the object reverses direction >= min_reversals times inside a window_s window, each
-    leg travelling >= min_amp_m along the dominant motion axis."""
+    leg travelling >= min_amp_m along the dominant motion axis. Legs are only tracked inside held intervals."""
     o = s["obj"]
-    P, C = r.obj[o]["pos"], r.hand_contact(o)
+    # a shaking hand loses and regains sim contact constantly; bridge gaps up to contact_gap_s (default 0.5 s)
+    P, C = r.obj[o]["pos"], fill_gaps(r.hand_contact(o), int(round(s.get("contact_gap_s", 0.5) / DT)))
+    while_held = s.get("while_held", True)
+    segments = _segments(C) if while_held else [(0, r.n)]
     V = np.diff(P, axis=0)
     held_v = V[C[1:]] if C[1:].any() else V
-    if len(held_v) < 3:
-        return np.zeros(r.n, bool), {"max_reversals_in_window": 0}
+    if len(held_v) < 3 or not segments:
+        return np.zeros(r.n, bool), {"max_reversals_in_window": 0, "n_reversals": 0}
     ax = np.linalg.svd(held_v - held_v.mean(0), full_matrices=False)[2][0]
     x = P @ ax
-    amp = s.get("min_amp_m", 0.03)
-    # turning points with hysteresis: a new extremum counts once the signal has moved >= amp back from it
-    ext, direction, cand = [0], 0, 0
-    for i in range(1, r.n):
-        if direction == 0:
-            if abs(x[i] - x[ext[-1]]) >= amp:
-                direction, cand = np.sign(x[i] - x[ext[-1]]), i
-        elif (x[i] - x[cand]) * direction > 0:
-            cand = i  # still travelling the same way: extend the leg
-        elif abs(x[i] - x[cand]) >= amp:
-            ext.append(cand)  # reversal confirmed
-            direction, cand = -direction, i
-    ext = np.array(ext[1:], int)
     win = int(round(s.get("window_s", 3.0) / DT))
-    counts = np.array([int(((ext <= i) & (ext > i - win)).sum()) for i in range(r.n)])
+    ext = _reversals(x, s.get("min_amp_m", 0.03), segments)
+    counts = _windowed_counts(ext, r.n, win)
     ok = counts >= s.get("min_reversals", 4)
-    if s.get("while_held", True):
+    if while_held:
         ok &= C
     metrics = {"max_reversals_in_window": int(counts.max()), "n_reversals": int(len(ext))}
-    for a2 in (0.02, 0.03, 0.05, 0.08):  # diagnostics at other amplitudes, for threshold calibration
-        e2, d2, c2 = [0], 0, 0
-        for i in range(1, r.n):
-            if d2 == 0:
-                if abs(x[i] - x[e2[-1]]) >= a2:
-                    d2, c2 = np.sign(x[i] - x[e2[-1]]), i
-            elif (x[i] - x[c2]) * d2 > 0:
-                c2 = i
-            elif abs(x[i] - x[c2]) >= a2:
-                e2.append(c2)
-                d2, c2 = -d2, i
-        e2 = np.array(e2[1:], int)
-        metrics[f"rev{int(a2 * 100)}cm"] = int(max((((e2 <= i) & (e2 > i - win)).sum() for i in range(r.n)), default=0))
+    for a2 in (0.02, 0.03, 0.05, 0.08):  # diagnostics at other amplitudes, for threshold calibration (same rule)
+        metrics[f"rev{int(a2 * 100)}cm"] = int(_windowed_counts(_reversals(x, a2, segments), r.n, win).max())
     return ok, metrics
 
 
@@ -502,8 +527,11 @@ def c_sweep(r: Replay, s):
         inside &= r.touching(tool, tgt)
     if s.get("while_held", True):
         inside &= r.hand_contact(tool)
+    inside = fill_gaps(inside)  # contact flicker must not split a stroke into uncredited pieces
     step = np.concatenate([[0.0], np.linalg.norm(np.diff(pw, axis=0), axis=1)])
-    path = np.cumsum(np.where(inside, step, 0.0))
+    valid = inside.copy()
+    valid[1:] &= inside[:-1]  # a step counts only when both its endpoints are inside (no credit for the approach)
+    path = np.cumsum(np.where(valid, step, 0.0))
     return path >= s.get("min_path_m", 0.2), {"path_in_target_m": float(path[-1]), "inside_s": float(inside.sum() * DT)}
 
 
@@ -525,24 +553,32 @@ def verify(rollout_dir: Path, env: SharpaWebXREnv, spec: dict, max_steps: int | 
         qpos = qpos[: max_steps + 1]
     r = Replay(env, qpos)
     stages = []
+    start = 0  # a stage only counts from the frame its predecessor was first satisfied (ordered chain, retries allowed)
     for st in spec["stages"]:
         mask, metrics = CHECKS[st["check"]](r, st)
-        i0, t0 = first_true(mask)
-        any_time, end_state = i0 is not None, bool(mask[-1])
+        seq = mask.copy()
+        seq[:start] = False
+        i0, t0 = first_true(seq)
+        any_time, end_state = i0 is not None, bool(seq[-1])
+        if i0 is not None:
+            start = i0
         # the spec decides which semantics this stage is graded on: end state for tasks the human labels judge
         # at the end (still holding, lid still closed), any time otherwise (RoboTwin "done on first success")
         achieved = end_state if st.get("final") else any_time
         stages.append({"name": st.get("name", st["check"]), "check": st["check"], "achieved": achieved, "any_time": any_time,
-                       "end_state": end_state, "t_first_s": t0, "final": end_state if st["check"] != "judge" else None, "metrics": metrics})
+                       "end_state": end_state, "t_first_s": t0, "graded_on": "end_state" if st.get("final") else "any_time",
+                       "unordered_any_time": bool(mask.any()), "metrics": metrics})
     sim_stages = [s for s in stages if s["check"] != "judge"]
     needs_judge = any(s["check"] == "judge" for s in stages)
     fails = {o: bool(r.fallen(o).any()) for o in spec.get("no_fall", [])}
     clean = not any(fails.values())
     sim_ok = all(s["achieved"] for s in sim_stages) and clean
+    # pure semantics for comparison: any-time = every stage reached in order; end-state = earlier stages reached in
+    # order and the goal stage still true on the last frame (earlier stages cannot all hold at the end: grasp needs
+    # contact, place needs release)
     ok_any = all(s["any_time"] for s in sim_stages) and clean
-    ok_end = all(s["end_state"] for s in sim_stages) and clean
-    times = [s["t_first_s"] for s in sim_stages]
-    in_order = all(a is not None for a in times) and all(times[i] <= times[i + 1] for i in range(len(times) - 1))
+    ok_end = bool(sim_stages) and all(s["any_time"] for s in sim_stages[:-1]) and sim_stages[-1]["end_state"] and clean
+    in_order = all(s["any_time"] for s in sim_stages)  # ordered evaluation: reached means reached after the predecessor
     out = {"scene_id": meta["scene_id"], "seed": meta["seed"], "category": spec.get("category"), "spec_version": spec.get("version", 1),
            "stages": stages, "n_sim_stages": len(sim_stages), "sim_stages_achieved": sum(s["achieved"] for s in sim_stages),
            "graded_sim": round(sum(s["achieved"] for s in sim_stages) / max(1, len(stages)), 4),

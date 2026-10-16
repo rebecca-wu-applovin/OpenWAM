@@ -72,7 +72,7 @@ def main():
                 st.append(f"{name}:J")
                 continue
             ap = rate([r["stages"][i]["achieved"] for r in pos]); an = rate([r["stages"][i]["achieved"] for r in neg])
-            fp_ = rate([bool(r["stages"][i]["final"]) for r in pos]); fn_ = rate([bool(r["stages"][i]["final"]) for r in neg])
+            fp_ = rate([bool(r["stages"][i]["end_state"]) for r in pos]); fn_ = rate([bool(r["stages"][i]["end_state"]) for r in neg])
             st.append(f"{name}:{ap}/{fp_}|{an}/{fn_}")
         n_s = sum(r["label"] == "success" for r in rs); n_r = sum(r["label"] == "recover" for r in rs)
         rec = {"scene": sid[:8], "category": rs[0].get("category"), "n_success": n_s, "n_recover": n_r, "n_failure": len(neg),
@@ -106,6 +106,9 @@ def main():
         if n:
             print(f"\n{name}: n={n} recall={t['tp'] / max(1, t['tp'] + t['fn']):.3f} specificity={t['tn'] / max(1, t['tn'] + t['fp']):.3f} "
                   f"accuracy={(t['tp'] + t['tn']) / n:.3f}  (tp={t['tp']} fn={t['fn']} tn={t['tn']} fp={t['fp']})")
+    if not out:
+        print("no scored scenes (no verifier.json under --root, or --scenes matched nothing)")
+        return
     if a.tsv:
         cols = list(out[0].keys())
         with open(a.tsv, "w") as f:
