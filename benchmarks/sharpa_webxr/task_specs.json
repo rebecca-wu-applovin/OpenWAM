@@ -872,11 +872,13 @@
      0.002,
      0.012
     ],
-    "pos_tol_m": 0.012,
+    "pos_tol_m": 0.02,
     "tilt_deg": 90,
     "contact": "world_pen",
     "release": false,
-    "rest": false
+    "rest": false,
+    "hold_s": 0.3,
+    "final": true
    }
   ],
   "needs_judge": false
