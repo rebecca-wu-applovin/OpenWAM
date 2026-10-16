@@ -49,8 +49,8 @@ def main():
             key = f"{scene}/{d.name}"
             label = v.get("label")
             r = reviews.get(key)
-            if r and r.get("decision") == "verifier":  # reviewer sided with the verifier: label corrected
-                label = "success" if v["sim_prefix_ok"] else "failure"
+            if r and r.get("decision") == "verifier":  # reviewer sided with the verifier: label corrected to the verdict reviewed
+                label = "success" if r.get("verifier") == "PASS" else "failure"
             elif r and r.get("decision") in ("unsure", "both_wrong"):
                 continue
             if label not in POS + NEG:

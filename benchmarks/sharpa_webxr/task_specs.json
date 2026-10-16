@@ -1548,10 +1548,20 @@
     "obj": "world_kettle",
     "target": "world_mug_025",
     "min_tilt_deg": 30,
-    "rim_slack_m": 0.02,
-    "hold_s": 0.2,
+    "rim_slack_m": 0.01,
+    "hold_s": 0.1,
     "end_upright_deg": 20,
-    "final": true
+    "final": true,
+    "spout": [
+     -0.116,
+     0.0,
+     0.14
+    ],
+    "spout_dir": [
+     -1.0,
+     0.0
+    ],
+    "spout_tol_deg": 60
    }
   ],
   "needs_judge": false
@@ -1688,10 +1698,20 @@
     "obj": "world_kettle",
     "target": "world_teapot",
     "min_tilt_deg": 30,
-    "rim_slack_m": 0.02,
-    "hold_s": 0.2,
+    "rim_slack_m": 0.01,
+    "hold_s": 0.1,
     "end_upright_deg": 20,
-    "final": true
+    "final": true,
+    "spout": [
+     -0.116,
+     0.0,
+     0.14
+    ],
+    "spout_dir": [
+     -1.0,
+     0.0
+    ],
+    "spout_tol_deg": 60
    }
   ],
   "needs_judge": false

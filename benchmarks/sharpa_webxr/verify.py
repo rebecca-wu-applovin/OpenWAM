@@ -818,20 +818,36 @@ def c_pour(r: Replay, s):
     o, tgt = s["obj"], s["target"]
     up = r.axis(o, s.get("up_axis", [0, 0, 1]))
     tilt = np.degrees(np.arccos(np.clip(up[:, 2], -1, 1)))
-    lip = r.lip(o, s.get("up_axis", [0, 0, 1]))
+    if s.get("spout"):  # container with a spout: the lip is a fixed point, and it only pours when leaned toward the spout
+        lip = r.point(o, s["spout"])
+    else:
+        lip = r.lip(o, s.get("up_axis", [0, 0, 1]))
     oc, rad = r.opening(tgt, s.get("opening"), s.get("opening_r"))
     lip_dxy = np.linalg.norm(lip[:, :2] - oc[:, :2], axis=1)
     lip_dz = lip[:, 2] - oc[:, 2]
     slack, dz_lo, dz_hi = s.get("rim_slack_m", 0.02), s.get("dz_lo_m", -0.05), s.get("dz_hi_m", 0.25)
     min_tilt, hold_s = s.get("min_tilt_deg", 30), s.get("hold_s", 0.2)
     tilted = tilt >= min_tilt
+    c = Conds()
+    if s.get("spout"):
+        sd = np.asarray(s.get("spout_dir", [s["spout"][0], s["spout"][1]]), float)
+        sd3 = np.array([sd[0], sd[1], 0.0]) / np.linalg.norm(sd)
+        spout_w = r.axis(o, sd3)[:, :2]  # spout direction in the world, horizontal part
+        lean = up[:, :2]
+        cosang = np.sum(spout_w * lean, axis=1) / np.maximum(np.linalg.norm(spout_w, axis=1) * np.linalg.norm(lean, axis=1), 1e-9)
+        tol = s.get("spout_tol_deg", 60)
+        toward = cosang >= np.cos(np.radians(tol))
+        best = float(np.degrees(np.arccos(np.clip(cosang[tilted].max(), -1, 1)))) if tilted.any() else float("nan")
+        c.add(f"leaned toward the spout (lean direction within {tol} deg of the spout direction; best {best:.0f} deg while tilted)", toward)
+        tilted = tilted & toward
     over = (lip_dxy <= rad + slack) & (lip_dz >= dz_lo) & (lip_dz <= dz_hi)
     hand = r.hand_contact(o)
     pouring = fill_gaps(tilted & over & hand, 3)
     poured_by = np.maximum.accumulate(held(pouring, hold_s))
     off = (lip_dxy[tilted].min() - rad) if tilted.any() else float("nan")
-    c = Conds()
-    c.add(f"poured at some time: {o} tilted >= {min_tilt} deg with its lip inside the {tgt} opening (radius {rad:.2f} m + {slack} m), "
+    if s.get("spout"):  # the lean condition is folded into "poured"; it must not also be required at the graded frame
+        lean_txt = c.popitem()[0]
+    c.add(f"poured at some time: {o} tilted >= {min_tilt} deg{' toward its spout' if s.get('spout') else ''} with its {'spout tip' if s.get('spout') else 'lip'} inside the {tgt} opening (radius {rad:.2f} m + {slack} m), "
           f"{dz_lo} to {dz_hi} m above it, while in hand, for {hold_s} s (max tilt {tilt.max():.0f} deg; lip {off:+.3f} m from the "
           f"opening rim at best while tilted; over the opening while tilted {(tilted & over).sum() * DT:.1f} s, in hand "
           f"{(tilted & over & hand).sum() * DT:.1f} s, longest run {run_length(pouring).max() * DT:.2f} s)", poured_by)

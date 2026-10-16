@@ -113,11 +113,11 @@ S = {
     "01605": ["world_nail_polish_bottle", None, [reach("world_nail_polish_bottle"), grasp("world_nail_polish_bottle"), {"name": "shaken", "check": "oscillation", "obj": "world_nail_polish_bottle", "min_reversals": 3, "min_amp_m": 0.03, "end_rule": "not_dropped", "allow_drop": True, "end_upright_deg": 30, "final": True}]],
     "01652": ["world_coin", None, [reach("world_coin"), grasp("world_coin", lift_m=0.02), {"name": "tossed_caught", "check": "free_flight", "obj": "world_coin", "min_rise_m": 0.04, "min_rel_rise_m": 0.02, "catch_dist_m": 0.22, "end_rule": "in_hand", "final": True}]],
     # ---- pour (sim: grasp, carry over, tilt; judge: the pour itself) ----------------------------------------
-    "00175": ["world_kettle", "world_mug_025", [reach("world_kettle"), grasp("world_kettle"), pour("world_kettle", "world_mug_025")]],
+    "00175": ["world_kettle", "world_mug_025", [reach("world_kettle"), grasp("world_kettle"), pour("world_kettle", "world_mug_025", spout=[-0.116, 0.0, 0.14], spout_dir=[-1.0, 0.0], spout_tol_deg=60, rim_slack_m=0.01, hold_s=0.1)]],
     "00475": ["world_beaker_01", "world_flask_02", [reach("world_beaker_01"), grasp("world_beaker_01"), pour("world_beaker_01", "world_flask_02")]],
     "00487": ["world_body_04", "world_bowl", [reach("world_body_04"), grasp("world_body_04"), pour("world_body_04", "world_bowl")]],
     "01480": ["world_bowl", "world_pan", [reach("world_bowl"), grasp("world_bowl"), pour("world_bowl", "world_pan")]],
-    "01498": ["world_kettle", "world_teapot", [reach("world_kettle"), grasp("world_kettle"), pour("world_kettle", "world_teapot")]],
+    "01498": ["world_kettle", "world_teapot", [reach("world_kettle"), grasp("world_kettle"), pour("world_kettle", "world_teapot", spout=[-0.116, 0.0, 0.14], spout_dir=[-1.0, 0.0], spout_tol_deg=60, rim_slack_m=0.01, hold_s=0.1)]],
     # ---- tool use (sim: grasp tool, tool acts on target; judge: the effect) ---------------------------------
     "00051": ["world_eraser_07", "world_plate_05", [reach("world_eraser_07"), grasp("world_eraser_07", lift_m=0.01, carry_m=0.03), {"name": "brushed", "check": "sweep", "obj": "world_eraser_07", "target": "world_plate_05", "contact": True, "min_path_m": 0.05}, judge("plate brushed with the eraser")]],
     "00749": ["world_spoon_08", "world_pan_06", [reach("world_spoon_08"), grasp("world_spoon_08"), {"name": "stirred", "check": "sweep", "obj": "world_spoon_08", "target": "world_pan_06", "xy_slack_m": 0.03, "z_above_m": 0.12, "min_path_m": 0.30}, judge("pot stirred with the spoon")]],

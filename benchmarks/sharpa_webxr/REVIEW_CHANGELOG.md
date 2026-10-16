@@ -214,3 +214,13 @@ measures, not the outcome, and say in the prompt that the gate is a precondition
 - **00175 kettle**: hold kept at 0.2 s; 0.1 s would rescue one recover and pass labelled failure 6d4cf7d3.
 
 State-only tasks (45 with labels, n = 2 420): recall 0.979, specificity 0.977 (was 0.973 / 0.967).
+
+## Kettle pours: spout, not rim (2026-10-16, late)
+
+Reviewer: failure 6d4cf7d3 passed at hold 0.1 s although the kettle mouth was never over the mug. Cause: the generic
+"lip = hull point on the low side" picked the kettle's body rim; a kettle pours through its spout. New `spout`
+option on the pour check: the lip is the fixed spout tip (kettle frame x -11.6 cm, z 14 cm, read off the mesh), and
+the kettle only counts as pouring while it leans toward the spout (lean direction within 60 degrees of the spout
+direction). Kettles: spout tip inside the target opening with 1 cm slack (was 2 cm), hold 0.1 s (was 0.2; the
+reviewer: position matters, duration does not). 00175: recall 0.97 / spec 0.97 (was 0.95 / 0.94); 01498 unchanged
+(1.00 / 0.80, n_neg = 5). State-only tasks: 0.981 / 0.977.
