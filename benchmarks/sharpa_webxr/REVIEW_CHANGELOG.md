@@ -157,3 +157,33 @@ was re-judged.
 
 63 judge calls in total (rubric r3, every judge-ending rollout re-judged). Pours moved from 0 to 19 successes across the
 four models once the state check replaced the judge's "no substance visible" verdicts.
+
+## Judge measured against the human labels (first time), rubric r3, 2026-10-16
+
+548 labelled teleop episodes of the 8 judge-ending tasks that have labels (judge frames rendered with
+`postprocess.py --frames-only --max-steps 1000000`, graded by `judge_labeled.py`: state prefix, then the judge with
+the sim facts, as in score.py --grader hybrid). 466 passed the state prefix and were judged.
+
+| task | n pos / neg | hybrid recall / spec | judge alone on prefix passers: n pos / neg, recall / spec |
+|---|---|---|---|
+| 00051 brush plate | 51 / 15 | 1.000 / 0.733 | 51 / 4, 1.000 / 0.000 |
+| 00749 stir pot | 51 / 15 | 1.000 / 0.733 | 51 / 4, 1.000 / 0.000 |
+| 00787 scramble | 47 / 30 | 0.979 / 0.567 | 46 / 13, 1.000 / 0.000 |
+| 00863 hammer box | 50 / 20 | 0.940 / 0.750 | 50 / 6, 0.940 / 0.167 |
+| 01477 camera button | 50 / 21 | 0.520 / 0.762 | 50 / 16, 0.520 / 0.688 |
+| 01587 scoop pudding | 49 / 24 | 0.959 / 0.500 | 49 / 12, 0.959 / 0.000 |
+| 01640 drum | 50 / 14 | 1.000 / 0.714 | 50 / 4, 1.000 / 0.000 |
+| cup on rack | 50 / 11 | 0.940 / 1.000 | 50 / 10, 0.940 / 1.000 |
+| all | 398 / 150 | 0.917 / 0.687 | 397 / 69, 0.919 / 0.319 |
+
+Reading: on the six tool tasks the judge passes almost everything that reaches it (specificity 0 to 0.17 on the
+labelled failures that passed the gate); the specificity the hybrid grader has there comes from the state gate, not
+from the judge. Its rationales lean on the sim facts ("the simulator confirms the eraser brushed the plate"): the
+gate stage is named for the outcome (brushed, scooped, stirred) and the rubric calls the sim block ground truth, so
+the judge takes the loose gate as the result. On the camera button it fails half of the labelled successes (no
+fingertip press visible). Only the cup rack task is judged well (10 of 10 failures caught).
+
+Consequence: for the tool tasks the judge is currently a pass-through; the policy numbers in the tool-use category
+are effectively "reached the gate". Next step: separate the labelled tool-task failures from successes in state (as
+done for pours) and move those tasks to state checks; where a judge is kept, name the gate stage for what it
+measures, not the outcome, and say in the prompt that the gate is a precondition.
