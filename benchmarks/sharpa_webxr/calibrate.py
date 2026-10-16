@@ -87,7 +87,7 @@ def main():
               f"{str(rec['recall_success']):>6s} {str(rec['recall_recover']):>6s}  {rec['stages']}" + (f"  ERR={len(errs)}" if errs else ""))
         if a.show_errors:
             for r in [r for r in pos if not r[key]][: a.show_errors]:
-                print("   FN", r["dir"].split("/")[-1], [(s["name"], s["achieved"]) for s in r["stages"]], {s["name"]: s["metrics"] for s in r["stages"] if not s["achieved"]})
+                print("   FN", r["dir"].split("/")[-1], [(s["name"], s["achieved"]) for s in r["stages"]], {s["name"]: s.get("why") or s["metrics"] for s in r["stages"] if not s["achieved"]})
             for r in [r for r in neg if r[key]][: a.show_errors]:
                 print("   FP", r["dir"].split("/")[-1], [(s["name"], round(s["t_first_s"], 1) if s["t_first_s"] is not None else None) for s in r["stages"]])
     # same totals under pure any-time and pure end-state semantics (sim-only scenes)

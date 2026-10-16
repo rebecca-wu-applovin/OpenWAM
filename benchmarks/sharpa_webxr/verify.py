@@ -194,26 +194,73 @@ def first_true(mask: np.ndarray):
     return (int(idx[0]), float(idx[0] * DT)) if len(idx) else (None, None)
 
 
+class Conds(dict):
+    """Named per-frame conditions a check ANDs together. Names carry the threshold and the measured value, so when a
+    stage fails verify() can say which condition failed and by how much (see why_failed)."""
+
+    def add(self, name: str, mask) -> np.ndarray:
+        self[name] = np.asarray(mask, bool)
+        return self[name]
+
+    def all(self, n: int) -> np.ndarray:
+        ok = np.ones(n, bool)
+        for m in self.values():
+            ok &= m
+        return ok
+
+
+def why_failed(conds: Conds, start: int, graded_end: bool, unordered_any: bool) -> list[str]:
+    """Which named conditions explain a failed stage: on the last frame (end-state grading) or never true after the
+    previous stage (any-time grading)."""
+    if not conds:
+        return ["(no condition breakdown for this check)"]
+    def trim(bad):  # the "held for N s" line only matters when it is the sole failing condition
+        core = [k for k in bad if not k.startswith("all of the above")]
+        return core or bad
+
+    if graded_end:
+        bad = [k for k, m in conds.items() if not m[-1]]
+        return trim(bad) or ["every condition true on the last frame but not for the required hold time"]
+    never = [k for k, m in conds.items() if not m[start:].any()]
+    if never:
+        never = trim(never)
+        if unordered_any:
+            never.append("(it was satisfied earlier, before the previous stage was done: out of order)")
+        return never
+    return ["each condition was met at some time after the previous stage, but never all together for the hold time"]
+
+
 # ---- stage checks: each returns (per-frame achieved mask, metrics) -----------------------------
 def c_reach(r: Replay, s):
-    return r.obj[s["obj"]]["dist"] < s.get("reach_m", DEFAULTS["reach_m"]), {"min_dist_m": float(r.obj[s["obj"]]["dist"].min())}
+    d, thr = r.obj[s["obj"]]["dist"], s.get("reach_m", DEFAULTS["reach_m"])
+    c = Conds()
+    ok = c.add(f"hand within {thr} m of {s['obj']} (closest {d.min():.3f} m)", d < thr)
+    return ok, {"min_dist_m": float(d.min())}, c
 
 
 def c_grasp(r: Replay, s):
     """Hand contact sustained hold_s while the object is lifted >= lift_m or carried >= carry_m."""
     o = s["obj"]
-    moved = (r.lift(o) >= s.get("lift_m", DEFAULTS["lift_m"])) | (r.disp(o) >= s.get("carry_m", DEFAULTS["carry_m"]))
-    ok = held(fill_gaps(r.hand_contact(o)), s.get("hold_s", DEFAULTS["hold_s"])) & moved
-    return ok, {"max_lift_m": float(r.lift(o).max()), "contact_s": float(r.hand_contact(o).sum() * DT)}
+    lift_m, carry_m, hold_s = s.get("lift_m", DEFAULTS["lift_m"]), s.get("carry_m", DEFAULTS["carry_m"]), s.get("hold_s", DEFAULTS["hold_s"])
+    z, dsp, Cf = r.lift(o), r.disp(o), fill_gaps(r.hand_contact(o))
+    c = Conds()
+    c.add(f"lifted >= {lift_m} m or carried >= {carry_m} m (max lift {z.max():.3f} m, max carry {dsp.max():.3f} m)", (z >= lift_m) | (dsp >= carry_m))
+    c.add(f"hand contact for {hold_s} s continuously (longest {run_length(Cf).max() * DT:.2f} s)", held(Cf, hold_s))
+    return c.all(r.n), {"max_lift_m": float(z.max()), "contact_s": float(r.hand_contact(o).sum() * DT)}, c
 
 
 def c_hold_lifted(r: Replay, s):
     """Object lifted >= lift_m with hand contact for hold_s continuously (pick / grasp-only tasks)."""
     o = s["obj"]
+    lift_m, hold_s = s.get("lift_m", DEFAULTS["lift_m"]), s.get("hold_s", DEFAULTS["hold_s"])
     C, z = r.hand_contact(o), r.lift(o)
-    up = fill_gaps(C) & (z >= s.get("lift_m", DEFAULTS["lift_m"]))
-    ok = held(up, s.get("hold_s", DEFAULTS["hold_s"]))
+    Cf = fill_gaps(C)
+    up = Cf & (z >= lift_m)
     max_hold = float(run_length(up).max() * DT)
+    c = Conds()
+    c.add(f"hand contact (gaps <= 0.15 s bridged; final {bool(Cf[-1])})", Cf)
+    c.add(f"lifted >= {lift_m} m (max {z.max():.3f} m, final {z[-1]:.3f} m)", z >= lift_m)
+    c.add(f"held lifted for {hold_s} s continuously (longest {max_hold:.2f} s)", held(up, hold_s))
     # end-state diagnostics: was it put down gently (released while low/slow) or dropped?
     last_c = int(np.flatnonzero(C)[-1]) if C.any() else -1
     vz = np.concatenate([[0.0], np.diff(r.obj[o]["pos"][:, 2]) / DT])
@@ -224,23 +271,27 @@ def c_hold_lifted(r: Replay, s):
         # labelled on the end state: still in hand, or set back steadily. A drop is the last release from a lifted
         # state (hand contact lost while the object was >= drop_lift_m up) followed by a fast fall, or any fall
         # >= 1 m/s; an object that ends lower than it started (fell off its perch) also counts as dropped.
-        Cf = fill_gaps(C)
         held_end = bool(Cf[-1] and z[-1] >= s.get("held_end_lift_m", 0.02))
         rel = [i for i in range(1, r.n) if Cf[i - 1] and not Cf[i] and z[i - 1] >= 0.03]
-        drop = False
+        drop, dl, ds = False, s.get("drop_lift_m", 0.08), s.get("drop_speed_m_s", 0.5)
+        rel_txt = "never released from a lifted state"
         if rel:
             i = rel[-1]
             j = min(r.n, i + int(round(0.75 / DT)))
             fall_r, lift_at = float(-vz[i:j].min()), float(z[i - 1])
-            drop = (lift_at >= s.get("drop_lift_m", 0.08) and fall_r >= s.get("drop_speed_m_s", 0.5)) or fall_r >= 1.0
+            drop = (lift_at >= dl and fall_r >= ds) or fall_r >= 1.0
             drop_info = {"last_release_lift_m": lift_at, "last_release_fall_m_s": fall_r}
-        lower = bool(z[-1] < -s.get("end_lift_tol_m", 0.03))
-        keep = held_end or (not drop and not lower)
+            rel_txt = f"last release at {lift_at:.3f} m up, fell {fall_r:.2f} m/s"
+        tol = s.get("end_lift_tol_m", 0.03)
+        lower = bool(z[-1] < -tol)
         drop_info.update({"held_at_end": held_end, "dropped": bool(drop), "ended_lower": lower})
-        ok = ok if keep else np.zeros(r.n, bool)
+        if not held_end:  # not still in hand: must have been set back steadily
+            c.add(f"not dropped: drop = released >= {dl} m up and falling >= {ds} m/s, or any fall >= 1 m/s ({rel_txt})", np.full(r.n, not drop))
+            c.add(f"not ended > {tol} m below its start height (final {z[-1]:+.3f} m)", np.full(r.n, not lower))
+    ok = c.all(r.n)
     return ok, {"max_lift_m": float(z.max()), "held_any": bool(ok.any()), "max_hold_s": max_hold, "final_lift_m": float(z[-1]), "final_contact": bool(C[-1]),
                 "lift_at_release_m": float(z[last_c]) if last_c >= 0 else 0.0, "max_fall_speed_after_release": fall,
-                "release_to_end_s": float((r.n - 1 - last_c) * DT) if last_c >= 0 else None, **drop_info}
+                "release_to_end_s": float((r.n - 1 - last_c) * DT) if last_c >= 0 else None, **drop_info}, c
 
 
 def _rest(r: Replay, o, s):
@@ -252,75 +303,93 @@ def _rest(r: Replay, o, s):
     return (r.speed(o) <= s.get("rest_speed_m_s", DEFAULTS["rest_speed_m_s"])) | (win <= s.get("rest_disp_m", 0.02))
 
 
-def _placed_common(r: Replay, s, inside):
+def _placed_common(r: Replay, s, c: Conds):
+    """Shared tail of the placement checks: released, touching the named body, level, at rest, all held hold_s."""
     o = s["obj"]
-    ok = inside
+    hold_s = s.get("hold_s", DEFAULTS["hold_s"])
     if s.get("release", True):
-        ok = ok & ~r.hand_contact(o)
+        C = r.hand_contact(o)
+        c.add(f"released (no hand contact; final contact {bool(C[-1])})", ~C)
     if s.get("contact"):
-        ok = ok & r.touching(o, s["contact"])
+        T = fill_gaps(r.touching(o, s["contact"]))  # contact flicker must not break the hold
+        c.add(f"touching {s['contact']} (gaps <= 0.15 s bridged; final {bool(T[-1])})", T)
     if s.get("level_deg"):
-        ok = ok & (r.axis(o, s.get("up_axis", [0, 0, 1]))[:, 2] >= np.cos(np.deg2rad(s["level_deg"])))
+        upz = r.axis(o, s.get("up_axis", [0, 0, 1]))[:, 2]
+        c.add(f"level within {s['level_deg']} deg (final tilt {np.degrees(np.arccos(np.clip(upz[-1], -1, 1))):.0f} deg)", upz >= np.cos(np.deg2rad(s["level_deg"])))
     if s.get("rest", True):
-        ok = ok & _rest(r, o, s)
-    ok = held(ok, s.get("hold_s", DEFAULTS["hold_s"]))
-    return ok
+        c.add(f"at rest: <= {s.get('rest_speed_m_s', DEFAULTS['rest_speed_m_s'])} m/s or moved <= {s.get('rest_disp_m', 0.02)} m over {hold_s} s (final speed {r.speed(o)[-1]:.2f} m/s)", _rest(r, o, s))
+    pre = c.all(r.n)
+    c.add(f"all of the above for {hold_s} s continuously (longest {run_length(pre).max() * DT:.2f} s)", held(pre, hold_s))
+    return c.all(r.n)
 
 
 def c_place_in(r: Replay, s):
     """Object point inside target footprint + z range, released, at rest (optionally touching target)."""
     inside = r.in_target(s["obj"], s["target"], s.get("point"), s.get("xy_margin_m", DEFAULTS["xy_margin_m"]),
                          s.get("z_lo"), s.get("z_hi"), s.get("target_box"), s.get("z_above_m", 0.05))
-    return _placed_common(r, s, inside), {"inside_s": float(inside.sum() * DT)}
+    c = Conds()
+    c.add(f"{s['obj']} inside the {s['target']} footprint (inside {inside.sum() * DT:.1f} s total; final {bool(inside[-1])})", inside)
+    return _placed_common(r, s, c), {"inside_s": float(inside.sum() * DT)}, c
 
 
 def c_place_region(r: Replay, s):
     inside = r.in_region(s["obj"], s["region"], s.get("point"))
-    return _placed_common(r, s, inside), {"inside_s": float(inside.sum() * DT)}
+    c = Conds()
+    c.add(f"{s['obj']} inside the region (inside {inside.sum() * DT:.1f} s total; final {bool(inside[-1])})", inside)
+    return _placed_common(r, s, c), {"inside_s": float(inside.sum() * DT)}, c
 
 
 def c_move_out(r: Replay, s):
     """Object taken out of a container: point outside target footprint (or region) and displaced >= min_disp_m."""
     o = s["obj"]
+    md = s.get("min_disp_m", 0.05)
     if "target" in s:
         inside = r.in_target(o, s["target"], s.get("point"), -s.get("xy_margin_m", 0.02), -1.0, 1.0, s.get("target_box"))
+        where = f"outside the {s['target']} footprint"
     elif "region" in s:
         inside = r.in_region(o, s["region"], s.get("point"))
+        where = "outside the region"
     else:  # container not simulated: "out" = displaced from where it started
-        inside = r.disp(o) < s.get("min_disp_m", 0.05)
-    ok = ~inside & (r.disp(o) >= s.get("min_disp_m", 0.05))
+        inside = r.disp(o) < md
+        where = "away from where it started"
+    c = Conds()
+    c.add(f"{o} {where} (final {not bool(inside[-1])})", ~inside)
+    c.add(f"moved >= {md} m from its start (max {r.disp(o).max():.3f} m, final {r.disp(o)[-1]:.3f} m)", r.disp(o) >= md)
+    hold_s = s.get("hold_s", DEFAULTS["hold_s"])
     if s.get("release", True):
-        ok = ok & ~r.hand_contact(o)
+        c.add(f"released (final contact {bool(r.hand_contact(o)[-1])})", ~r.hand_contact(o))
     if s.get("rest", True):
-        ok = ok & _rest(r, o, s)
-    ok = held(ok, s.get("hold_s", DEFAULTS["hold_s"]))
-    return ok, {"max_disp_m": float(r.disp(o).max()), "final_inside": bool(inside[-1])}
+        c.add(f"at rest (final speed {r.speed(o)[-1]:.2f} m/s)", _rest(r, o, s))
+    pre = c.all(r.n)
+    c.add(f"all of the above for {hold_s} s continuously (longest {run_length(pre).max() * DT:.2f} s)", held(pre, hold_s))
+    return c.all(r.n), {"max_disp_m": float(r.disp(o).max()), "final_inside": bool(inside[-1])}, c
 
 
 def c_joint_goal(r: Replay, s):
     """Articulated joint reaches a goal: 'min'/'max' absolute, or 'delta' from q0 (sign = direction), held hold_s."""
     q = r.joint(s["obj"], s.get("joint"))
-    ok = np.ones_like(q, bool)
+    c = Conds()
     if "delta" in s:  # relative to the start; either_direction accepts |dq| >= |delta|
         dq = q - q[0]
-        ok &= np.abs(dq) >= abs(s["delta"]) if s.get("either_direction") else (dq >= s["delta"] if s["delta"] > 0 else dq <= s["delta"])
+        m = np.abs(dq) >= abs(s["delta"]) if s.get("either_direction") else (dq >= s["delta"] if s["delta"] > 0 else dq <= s["delta"])
+        c.add(f"joint moved by {'|' if s.get('either_direction') else ''}{s['delta']}{'|' if s.get('either_direction') else ''} rad from start (final change {dq[-1]:+.2f} rad)", m)
     if "min" in s:
-        ok &= q >= s["min"]
+        c.add(f"joint >= {s['min']} rad (final {q[-1]:.2f}, max {q.max():.2f})", q >= s["min"])
     if "max" in s:
-        ok &= q <= s["max"]
+        c.add(f"joint <= {s['max']} rad (final {q[-1]:.2f}, min {q.min():.2f})", q <= s["max"])
     if s.get("release"):
-        ok = ok & ~r.hand_contact(s["obj"])
+        c.add(f"released (final hand contact {bool(r.hand_contact(s['obj'])[-1])})", ~r.hand_contact(s["obj"]))
     speed = np.concatenate([[0.0], np.abs(np.diff(q)) / DT])
     peak = float(np.maximum.accumulate(speed).max())
     if s.get("max_speed"):  # gentle: the joint never moved faster than this before the goal was reached
-        ok = ok & (np.maximum.accumulate(speed) <= s["max_speed"])
+        c.add(f"joint speed never above {s['max_speed']} rad/s (peak {peak:.1f})", np.maximum.accumulate(speed) <= s["max_speed"])
     metrics = {"q0": float(q[0]), "q_min": float(q.min()), "q_max": float(q.max()), "q_final": float(q[-1]), "peak_speed": peak}
     if s.get("max_approach_speed"):  # gentle at the stop: joint speed while q is inside approach_band (the last few
         # degrees before the lid meets the base) never exceeds this. A fast mid-swing is fine if it slows down before contact.
         lo_b, hi_b = s["approach_band"]
         in_band = (q >= lo_b) & (q <= hi_b)
         approach = np.maximum.accumulate(np.where(in_band, speed, 0.0))
-        ok = ok & (approach <= s["max_approach_speed"])
+        c.add(f"gentle: joint speed <= {s['max_approach_speed']} rad/s while q in [{lo_b}, {hi_b}] (peak there {approach.max():.1f})", approach <= s["max_approach_speed"])
         metrics["peak_approach_speed"] = float(approach.max())
     o = s["obj"]
     if s.get("front_axis"):  # the body's front (object-local) must point within face_tol_deg of base direction `toward`
@@ -328,20 +397,23 @@ def c_joint_goal(r: Replay, s):
         ab = (Rb.T @ r.axis(o, s["front_axis"]).T).T[:, :2]
         tw = np.asarray(s.get("toward", [-1, 0]), float)
         face = np.degrees(np.arccos(np.clip((ab @ tw) / (np.linalg.norm(ab, axis=1) * np.linalg.norm(tw) + 1e-9), -1, 1)))
-        ok = ok & (face <= s.get("face_tol_deg", 25))
+        c.add(f"front faces within {s.get('face_tol_deg', 25)} deg of the target direction (final {face[-1]:.0f} deg, start {face[0]:.0f})", face <= s.get("face_tol_deg", 25))
         metrics.update({"face0_deg": float(face[0]), "final_face_deg": float(face[-1])})
         if s.get("min_change"):  # something must have changed: the joint moved, or the facing improved
             ch = s["min_change"]
-            ok = ok & ((np.abs(q - q[0]) >= ch.get("joint", 0.1)) | ((face[0] - face) >= ch.get("face_deg", 10)))
+            c.add(f"something changed: joint moved >= {ch.get('joint', 0.1)} rad (actual {abs(q[-1] - q[0]):.2f}) or facing improved >= {ch.get('face_deg', 10)} deg (actual {face[0] - face[-1]:+.0f})",
+                  (np.abs(q - q[0]) >= ch.get("joint", 0.1)) | ((face[0] - face) >= ch.get("face_deg", 10)))
     if s.get("keep_upright_deg"):  # not knocked over or flipped at the end
         up = r.axis(o, [0, 0, 1])[:, 2]
-        ok = ok & (up >= np.cos(np.deg2rad(s["keep_upright_deg"])))
+        c.add(f"upright within {s['keep_upright_deg']} deg (final tilt {np.degrees(np.arccos(np.clip(up[-1], -1, 1))):.0f} deg)", up >= np.cos(np.deg2rad(s["keep_upright_deg"])))
         metrics.update({"final_up": float(up[-1]), "min_up": float(up.min())})
     if s.get("max_lift_m") is not None:  # the body itself stays where it rests (keyboard on the table)
-        ok = ok & (r.lift(o) <= s["max_lift_m"])
+        c.add(f"body lifted <= {s['max_lift_m']} m (final {r.lift(o)[-1]:.3f} m)", r.lift(o) <= s["max_lift_m"])
         metrics["final_lift_m"] = float(r.lift(o)[-1])
-    ok = held(ok, s.get("hold_s", DEFAULTS["hold_s"]))
-    return ok, metrics
+    hold_s = s.get("hold_s", DEFAULTS["hold_s"])
+    pre = c.all(r.n)
+    c.add(f"all of the above for {hold_s} s continuously (longest {run_length(pre).max() * DT:.2f} s)", held(pre, hold_s))
+    return c.all(r.n), metrics, c
 
 
 def c_relative_pose(r: Replay, s):
@@ -365,10 +437,16 @@ def c_relative_pose(r: Replay, s):
             inside[i] = err[i] <= s.get("xy_tol_m", 0.03) and hi[2] - s.get("z_tol_m", DEFAULTS["z_tol_m"]) <= pw[i, 2] <= hi[2] + s.get("z_above_m", 0.08)
     Ro, Rr = [rot(q) for q in r.obj[o]["quat"]], [rot(q) for q in tq]
     tilt = np.array([np.arccos(np.clip(abs((Rr[i].T @ Ro[i])[2, 2]), 0, 1)) for i in range(r.n)])
-    ok = inside & (tilt <= np.deg2rad(s.get("tilt_deg", DEFAULTS["tilt_deg"])))
-    ok = _placed_common(r, {**s, "level_deg": None}, ok)
+    c = Conds()
+    if s.get("offset") is not None:
+        c.add(f"{o} point within {s.get('pos_tol_m', 0.02)} m of its seated offset in the {ref} frame (final {err[-1]:.3f} m, best {err.min():.3f})", inside)
+    else:
+        c.add(f"{o} centred on top of {ref} within {s.get('xy_tol_m', 0.03)} m (final xy error {err[-1]:.3f} m)", inside)
+    td = s.get("tilt_deg", DEFAULTS["tilt_deg"])
+    c.add(f"tilt relative to {ref} <= {td} deg (final {np.degrees(tilt[-1]):.0f} deg)", tilt <= np.deg2rad(td))
+    ok = _placed_common(r, {**s, "level_deg": None}, c)
     return ok, {"min_err_m": float(err.min()), "final_err_m": float(err[-1]), "final_tilt_deg": float(np.degrees(tilt[-1])),
-                "final_local": loc[-1].round(4).tolist(), "final_touching": bool(r.touching(o, ref)[-1])}
+                "final_local": loc[-1].round(4).tolist(), "final_touching": bool(r.touching(o, ref)[-1])}, c
 
 
 def c_attached(r: Replay, s):
@@ -376,11 +454,14 @@ def c_attached(r: Replay, s):
     ref, released, at rest (calibrate to relative_pose with an offset once success episodes give one)."""
     o, ref = s["obj"], s["ref"]
     dist = np.linalg.norm(r.point(o, s.get("point")) - r.point(ref, s.get("ref_point")), axis=1)
-    ok = (dist <= s.get("max_dist_m", 0.05)) & r.touching(o, ref)
-    ok = _placed_common(r, {**s, "contact": None}, ok)
+    c = Conds()
+    c.add(f"{o} within {s.get('max_dist_m', 0.05)} m of {ref} (final {dist[-1]:.3f} m)", dist <= s.get("max_dist_m", 0.05))
+    T = fill_gaps(r.touching(o, ref))
+    c.add(f"touching {ref} (final {bool(T[-1])})", T)
+    ok = _placed_common(r, {**s, "contact": None}, c)
     loc = rot(r.obj[ref]["quat"][-1]).T @ (r.point(o, s.get("point"))[-1] - r.obj[ref]["pos"][-1])
     return ok, {"min_dist_m": float(dist.min()), "final_dist_m": float(dist[-1]), "final_local": loc.round(4).tolist(),
-                "final_touching": bool(r.touching(o, ref)[-1])}
+                "final_touching": bool(r.touching(o, ref)[-1])}, c
 
 
 def c_orientation(r: Replay, s):
@@ -394,10 +475,12 @@ def c_orientation(r: Replay, s):
     Rb = r.base[:3, :3]
     xb = (Rb.T @ r.axis(o, s.get("heading_axis", [1, 0, 0])).T).T
     yaw_base = np.degrees(np.arctan2(xb[:, 1], xb[:, 0]))
+    c = Conds()
     if mode == "flip":  # the axis that pointed up at the start now points down
         a = r.axis(o, s.get("axis", [0, 0, 1]))
         up0 = np.sign(a[0, 2]) or 1.0
-        ok = a[:, 2] * up0 <= -np.cos(np.deg2rad(s.get("tol_deg", 35)))
+        tol = s.get("tol_deg", 35)
+        c.add(f"flipped: start-up axis points down within {tol} deg (final {np.degrees(np.arccos(np.clip(-a[-1, 2] * up0, -1, 1))):.0f} deg from straight down)", a[:, 2] * up0 <= -np.cos(np.deg2rad(tol)))
         metric = {"min_axis_z_rel": float((a[:, 2] * up0).min()), "final_axis_z_rel": float(a[-1, 2] * up0)}
     elif mode == "rotate":
         R0 = rot(r.obj[o]["quat"][0])
@@ -410,9 +493,9 @@ def c_orientation(r: Replay, s):
             ang = np.asarray(ang)
         else:
             ang = np.array([Rotation.from_matrix(rot(q) @ R0.T).magnitude() for q in r.obj[o]["quat"]])
-        ok = np.degrees(ang) >= s["min_deg"]
+        c.add(f"rotated >= {s['min_deg']} deg from the start{' about ' + str(s['about']) if 'about' in s else ''} (final {np.degrees(ang[-1]):.0f} deg, max {np.degrees(ang).max():.0f})", np.degrees(ang) >= s["min_deg"])
         if s.get("max_deg"):
-            ok &= np.degrees(ang) <= s["max_deg"]
+            c.add(f"rotated <= {s['max_deg']} deg (final {np.degrees(ang[-1]):.0f} deg)", np.degrees(ang) <= s["max_deg"])
         metric = {"max_rot_deg": float(np.degrees(ang).max()), "final_rot_deg": float(np.degrees(ang[-1]))}
     elif mode == "face":
         a = r.axis(o, s["axis"])
@@ -420,27 +503,31 @@ def c_orientation(r: Replay, s):
         ab = (Rb.T @ a.T).T[:, :2]
         tw = np.asarray(s.get("toward", [-1, 0]), float)
         cosang = (ab @ tw) / (np.linalg.norm(ab, axis=1) * np.linalg.norm(tw) + 1e-9)
-        ok = cosang >= np.cos(np.deg2rad(s.get("tol_deg", 30)))
-        metric = {"final_face_deg": float(np.degrees(np.arccos(np.clip(cosang[-1], -1, 1))))}
+        fdeg = np.degrees(np.arccos(np.clip(cosang, -1, 1)))
+        c.add(f"axis {s['axis']} faces within {s.get('tol_deg', 30)} deg of base direction {s.get('toward', [-1, 0])} (final {fdeg[-1]:.0f} deg, best {fdeg.min():.0f})", cosang >= np.cos(np.deg2rad(s.get("tol_deg", 30))))
+        metric = {"final_face_deg": float(fdeg[-1])}
     elif mode == "axis_away":  # local `axis` (sign-insensitive) at least min_deg away from base-frame direction `ref`
         # e.g. portrait: the tablet's long axis no longer runs left-right, whether it lies flat or is held upright
         a = r.axis(o, s["axis"])
         ref = r.base[:3, :3] @ (np.asarray(s["ref"], float) / np.linalg.norm(s["ref"]))
         ang = np.degrees(np.arccos(np.clip(np.abs(a @ ref) / (np.linalg.norm(a, axis=1) + 1e-9), 0, 1)))
-        ok = ang >= s["min_deg"]
+        c.add(f"axis {s['axis']} >= {s['min_deg']} deg away from base direction {s['ref']} (final {ang[-1]:.0f} deg, start {ang[0]:.0f}, max {ang.max():.0f})", ang >= s["min_deg"])
         metric = {"max_axis_away_deg": float(ang.max()), "final_axis_away_deg": float(ang[-1]), "axis_away0_deg": float(ang[0])}
     else:
         raise ValueError(mode)
     if s.get("keep_upright_deg"):
-        ok &= r.axis(o, [0, 0, 1])[:, 2] >= np.cos(np.deg2rad(s["keep_upright_deg"]))
+        upz = r.axis(o, [0, 0, 1])[:, 2]
+        c.add(f"upright within {s['keep_upright_deg']} deg (final tilt {np.degrees(np.arccos(np.clip(upz[-1], -1, 1))):.0f} deg)", upz >= np.cos(np.deg2rad(s["keep_upright_deg"])))
     if s.get("release", True):
-        ok = ok & ~r.hand_contact(o)
+        c.add(f"released (final hand contact {bool(r.hand_contact(o)[-1])})", ~r.hand_contact(o))
     if s.get("rest", True):
-        ok = ok & _rest(r, o, s)
-    ok = held(ok, s.get("hold_s", DEFAULTS["hold_s"]))
+        c.add(f"at rest (final speed {r.speed(o)[-1]:.2f} m/s)", _rest(r, o, s))
+    hold_s = s.get("hold_s", DEFAULTS["hold_s"])
+    pre = c.all(r.n)
+    c.add(f"all of the above for {hold_s} s continuously (longest {run_length(pre).max() * DT:.2f} s)", held(pre, hold_s))
     metric.update({"max_total_rot_deg": float(np.degrees(total).max()), "final_total_rot_deg": float(np.degrees(total[-1])),
                    "yaw_base0_deg": float(yaw_base[0]), "final_yaw_base_deg": float(yaw_base[-1])})
-    return ok, metric
+    return c.all(r.n), metric, c
 
 
 def _segments(mask: np.ndarray):
@@ -482,20 +569,22 @@ def c_oscillation(r: Replay, s):
     segments = _segments(C) if while_held else [(0, r.n)]
     V = np.diff(P, axis=0)
     held_v = V[C[1:]] if C[1:].any() else V
+    c = Conds()
     if len(held_v) < 3 or not segments:
-        return np.zeros(r.n, bool), {"max_reversals_in_window": 0, "n_reversals": 0}
+        c.add("object held in hand long enough to move (no held motion found)", np.zeros(r.n, bool))
+        return np.zeros(r.n, bool), {"max_reversals_in_window": 0, "n_reversals": 0}, c
     ax = np.linalg.svd(held_v - held_v.mean(0), full_matrices=False)[2][0]
     x = P @ ax
     win = int(round(s.get("window_s", 3.0) / DT))
     ext = _reversals(x, s.get("min_amp_m", 0.03), segments)
     counts = _windowed_counts(ext, r.n, win)
-    ok = counts >= s.get("min_reversals", 4)
+    c.add(f">= {s.get('min_reversals', 4)} direction reversals of >= {s.get('min_amp_m', 0.03)} m within {s.get('window_s', 3.0)} s while held (best window {counts.max()})", counts >= s.get("min_reversals", 4))
     if while_held:
-        ok &= C
+        c.add("hand contact at that time (gaps <= 0.5 s bridged)", C)
     metrics = {"max_reversals_in_window": int(counts.max()), "n_reversals": int(len(ext))}
     for a2 in (0.02, 0.03, 0.05, 0.08):  # diagnostics at other amplitudes, for threshold calibration (same rule)
         metrics[f"rev{int(a2 * 100)}cm"] = int(_windowed_counts(_reversals(x, a2, segments), r.n, win).max())
-    return ok, metrics
+    return c.all(r.n), metrics, c
 
 
 def c_free_flight(r: Replay, s):
@@ -529,7 +618,11 @@ def c_free_flight(r: Replay, s):
         if k + hold_n <= r.n and caught and not r.fallen(o)[k:k + hold_n].any():
             ok[k + hold_n - 1:] = True
             break
-    return ok, {"best_rel_rise_m": float(best), "final_near_wrist_m": float(near[-1])}
+    c = Conds()
+    c.add(f"toss detected: rose >= {min_rise} m and >= {s.get('min_rel_rise_m', 0.02)} m away from the wrist within {s.get('rise_s', 0.6)} s, came down, "
+          f"then stayed within {s.get('catch_dist_m', 0.22)} m of a wrist and >= {s.get('min_catch_lift_m', 0.02)} m up for {s.get('catch_hold_s', 0.3)} s "
+          f"(best rise away from wrist {best:.3f} m, final distance to wrist {near[-1]:.2f} m)", ok)
+    return ok, {"best_rel_rise_m": float(best), "final_near_wrist_m": float(near[-1])}, c
 
 
 def c_tilt_over(r: Replay, s):
@@ -539,12 +632,15 @@ def c_tilt_over(r: Replay, s):
     up = r.axis(o, s.get("up_axis", [0, 0, 1]))
     tilt = np.degrees(np.arccos(np.clip(up[:, 2], -1, 1)))
     over = r.in_target(o, tgt, s.get("point"), -s.get("xy_slack_m", 0.03), None, s.get("z_above_m", 0.30), s.get("target_box"))
-    ok = (tilt >= s.get("min_tilt_deg", 60)) & over
+    c = Conds()
+    c.add(f"{o} over the {tgt} footprint (+{s.get('xy_slack_m', 0.03)} m slack), up to {s.get('z_above_m', 0.30)} m above it ({over.sum() * DT:.1f} s total)", over)
+    c.add(f"tilted >= {s.get('min_tilt_deg', 60)} deg (max {tilt.max():.0f} deg; max while over target {(tilt[over].max() if over.any() else 0):.0f})", tilt >= s.get("min_tilt_deg", 60))
     if s.get("while_held", True):
-        ok &= r.hand_contact(o)
-    ok = held(ok, s.get("hold_s", 0.3))
-    return ok, {"max_tilt_deg": float(tilt.max()), "max_tilt_over_target_deg": float(tilt[over].max()) if over.any() else 0.0,
-                "over_s": float(over.sum() * DT)}
+        c.add("hand contact at that time", r.hand_contact(o))
+    pre = c.all(r.n)
+    c.add(f"all of the above for {s.get('hold_s', 0.3)} s continuously (longest {run_length(pre).max() * DT:.2f} s)", held(pre, s.get("hold_s", 0.3)))
+    return c.all(r.n), {"max_tilt_deg": float(tilt.max()), "max_tilt_over_target_deg": float(tilt[over].max()) if over.any() else 0.0,
+                        "over_s": float(over.sum() * DT)}, c
 
 
 def c_contact_events(r: Replay, s):
@@ -559,7 +655,9 @@ def c_contact_events(r: Replay, s):
         v = r.speed(tool)
         onsets &= np.concatenate([[False], v[:-1] >= s["min_speed_m_s"]]) | (v >= s["min_speed_m_s"])
     cum = np.cumsum(onsets)
-    return cum >= s.get("min_events", 1), {"events": int(cum[-1]), "contact_s": float(T.sum() * DT)}
+    c = Conds()
+    c.add(f">= {s.get('min_events', 1)} {tool} strikes on {tgt} while held{' at >= ' + str(s['min_speed_m_s']) + ' m/s' if s.get('min_speed_m_s') else ''} (counted {int(cum[-1])})", cum >= s.get("min_events", 1))
+    return c.all(r.n), {"events": int(cum[-1]), "contact_s": float(T.sum() * DT)}, c
 
 
 def c_sweep(r: Replay, s):
@@ -578,11 +676,13 @@ def c_sweep(r: Replay, s):
     valid = inside.copy()
     valid[1:] &= inside[:-1]  # a step counts only when both its endpoints are inside (no credit for the approach)
     path = np.cumsum(np.where(valid, step, 0.0))
-    return path >= s.get("min_path_m", 0.2), {"path_in_target_m": float(path[-1]), "inside_s": float(inside.sum() * DT)}
+    c = Conds()
+    c.add(f"{tool} path inside the {tgt} footprint{' while touching it' if s.get('contact') else ''} while held >= {s.get('min_path_m', 0.2)} m (actual {path[-1]:.2f} m over {inside.sum() * DT:.1f} s)", path >= s.get("min_path_m", 0.2))
+    return c.all(r.n), {"path_in_target_m": float(path[-1]), "inside_s": float(inside.sum() * DT)}, c
 
 
 def c_judge(r: Replay, s):
-    return np.zeros(r.n, bool), {}
+    return np.zeros(r.n, bool), {}, Conds()
 
 
 CHECKS = {"reach": c_reach, "grasp": c_grasp, "hold_lifted": c_hold_lifted, "place_in": c_place_in,
@@ -601,19 +701,23 @@ def verify(rollout_dir: Path, env: SharpaWebXREnv, spec: dict, max_steps: int | 
     stages = []
     start = 0  # a stage only counts from the frame its predecessor was first satisfied (ordered chain, retries allowed)
     for st in spec["stages"]:
-        mask, metrics = CHECKS[st["check"]](r, st)
+        res = CHECKS[st["check"]](r, st)
+        mask, metrics = res[0], res[1]
+        conds = res[2] if len(res) > 2 else Conds()
         seq = mask.copy()
         seq[:start] = False
         i0, t0 = first_true(seq)
         any_time, end_state = i0 is not None, bool(seq[-1])
+        stage_start = start
         if i0 is not None:
             start = i0
         # the spec decides which semantics this stage is graded on: end state for tasks the human labels judge
         # at the end (still holding, lid still closed), any time otherwise (RoboTwin "done on first success")
         achieved = end_state if st.get("final") else any_time
+        why = [] if achieved or st["check"] == "judge" else why_failed(conds, stage_start, bool(st.get("final")), bool(mask.any()))
         stages.append({"name": st.get("name", st["check"]), "check": st["check"], "achieved": achieved, "any_time": any_time,
                        "end_state": end_state, "t_first_s": t0, "graded_on": "end_state" if st.get("final") else "any_time",
-                       "unordered_any_time": bool(mask.any()), "metrics": metrics})
+                       "unordered_any_time": bool(mask.any()), "why": why, "conditions": list(conds.keys()), "metrics": metrics})
     sim_stages = [s for s in stages if s["check"] != "judge"]
     needs_judge = any(s["check"] == "judge" for s in stages)
     fails = {o: bool(r.fallen(o).any()) for o in spec.get("no_fall", [])}
@@ -643,7 +747,9 @@ def judge_context(stages, spec) -> str:
         if s["check"] == "judge":
             continue
         m = ", ".join(f"{k}={v:.3g}" if isinstance(v, float) else f"{k}={v}" for k, v in s["metrics"].items())
-        parts.append(f"{s['name']}: {'yes' if s['achieved'] else 'no'}" + (f" (first at {s['t_first_s']:.1f} s)" if s["achieved"] else "") + (f" [{m}]" if m else ""))
+        why = "; ".join(s.get("why", []))
+        parts.append(f"{s['name']}: {'yes' if s['achieved'] else 'no'}" + (f" (first at {s['t_first_s']:.1f} s)" if s["achieved"] else (f" because {why}" if why else ""))
+                     + (f" [{m}]" if m else ""))
     return "Simulator state checks: " + "; ".join(parts) + "."
 
 
