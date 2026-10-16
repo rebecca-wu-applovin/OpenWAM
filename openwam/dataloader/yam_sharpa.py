@@ -17,8 +17,9 @@ Per sample (anchor = first window frame t, OpenWAM temporal contract):
 Sparse-history layout (``history_offsets`` + ``future_offsets`` set; used by
 07_sparse_history_backbones): video = the history rows ``t + history_offsets``
 (clamped to the episode start, i.e. the first frame repeats) followed by the
-future rows ``t + future_offsets``; proprio = the history rows (H, D); action is
-unchanged. A window is only drawn where every future / action row exists.
+future rows ``t + future_offsets``; proprio = the history rows (H, D), each
+wrist re-expressed in the frame-t ego camera (the action's frame); action is unchanged.
+A window is only drawn where every future / action row exists.
 
 Width D is 48 for ``fingertips_*`` (``unify_action`` off) and 80 for
 ``unify_*`` (raw 62 scattered by ``UNIFY_ACTION_MAP``). The unify switch is
@@ -47,6 +48,7 @@ from openwam.dataloader.utils.yam_sharpa_repr import (
     POSE48_DIM,
     encode_action_pairs,
     encode_proprio,
+    encode_proprio_in_anchor_cam,
     is_unify,
     raw_dim,
     unify_action_map,
@@ -330,7 +332,8 @@ class YamSharpaDataset(LeRobotV3Reader):
         lo = int(hist_rows.min())
         hist_tab = table.slice(ep_row0 + lo, offset - lo + 1).to_pandas()
         hist = hist_tab.iloc[hist_rows - lo]
-        proprio, proprio_mask = self._finalize_proprio(self._proprio_history(hist))
+        # Anchor = frame t (window row 0): history proprio goes into its ego camera, like the action.
+        proprio, proprio_mask = self._finalize_proprio(self._proprio_history(hist, win[CAM_POSE_COL].values[0]))
 
         # Video indices are relative to the window start ``offset`` (history ones are <= 0).
         rel = np.concatenate([hist_rows - offset, self._future_offsets]).astype(np.int64)
@@ -354,17 +357,22 @@ class YamSharpaDataset(LeRobotV3Reader):
             "num_history_frames": int(len(self._history_offsets)),
         }
 
-    def _proprio_history(self, hist) -> np.ndarray:
-        """Normalized raw proprio of every history row.
+    def _proprio_history(self, hist, anchor_cam16) -> np.ndarray:
+        """Normalized raw proprio of every history row, wrists in the frame-t ego camera.
 
         Args:
             hist: DataFrame, the H history rows (oldest first).
+            anchor_cam16: (16,) ``camera_pose.ego_view`` of frame t (the action's frame too).
 
         Returns:
             (H, D) float32, normalized with the ``_state`` stats block.
         """
-        raw = encode_proprio(
-            self.action_mode, np.stack(hist[STATE_COL].values), np.stack(hist[JOINT_COL].values)
+        raw = encode_proprio_in_anchor_cam(
+            self.action_mode,
+            np.stack(hist[STATE_COL].values),
+            np.stack(hist[JOINT_COL].values),
+            np.stack(hist[CAM_POSE_COL].values),
+            anchor_cam16,
         )
         return apply_normalization(raw, self._state_normalization_stats, self._normalize_mode)
 

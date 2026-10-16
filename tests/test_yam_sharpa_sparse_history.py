@@ -94,8 +94,9 @@ def test_rows_match_legacy_window(readers, k):
     assert np.abs(_px(sparse["video"][4]) - _px(legacy["video"][0])).max() == 0
     # Row t+20 = future index 3 (offset 20) = legacy frame 5 (stride 4).
     assert np.abs(_px(sparse["video"][5 + 3]) - _px(legacy["video"][5])).max() == 0
-    # Proprio of frame t and the full action chunk are unchanged.
-    np.testing.assert_allclose(sparse["proprio"][4].numpy(), legacy["proprio"][0].numpy())
+    # Proprio of frame t (up to the rot6d round trip of the anchor-camera re-expression) and the
+    # full action chunk are unchanged.
+    np.testing.assert_allclose(sparse["proprio"][4].numpy(), legacy["proprio"][0].numpy(), atol=1e-6)
     np.testing.assert_allclose(sparse["action"].numpy(), legacy["action"].numpy())
 
 
@@ -120,3 +121,38 @@ def test_offset_validation():
         _validate_sparse_offsets([-40, -20], FUT4)  # does not end at frame t
     with pytest.raises(ValueError):
         _validate_sparse_offsets(HIST, None)  # half-configured
+
+
+def test_history_proprio_in_anchor_camera():
+    # A moving camera must not leak into the proprio: re-expressing each row's wrist from its
+    # own camera into the frame-t camera recovers the same base-frame pose for every row.
+    from openwam.dataloader.transforms.rotation import _matrix_to_rotation_6d
+    from openwam.dataloader.utils.yam_sharpa_repr import encode_proprio_in_anchor_cam
+
+    rng = np.random.default_rng(0)
+
+    def rigid(angle, t):
+        """(4, 4) rotation about z by ``angle`` plus translation ``t``."""
+        c, s_ = np.cos(angle), np.sin(angle)
+        m = np.eye(4)
+        m[:3, :3] = [[c, -s_, 0], [s_, c, 0], [0, 0, 1]]
+        m[:3, 3] = t
+        return m
+
+    # Fixed wrist poses in the base frame, seen by 3 differently placed cameras.
+    base_from_wrist = [rigid(0.3, [0.1, 0.2, 0.3]), rigid(-0.5, [0.4, -0.1, 0.2])]
+    cams = [rigid(a, rng.normal(size=3)) for a in (0.0, 0.4, -0.7)]
+    state = np.zeros((3, 48))
+    for i, cam in enumerate(cams):
+        for o, bw in zip((0, 24), base_from_wrist):
+            cw = np.linalg.inv(cam) @ bw  # wrist in this row's camera
+            state[i, o : o + 3] = cw[:3, 3]
+            state[i, o + 3 : o + 9] = _matrix_to_rotation_6d(cw[None, :3, :3])[0]
+            state[i, o + 9 : o + 24] = rng.normal(size=15)  # fingertips (wrist frame): untouched
+    cam16 = np.stack([c.reshape(16) for c in cams])
+    out = encode_proprio_in_anchor_cam("fingertips_rel", state, None, cam16, cam16[2])
+    # Every row now equals the anchor row (wrist static in base), fingertips unchanged.
+    np.testing.assert_allclose(out[:, :9], np.repeat(out[2:3, :9], 3, 0), atol=1e-6)
+    np.testing.assert_allclose(out[:, 24:33], np.repeat(out[2:3, 24:33], 3, 0), atol=1e-6)
+    np.testing.assert_allclose(out[:, 9:24], state[:, 9:24], atol=1e-6)
+    np.testing.assert_allclose(out[2], state[2], atol=1e-6)  # anchor row itself is unchanged

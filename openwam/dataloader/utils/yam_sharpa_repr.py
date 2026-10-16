@@ -200,6 +200,40 @@ def encode_proprio(action_repr: str, state48: np.ndarray, joint_angles56: np.nda
     return np.concatenate(parts, axis=-1).astype(np.float32)
 
 
+def encode_proprio_in_anchor_cam(
+    action_repr: str,
+    state48: np.ndarray,
+    joint_angles56: np.ndarray,
+    cam16: np.ndarray,
+    anchor_cam16: np.ndarray,
+) -> np.ndarray:
+    """Raw proprio of N rows with every wrist pose re-expressed in the anchor (frame-t) ego camera.
+
+    Same frame as the action (:func:`encode_action_pairs`), so history proprio, proprio[t]
+    and the action chunk share one camera frame. Fingertips stay in their own wrist frame.
+
+    Args:
+        action_repr: str.
+        state48: (N, 48) ``observation.state`` of the rows (wrist in each row's own camera).
+        joint_angles56: (N, 56) ``joint_angles`` of the rows (read for ``unify_*``; may be None otherwise).
+        cam16: (N, 16) ``camera_pose.ego_view`` of the rows.
+        anchor_cam16: (16,) or (1, 16) ``camera_pose.ego_view`` of frame t.
+
+    Returns:
+        (N, D) float32, D = :func:`raw_dim`, laid out as :func:`encode_proprio`.
+    """
+    s = np.array(state48, dtype=np.float64).reshape(-1, POSE48_DIM)
+    cam = np.asarray(cam16, dtype=np.float64).reshape(-1, CAM_POSE_DIM)
+    anchor = np.broadcast_to(np.asarray(anchor_cam16, dtype=np.float64).reshape(1, CAM_POSE_DIM), cam.shape)
+    rel = _cam_rel(anchor, cam)  # cam_t_from_cam_row, per row
+    for o in _POSE_OFFSETS:
+        # Overwrite this hand's wrist [pos 3, rot6d 6] with its frame-t-camera version.
+        p_a, R_a = _wrist_in_anchor_cam(s, rel, o)
+        s[:, o : o + 3] = p_a
+        s[:, o + 3 : o + _WRIST_DIM] = _matrix_to_rotation_6d(R_a)
+    return encode_proprio(action_repr, s, joint_angles56)
+
+
 def encode_action_pairs(
     action_repr: str,
     *,
@@ -302,6 +336,7 @@ __all__ = [
     "decode_action",
     "encode_action_pairs",
     "encode_proprio",
+    "encode_proprio_in_anchor_cam",
     "is_relative",
     "is_unify",
     "raw_dim",
