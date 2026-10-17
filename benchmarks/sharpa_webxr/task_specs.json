@@ -1038,7 +1038,8 @@
     "lift_m": 0.05,
     "hold_s": 0.8,
     "end_rule": "not_dropped",
-    "end_hold_s": 0.4
+    "end_hold_s": 0.4,
+    "drop_rule": "hand_motion"
    }
   ],
   "needs_judge": false
@@ -1065,7 +1066,8 @@
     "lift_m": 0.05,
     "hold_s": 0.8,
     "end_rule": "not_dropped",
-    "end_hold_s": 0.4
+    "end_hold_s": 0.4,
+    "drop_rule": "hand_motion"
    }
   ],
   "needs_judge": false
@@ -1131,7 +1133,8 @@
     "lift_m": 0.05,
     "hold_s": 0.8,
     "end_rule": "not_dropped",
-    "end_hold_s": 0.4
+    "end_hold_s": 0.4,
+    "drop_rule": "hand_motion"
    }
   ],
   "needs_judge": false

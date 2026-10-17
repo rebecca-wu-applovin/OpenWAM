@@ -242,3 +242,15 @@ cache (same sim facts), no new API calls. Viewer republished at the same links.
 `end_hold_s` on every end-graded pick task: if the object is still held lifted on the last frame, 0.4 s of continuous
 hold is enough (the recording ended during the hold; it was not released). No labelled failure gains a pass on any
 of the seven pick tasks; 00177 goes to 1.00 / 1.00.
+
+## Stamp (01174) and the meaning of "dropped" (2026-10-17)
+
+Reviewer: a stamp released from 2 cm while the hand swept away is "dropped"; stamps released from 10 to 14 cm by a
+hand that was lowering or still are "not dropped, just low". Fall speed cannot express that. New `drop_rule:
+hand_motion` for pick tasks: at the last release from a lifted state, it is a drop when the hand was rising faster
+than 0.05 m/s (the object slipped out), or the release was from >= 20 cm and the object fell, or the object tumbled
+more than 70 degrees afterwards, or ended more than 45 degrees from its start tilt. A hand that is lowering or still
+is putting the object down, whatever the height. Applied to the stamp, the massage-gun pick 00375 and 00178:
+stamp recall 0.98 / spec 1.00 (was 0.89 / 0.96); the other two unchanged at 1.00 / 1.00. Kept the fall-speed rule
+where the hand-motion rule was worse on the labels: ukulele (one new false pass), drill 01116 (one reviewed success
+lost), scissors (spec 0.97 to 0.84), dice.

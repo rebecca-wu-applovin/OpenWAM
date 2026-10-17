@@ -94,11 +94,11 @@ S = {
     # >= 8 cm up and falling >= 0.5 m/s, or any fall >= 1 m/s) or ending lower than it started is a failure.
     # 00177 "grip firmly": held clear of the table >= 1.5 s (labelled slips held 1.1-1.3 s, every success >= 1.6 s)
     "00177": ["world_ukelele_01", None, [reach("world_ukelele_01"), pick("world_ukelele_01", hold=0.8, final=True, drop_lift_m=0.10)]],  # slip from 9 cm judged a put-down by the user (5aa35ed2)
-    "00178": ["world_sauce_01", None, [reach("world_sauce_01"), pick("world_sauce_01", final=True)]],
-    "00375": ["world_bag_02", None, [reach("world_bag_02"), pick("world_bag_02", final=True)]],
+    "00178": ["world_sauce_01", None, [reach("world_sauce_01"), pick("world_sauce_01", final=True, drop_rule="hand_motion")]],
+    "00375": ["world_bag_02", None, [reach("world_bag_02"), pick("world_bag_02", final=True, drop_rule="hand_motion")]],
     "01116": ["world_drill", None, [reach("world_drill"), pick("world_drill", hold=0.6, final=True, grasp_box=[[-0.085, -0.045, -0.09], [-0.005, 0.045, 0.025]])]],
     # every pick task graded on the end state: a drop after the grab is a failure (user review of 01174 videos)
-    "01174": ["world_stamp", None, [reach("world_stamp"), pick("world_stamp", final=True)]],
+    "01174": ["world_stamp", None, [reach("world_stamp"), pick("world_stamp", final=True, drop_rule="hand_motion")]],
     "01304": ["world_kettle", None, [reach("world_kettle"), pick("world_kettle", final=True)]],
     "01337": ["world_scissors", None, [reach("world_scissors"), pick("world_scissors", final=True, grasp_box=[[-0.025, -0.08, -0.135], [0.025, 0.08, -0.02]])]],
     # ---- reorient / flip / rotate -------------------------------------------------------------------------

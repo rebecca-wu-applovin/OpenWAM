@@ -359,20 +359,44 @@ def _not_dropped(r: Replay, o: str, s, c: Conds) -> dict:
     rel = [i for i in range(1, r.n) if Cf[i - 1] and not Cf[i] and zo[i - 1] >= 0.03]
     drop, dl, ds = False, s.get("drop_lift_m", 0.08), s.get("drop_speed_m_s", 0.5)
     rel_txt, info = "never released from a lifted state", {}
+    v2 = s.get("drop_rule") == "hand_motion"
     if rel:
         i = rel[-1]
         j = min(r.n, i + int(round(0.75 / DT)))
         fall_r, lift_at = float(vz[i:j].max()), float(zo[i - 1])
-        drop = (lift_at >= dl and fall_r >= ds) or fall_r >= 1.0
         info = {"last_release_lift_m": lift_at, "last_release_fall_m_s": fall_r}
-        rel_txt = f"last release at {lift_at:.3f} m up, fell {fall_r:.2f} m/s"
+        if v2:
+            # what the hand was doing when it let go decides between a put-down and a drop: a hand that is lowering
+            # or still is placing; a hand rising or moving away lets the object slip out. Independently, a release
+            # from high up or one followed by the object tumbling over is a drop.
+            k = int(np.argmin(np.linalg.norm(r.wrist[i - 1] - r.obj[o]["pos"][i - 1], axis=1)))
+            wvz = float((r.wrist[i, k, 2] - r.wrist[i - 1, k, 2]) / DT)
+            hb = float(zb[i - 1])
+            upz = r.axis(o, [0, 0, 1])[:, 2]
+            tilt = np.degrees(np.arccos(np.clip(upz, -1, 1)))
+            free = ~Cf[i:]
+            tumble = bool(((tilt[i:] - tilt[i - 1]) > s.get("tumble_deg", 70))[free].any()) if free.any() else False
+            toppled = bool(not Cf[-1] and (tilt[-1] - tilt[0]) > s.get("end_tilt_deg", 45))  # relative to how it started (a ukulele lies flat)
+            lifted = hb >= s.get("drop_min_height_m", 0.02)
+            high = hb >= s.get("drop_height_m", 0.20) and fall_r >= ds  # from high up, and it did come down (not cut at the release)
+            drop = lifted and (wvz > s.get("hand_rise_m_s", 0.05) or high or tumble or toppled)
+            info.update({"release_hand_vz_m_s": wvz, "release_bottom_m": hb, "tumbled_after": tumble, "toppled_end": toppled})
+            rel_txt = (f"last release from {hb:.3f} m with the hand moving {wvz:+.2f} m/s vertically; "
+                       f"tumbled after: {'yes' if tumble else 'no'}; toppled at the end: {'yes' if toppled else 'no'}")
+        else:
+            drop = (lift_at >= dl and fall_r >= ds) or fall_r >= 1.0
+            rel_txt = f"last release at {lift_at:.3f} m up, fell {fall_r:.2f} m/s"
     tol = s.get("end_lift_tol_m", 0.03)
     lower = bool(zb[-1] < -tol)
     fell = bool(r.fallen(o)[-1])
     info.update({"held_at_end": held_end, "dropped": bool(drop), "ended_lower": lower})
     if not held_end:  # not still in hand: must have been set back steadily (unless allow_drop: only the end pose counts)
         if not s.get("allow_drop"):
-            c.add(f"not dropped: drop = released >= {dl} m up and falling >= {ds} m/s, or any fall >= 1 m/s ({rel_txt})", np.full(r.n, not drop))
+            if v2:
+                c.add(f"not dropped: a release from >= {s.get('drop_min_height_m', 0.02)} m counts as a drop when the hand was rising > {s.get('hand_rise_m_s', 0.05)} m/s "
+                      f"(slipped out), or from >= {s.get('drop_height_m', 0.20)} m and falling >= {ds} m/s, or the object tumbled > {s.get('tumble_deg', 70)} deg afterwards or ended > {s.get('end_tilt_deg', 45)} deg from its start tilt ({rel_txt})", np.full(r.n, not drop))
+            else:
+                c.add(f"not dropped: drop = released >= {dl} m up and falling >= {ds} m/s, or any fall >= 1 m/s ({rel_txt})", np.full(r.n, not drop))
         c.add(f"not ended > {tol} m below its start height or off the table (final {zb[-1]:+.3f} m)", np.full(r.n, not (lower or fell)))
         if s.get("end_upright_deg"):  # a bottle set down must be standing, not lying on its side
             upz = r.axis(o, [0, 0, 1])[:, 2]
