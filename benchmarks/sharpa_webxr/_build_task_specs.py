@@ -35,15 +35,23 @@ def pick(o, lift=0.05, hold=0.8, final=False, **kw):
             **({"end_rule": "not_dropped", "end_hold_s": 0.4, "drop_rule": "hand_motion"} if final else {}), **kw}
 
 
+# the universal drop rule (verify._release_event) on tasks whose end pose is graded anyway: only the "let go too high"
+# clause is on, measured above where the object landed. Labelled placements count an object that slipped out 5-15 cm
+# above the pan/box and landed inside as done (the slip clause would fail 17% of labelled successes for no gain), and
+# every labelled failure already fails on the end pose; 30 cm catches nothing in the labels, it guards against policies
+# flinging the object in from high up.
+DROP_END_GRADED = {"drop_rule": "hand_motion", "drop_height_ref": "end", "drop_height_m": 0.30, "slip_fall_m_s": None, "tumble_deg": None, "end_tilt_deg": None}
+
+
 def place(o, t, **kw):
     # graded at the end: the object must still be in the target on the last frame (a placement that later falls out fails)
-    return {"name": "place", "check": "place_in", "obj": o, "target": t, "hold_s": 0.3, "final": True, **kw}
+    return {"name": "place", "check": "place_in", "obj": o, "target": t, "hold_s": 0.3, "final": True, **DROP_END_GRADED, **kw}
 
 
 def pour(o, t, **kw):
     # judged from state only (no liquid in the sim): lip over the opening while tilted and in hand, then set down upright
     return {"name": "poured", "check": "pour", "obj": o, "target": t, "min_tilt_deg": 30, "rim_slack_m": 0.02, "hold_s": 0.2,
-            "end_upright_deg": 20, "final": True, **kw}
+            "end_upright_deg": 20, "final": True, **DROP_END_GRADED, **kw}
 
 
 def judge(what):

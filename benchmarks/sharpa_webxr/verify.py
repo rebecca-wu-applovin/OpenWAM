@@ -355,55 +355,91 @@ def c_grasp(r: Replay, s):
     return c.all(r.n), {"max_lift_m": float(z.max()), "contact_s": float(r.hand_contact(o).sum() * DT)}, c
 
 
-def _not_dropped(r: Replay, o: str, s, c: Conds) -> dict:
-    """End-state rule shared by pick, shake and rotate tasks: the object is still in hand at the end (contact and its
-    lowest point >= held_end_lift_m up), or it was set back steadily. A drop is the last release from a lifted state
-    (hand contact lost while the lowest point was >= drop_lift_m up) followed by a fall >= drop_speed_m_s, or any fall
-    >= 1 m/s; ending > end_lift_tol_m below the start height (fell off its perch) or off the table also counts.
-    Heights use the object's lowest point, so a standing object tipping over is not a 'fall'. Adds conditions to c."""
+def _release_event(r: Replay, o: str, s) -> tuple[bool, dict, str]:
+    """Universal accidental-drop detector, read from the hand at the last release of the object from a lifted state
+    (hand contact lost while the origin was >= 0.03 m above its start). Returns (drop, info, text).
+    A release is deliberate when the fingers are opening (<= -finger_open_rad_s) or the hand is lowering
+    (<= -hand_lower_m_s) and the hand is not shooting up (>= hand_rise_m_s). Then, with h = release height of the
+    object's lowest point (above its start, or above where it ended when drop_height_ref == "end"):
+      slip   = h >= drop_min_height_m, not deliberate, and the object came down >= slip_fall_m_s
+      high   = h >= drop_height_m and it fell >= drop_speed_m_s, however the hand moved (let go too high)
+      tumble = rotated > tumble_deg while free afterwards
+      toppled = ended > end_tilt_deg from its start tilt, after a release that was not deliberate
+    drop = slip or (h >= drop_min_height_m and (high or tumble or toppled)). Per-task thresholds, same logic everywhere."""
     zb, zo, Cf = r.lift_bottom(o), r.lift(o), fill_gaps(r.hand_contact(o))
     # fall speed = the slower of origin and lowest-point descent: a true drop shows in both, a standing object
     # tipping over only in the origin, an object rotating in the hand only in the lowest point
     vz = np.minimum(np.concatenate([[0.0], np.diff(r.obj[o]["pos"][:, 2]) / DT]) * -1, np.concatenate([[0.0], np.diff(r.bottom_z(o)) / DT]) * -1)
-    held_end = bool(Cf[-1] and zb[-1] >= s.get("held_end_lift_m", 0.02))
     rel = [i for i in range(1, r.n) if Cf[i - 1] and not Cf[i] and zo[i - 1] >= 0.03]
+    if not rel:
+        return False, {"release_kind": "none"}, "never released from a lifted state"
+    i = rel[-1]
+    j = min(r.n, i + int(round(0.75 / DT)))
+    fall_r, ds = float(vz[i:j].max()), s.get("drop_speed_m_s", 0.5)
+    k = int(np.argmin(np.linalg.norm(r.wrist[i - 1] - r.obj[o]["pos"][i - 1], axis=1)))
+    a, b = max(0, i - 3), min(r.n - 1, i + 2)  # 5-frame window around the release
+    wvz = float((r.wrist[b, k, 2] - r.wrist[a, k, 2]) / ((b - a) * DT))
+    frate = float((r.flex[b, k] - r.flex[a, k]) / ((b - a) * DT))  # finger flexion rate: negative = opening
+    hb = float(zb[i - 1] - (zb[-1] if s.get("drop_height_ref") == "end" else 0.0))
+    upz = r.axis(o, [0, 0, 1])[:, 2]
+    tilt = np.degrees(np.arccos(np.clip(upz, -1, 1)))
+    free = ~Cf[i:]
+    tdeg, edeg, sfall = s.get("tumble_deg", 70), s.get("end_tilt_deg", 45), s.get("slip_fall_m_s", 0.3)  # None switches a clause off
+    tumble = bool(((tilt[i:] - tilt[i - 1]) > tdeg)[free].any()) if (free.any() and tdeg is not None) else False
+    toppled = bool(edeg is not None and not Cf[-1] and (tilt[-1] - tilt[0]) > edeg)  # relative to how it started (a ukulele lies flat)
+    lifted = hb >= s.get("drop_min_height_m", 0.02)
+    opening = frate <= -s.get("finger_open_rad_s", 0.10)
+    lowering = wvz <= -s.get("hand_lower_m_s", 0.06)
+    rising = wvz >= s.get("hand_rise_m_s", 0.15)
+    deliberate = (opening or lowering) and not rising
+    slip = sfall is not None and lifted and not deliberate and fall_r >= sfall  # closed hand moved off and the object came down
+    high = hb >= s.get("drop_height_m", 0.20) and fall_r >= ds  # let go from high up and it fell, however the hand moved
+    # a toppled end pose only convicts a release that was not deliberate (a drill set down lying on its side is a put-down)
+    drop = slip or (lifted and (high or tumble or (toppled and not deliberate)))
+    info = {"last_release_lift_m": float(zo[i - 1]), "last_release_fall_m_s": fall_r, "release_hand_vz_m_s": wvz,
+            "release_finger_rate_rad_s": frate, "release_bottom_m": hb,
+            "release_kind": "slip" if slip else ("deliberate" if deliberate else "n/a"), "tumbled_after": tumble, "toppled_end": toppled}
+    txt = (f"last release from {hb:.3f} m{' above where it ended' if s.get('drop_height_ref') == 'end' else ''}: fingers {'opening' if opening else 'not opening'} ({frate:+.2f} rad/s), hand "
+           f"{'lowering' if lowering else ('rising' if rising else 'level')} ({wvz:+.2f} m/s), then fell {fall_r:.2f} m/s; "
+           f"tumbled after: {'yes' if tumble else 'no'}; toppled at the end: {'yes' if toppled else 'no'}")
+    return bool(drop), info, txt
+
+
+def _drop_rule_text(s) -> str:
+    ref = "above where it ended" if s.get("drop_height_ref") == "end" else "up"
+    parts = []
+    if s.get("slip_fall_m_s", 0.3) is not None:
+        parts.append(f"it slipped out (fingers not opening and hand not lowering, or hand rising >= {s.get('hand_rise_m_s', 0.15)} m/s, and the object came down >= {s.get('slip_fall_m_s', 0.3)} m/s)")
+    parts.append(f"it was let go from >= {s.get('drop_height_m', 0.20)} m {ref} and fell >= {s.get('drop_speed_m_s', 0.5)} m/s")
+    if s.get("tumble_deg", 70) is not None:
+        parts.append(f"it tumbled > {s.get('tumble_deg', 70)} deg afterwards")
+    if s.get("end_tilt_deg", 45) is not None:
+        parts.append(f"it ended > {s.get('end_tilt_deg', 45)} deg from its start tilt after slipping out")
+    return f"a release from >= {s.get('drop_min_height_m', 0.02)} m {ref} is a drop when " + ", or ".join(parts)
+
+
+def _not_dropped(r: Replay, o: str, s, c: Conds) -> dict:
+    """End-state rule shared by pick, shake and rotate tasks: the object is still in hand at the end (contact and its
+    lowest point >= held_end_lift_m up), or it was set back steadily. With drop_rule == "hand_motion" a drop is read
+    from the hand at the last release (_release_event); otherwise it is the last release from a lifted state (hand
+    contact lost while the lowest point was >= drop_lift_m up) followed by a fall >= drop_speed_m_s, or any fall
+    >= 1 m/s. Ending > end_lift_tol_m below the start height (fell off its perch) or off the table also counts.
+    Heights use the object's lowest point, so a standing object tipping over is not a 'fall'. Adds conditions to c."""
+    zb, zo, Cf = r.lift_bottom(o), r.lift(o), fill_gaps(r.hand_contact(o))
+    vz = np.minimum(np.concatenate([[0.0], np.diff(r.obj[o]["pos"][:, 2]) / DT]) * -1, np.concatenate([[0.0], np.diff(r.bottom_z(o)) / DT]) * -1)
+    held_end = bool(Cf[-1] and zb[-1] >= s.get("held_end_lift_m", 0.02))
     drop, dl, ds = False, s.get("drop_lift_m", 0.08), s.get("drop_speed_m_s", 0.5)
     rel_txt, info = "never released from a lifted state", {}
     v2 = s.get("drop_rule") == "hand_motion"
-    if rel:
-        i = rel[-1]
-        j = min(r.n, i + int(round(0.75 / DT)))
-        fall_r, lift_at = float(vz[i:j].max()), float(zo[i - 1])
-        info = {"last_release_lift_m": lift_at, "last_release_fall_m_s": fall_r}
-        if v2:
-            # what the hand was doing when it let go decides between a put-down and a drop: a hand that is lowering
-            # or still is placing; a hand rising or moving away lets the object slip out. Independently, a release
-            # from high up or one followed by the object tumbling over is a drop.
-            k = int(np.argmin(np.linalg.norm(r.wrist[i - 1] - r.obj[o]["pos"][i - 1], axis=1)))
-            a, b = max(0, i - 3), min(r.n - 1, i + 2)  # 5-frame window around the release
-            wvz = float((r.wrist[b, k, 2] - r.wrist[a, k, 2]) / ((b - a) * DT))
-            frate = float((r.flex[b, k] - r.flex[a, k]) / ((b - a) * DT))  # finger flexion rate: negative = opening
-            hb = float(zb[i - 1])
-            upz = r.axis(o, [0, 0, 1])[:, 2]
-            tilt = np.degrees(np.arccos(np.clip(upz, -1, 1)))
-            free = ~Cf[i:]
-            tumble = bool(((tilt[i:] - tilt[i - 1]) > s.get("tumble_deg", 70))[free].any()) if free.any() else False
-            toppled = bool(not Cf[-1] and (tilt[-1] - tilt[0]) > s.get("end_tilt_deg", 45))  # relative to how it started (a ukulele lies flat)
-            lifted = hb >= s.get("drop_min_height_m", 0.02)
-            opening = frate <= -s.get("finger_open_rad_s", 0.10)
-            lowering = wvz <= -s.get("hand_lower_m_s", 0.06)
-            rising = wvz >= s.get("hand_rise_m_s", 0.15)
-            deliberate = (opening or lowering) and not rising
-            slip = lifted and not deliberate and fall_r >= s.get("slip_fall_m_s", 0.3)  # closed hand moved off and the object came down
-            high = hb >= s.get("drop_height_m", 0.20) and fall_r >= ds  # let go from high up and it fell, however the hand moved
-            # a toppled end pose only convicts a release that was not deliberate (a drill set down lying on its side is a put-down)
-            drop = slip or (lifted and (high or tumble or (toppled and not deliberate)))
-            info.update({"release_hand_vz_m_s": wvz, "release_finger_rate_rad_s": frate, "release_bottom_m": hb,
-                         "release_kind": "slip" if slip else ("deliberate" if deliberate else "n/a"), "tumbled_after": tumble, "toppled_end": toppled})
-            rel_txt = (f"last release from {hb:.3f} m: fingers {'opening' if opening else 'not opening'} ({frate:+.2f} rad/s), hand "
-                       f"{'lowering' if lowering else ('rising' if rising else 'level')} ({wvz:+.2f} m/s), then fell {fall_r:.2f} m/s; "
-                       f"tumbled after: {'yes' if tumble else 'no'}; toppled at the end: {'yes' if toppled else 'no'}")
-        else:
+    if v2:
+        drop, info, rel_txt = _release_event(r, o, s)
+    else:
+        rel = [i for i in range(1, r.n) if Cf[i - 1] and not Cf[i] and zo[i - 1] >= 0.03]
+        if rel:
+            i = rel[-1]
+            j = min(r.n, i + int(round(0.75 / DT)))
+            fall_r, lift_at = float(vz[i:j].max()), float(zo[i - 1])
+            info = {"last_release_lift_m": lift_at, "last_release_fall_m_s": fall_r}
             drop = (lift_at >= dl and fall_r >= ds) or fall_r >= 1.0
             rel_txt = f"last release at {lift_at:.3f} m up, fell {fall_r:.2f} m/s"
     tol = s.get("end_lift_tol_m", 0.03)
@@ -413,9 +449,7 @@ def _not_dropped(r: Replay, o: str, s, c: Conds) -> dict:
     if not held_end:  # not still in hand: must have been set back steadily (unless allow_drop: only the end pose counts)
         if not s.get("allow_drop"):
             if v2:
-                c.add(f"not dropped: a release from >= {s.get('drop_min_height_m', 0.02)} m is a drop when it slipped out (fingers not opening and hand not lowering, or hand "
-                      f"rising >= {s.get('hand_rise_m_s', 0.15)} m/s, and the object came down >= {s.get('slip_fall_m_s', 0.3)} m/s), or it was let go from >= {s.get('drop_height_m', 0.20)} m and fell >= {ds} m/s, "
-                      f"or it tumbled > {s.get('tumble_deg', 70)} deg afterwards or ended > {s.get('end_tilt_deg', 45)} deg from its start tilt ({rel_txt})", np.full(r.n, not drop))
+                c.add(f"not dropped: {_drop_rule_text(s)} ({rel_txt})", np.full(r.n, not drop))
             else:
                 c.add(f"not dropped: drop = released >= {dl} m up and falling >= {ds} m/s, or any fall >= 1 m/s ({rel_txt})", np.full(r.n, not drop))
         c.add(f"not ended > {tol} m below its start height or off the table (final {zb[-1]:+.3f} m)", np.full(r.n, not (lower or fell)))
@@ -423,6 +457,16 @@ def _not_dropped(r: Replay, o: str, s, c: Conds) -> dict:
             upz = r.axis(o, [0, 0, 1])[:, 2]
             c.add(f"standing upright within {s['end_upright_deg']} deg at the end (final tilt {np.degrees(np.arccos(np.clip(upz[-1], -1, 1))):.0f} deg)", upz >= np.cos(np.deg2rad(s["end_upright_deg"])))
     return info
+
+
+def _not_dropped_simple(r: Replay, o: str, s, c: Conds) -> dict:
+    """Drop rule alone (no end-pose conditions) for stages that already grade the end pose themselves: placements
+    and pours. Active when drop_rule == "hand_motion"; adds one condition to c and returns the release info."""
+    if s.get("drop_rule") != "hand_motion":
+        return {}
+    drop, info, txt = _release_event(r, o, s)
+    c.add(f"not dropped: {_drop_rule_text(s)} ({txt})", np.full(r.n, not drop))
+    return {"dropped": drop, **info}
 
 
 def c_hold_lifted(r: Replay, s):
@@ -491,6 +535,7 @@ def _placed_common(r: Replay, s, c: Conds):
     if s.get("rest", True):
         c.add(f"at rest: <= {s.get('rest_speed_m_s', DEFAULTS['rest_speed_m_s'])} m/s or moved <= {s.get('rest_disp_m', 0.02)} m over {hold_s} s"
               + (f" or bounce height <= {s['rest_z_m']} m" if s.get("rest_z_m") else "") + f" (final speed {r.speed(o)[-1]:.2f} m/s)", _rest(r, o, s))
+    _not_dropped_simple(r, o, s, c)
     return c.all(r.n)
 
 
@@ -916,11 +961,12 @@ def c_pour(r: Replay, s):
     c.add(f"{tgt} not knocked over (tilt <= {s.get('target_tilt_deg', 30)} deg; now {t_tilt[-1]:.0f})", t_tilt <= s.get("target_tilt_deg", 30))
     t_disp = r.disp(tgt)
     c.add(f"{tgt} not pushed away (moved <= {s.get('target_disp_m', 0.5)} m; now {t_disp[-1]:.2f})", t_disp <= s.get("target_disp_m", 0.5))
+    drop_info = _not_dropped_simple(r, o, s, c)
     i_p = first_true(poured_by)[0]
     return c.all(r.n), {"max_tilt_deg": float(tilt.max()), "lip_rim_offset_m": float(off), "pour_s": float(pouring.sum() * DT),
                         "longest_pour_s": float(run_length(pouring).max() * DT), "t_poured_s": (None if i_p is None else float(i_p * DT)),
                         "end_tilt_deg": float(tilt[-1]), "held_end": bool(hand[-1]), "target_tilt_end_deg": float(t_tilt[-1]),
-                        "target_disp_end_m": float(t_disp[-1])}, c
+                        "target_disp_end_m": float(t_disp[-1]), **drop_info}, c
 
 
 def c_contact_events(r: Replay, s):

@@ -274,3 +274,25 @@ Against the labels (recall / spec, fall-speed rule -> hand rule): ukulele 1.00/1
 same; stamp 0.89/0.96 -> 1.00/1.00; drill 1.00/1.00 -> 1.00/1.00; scissors 0.94/0.97 -> 0.94/0.95 (one labelled
 failure let go at 11 cm with closing fingers after the scissors had left the table edge); box rotate same.
 State-only tasks: recall 0.984, specificity 0.979.
+
+## Drop rule on placements and pours (2026-10-17)
+
+Reviewer: "deliberate release means fingers opening, but a drop can also open the fingers; it is just a finger
+release at a reasonable height". That is how the rule reads: opening the fingers only exempts a release below the
+task's `drop_height_m`; above it, any release that falls is a drop. The detector is now one function,
+`verify._release_event`, used by every stage type.
+
+Placements (`place_in`) and pours (`pour`) now run it too, with the end-graded settings `DROP_END_GRADED` in
+`_build_task_specs.py`: height measured above where the object landed, 30 cm, and only the "let go too high" clause.
+Measured on the labels before choosing that:
+
+- full pick rule (slip + height + tumble + toppled) on the 11 placements: recall 1.00 -> 0.83, specificity 1.00 -> 1.00.
+  The labels count an object that slipped out 5-15 cm above the pan or box and landed inside as done (test tube into
+  rack: 13 of 39 labelled successes read as slips), and every labelled failure already fails on the end pose.
+- same on the 5 pours: recall 0.97 -> 0.91, specificity unchanged.
+- height clause alone, above the landing spot: 20 cm costs 6 labelled successes (coins dropped into the game box from
+  20-25 cm, butter from 27 cm); 30 cm and 40 cm cost nothing and catch nothing.
+
+So placements and pours keep their label numbers (placements 1.00 / 1.00, pours 0.97 / 0.98); the 30 cm clause is a
+guard against policies flinging the object in from high up. Pick tasks unchanged (height still measured above the
+start; measuring above the landing spot costs one scissors case).

@@ -27,6 +27,12 @@
     "target": "world_pan_01",
     "hold_s": 0.3,
     "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null,
     "target_box": [
      [
       -0.09,
@@ -72,6 +78,12 @@
     "target": "world_bread_03",
     "hold_s": 0.3,
     "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null,
     "contact": "world_bread_03",
     "xy_margin_m": -0.01,
     "center_xy_m": 0.04
@@ -107,6 +119,12 @@
     "target": "world_plate",
     "hold_s": 0.3,
     "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null,
     "contact": "world_plate"
    }
   ],
@@ -205,6 +223,12 @@
     "target": "world_rack",
     "hold_s": 0.3,
     "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null,
     "z_above_m": 0.12,
     "contact": "world_rack"
    }
@@ -305,6 +329,12 @@
     "target": "world_pan_01",
     "hold_s": 0.3,
     "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null,
     "target_box": [
      [
       -0.07,
@@ -351,6 +381,12 @@
     "target": "world_pan",
     "hold_s": 0.3,
     "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null,
     "xy_margin_m": 0.03,
     "contact": "world_pan",
     "rest_disp_m": 0.03,
@@ -387,6 +423,12 @@
     "target": "world_eyeshadow_box",
     "hold_s": 0.3,
     "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null,
     "z_above_m": 0.04,
     "contact": "world_eyeshadow_box"
    }
@@ -421,6 +463,12 @@
     "target": "world_game_box",
     "hold_s": 0.3,
     "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null,
     "z_above_m": 0.03,
     "contact": "world_game_box"
    }
@@ -455,6 +503,12 @@
     "target": "world_game_box",
     "hold_s": 0.3,
     "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null,
     "z_above_m": 0.03,
     "contact": "world_game_box"
    }
@@ -489,6 +543,12 @@
     "target": "world_game_board",
     "hold_s": 0.3,
     "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null,
     "contact": "world_game_board"
    }
   ],
@@ -540,6 +600,12 @@
     "target": "world_pot",
     "hold_s": 0.3,
     "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null,
     "z_above_m": 0.12,
     "contact": "world_pot"
    }
@@ -1570,6 +1636,12 @@
     "hold_s": 0.1,
     "end_upright_deg": 20,
     "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null,
     "spout": [
      -0.116,
      0.0,
@@ -1614,7 +1686,13 @@
     "rim_slack_m": 0.02,
     "hold_s": 0.2,
     "end_upright_deg": 20,
-    "final": true
+    "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null
    }
   ],
   "needs_judge": false
@@ -1649,7 +1727,13 @@
     "rim_slack_m": 0.02,
     "hold_s": 0.2,
     "end_upright_deg": 20,
-    "final": true
+    "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null
    }
   ],
   "needs_judge": false
@@ -1684,7 +1768,13 @@
     "rim_slack_m": 0.02,
     "hold_s": 0.2,
     "end_upright_deg": 20,
-    "final": true
+    "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null
    }
   ],
   "needs_judge": false
@@ -1720,6 +1810,12 @@
     "hold_s": 0.1,
     "end_upright_deg": 20,
     "final": true,
+    "drop_rule": "hand_motion",
+    "drop_height_ref": "end",
+    "drop_height_m": 0.3,
+    "slip_fall_m_s": null,
+    "tumble_deg": null,
+    "end_tilt_deg": null,
     "spout": [
      -0.116,
      0.0,
