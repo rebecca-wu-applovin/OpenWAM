@@ -27,6 +27,9 @@ from postprocess import DT, SCENES_ROOT, Analyzer  # noqa: E402
 from scipy.spatial.transform import Rotation  # noqa: E402
 
 SPECS_PATH = HERE / "task_specs.json"
+FINGERS = ("thumb", "index", "middle", "ring", "pinky")
+SEGMENTS = ("PP", "MP", "DP", "fingertip")
+
 DEFAULTS = {"hold_s": 0.5, "reach_m": 0.03, "lift_m": 0.03, "carry_m": 0.05, "rest_speed_m_s": 0.03,
             "xy_margin_m": 0.0, "z_tol_m": 0.03, "tilt_deg": 15.0}
 
@@ -59,6 +62,13 @@ class Replay:
         self.pairs = []
         self.cpts = {o: [None] * self.n for o in self.an.objects}  # hand contact points per frame, object frame
         self.wrist = np.zeros((self.n, 2, 3))
+        # finger segment origins (world) per frame: (n, hand L/R, finger thumb..pinky, segment PP/MP/DP/fingertip, xyz); NaN if absent
+        self._fbod = np.full((2, 5, 4), -1, int)
+        for hi, h in enumerate(("left", "right")):
+            for fi, f in enumerate(FINGERS):
+                for si, sg in enumerate(SEGMENTS):
+                    self._fbod[hi, fi, si] = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, f"{h}_{f}_{sg}")
+        self.fingers = np.full((self.n, 2, 5, 4, 3), np.nan)
         self.base = None
         # local AABB of each object's collision geometry (object frame), for footprints / regions
         self.local_aabb = {}
@@ -97,6 +107,8 @@ class Replay:
                     self.cpts[o][i] = (rot(s["quat"]).T @ (np.stack(cpts[o]) - s["pos"]).T).T
             self.pairs.append(pairs)
             self.wrist[i] = wrist
+            ok = self._fbod >= 0
+            self.fingers[i][ok] = d.xpos[self._fbod[ok]]
             if i == 0:
                 self.base = env.world_from_base()
         self.table_z = self.an.table_z
@@ -160,6 +172,18 @@ class Replay:
 
     def hand_contact(self, o: str) -> np.ndarray:
         return self.obj[o]["contact"]
+
+    def fingers_in_holes(self, o: str, holes) -> np.ndarray:
+        """(n, 2, 5, n_holes) bool: a segment of that finger lies inside hole k of object o. holes = {"centers": [[x,y,z],...],
+        "radii": [rx, ry, rz]} in the object frame (ellipsoids: the hole of a scissors ring, a mug handle, ...)."""
+        C = np.asarray(holes["centers"], float); R = np.asarray(holes["radii"], float)
+        out = np.zeros((self.n, 2, 5, len(C)), bool)
+        for i in range(self.n):
+            Rm, p = rot(self.obj[o]["quat"][i]), self.obj[o]["pos"][i]
+            loc = np.einsum("ab,...b->...a", Rm.T, self.fingers[i] - p)  # (2,5,4,3) object frame
+            for k, c in enumerate(C):
+                out[i, :, :, k] = np.nansum(((loc - c) / R) ** 2, axis=-1).__lt__(1.0).__and__(~np.isnan(loc).any(-1)).any(-1)
+        return out
 
     def hand_contact_in(self, o: str, box) -> np.ndarray:
         """Per frame: some hand-object contact point lies inside `box` ([lo, hi] in the object frame): the object is
@@ -475,6 +499,16 @@ def c_hold_lifted(r: Replay, s):
     o = s["obj"]
     lift_m, hold_s = s.get("lift_m", DEFAULTS["lift_m"]), s.get("hold_s", DEFAULTS["hold_s"])
     C = r.hand_contact_in(o, s["grasp_box"]) if s.get("grasp_box") else r.hand_contact(o)
+    grip_txt = None
+    if s.get("finger_holes"):  # proper grip = fingers through the holes (scissors rings): thumb in one, or fingers in two
+        fh = r.fingers_in_holes(o, s["finger_holes"])
+        thumb = fh[:, :, 0, :].any(axis=(1, 2))
+        two = (fh.any(axis=(1, 2)).sum(axis=1) >= 2)
+        G = thumb | two
+        n_any = int((C & fh.any(axis=(1, 2, 3))).sum())
+        grip_txt = (f"fingers through the holes: thumb in one, or fingers in two (while touching: thumb {(C & thumb).sum() * DT:.1f} s, "
+                    f"two holes {(C & two).sum() * DT:.1f} s, any finger in a hole {n_any * DT:.1f} s, touching {C.sum() * DT:.1f} s)")
+        C = C & G
     z = r.lift(o) if s.get("lift_from") == "origin" else r.lift_bottom(o)
     Cf = fill_gaps(C)
     up = Cf & (z >= lift_m)
@@ -483,6 +517,8 @@ def c_hold_lifted(r: Replay, s):
     if s.get("grasp_box"):
         c.add(f"hand on the handle: a contact point inside the handle box {s['grasp_box']} in the object frame (gaps <= 0.15 s bridged; "
               f"{C.sum() * DT:.1f} s on the handle, {r.hand_contact(o).sum() * DT:.1f} s touching anywhere; final {bool(Cf[-1])})", Cf)
+    elif grip_txt:
+        c.add(f"held properly: hand contact and {grip_txt} (gaps <= 0.15 s bridged; final {bool(Cf[-1])})", Cf)
     else:
         c.add(f"hand contact (gaps <= 0.15 s bridged; final {bool(Cf[-1])})", Cf)
     c.add(f"lowest point lifted >= {lift_m} m (max {z.max():.3f} m, final {z[-1]:.3f} m)", z >= lift_m)

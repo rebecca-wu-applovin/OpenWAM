@@ -296,3 +296,24 @@ Measured on the labels before choosing that:
 So placements and pours keep their label numbers (placements 1.00 / 1.00, pours 0.97 / 0.98); the 30 cm clause is a
 guard against policies flinging the object in from high up. Pick tasks unchanged (height still measured above the
 start; measuring above the landing spot costs one scissors case).
+
+## Scissors: held properly = fingers through the rings (2026-10-17)
+
+Reviewer: two labelled failures that passed were "wrong pose to hold scissor" (7b7acaed, d6000e1d). The handle box
+did not catch them: both hold the rings, but pinched from the outside by the middle and ring fingers, blades pointing
+straight away from the wrist. Every labelled success holds them with the thumb through one ring and a finger through
+the other (29 of 31 successes, the other two thumb only).
+
+New `finger_holes` option on `hold_lifted` (`verify.py` `Replay.fingers_in_holes`, `c_hold_lifted`): the finger
+segment origins (PP/MP/DP/fingertip of all five fingers, both hands, new `Replay.fingers`) are mapped into the object
+frame; a finger is "through" a hole when a segment lies inside an ellipsoid at the hole. Held properly = thumb in one
+hole, or fingers in two holes, while touching. Scissors holes read off the mesh: centres y +-4.4 cm, z -7.9 cm, radii
+2.5 / 2.0 / 3.4 cm; the labels give the same result from 2.2 to 3.0 cm.
+
+Measured on the labels (recall / spec): 0.936 / 0.947 -> 0.936 / 1.000. Fixed: 7b7acaed, d6000e1d. Nothing lost.
+Still wrong: 7850423f (drop at 19 cm, reviewer sided with the label) and two labelled successes.
+
+Note on method: labelled recordings are verified in full (what the labeller watched); policy rollouts are cut at
+the task limit. The placement/pour and first scissors verify runs of this round, launched from the PR worktree,
+failed on an import and left old verifier files in place; the quoted label numbers were unaffected. Re-run from the
+main tree on the full recordings; all 17 tasks re-verified. State-only tasks: recall 0.986, specificity 0.982.
