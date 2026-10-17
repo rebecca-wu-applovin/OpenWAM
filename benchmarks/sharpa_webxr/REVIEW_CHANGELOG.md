@@ -254,3 +254,23 @@ is putting the object down, whatever the height. Applied to the stamp, the massa
 stamp recall 0.98 / spec 1.00 (was 0.89 / 0.96); the other two unchanged at 1.00 / 1.00. Kept the fall-speed rule
 where the hand-motion rule was worse on the labels: ukulele (one new false pass), drill 01116 (one reviewed success
 lost), scissors (spec 0.97 to 0.84), dice.
+
+## Accidental drop: one rule for every task (2026-10-17)
+
+Reviewer: an accidental drop should be judged the same way everywhere, with per-task numbers. The hand-motion rule
+is now the default drop rule (`drop_rule: hand_motion`, `verify.py` `_not_dropped`) for every pick task, the dice
+shake and the box rotate; the flask and nail-polish shakes keep "drop allowed, must end standing" by the earlier
+decision. It reads the hand, not the fall:
+
+- fingers: mean flexion of the 11 flexion joints of the hand nearest the object (new `Replay.flex`), rate over a
+  5-frame window around the release; opening = <= -0.10 rad/s
+- wrist: vertical speed over the same window; lowering = <= -0.06 m/s, rising = >= +0.15 m/s
+- deliberate release = (fingers opening or wrist lowering) and wrist not rising
+- slip = released >= 2 cm up (3 cm for the box), not deliberate, and the object came down >= 0.3 m/s
+- also a drop: let go from >= `drop_height_m` (20 cm; 6 cm for scissors) and fell >= 0.5 m/s; tumbled > 70 degrees
+  afterwards; ended > 45 degrees from its start tilt after a non-deliberate release
+
+Against the labels (recall / spec, fall-speed rule -> hand rule): ukulele 1.00/1.00 -> same; sauce, bag, dice
+same; stamp 0.89/0.96 -> 1.00/1.00; drill 1.00/1.00 -> 1.00/1.00; scissors 0.94/0.97 -> 0.94/0.95 (one labelled
+failure let go at 11 cm with closing fingers after the scissors had left the table edge); box rotate same.
+State-only tasks: recall 0.984, specificity 0.979.

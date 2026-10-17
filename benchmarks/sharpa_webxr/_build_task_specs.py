@@ -29,7 +29,10 @@ def pick(o, lift=0.05, hold=0.8, final=False, **kw):
     # "pick up X" is labelled on ever having held it; "grasp/grip X firmly" (final=True) also requires it was not
     # dropped afterwards (still held at the end, or set down gently)
     # end_hold_s: a recording that stops while the object is still held lifted only needs 0.4 s of hold (cut short, not released)
-    return {"name": "lift_hold", "check": "hold_lifted", "obj": o, "lift_m": lift, "hold_s": hold, **({"end_rule": "not_dropped", "end_hold_s": 0.4} if final else {}), **kw}
+    # drop_rule hand_motion: an accidental drop is read from the hand (fingers not opening, hand not lowering, or
+    # shooting up) plus a high release, a tumble or a toppled end pose; the same logic on every task, per-task heights
+    return {"name": "lift_hold", "check": "hold_lifted", "obj": o, "lift_m": lift, "hold_s": hold,
+            **({"end_rule": "not_dropped", "end_hold_s": 0.4, "drop_rule": "hand_motion"} if final else {}), **kw}
 
 
 def place(o, t, **kw):
@@ -94,23 +97,23 @@ S = {
     # >= 8 cm up and falling >= 0.5 m/s, or any fall >= 1 m/s) or ending lower than it started is a failure.
     # 00177 "grip firmly": held clear of the table >= 1.5 s (labelled slips held 1.1-1.3 s, every success >= 1.6 s)
     "00177": ["world_ukelele_01", None, [reach("world_ukelele_01"), pick("world_ukelele_01", hold=0.8, final=True, drop_lift_m=0.10)]],  # slip from 9 cm judged a put-down by the user (5aa35ed2)
-    "00178": ["world_sauce_01", None, [reach("world_sauce_01"), pick("world_sauce_01", final=True, drop_rule="hand_motion")]],
-    "00375": ["world_bag_02", None, [reach("world_bag_02"), pick("world_bag_02", final=True, drop_rule="hand_motion")]],
+    "00178": ["world_sauce_01", None, [reach("world_sauce_01"), pick("world_sauce_01", final=True)]],
+    "00375": ["world_bag_02", None, [reach("world_bag_02"), pick("world_bag_02", final=True)]],
     "01116": ["world_drill", None, [reach("world_drill"), pick("world_drill", hold=0.6, final=True, grasp_box=[[-0.085, -0.045, -0.09], [-0.005, 0.045, 0.025]])]],
     # every pick task graded on the end state: a drop after the grab is a failure (user review of 01174 videos)
-    "01174": ["world_stamp", None, [reach("world_stamp"), pick("world_stamp", final=True, drop_rule="hand_motion")]],
+    "01174": ["world_stamp", None, [reach("world_stamp"), pick("world_stamp", final=True)]],
     "01304": ["world_kettle", None, [reach("world_kettle"), pick("world_kettle", final=True)]],
-    "01337": ["world_scissors", None, [reach("world_scissors"), pick("world_scissors", final=True, grasp_box=[[-0.025, -0.08, -0.135], [0.025, 0.08, -0.02]])]],
+    "01337": ["world_scissors", None, [reach("world_scissors"), pick("world_scissors", final=True, grasp_box=[[-0.025, -0.08, -0.135], [0.025, 0.08, -0.02]], drop_height_m=0.06)]],
     # ---- reorient / flip / rotate -------------------------------------------------------------------------
     "01032": ["world_box", None, [reach("world_box"), {"name": "upturned", "check": "orientation", "obj": "world_box", "mode": "flip", "tol_deg": 35, "max_speed_m_s": 2.1, "max_disp_m": 0.40, "max_lift_m": 0.40, "final": True, "release": False, "rest": False}]],
     "01041": ["world_game_board", None, [reach("world_game_board"), {"name": "flipped", "check": "orientation", "obj": "world_game_board", "mode": "flip", "tol_deg": 35, "max_speed_m_s": 2.1, "max_disp_m": 0.55, "max_lift_m": 0.40, "final": True, "release": False, "rest": False}]],
     "01246": ["world_bowl", None, [reach("world_bowl"), {"name": "upturned", "check": "orientation", "obj": "world_bowl", "mode": "flip", "tol_deg": 45, "max_speed_m_s": 2.1, "max_disp_m": 0.55, "max_lift_m": 0.40, "final": True, "release": False, "rest": False}]],
-    "01541": ["world_box", None, [reach("world_box"), {"name": "rotated_side", "check": "orientation", "obj": "world_box", "mode": "rotate", "min_deg": 60, "max_speed_m_s": 2.1, "max_disp_m": 0.55, "end_rule": "not_dropped", "final": True}]],  # graded at the end; a box thrown across the table fails
+    "01541": ["world_box", None, [reach("world_box"), {"name": "rotated_side", "check": "orientation", "obj": "world_box", "mode": "rotate", "min_deg": 60, "max_speed_m_s": 2.1, "max_disp_m": 0.55, "end_rule": "not_dropped", "drop_rule": "hand_motion", "drop_min_height_m": 0.03, "final": True}]],  # graded at the end; a box thrown across the table fails
     "01542": ["world_teacup", None, [{"name": "handle_faces_robot", "check": "orientation", "obj": "world_teacup", "mode": "face", "axis": [1, 0, 0], "toward": [1, 0], "tol_deg": 25, "keep_upright_deg": 30, "final": True}]],
     "01564": ["world_tablet", None, [reach("world_tablet"), {"name": "portrait", "check": "orientation", "obj": "world_tablet", "mode": "axis_away", "axis": [0, 0, 1], "ref": [0, 1, 0], "min_deg": 55, "final": True, "release": False, "rest": True}]],  # long axis (local z, 30 cm) starts left-right (base y); portrait = long axis >= 55 deg away from that, flat or held upright; a half turn stays landscape
     # ---- shake / toss -------------------------------------------------------------------------------------
     "00779": ["world_flask_02", None, [reach("world_flask_02"), grasp("world_flask_02"), {"name": "shaken", "check": "oscillation", "obj": "world_flask_02", "min_reversals": 3, "min_amp_m": 0.03, "end_rule": "not_dropped", "allow_drop": True, "end_upright_deg": 30, "final": True}]],
-    "01592": ["world_dice", None, [reach("world_dice"), grasp("world_dice", lift_m=0.02), {"name": "shaken", "check": "oscillation", "obj": "world_dice", "min_reversals": 3, "min_amp_m": 0.02, "end_rule": "not_dropped", "final": True}]],
+    "01592": ["world_dice", None, [reach("world_dice"), grasp("world_dice", lift_m=0.02), {"name": "shaken", "check": "oscillation", "obj": "world_dice", "min_reversals": 3, "min_amp_m": 0.02, "end_rule": "not_dropped", "drop_rule": "hand_motion", "final": True}]],
     "01605": ["world_nail_polish_bottle", None, [reach("world_nail_polish_bottle"), grasp("world_nail_polish_bottle"), {"name": "shaken", "check": "oscillation", "obj": "world_nail_polish_bottle", "min_reversals": 3, "min_amp_m": 0.03, "end_rule": "not_dropped", "allow_drop": True, "end_upright_deg": 30, "final": True}]],
     "01652": ["world_coin", None, [reach("world_coin"), grasp("world_coin", lift_m=0.02), {"name": "tossed_caught", "check": "free_flight", "obj": "world_coin", "min_rise_m": 0.04, "min_rel_rise_m": 0.02, "catch_dist_m": 0.22, "end_rule": "in_hand", "final": True}]],
     # ---- pour (sim: grasp, carry over, tilt; judge: the pour itself) ----------------------------------------

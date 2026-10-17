@@ -1011,6 +1011,7 @@
     "hold_s": 0.8,
     "end_rule": "not_dropped",
     "end_hold_s": 0.4,
+    "drop_rule": "hand_motion",
     "drop_lift_m": 0.1
    }
   ],
@@ -1095,6 +1096,7 @@
     "hold_s": 0.6,
     "end_rule": "not_dropped",
     "end_hold_s": 0.4,
+    "drop_rule": "hand_motion",
     "grasp_box": [
      [
       -0.085,
@@ -1161,7 +1163,8 @@
     "lift_m": 0.05,
     "hold_s": 0.8,
     "end_rule": "not_dropped",
-    "end_hold_s": 0.4
+    "end_hold_s": 0.4,
+    "drop_rule": "hand_motion"
    }
   ],
   "needs_judge": false
@@ -1189,6 +1192,7 @@
     "hold_s": 0.8,
     "end_rule": "not_dropped",
     "end_hold_s": 0.4,
+    "drop_rule": "hand_motion",
     "grasp_box": [
      [
       -0.025,
@@ -1200,7 +1204,8 @@
       0.08,
       -0.02
      ]
-    ]
+    ],
+    "drop_height_m": 0.06
    }
   ],
   "needs_judge": false
@@ -1322,6 +1327,8 @@
     "max_speed_m_s": 2.1,
     "max_disp_m": 0.55,
     "end_rule": "not_dropped",
+    "drop_rule": "hand_motion",
+    "drop_min_height_m": 0.03,
     "final": true
    }
   ],
@@ -1458,6 +1465,7 @@
     "min_reversals": 3,
     "min_amp_m": 0.02,
     "end_rule": "not_dropped",
+    "drop_rule": "hand_motion",
     "final": true
    }
   ],
