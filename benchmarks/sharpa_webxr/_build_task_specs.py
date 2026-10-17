@@ -28,7 +28,8 @@ def grasp(o, **kw):
 def pick(o, lift=0.05, hold=0.8, final=False, **kw):
     # "pick up X" is labelled on ever having held it; "grasp/grip X firmly" (final=True) also requires it was not
     # dropped afterwards (still held at the end, or set down gently)
-    return {"name": "lift_hold", "check": "hold_lifted", "obj": o, "lift_m": lift, "hold_s": hold, **({"end_rule": "not_dropped"} if final else {}), **kw}
+    # end_hold_s: a recording that stops while the object is still held lifted only needs 0.4 s of hold (cut short, not released)
+    return {"name": "lift_hold", "check": "hold_lifted", "obj": o, "lift_m": lift, "hold_s": hold, **({"end_rule": "not_dropped", "end_hold_s": 0.4} if final else {}), **kw}
 
 
 def place(o, t, **kw):

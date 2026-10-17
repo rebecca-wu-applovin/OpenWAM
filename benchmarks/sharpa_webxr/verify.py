@@ -397,7 +397,12 @@ def c_hold_lifted(r: Replay, s):
     else:
         c.add(f"hand contact (gaps <= 0.15 s bridged; final {bool(Cf[-1])})", Cf)
     c.add(f"lowest point lifted >= {lift_m} m (max {z.max():.3f} m, final {z[-1]:.3f} m)", z >= lift_m)
-    c.add(f"held lifted for {hold_s} s continuously (longest {max_hold:.2f} s)", held(up, hold_s))
+    hold_ok = held(up, hold_s)
+    if s.get("end_hold_s") and up[-1]:  # still held lifted when the recording ends: the hold was cut short, not released
+        hold_ok = hold_ok | (held(up, s["end_hold_s"]) & (np.arange(r.n) == r.n - 1))
+        c.add(f"held lifted for {hold_s} s continuously, or {s['end_hold_s']} s when still held lifted on the last frame (longest {max_hold:.2f} s)", hold_ok)
+    else:
+        c.add(f"held lifted for {hold_s} s continuously (longest {max_hold:.2f} s)", hold_ok)
     last_c = int(np.flatnonzero(C)[-1]) if C.any() else -1
     drop_info = _not_dropped(r, o, s, c) if s.get("end_rule") == "not_dropped" else {}
     ok = c.all(r.n)

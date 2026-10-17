@@ -1010,6 +1010,7 @@
     "lift_m": 0.05,
     "hold_s": 0.8,
     "end_rule": "not_dropped",
+    "end_hold_s": 0.4,
     "drop_lift_m": 0.1
    }
   ],
@@ -1036,7 +1037,8 @@
     "obj": "world_sauce_01",
     "lift_m": 0.05,
     "hold_s": 0.8,
-    "end_rule": "not_dropped"
+    "end_rule": "not_dropped",
+    "end_hold_s": 0.4
    }
   ],
   "needs_judge": false
@@ -1062,7 +1064,8 @@
     "obj": "world_bag_02",
     "lift_m": 0.05,
     "hold_s": 0.8,
-    "end_rule": "not_dropped"
+    "end_rule": "not_dropped",
+    "end_hold_s": 0.4
    }
   ],
   "needs_judge": false
@@ -1089,6 +1092,7 @@
     "lift_m": 0.05,
     "hold_s": 0.6,
     "end_rule": "not_dropped",
+    "end_hold_s": 0.4,
     "grasp_box": [
      [
       -0.085,
@@ -1126,7 +1130,8 @@
     "obj": "world_stamp",
     "lift_m": 0.05,
     "hold_s": 0.8,
-    "end_rule": "not_dropped"
+    "end_rule": "not_dropped",
+    "end_hold_s": 0.4
    }
   ],
   "needs_judge": false
@@ -1152,7 +1157,8 @@
     "obj": "world_kettle",
     "lift_m": 0.05,
     "hold_s": 0.8,
-    "end_rule": "not_dropped"
+    "end_rule": "not_dropped",
+    "end_hold_s": 0.4
    }
   ],
   "needs_judge": false
@@ -1179,6 +1185,7 @@
     "lift_m": 0.05,
     "hold_s": 0.8,
     "end_rule": "not_dropped",
+    "end_hold_s": 0.4,
     "grasp_box": [
      [
       -0.025,

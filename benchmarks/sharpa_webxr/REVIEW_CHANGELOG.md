@@ -236,3 +236,9 @@ reviewer: position matters, duration does not). 00175: recall 0.97 / spec 0.97 (
 
 Previous round (pour change only): xwam 26.2%, motus 22.2%, gwp 20.7%, cosmos3 4.4%. Judge verdicts reused from the
 cache (same sim facts), no new API calls. Viewer republished at the same links.
+
+## Ukulele follow-up (2026-10-17): hold cut short by the end of the recording
+
+`end_hold_s` on every end-graded pick task: if the object is still held lifted on the last frame, 0.4 s of continuous
+hold is enough (the recording ended during the hold; it was not released). No labelled failure gains a pass on any
+of the seven pick tasks; 00177 goes to 1.00 / 1.00.
