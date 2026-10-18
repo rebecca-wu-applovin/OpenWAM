@@ -415,3 +415,10 @@ failure_358e3d99 (bowl tipped sideways over the pan edge) now fails; recover_305
   (01480), in hand, all together for hold_s. 01480 recover_305611be: every part holds, but together only for 0.10 s
   in a row (needs 0.2 s).
 State-only tasks: recall 0.997, specificity 0.994 (with the reviewer's latest decisions). Policy hybrid SR unchanged.
+
+## Pours: 0.1 s is enough (2026-10-18)
+
+Reviewer on 01480 recover_305611be: "0.1s is enough". `pour()` now needs the pour parts together for 0.1 s (was
+0.2 s; the kettle pours already used 0.1 s). 01480: recall 0.980 -> 1.000, specificity 1.000 -> 0.972: failure_617fef78
+now passes (it pours for 0.15 s; the operator also picked up the pan and moved it 0.25 m, within the 0.5 m
+"not pushed away" limit). 00475 / 00487 unchanged. State-only tasks: recall 0.998, specificity 0.992.

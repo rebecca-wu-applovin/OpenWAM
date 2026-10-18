@@ -50,8 +50,8 @@ def place(o, t, **kw):
 
 def pour(o, t, **kw):
     # judged from state only (no liquid in the sim): lip over the opening while tilted and in hand, then set down upright;
-    # pouring must not include a collision (the poured object touching the target while moving > 0.7 m/s)
-    return {"name": "poured", "check": "pour", "obj": o, "target": t, "min_tilt_deg": 30, "rim_slack_m": 0.02, "hold_s": 0.2,
+    # a pour of 0.1 s counts (reviewer, 01480 recover_305611be); pouring must not include a collision (the poured object touching the target while moving > 0.7 m/s)
+    return {"name": "poured", "check": "pour", "obj": o, "target": t, "min_tilt_deg": 30, "rim_slack_m": 0.02, "hold_s": 0.1,
             "end_upright_deg": 20, "max_hit_speed_m_s": 0.7, "final": True, **DROP_END_GRADED, **kw}
 
 
