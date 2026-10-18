@@ -115,7 +115,7 @@ S = {
     # pinched from outside by middle/ring fingers). Ring holes read off the mesh: centres y +-4.4 cm, z -7.9 cm, holes
     # ~3.5 x 6.5 cm; ellipsoid radii 2.5 / 2.0 / 3.4 cm (same labels from 2.2 to 3.0 cm)
     "01337": ["world_scissors", None, [reach("world_scissors"), pick("world_scissors", final=True, grasp_box=[[-0.025, -0.08, -0.135], [0.025, 0.08, -0.02]], drop_height_m=0.06,
-                                                                       finger_holes={"centers": [[0, -0.044, -0.079], [0, 0.044, -0.079]], "radii": [0.025, 0.020, 0.034]})]],
+                                                                       finger_holes={"centers": [[0, -0.044, -0.079], [0, 0.044, -0.079]], "radii": [0.025, 0.020, 0.034], "rule": "thumb_and_index"})]],
     # ---- reorient / flip / rotate -------------------------------------------------------------------------
     "01032": ["world_box", None, [reach("world_box"), {"name": "upturned", "check": "orientation", "obj": "world_box", "mode": "flip", "tol_deg": 35, "max_speed_m_s": 2.1, "max_disp_m": 0.40, "max_lift_m": 0.40, "final": True, "release": False, "rest": False}]],
     "01041": ["world_game_board", None, [reach("world_game_board"), {"name": "flipped", "check": "orientation", "obj": "world_game_board", "mode": "flip", "tol_deg": 35, "max_speed_m_s": 2.1, "max_disp_m": 0.55, "max_lift_m": 0.40, "final": True, "release": False, "rest": False}]],

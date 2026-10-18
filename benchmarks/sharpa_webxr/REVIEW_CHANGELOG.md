@@ -317,3 +317,17 @@ Note on method: labelled recordings are verified in full (what the labeller watc
 the task limit. The placement/pour and first scissors verify runs of this round, launched from the PR worktree,
 failed on an import and left old verifier files in place; the quoted label numbers were unaffected. Re-run from the
 main tree on the full recordings; all 17 tasks re-verified. State-only tasks: recall 0.986, specificity 0.982.
+
+## Scissors: strict grip, thumb in one ring and index in the other (2026-10-18)
+
+Reviewer: the correct way to hold scissors is the thumb through one ring and the index finger through the other.
+`finger_holes` gains a `rule` option (`verify.py` `c_hold_lifted`): `thumb_or_two` (previous default), `thumb_and_finger`
+(thumb in one hole, any other finger of the same hand in another) and `thumb_and_index` (same, index only). 01337 now
+uses `thumb_and_index`.
+
+Measured on the labels (recall / spec): 0.936 / 1.000 -> 0.894 / 1.000. Newly failing labelled successes, by the
+reviewer's choice: recover_dd4f756f (index and middle through the rings, no thumb) and success_4f76159a (thumb through
+one ring; the other ring holds the ring finger for 0.4 s, the index sits outside it). State-only tasks: recall 0.984,
+specificity 0.982. Policy hybrid SR unchanged (xwam 25.4%, motus 22.6%, gwp 20.4%, cosmos3 4.7%).
+
+Also: when a stage sets both `grasp_box` and `finger_holes`, the failure explanation now names both checks.

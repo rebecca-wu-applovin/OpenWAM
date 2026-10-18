@@ -504,7 +504,17 @@ def c_hold_lifted(r: Replay, s):
         fh = r.fingers_in_holes(o, s["finger_holes"])
         thumb = fh[:, :, 0, :].any(axis=(1, 2))
         two = (fh.any(axis=(1, 2)).sum(axis=1) >= 2)
-        G = thumb | two
+        rule = s["finger_holes"].get("rule", "thumb_or_two")
+        if rule == "thumb_or_two":
+            G = thumb | two
+        else:  # same hand: thumb in one hole and the index (or any other finger) in another
+            oth = (fh[:, :, 1:2, :] if rule == "thumb_and_index" else fh[:, :, 1:, :]).any(axis=2)  # (n, 2, k)
+            t = fh[:, :, 0, :]
+            G = np.zeros(r.n, bool)
+            for a in range(t.shape[2]):
+                for b in range(t.shape[2]):
+                    if a != b:
+                        G |= (t[:, :, a] & oth[:, :, b]).any(axis=1)
         n_any = int((C & fh.any(axis=(1, 2, 3))).sum())
         grip_txt = (f"fingers through the holes: thumb in one, or fingers in two (while touching: thumb {(C & thumb).sum() * DT:.1f} s, "
                     f"two holes {(C & two).sum() * DT:.1f} s, any finger in a hole {n_any * DT:.1f} s, touching {C.sum() * DT:.1f} s)")
@@ -515,7 +525,8 @@ def c_hold_lifted(r: Replay, s):
     max_hold = float(run_length(up).max() * DT)
     c = Conds()
     if s.get("grasp_box"):
-        c.add(f"hand on the handle: a contact point inside the handle box {s['grasp_box']} in the object frame (gaps <= 0.15 s bridged; "
+        c.add(f"hand on the handle: a contact point inside the handle box {s['grasp_box']} in the object frame"
+              f"{' and ' + grip_txt if grip_txt else ''} (gaps <= 0.15 s bridged; "
               f"{C.sum() * DT:.1f} s on the handle, {r.hand_contact(o).sum() * DT:.1f} s touching anywhere; final {bool(Cf[-1])})", Cf)
     elif grip_txt:
         c.add(f"held properly: hand contact and {grip_txt} (gaps <= 0.15 s bridged; final {bool(Cf[-1])})", Cf)
