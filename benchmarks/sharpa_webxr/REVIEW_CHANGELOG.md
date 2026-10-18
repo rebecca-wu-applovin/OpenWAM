@@ -432,3 +432,14 @@ pan while slipping out of the hand and falls next to it; for 0.15 s its low rim 
 - 01480 pan opening: the pan's box includes the handle, so its centre sat 7 cm toward the handle. The opening is now
   the pan body (centre x 0.07 m in the pan frame, radius 0.158 m, rim top 0.034 m).
 01480: 1.000 / 1.000; 00475 and 00487 unchanged. State-only tasks: recall 0.998, specificity 0.994.
+
+## 00051 brushing a held-up plate (2026-10-18)
+
+Reviewer on 00051 success_03ac6849: "it is brushed...". Since the oriented footprint became the default, brushing was
+measured inside the plate's footprint on its two most horizontal axes; this plate is held up, tilted and upside down
+while the other hand brushes it, so the eraser was never "inside" (0.00 m). New `inside_box_m` option on `sweep`: the
+eraser must be on the plate's own box grown by 2.5 cm on every side, whatever the plate's pose. The brushing stage is
+now graded at the end and adds the "not flung" rule (1.2 m/s), matching the reviewer's note on success_df3b7731
+("brush drops in the end"). Sweep stages can also take the drop rule now.
+00051 state prefix (judge decides after it): recall 0.98 -> 1.000; failure_2031b10e and failure_e88912cc (eraser
+flung away at 2.1 / 2.4 m/s) now fail before the judge. State-only tasks unchanged (0.998 / 0.994).

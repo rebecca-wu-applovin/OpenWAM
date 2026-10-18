@@ -1901,7 +1901,10 @@
     "obj": "world_eraser_07",
     "target": "world_plate_05",
     "contact": true,
-    "min_path_m": 0.05
+    "min_path_m": 0.05,
+    "inside_box_m": 0.025,
+    "max_free_speed_m_s": 1.2,
+    "final": true
    },
    {
     "name": "complete",

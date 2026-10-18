@@ -1097,8 +1097,15 @@ def c_sweep(r: Replay, s):
     >= min_path_m, optionally requiring tool-target contact, while hand-held."""
     tool, tgt = s["obj"], s["target"]
     pw = r.point(tool, s.get("point"))
-    inside = (r.in_target(tool, tgt, s.get("point"), -s.get("xy_slack_m", 0.0), s.get("z_lo"), s.get("z_hi"), s.get("target_box"), s.get("z_above_m", 0.15))
-              if s.get("require_inside", True) else np.ones(r.n, bool))
+    if s.get("inside_box_m") is not None:  # on the target's own box (grown by inside_box_m on every side), whatever its
+        # pose: a plate held up or upside down while it is brushed has no footprint on the table
+        lo, hi = (np.asarray(s["target_box"], float) if s.get("target_box") else r.local_aabb[tgt])
+        m = s["inside_box_m"]
+        inside = np.array([bool(np.all((lambda l: (l >= lo - m) & (l <= hi + m))(rot(r.obj[tgt]["quat"][i]).T @ (pw[i] - r.obj[tgt]["pos"][i]))))
+                           for i in range(r.n)])
+    else:
+        inside = (r.in_target(tool, tgt, s.get("point"), -s.get("xy_slack_m", 0.0), s.get("z_lo"), s.get("z_hi"), s.get("target_box"), s.get("z_above_m", 0.15))
+                  if s.get("require_inside", True) else np.ones(r.n, bool))
     if s.get("contact"):
         inside &= r.touching(tool, tgt)
     if s.get("while_held", True):
@@ -1109,8 +1116,13 @@ def c_sweep(r: Replay, s):
     valid[1:] &= inside[:-1]  # a step counts only when both its endpoints are inside (no credit for the approach)
     path = np.cumsum(np.where(valid, step, 0.0))
     c = Conds()
-    c.add(f"{tool} path inside the {tgt} footprint{' while touching it' if s.get('contact') else ''} while held >= {s.get('min_path_m', 0.2)} m (actual {path[-1]:.2f} m over {inside.sum() * DT:.1f} s)", path >= s.get("min_path_m", 0.2))
-    return c.all(r.n), {"path_in_target_m": float(path[-1]), "inside_s": float(inside.sum() * DT)}, c
+    where = f"on the {tgt} (within {s['inside_box_m']} m of its own box)" if s.get("inside_box_m") is not None else f"inside the {tgt} footprint"
+    c.add(f"{tool} path {where}{' while touching it' if s.get('contact') else ''} while held >= {s.get('min_path_m', 0.2)} m (actual {path[-1]:.2f} m over {inside.sum() * DT:.1f} s)",
+          np.maximum.accumulate(path >= s.get("min_path_m", 0.2)) if s.get("final") else path >= s.get("min_path_m", 0.2))
+    m = {"path_in_target_m": float(path[-1]), "inside_s": float(inside.sum() * DT)}
+    m.update(_not_dropped_simple(r, tool, s, c))  # tool not dropped / flung at the end (when the stage asks for it)
+    m.update(_not_flung(r, tool, s, c))
+    return c.all(r.n), m, c
 
 
 def c_judge(r: Replay, s):
