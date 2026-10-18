@@ -132,11 +132,11 @@ class Replay:
         return W.min(0), W.max(0)
 
     def in_target(self, o: str, target: str, point=None, xy_margin=0.0, z_lo=None, z_hi=None, box=None,
-                  z_above=0.05, oriented=False) -> np.ndarray:
+                  z_above=0.05, oriented=True) -> np.ndarray:
         """Per frame: object point inside the target's world AABB footprint (shrunk by xy_margin; negative = grown)
         with z in [bottom - 1 cm (or z_lo offset from bottom), top + z_above (or z_hi offset from top)].
-        oriented: the footprint is the target's own box (its two most horizontal local axes) instead of the world AABB,
-        which grows with the target's yaw (a case turned 45 deg covers the table beside it)."""
+        oriented (default): the footprint is the target's own box (its two most horizontal local axes), not the world
+        AABB, which grows with the target's yaw (a case turned 45 deg covers the table beside it). False = world AABB."""
         pw = self.point(o, point)
         ok = np.zeros(self.n, bool)
         blo, bhi = np.asarray(box, float) if box is not None else self.local_aabb[target]
@@ -621,7 +621,7 @@ def c_move_out(r: Replay, s):
     md = s.get("min_disp_m", 0.05)
     if "target" in s:  # inside = within the container's footprint and no higher than clear_m above its top
         inside = r.in_target(o, s["target"], s.get("point"), -s.get("xy_margin_m", 0.02), -1.0, s.get("clear_m", 0.03), s.get("target_box"),
-                             oriented=s.get("oriented", False))
+                             oriented=s.get("oriented", True))
         where = f"out of the {s['target']} (outside its footprint or lifted > {s.get('clear_m', 0.03)} m above it)"
     elif "region" in s:
         inside = r.in_region(o, s["region"], s.get("point"))

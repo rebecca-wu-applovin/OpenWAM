@@ -293,7 +293,6 @@
     "obj": "world_phone_01",
     "target": "world_phone_case",
     "min_disp_m": 0,
-    "oriented": true,
     "clear_m": 0.1,
     "release": false,
     "rest": false,

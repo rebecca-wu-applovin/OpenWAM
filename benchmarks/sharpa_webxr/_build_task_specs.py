@@ -69,7 +69,7 @@ S = {
     "00636": ["world_teapot_lid", None, [reach("world_teapot_lid"), grasp("world_teapot_lid"), {"name": "lid_off_and_down", "check": "move_out", "obj": "world_teapot_lid", "min_disp_m": 0.10}]],
     # out of the case = outside the case's own (rotated) footprint; no minimum distance (reviewer: "it should be just out
     # of box"); a phone slid out of the case is carried only a few cm, so the grasp needs 3 cm of carry, not 5
-    "00646": ["world_phone_01", "world_phone_case", [reach("world_phone_01"), grasp("world_phone_01", carry_m=0.03), {"name": "out_of_case", "check": "move_out", "obj": "world_phone_01", "target": "world_phone_case", "min_disp_m": 0, "oriented": True, "clear_m": 0.10, "release": False, "rest": False, "target_max_speed_m_s": 1.6, "final": True}]],
+    "00646": ["world_phone_01", "world_phone_case", [reach("world_phone_01"), grasp("world_phone_01", carry_m=0.03), {"name": "out_of_case", "check": "move_out", "obj": "world_phone_01", "target": "world_phone_case", "min_disp_m": 0, "clear_m": 0.10, "release": False, "rest": False, "target_max_speed_m_s": 1.6, "final": True}]],
     "00807": ["world_egg", "world_pan_01", [reach("world_egg"), grasp("world_egg"), place("world_egg", "world_pan_01", target_box=[[-0.07, -0.095, -0.016], [0.07, 0.055, 0.022]], contact="world_pan_01", rest_disp_m=0.04)]],
     "00921": ["world_butter", "world_pan", [reach("world_butter"), grasp("world_butter"), place("world_butter", "world_pan", xy_margin_m=0.03, contact="world_pan", rest_disp_m=0.03, rest_z_m=0.01)]],
     "01012": ["world_eyeshadow_brush", "world_eyeshadow_box", [reach("world_eyeshadow_brush"), grasp("world_eyeshadow_brush"), place("world_eyeshadow_brush", "world_eyeshadow_box", z_above_m=0.04, contact="world_eyeshadow_box")]],

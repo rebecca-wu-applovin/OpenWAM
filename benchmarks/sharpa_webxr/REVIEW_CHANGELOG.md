@@ -349,3 +349,14 @@ success_cc5f5691 "why is this wrong".
 Measured on 00646 labels: recall 0.960 -> 1.000; recover_14ac3297 (phone ends on the table beside the case, reviewed
 "verifier right" when it failed) now passes, so it counts against specificity until re-reviewed (0.958).
 Policy hybrid SR unchanged.
+
+## Oriented footprint is the default (2026-10-18)
+
+Reviewer: make the rotated footprint the default everywhere. `Replay.in_target` now tests the target's own box on its
+two most horizontal axes by default (`oriented=False` keeps the world-axis box). Re-verified all 23 tasks with a
+target (1533 labelled recordings in full, 480 policy rollouts at the task cut).
+
+Changes on the labels: 00646 as before (recall 1.000); 00051 loses success_03ac6849 (eraser path over the plate
+0.00 m in the rotated box) and catches one more failure; 00787 loses success_ccf05e19 (spatula path in the pan
+0.12 m, needs 0.15) and catches two more failures. State-only tasks: recall 0.986, specificity 0.981.
+Policy hybrid SR unchanged (xwam 25.4%, motus 22.6%, gwp 20.4%, cosmos3 4.7%).
