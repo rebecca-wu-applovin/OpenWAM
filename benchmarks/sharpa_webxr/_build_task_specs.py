@@ -137,7 +137,9 @@ S = {
     "00175": ["world_kettle", "world_mug_025", [reach("world_kettle"), grasp("world_kettle"), pour("world_kettle", "world_mug_025", spout=[-0.116, 0.0, 0.14], spout_dir=[-1.0, 0.0], spout_tol_deg=60, rim_slack_m=0.01, hold_s=0.1)]],
     "00475": ["world_beaker_01", "world_flask_02", [reach("world_beaker_01"), grasp("world_beaker_01"), pour("world_beaker_01", "world_flask_02")]],
     "00487": ["world_body_04", "world_bowl", [reach("world_body_04"), grasp("world_body_04"), pour("world_body_04", "world_bowl")]],
-    "01480": ["world_bowl", "world_pan", [reach("world_bowl"), grasp("world_bowl"), pour("world_bowl", "world_pan")]],
+    # poured toward the pan: the low rim must be nearer the pan centre than the bowl's body (+3 cm), not a bowl tipped
+    # sideways over the pan edge (reviewer, failure_358e3d99)
+    "01480": ["world_bowl", "world_pan", [reach("world_bowl"), grasp("world_bowl"), pour("world_bowl", "world_pan", toward_target_m=0.03)]],
     "01498": ["world_kettle", "world_teapot", [reach("world_kettle"), grasp("world_kettle"), pour("world_kettle", "world_teapot", spout=[-0.116, 0.0, 0.14], spout_dir=[-1.0, 0.0], spout_tol_deg=60, rim_slack_m=0.01, hold_s=0.1)]],
     # ---- tool use (sim: grasp tool, tool acts on target; judge: the effect) ---------------------------------
     "00051": ["world_eraser_07", "world_plate_05", [reach("world_eraser_07"), grasp("world_eraser_07", lift_m=0.01, carry_m=0.03), {"name": "brushed", "check": "sweep", "obj": "world_eraser_07", "target": "world_plate_05", "contact": True, "min_path_m": 0.05}, judge("plate brushed with the eraser")]],

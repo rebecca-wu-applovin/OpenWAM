@@ -1804,7 +1804,8 @@
     "drop_height_m": 0.3,
     "slip_fall_m_s": null,
     "tumble_deg": null,
-    "end_tilt_deg": null
+    "end_tilt_deg": null,
+    "toward_target_m": 0.03
    }
   ],
   "needs_judge": false

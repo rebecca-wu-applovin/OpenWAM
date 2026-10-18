@@ -391,3 +391,10 @@ Not fixed: 01564 failure_be78a36c (released 4 cm up, slides 4 cm at 0.8 m/s: not
 00175 recover_3db6087a (spout tip never within 1 cm of the mug rim while tilted toward the spout: best 3.6 cm out);
 00779 recover_186a553e (flask ends lying at 62 deg) and success_b4391e4e; 01480 success_d4aaa0fe has no pan in the
 sim (pan 266 m away: scene glitch, excluded as "both wrong").
+
+## 01480: pour toward the pan (2026-10-18)
+
+Reviewer: turn on the "pour toward the target" check for 01480 (`toward_target_m: 0.03`): while pouring, the low rim
+must be nearer the pan centre than the bowl's body (+3 cm), unless the bowl is above the middle half of the pan.
+failure_358e3d99 (bowl tipped sideways over the pan edge) now fails; recover_305611be is lost.
+01480: recall 1.000 -> 0.980, specificity 0.972 -> 1.000. State-only tasks: recall 0.988, specificity 0.994.
