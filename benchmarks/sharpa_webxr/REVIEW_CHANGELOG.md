@@ -398,3 +398,20 @@ Reviewer: turn on the "pour toward the target" check for 01480 (`toward_target_m
 must be nearer the pan centre than the bowl's body (+3 cm), unless the bowl is above the middle half of the pan.
 failure_358e3d99 (bowl tipped sideways over the pan edge) now fails; recover_305611be is lost.
 01480: recall 1.000 -> 0.980, specificity 0.972 -> 1.000. State-only tasks: recall 0.988, specificity 0.994.
+
+## Scissors hold time, shakes ending in the hand, readable explanations (2026-10-18)
+
+- 01337 success_ce440a8c "it is held enough long": a proper scissors grip now needs 0.5 s lifted (was 0.8 s); the
+  episode holds it 0.50 s. Nothing lost. success_4f76159a "why it detects held 0 second": the index finger is in a ring
+  for only 0.7 s, never while lifted, so the strict thumb-and-index grip is held lifted 0 s. The explanation now lists
+  touching / on the handle / proper grip (with thumb and index times) / all together, and names the rule in force
+  (it still described the old "thumb in one, or fingers in two" rule).
+- 00779 / 01605 "the final bottle is in the hand": a shake ends either in the hand (touching for the whole last 0.5 s,
+  at any height: new `held_end_s` and `held_end_lift_m: -0.05`) or standing upright on the table. Fixes
+  recover_186a553e (flask held tilted, resting on the table). A single touch on the last frame is not "in hand"
+  (failure_07c04993 lies on its side with one fingertip on it). success_b4391e4e stays a failure: the hand lost contact
+  0.7 s before the end and the flask tips to 48-55 deg against the open palm.
+- Pour explanation rewritten as named parts with times: tilted, low rim over the opening, tipped toward the target
+  (01480), in hand, all together for hold_s. 01480 recover_305611be: every part holds, but together only for 0.10 s
+  in a row (needs 0.2 s).
+State-only tasks: recall 0.997, specificity 0.994 (with the reviewer's latest decisions). Policy hybrid SR unchanged.

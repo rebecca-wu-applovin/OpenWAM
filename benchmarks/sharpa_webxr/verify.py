@@ -478,7 +478,10 @@ def _not_dropped(r: Replay, o: str, s, c: Conds) -> dict:
     Heights use the object's lowest point, so a standing object tipping over is not a 'fall'. Adds conditions to c."""
     zb, zo, Cf = r.lift_bottom(o), r.lift(o), fill_gaps(r.hand_contact(o))
     vz = np.minimum(np.concatenate([[0.0], np.diff(r.obj[o]["pos"][:, 2]) / DT]) * -1, np.concatenate([[0.0], np.diff(r.bottom_z(o)) / DT]) * -1)
-    held_end = bool(Cf[-1] and zb[-1] >= s.get("held_end_lift_m", 0.02))
+    # still in hand at the end: in contact over the last held_end_s (default: the last frame) with the lowest point
+    # >= held_end_lift_m up (a negative value: in the hand at any height, e.g. a flask held while resting on the table)
+    k = max(1, int(round(s.get("held_end_s", 0.0) / DT)))
+    held_end = bool(Cf[-k:].all() and zb[-1] >= s.get("held_end_lift_m", 0.02))
     drop, dl, ds = False, s.get("drop_lift_m", 0.08), s.get("drop_speed_m_s", 0.5)
     rel_txt, info = "never released from a lifted state", {}
     v2 = s.get("drop_rule") == "hand_motion"
@@ -526,15 +529,18 @@ def c_hold_lifted(r: Replay, s):
     at the object's lowest point, so tipping one end up does not count as lifting."""
     o = s["obj"]
     lift_m, hold_s = s.get("lift_m", DEFAULTS["lift_m"]), s.get("hold_s", DEFAULTS["hold_s"])
-    C = r.hand_contact_in(o, s["grasp_box"]) if s.get("grasp_box") else r.hand_contact(o)
+    touch = r.hand_contact(o)
+    C = r.hand_contact_in(o, s["grasp_box"]) if s.get("grasp_box") else touch
+    on_handle = C.copy()
     grip_txt = None
-    if s.get("finger_holes"):  # proper grip = fingers through the holes (scissors rings): thumb in one, or fingers in two
+    if s.get("finger_holes"):  # proper grip = fingers through the holes (scissors rings)
         fh = r.fingers_in_holes(o, s["finger_holes"])
         thumb = fh[:, :, 0, :].any(axis=(1, 2))
         two = (fh.any(axis=(1, 2)).sum(axis=1) >= 2)
         rule = s["finger_holes"].get("rule", "thumb_or_two")
         if rule == "thumb_or_two":
             G = thumb | two
+            rule_txt = "thumb through one hole, or fingers through two"
         else:  # same hand: thumb in one hole and the index (or any other finger) in another
             oth = (fh[:, :, 1:2, :] if rule == "thumb_and_index" else fh[:, :, 1:, :]).any(axis=2)  # (n, 2, k)
             t = fh[:, :, 0, :]
@@ -543,21 +549,24 @@ def c_hold_lifted(r: Replay, s):
                 for b in range(t.shape[2]):
                     if a != b:
                         G |= (t[:, :, a] & oth[:, :, b]).any(axis=1)
-        n_any = int((C & fh.any(axis=(1, 2, 3))).sum())
-        grip_txt = (f"fingers through the holes: thumb in one, or fingers in two (while touching: thumb {(C & thumb).sum() * DT:.1f} s, "
-                    f"two holes {(C & two).sum() * DT:.1f} s, any finger in a hole {n_any * DT:.1f} s, touching {C.sum() * DT:.1f} s)")
+            rule_txt = f"thumb through one hole and the {'index finger' if rule == 'thumb_and_index' else 'another finger'} of the same hand through the other"
+        idx = fh[:, :, 1, :].any(axis=(1, 2))
+        grip_txt = (f"proper grip: {rule_txt} (while touching: grip {(touch & G).sum() * DT:.1f} s; thumb in a hole "
+                    f"{(touch & thumb).sum() * DT:.1f} s, index in a hole {(touch & idx).sum() * DT:.1f} s)")
         C = C & G
     z = r.lift(o) if s.get("lift_from") == "origin" else r.lift_bottom(o)
     Cf = fill_gaps(C)
     up = Cf & (z >= lift_m)
     max_hold = float(run_length(up).max() * DT)
     c = Conds()
+    parts = [f"touching {touch.sum() * DT:.1f} s"]
     if s.get("grasp_box"):
-        c.add(f"hand on the handle: a contact point inside the handle box {s['grasp_box']} in the object frame"
-              f"{' and ' + grip_txt if grip_txt else ''} (gaps <= 0.15 s bridged; "
-              f"{C.sum() * DT:.1f} s on the handle, {r.hand_contact(o).sum() * DT:.1f} s touching anywhere; final {bool(Cf[-1])})", Cf)
-    elif grip_txt:
-        c.add(f"held properly: hand contact and {grip_txt} (gaps <= 0.15 s bridged; final {bool(Cf[-1])})", Cf)
+        parts.append(f"on the handle (a contact point inside {s['grasp_box']} in the object frame) {on_handle.sum() * DT:.1f} s")
+    if grip_txt:
+        parts.append(grip_txt)
+    if s.get("grasp_box") or grip_txt:
+        parts.append(f"all of these together {C.sum() * DT:.1f} s")
+        c.add(f"held properly: {'; '.join(parts)} (gaps <= 0.15 s bridged; final {bool(Cf[-1])})", Cf)
     else:
         c.add(f"hand contact (gaps <= 0.15 s bridged; final {bool(Cf[-1])})", Cf)
     c.add(f"lowest point lifted >= {lift_m} m (max {z.max():.3f} m, final {z[-1]:.3f} m)", z >= lift_m)
@@ -566,7 +575,7 @@ def c_hold_lifted(r: Replay, s):
         hold_ok = hold_ok | (held(up, s["end_hold_s"]) & (np.arange(r.n) == r.n - 1))
         c.add(f"held lifted for {hold_s} s continuously, or {s['end_hold_s']} s when still held lifted on the last frame (longest {max_hold:.2f} s)", hold_ok)
     else:
-        c.add(f"held lifted for {hold_s} s continuously (longest {max_hold:.2f} s)", hold_ok)
+        c.add(f"held{' properly' if (s.get('grasp_box') or grip_txt) else ''} and lifted for {hold_s} s continuously (longest {max_hold:.2f} s)", hold_ok)
     last_c = int(np.flatnonzero(C)[-1]) if C.any() else -1
     drop_info = _not_dropped(r, o, s, c) if s.get("end_rule") == "not_dropped" else {}
     ok = c.all(r.n)
@@ -1015,20 +1024,29 @@ def c_pour(r: Replay, s):
         c.add(f"leaned toward the spout (lean direction within {tol} deg of the spout direction; best {best:.0f} deg while tilted)", toward)
         tilted = tilted & toward
     over = (lip_dxy <= rad + slack) & (lip_dz >= dz_lo) & (lip_dz <= dz_hi)
+    over_only = over.copy()
     tt = s.get("toward_target_m")
+    toward_t = np.ones(r.n, bool)
     if tt is not None and not s.get("spout"):  # poured toward the target: the low lip is nearer the opening's centre than the body
         odxy0 = np.linalg.norm(r.obj[o]["pos"][:, :2] - oc[:, :2], axis=1)
-        over &= (lip_dxy <= odxy0 + tt) | (odxy0 <= rad / 2)  # (directly above the middle of the opening, any side pours in)
+        toward_t = (lip_dxy <= odxy0 + tt) | (odxy0 <= rad / 2)  # (directly above the middle of the opening, any side pours in)
+        over &= toward_t
     hand = r.hand_contact(o)
     pouring = fill_gaps(tilted & over & hand, 3)
     poured_by = np.maximum.accumulate(held(pouring, hold_s))
     off = (lip_dxy[tilted].min() - rad) if tilted.any() else float("nan")
     if s.get("spout"):  # the lean condition is folded into "poured"; it must not also be required at the graded frame
         lean_txt = c.popitem()[0]
-    c.add(f"poured at some time: {o} tilted >= {min_tilt} deg{' toward its spout' if s.get('spout') else ''} with its {'spout tip' if s.get('spout') else 'lip'} inside the {tgt} opening (radius {rad:.2f} m + {slack} m), "
-          f"{dz_lo} to {dz_hi} m above it, while in hand, for {hold_s} s (max tilt {tilt.max():.0f} deg; lip {off:+.3f} m from the "
-          f"opening rim at best while tilted; over the opening while tilted {(tilted & over).sum() * DT:.1f} s, in hand "
-          f"{(tilted & over & hand).sum() * DT:.1f} s, longest run {run_length(pouring).max() * DT:.2f} s)", poured_by)
+    tw = " toward its spout" if s.get("spout") else ""
+    req = [f"tilted >= {min_tilt} deg{tw} (max {tilt.max():.0f} deg; {tilted.sum() * DT:.1f} s)",
+           f"{'spout tip' if s.get('spout') else 'low rim'} over the {tgt} opening: within its radius {rad:.2f} m + {slack} m, "
+           f"{dz_lo} to {dz_hi} m above it (closest while tilted: {abs(off):.3f} m {'inside' if off <= 0 else 'outside'} the rim; "
+           f"{(tilted & over_only).sum() * DT:.1f} s while tilted)"]
+    if tt is not None and not s.get("spout"):
+        req.append(f"tipped toward the {tgt}: the low rim nearer its centre than the {o} body (+{tt} m) "
+                   f"({(tilted & over_only & toward_t).sum() * DT:.1f} s while tilted and over it)")
+    req.append(f"in hand ({(tilted & over & hand).sum() * DT:.1f} s with all of the above)")
+    c.add(f"poured at some time, all together for {hold_s} s (longest {run_length(pouring).max() * DT:.2f} s): " + "; ".join(req), poured_by)
     free = ~hand
     end_up = s.get("end_upright_deg", 20)
     if r.table_z is not None:

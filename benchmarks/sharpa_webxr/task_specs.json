@@ -1256,7 +1256,7 @@
     "check": "hold_lifted",
     "obj": "world_scissors",
     "lift_m": 0.05,
-    "hold_s": 0.8,
+    "hold_s": 0.5,
     "end_rule": "not_dropped",
     "end_hold_s": 0.4,
     "drop_rule": "hand_motion",
@@ -1522,6 +1522,8 @@
     "end_rule": "not_dropped",
     "allow_drop": true,
     "max_free_speed_m_s": 1.0,
+    "held_end_s": 0.5,
+    "held_end_lift_m": -0.05,
     "end_upright_deg": 30,
     "final": true
    }
@@ -1591,6 +1593,8 @@
     "end_rule": "not_dropped",
     "allow_drop": true,
     "max_free_speed_m_s": 1.0,
+    "held_end_s": 0.5,
+    "held_end_lift_m": -0.05,
     "end_upright_deg": 30,
     "final": true
    }

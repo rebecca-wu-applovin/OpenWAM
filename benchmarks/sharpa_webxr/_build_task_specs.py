@@ -117,7 +117,7 @@ S = {
     # scissors held properly = thumb through one ring, or fingers through both (reviewer: "wrong pose to hold" = rings
     # pinched from outside by middle/ring fingers). Ring holes read off the mesh: centres y +-4.4 cm, z -7.9 cm, holes
     # ~3.5 x 6.5 cm; ellipsoid radii 2.5 / 2.0 / 3.4 cm (same labels from 2.2 to 3.0 cm)
-    "01337": ["world_scissors", None, [reach("world_scissors"), pick("world_scissors", final=True, grasp_box=[[-0.025, -0.08, -0.135], [0.025, 0.08, -0.02]], drop_height_m=0.06,
+    "01337": ["world_scissors", None, [reach("world_scissors"), pick("world_scissors", final=True, hold=0.5, grasp_box=[[-0.025, -0.08, -0.135], [0.025, 0.08, -0.02]], drop_height_m=0.06,
                                                                        finger_holes={"centers": [[0, -0.044, -0.079], [0, 0.044, -0.079]], "radii": [0.025, 0.020, 0.034], "rule": "thumb_and_index"})]],
     # ---- reorient / flip / rotate -------------------------------------------------------------------------
     # flips / rotations: "not flung" (max_free_speed_m_s) = after the last release the object never moves faster than that;
@@ -129,9 +129,11 @@ S = {
     "01542": ["world_teacup", None, [{"name": "handle_faces_robot", "check": "orientation", "obj": "world_teacup", "mode": "face", "axis": [1, 0, 0], "toward": [1, 0], "tol_deg": 25, "keep_upright_deg": 30, "max_free_speed_m_s": 1.2, "final": True}]],
     "01564": ["world_tablet", None, [reach("world_tablet"), {"name": "portrait", "check": "orientation", "obj": "world_tablet", "mode": "axis_away", "axis": [0, 0, 1], "ref": [0, 1, 0], "min_deg": 55, "max_free_speed_m_s": 1.2, "final": True, "release": False, "rest": True}]],  # long axis (local z, 30 cm) starts left-right (base y); portrait = long axis >= 55 deg away from that, flat or held upright; a half turn stays landscape
     # ---- shake / toss -------------------------------------------------------------------------------------
-    "00779": ["world_flask_02", None, [reach("world_flask_02"), grasp("world_flask_02"), {"name": "shaken", "check": "oscillation", "obj": "world_flask_02", "min_reversals": 3, "min_amp_m": 0.02, "end_rule": "not_dropped", "allow_drop": True, "max_free_speed_m_s": 1.0, "end_upright_deg": 30, "final": True}]],
+    # shakes end either in the hand (touching for the last 0.5 s, at any height: reviewer "the final bottle is in the hand")
+    # or standing upright on the table
+    "00779": ["world_flask_02", None, [reach("world_flask_02"), grasp("world_flask_02"), {"name": "shaken", "check": "oscillation", "obj": "world_flask_02", "min_reversals": 3, "min_amp_m": 0.02, "end_rule": "not_dropped", "allow_drop": True, "max_free_speed_m_s": 1.0, "held_end_s": 0.5, "held_end_lift_m": -0.05, "end_upright_deg": 30, "final": True}]],
     "01592": ["world_dice", None, [reach("world_dice"), grasp("world_dice", lift_m=0.02), {"name": "shaken", "check": "oscillation", "obj": "world_dice", "min_reversals": 3, "min_amp_m": 0.02, "end_rule": "not_dropped", "drop_rule": "hand_motion", "final": True}]],
-    "01605": ["world_nail_polish_bottle", None, [reach("world_nail_polish_bottle"), grasp("world_nail_polish_bottle"), {"name": "shaken", "check": "oscillation", "obj": "world_nail_polish_bottle", "min_reversals": 3, "min_amp_m": 0.02, "end_rule": "not_dropped", "allow_drop": True, "max_free_speed_m_s": 1.0, "end_upright_deg": 30, "final": True}]],
+    "01605": ["world_nail_polish_bottle", None, [reach("world_nail_polish_bottle"), grasp("world_nail_polish_bottle"), {"name": "shaken", "check": "oscillation", "obj": "world_nail_polish_bottle", "min_reversals": 3, "min_amp_m": 0.02, "end_rule": "not_dropped", "allow_drop": True, "max_free_speed_m_s": 1.0, "held_end_s": 0.5, "held_end_lift_m": -0.05, "end_upright_deg": 30, "final": True}]],
     "01652": ["world_coin", None, [reach("world_coin"), grasp("world_coin", lift_m=0.02), {"name": "tossed_caught", "check": "free_flight", "obj": "world_coin", "min_rise_m": 0.04, "min_rel_rise_m": 0.02, "catch_dist_m": 0.22, "end_rule": "in_hand", "final": True}]],
     # ---- pour (sim: grasp, carry over, tilt; judge: the pour itself) ----------------------------------------
     "00175": ["world_kettle", "world_mug_025", [reach("world_kettle"), grasp("world_kettle"), pour("world_kettle", "world_mug_025", spout=[-0.116, 0.0, 0.14], spout_dir=[-1.0, 0.0], spout_tol_deg=60, rim_slack_m=0.01, hold_s=0.1)]],
