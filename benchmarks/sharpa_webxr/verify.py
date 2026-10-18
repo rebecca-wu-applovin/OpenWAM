@@ -451,6 +451,24 @@ def _drop_rule_text(s) -> str:
     return f"a release from >= {s.get('drop_min_height_m', 0.02)} m {ref} is a drop when " + ", or ".join(parts)
 
 
+def _not_flung(r: Replay, o: str, s, c: Conds) -> dict:
+    """Not flung / flew away: after the hand lets go for the last time, the object never moves faster than
+    max_free_speed_m_s (a put-down or a short slip stays slow; a throw, a toss or an object that falls far is fast).
+    Only the last release counts, like the drop rule: an object that got away and was picked up again is a recover.
+    Adds the condition when the stage sets max_free_speed_m_s."""
+    lim = s.get("max_free_speed_m_s")
+    if not lim:
+        return {}
+    Cf = fill_gaps(r.hand_contact(o))
+    free = np.zeros(r.n, bool)
+    if Cf.any():
+        free[int(np.flatnonzero(Cf)[-1]) + 1:] = True
+    vf = np.where(free & np.roll(free, 1), r.speed(o), 0.0)
+    peak = np.maximum.accumulate(vf)
+    c.add(f"not flung: never faster than {lim} m/s while out of the hand (fastest so far {peak[-1]:.2f} m/s)", peak <= lim)
+    return {"max_free_speed_m_s": float(peak[-1])}
+
+
 def _not_dropped(r: Replay, o: str, s, c: Conds) -> dict:
     """End-state rule shared by pick, shake and rotate tasks: the object is still in hand at the end (contact and its
     lowest point >= held_end_lift_m up), or it was set back steadily. With drop_rule == "hand_motion" a drop is read
@@ -489,6 +507,7 @@ def _not_dropped(r: Replay, o: str, s, c: Conds) -> dict:
         if s.get("end_upright_deg"):  # a bottle set down must be standing, not lying on its side
             upz = r.axis(o, [0, 0, 1])[:, 2]
             c.add(f"standing upright within {s['end_upright_deg']} deg at the end (final tilt {np.degrees(np.arccos(np.clip(upz[-1], -1, 1))):.0f} deg)", upz >= np.cos(np.deg2rad(s["end_upright_deg"])))
+    info.update(_not_flung(r, o, s, c))
     return info
 
 
@@ -821,6 +840,8 @@ def c_orientation(r: Replay, s):
         c.clear()
         c.add("goal orientation reached at some point (see metrics)", np.maximum.accumulate(goal))
         metric.update(_not_dropped(r, o, s, c))
+    else:
+        metric.update(_not_flung(r, o, s, c))
     hold_s = s.get("hold_s", DEFAULTS["hold_s"])
     pre = c.all(r.n)
     c.add(f"all of the above for {hold_s} s continuously (longest {run_length(pre).max() * DT:.2f} s)", held(pre, hold_s))
@@ -994,6 +1015,10 @@ def c_pour(r: Replay, s):
         c.add(f"leaned toward the spout (lean direction within {tol} deg of the spout direction; best {best:.0f} deg while tilted)", toward)
         tilted = tilted & toward
     over = (lip_dxy <= rad + slack) & (lip_dz >= dz_lo) & (lip_dz <= dz_hi)
+    tt = s.get("toward_target_m")
+    if tt is not None and not s.get("spout"):  # poured toward the target: the low lip is nearer the opening's centre than the body
+        odxy0 = np.linalg.norm(r.obj[o]["pos"][:, :2] - oc[:, :2], axis=1)
+        over &= (lip_dxy <= odxy0 + tt) | (odxy0 <= rad / 2)  # (directly above the middle of the opening, any side pours in)
     hand = r.hand_contact(o)
     pouring = fill_gaps(tilted & over & hand, 3)
     poured_by = np.maximum.accumulate(held(pouring, hold_s))
@@ -1019,6 +1044,11 @@ def c_pour(r: Replay, s):
     c.add(f"{tgt} not knocked over (tilt <= {s.get('target_tilt_deg', 30)} deg; now {t_tilt[-1]:.0f})", t_tilt <= s.get("target_tilt_deg", 30))
     t_disp = r.disp(tgt)
     c.add(f"{tgt} not pushed away (moved <= {s.get('target_disp_m', 0.5)} m; now {t_disp[-1]:.2f})", t_disp <= s.get("target_disp_m", 0.5))
+    hit_v = s.get("max_hit_speed_m_s")
+    if hit_v:  # pouring must not include a collision: the poured object touching the target while moving fast
+        hv = np.where(r.touching(o, tgt), r.speed(o), 0.0)
+        c.add(f"{o} never hit the {tgt} (touching it while moving > {hit_v} m/s; fastest touch so far "
+              f"{np.maximum.accumulate(hv)[-1]:.2f} m/s)", np.maximum.accumulate(hv) <= hit_v)
     drop_info = _not_dropped_simple(r, o, s, c)
     i_p = first_true(poured_by)[0]
     return c.all(r.n), {"max_tilt_deg": float(tilt.max()), "lip_rim_offset_m": float(off), "pour_s": float(pouring.sum() * DT),

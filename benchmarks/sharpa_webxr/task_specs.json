@@ -732,7 +732,7 @@
     "obj": "world_laptop_03",
     "min": 1.78,
     "hold_s": 0.5,
-    "max_approach_speed": 3.3,
+    "max_approach_speed": 4.8,
     "approach_band": [
      1.65,
      1.95
@@ -1319,7 +1319,7 @@
     "mode": "flip",
     "tol_deg": 35,
     "max_speed_m_s": 2.1,
-    "max_disp_m": 0.4,
+    "max_free_speed_m_s": 1.2,
     "max_lift_m": 0.4,
     "final": true,
     "release": false,
@@ -1350,7 +1350,7 @@
     "mode": "flip",
     "tol_deg": 35,
     "max_speed_m_s": 2.1,
-    "max_disp_m": 0.55,
+    "max_free_speed_m_s": 1.8,
     "max_lift_m": 0.4,
     "final": true,
     "release": false,
@@ -1381,7 +1381,7 @@
     "mode": "flip",
     "tol_deg": 45,
     "max_speed_m_s": 2.1,
-    "max_disp_m": 0.55,
+    "max_free_speed_m_s": 1.2,
     "max_lift_m": 0.4,
     "final": true,
     "release": false,
@@ -1416,6 +1416,7 @@
     "end_rule": "not_dropped",
     "drop_rule": "hand_motion",
     "drop_min_height_m": 0.03,
+    "max_free_speed_m_s": 1.2,
     "final": true
    }
   ],
@@ -1447,6 +1448,7 @@
     ],
     "tol_deg": 25,
     "keep_upright_deg": 30,
+    "max_free_speed_m_s": 1.2,
     "final": true
    }
   ],
@@ -1483,6 +1485,7 @@
      0
     ],
     "min_deg": 55,
+    "max_free_speed_m_s": 1.2,
     "final": true,
     "release": false,
     "rest": true
@@ -1515,9 +1518,10 @@
     "check": "oscillation",
     "obj": "world_flask_02",
     "min_reversals": 3,
-    "min_amp_m": 0.03,
+    "min_amp_m": 0.02,
     "end_rule": "not_dropped",
     "allow_drop": true,
+    "max_free_speed_m_s": 1.0,
     "end_upright_deg": 30,
     "final": true
    }
@@ -1583,9 +1587,10 @@
     "check": "oscillation",
     "obj": "world_nail_polish_bottle",
     "min_reversals": 3,
-    "min_amp_m": 0.03,
+    "min_amp_m": 0.02,
     "end_rule": "not_dropped",
     "allow_drop": true,
+    "max_free_speed_m_s": 1.0,
     "end_upright_deg": 30,
     "final": true
    }
@@ -1656,6 +1661,7 @@
     "rim_slack_m": 0.01,
     "hold_s": 0.1,
     "end_upright_deg": 20,
+    "max_hit_speed_m_s": 0.7,
     "final": true,
     "drop_rule": "hand_motion",
     "drop_height_ref": "end",
@@ -1707,6 +1713,7 @@
     "rim_slack_m": 0.02,
     "hold_s": 0.2,
     "end_upright_deg": 20,
+    "max_hit_speed_m_s": 0.7,
     "final": true,
     "drop_rule": "hand_motion",
     "drop_height_ref": "end",
@@ -1748,6 +1755,7 @@
     "rim_slack_m": 0.02,
     "hold_s": 0.2,
     "end_upright_deg": 20,
+    "max_hit_speed_m_s": 0.7,
     "final": true,
     "drop_rule": "hand_motion",
     "drop_height_ref": "end",
@@ -1789,6 +1797,7 @@
     "rim_slack_m": 0.02,
     "hold_s": 0.2,
     "end_upright_deg": 20,
+    "max_hit_speed_m_s": 0.7,
     "final": true,
     "drop_rule": "hand_motion",
     "drop_height_ref": "end",
@@ -1830,6 +1839,7 @@
     "rim_slack_m": 0.01,
     "hold_s": 0.1,
     "end_upright_deg": 20,
+    "max_hit_speed_m_s": 0.7,
     "final": true,
     "drop_rule": "hand_motion",
     "drop_height_ref": "end",

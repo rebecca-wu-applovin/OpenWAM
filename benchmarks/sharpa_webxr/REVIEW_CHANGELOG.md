@@ -360,3 +360,34 @@ Changes on the labels: 00646 as before (recall 1.000); 00051 loses success_03ac6
 0.00 m in the rotated box) and catches one more failure; 00787 loses success_ccf05e19 (spatula path in the pan
 0.12 m, needs 0.15) and catches two more failures. State-only tasks: recall 0.986, specificity 0.981.
 Policy hybrid SR unchanged (xwam 25.4%, motus 22.6%, gwp 20.4%, cosmos3 4.7%).
+
+## Review round 2026-10-18: drops at the end, flung objects, pour collisions (2026-10-18)
+
+New rules (`verify.py`):
+- **Not flung** (`_not_flung`, stage key `max_free_speed_m_s`): after the hand lets go for the last time, the object
+  never moves faster than the limit. A put-down or a short slip stays slow; a throw, a toss, a box that flies off or a
+  tablet that falls flat is fast. Only the last release counts (an object that got away and was picked up again is a
+  recover). Labelled positives stay below ~1.1 m/s; the commented failures reach 1.5-2.4 m/s. Limits: 1.2 m/s for
+  rotate / flip tasks (01032, 01246, 01541, 01542, 01564), 1.8 m/s for the game board flip (01041, positives toss it
+  up to 1.8), 1.0 m/s for the shakes (00779, 01605).
+- **Pour without collision** (`c_pour`, `max_hit_speed_m_s`, default 0.7 m/s in `pour()`): the poured object must
+  not touch the target while moving faster than 0.7 m/s. Labelled successes touch at <= 0.45 m/s; 01498
+  failure_c137b850 hits the teapot at 0.84 m/s. No labelled pour success lost on any of the five pour tasks.
+- Flip tasks (01032, 01041, 01246) no longer limit how far the object travels from its start (reviewer: "this should
+  not be the condition of upturn"); "not flung" replaces it.
+- Optional `toward_target_m` on pours without a spout (pour toward the target: the low lip nearer the opening centre
+  than the body). Not enabled: on 01480 it catches failure_358e3d99 only in a 1 cm window of the margin and loses
+  recover_305611be there.
+
+Spec changes: 00082 laptop closing speed limit 3.3 -> 4.8 rad/s (reviewer: "speed is not that bad"; costs
+failure_7e48c8c2, which closes at 3.6 rad/s and fails for a reason the state does not show); shakes 00779 / 01605
+count 2 cm shake strokes (was 3 cm).
+
+Per task (recall / spec): 00082 0.983/1.000 -> 1.000/0.955; 01032 0.975/1.0 -> 1.0/1.0; 01246 1.0/0.8 -> 1.0/1.0;
+01541 spec 0.5 -> 1.0; 01564 spec 0.875 -> 0.958; 01605 0.980/0.917 -> 1.0/1.0; 00779 recall 0.92 -> 0.96;
+01498 spec 0.8 -> 1.0. State-only tasks: recall 0.988, specificity 0.990. Policy hybrid SR unchanged.
+
+Not fixed: 01564 failure_be78a36c (released 4 cm up, slides 4 cm at 0.8 m/s: not distinguishable from a put-down);
+00175 recover_3db6087a (spout tip never within 1 cm of the mug rim while tilted toward the spout: best 3.6 cm out);
+00779 recover_186a553e (flask ends lying at 62 deg) and success_b4391e4e; 01480 success_d4aaa0fe has no pan in the
+sim (pan 266 m away: scene glitch, excluded as "both wrong").

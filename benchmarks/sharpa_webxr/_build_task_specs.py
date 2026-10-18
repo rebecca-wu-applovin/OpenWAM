@@ -49,9 +49,10 @@ def place(o, t, **kw):
 
 
 def pour(o, t, **kw):
-    # judged from state only (no liquid in the sim): lip over the opening while tilted and in hand, then set down upright
+    # judged from state only (no liquid in the sim): lip over the opening while tilted and in hand, then set down upright;
+    # pouring must not include a collision (the poured object touching the target while moving > 0.7 m/s)
     return {"name": "poured", "check": "pour", "obj": o, "target": t, "min_tilt_deg": 30, "rim_slack_m": 0.02, "hold_s": 0.2,
-            "end_upright_deg": 20, "final": True, **DROP_END_GRADED, **kw}
+            "end_upright_deg": 20, "max_hit_speed_m_s": 0.7, "final": True, **DROP_END_GRADED, **kw}
 
 
 def judge(what):
@@ -87,7 +88,7 @@ S = {
     # lid (child body, hinged on the base's local x) within ~10 deg of closed (q >= 1.78; closed is q~2.0), arriving
     # gently: hinge speed over the last ~20 deg before contact (q in [1.65, 1.95]) <= 3.3 rad/s (labelled successes
     # <= 3.0, slams >= 3.6), and the keyboard (root body) still flat on the table: upright, lifted <= 3 cm
-    "00082": ["world_laptop_03", None, [reach("world_laptop_03"), {"name": "closed", "check": "joint_goal", "obj": "world_laptop_03", "min": 1.78, "hold_s": 0.5, "max_approach_speed": 3.3, "approach_band": [1.65, 1.95], "keep_upright_deg": 25, "max_lift_m": 0.03, "final": True}]],
+    "00082": ["world_laptop_03", None, [reach("world_laptop_03"), {"name": "closed", "check": "joint_goal", "obj": "world_laptop_03", "min": 1.78, "hold_s": 0.5, "max_approach_speed": 4.8, "approach_band": [1.65, 1.95], "keep_upright_deg": 25, "max_lift_m": 0.03, "final": True}]],
     "00337": ["world_laptop_03", None, [reach("world_laptop_03"), {"name": "opened", "check": "joint_goal", "obj": "world_laptop_03", "max": 1.25, "hold_s": 1.0, "final": True}]],
     "00626": ["world_rec_desk_with_drawer_0005", None, [reach("world_rec_desk_with_drawer_0005"), {"name": "pulled_out", "check": "joint_goal", "obj": "world_rec_desk_with_drawer_0005", "min": 0.08, "hold_s": 0.5, "final": True}]],
     "01000": ["world_burger_box", None, [reach("world_burger_box"), {"name": "opened", "check": "joint_goal", "obj": "world_burger_box", "delta": -0.9, "hold_s": 0.5, "final": True}]],
@@ -119,16 +120,18 @@ S = {
     "01337": ["world_scissors", None, [reach("world_scissors"), pick("world_scissors", final=True, grasp_box=[[-0.025, -0.08, -0.135], [0.025, 0.08, -0.02]], drop_height_m=0.06,
                                                                        finger_holes={"centers": [[0, -0.044, -0.079], [0, 0.044, -0.079]], "radii": [0.025, 0.020, 0.034], "rule": "thumb_and_index"})]],
     # ---- reorient / flip / rotate -------------------------------------------------------------------------
-    "01032": ["world_box", None, [reach("world_box"), {"name": "upturned", "check": "orientation", "obj": "world_box", "mode": "flip", "tol_deg": 35, "max_speed_m_s": 2.1, "max_disp_m": 0.40, "max_lift_m": 0.40, "final": True, "release": False, "rest": False}]],
-    "01041": ["world_game_board", None, [reach("world_game_board"), {"name": "flipped", "check": "orientation", "obj": "world_game_board", "mode": "flip", "tol_deg": 35, "max_speed_m_s": 2.1, "max_disp_m": 0.55, "max_lift_m": 0.40, "final": True, "release": False, "rest": False}]],
-    "01246": ["world_bowl", None, [reach("world_bowl"), {"name": "upturned", "check": "orientation", "obj": "world_bowl", "mode": "flip", "tol_deg": 45, "max_speed_m_s": 2.1, "max_disp_m": 0.55, "max_lift_m": 0.40, "final": True, "release": False, "rest": False}]],
-    "01541": ["world_box", None, [reach("world_box"), {"name": "rotated_side", "check": "orientation", "obj": "world_box", "mode": "rotate", "min_deg": 60, "max_speed_m_s": 2.1, "max_disp_m": 0.55, "end_rule": "not_dropped", "drop_rule": "hand_motion", "drop_min_height_m": 0.03, "final": True}]],  # graded at the end; a box thrown across the table fails
-    "01542": ["world_teacup", None, [{"name": "handle_faces_robot", "check": "orientation", "obj": "world_teacup", "mode": "face", "axis": [1, 0, 0], "toward": [1, 0], "tol_deg": 25, "keep_upright_deg": 30, "final": True}]],
-    "01564": ["world_tablet", None, [reach("world_tablet"), {"name": "portrait", "check": "orientation", "obj": "world_tablet", "mode": "axis_away", "axis": [0, 0, 1], "ref": [0, 1, 0], "min_deg": 55, "final": True, "release": False, "rest": True}]],  # long axis (local z, 30 cm) starts left-right (base y); portrait = long axis >= 55 deg away from that, flat or held upright; a half turn stays landscape
+    # flips / rotations: "not flung" (max_free_speed_m_s) = after the last release the object never moves faster than that;
+    # it replaces the old "never moved > 0.4 m from the start" limit (reviewer: travel is not a condition of upturning)
+    "01032": ["world_box", None, [reach("world_box"), {"name": "upturned", "check": "orientation", "obj": "world_box", "mode": "flip", "tol_deg": 35, "max_speed_m_s": 2.1, "max_free_speed_m_s": 1.2, "max_lift_m": 0.40, "final": True, "release": False, "rest": False}]],
+    "01041": ["world_game_board", None, [reach("world_game_board"), {"name": "flipped", "check": "orientation", "obj": "world_game_board", "mode": "flip", "tol_deg": 35, "max_speed_m_s": 2.1, "max_free_speed_m_s": 1.8, "max_lift_m": 0.40, "final": True, "release": False, "rest": False}]],
+    "01246": ["world_bowl", None, [reach("world_bowl"), {"name": "upturned", "check": "orientation", "obj": "world_bowl", "mode": "flip", "tol_deg": 45, "max_speed_m_s": 2.1, "max_free_speed_m_s": 1.2, "max_lift_m": 0.40, "final": True, "release": False, "rest": False}]],
+    "01541": ["world_box", None, [reach("world_box"), {"name": "rotated_side", "check": "orientation", "obj": "world_box", "mode": "rotate", "min_deg": 60, "max_speed_m_s": 2.1, "max_disp_m": 0.55, "end_rule": "not_dropped", "drop_rule": "hand_motion", "drop_min_height_m": 0.03, "max_free_speed_m_s": 1.2, "final": True}]],  # graded at the end; a box thrown across the table fails
+    "01542": ["world_teacup", None, [{"name": "handle_faces_robot", "check": "orientation", "obj": "world_teacup", "mode": "face", "axis": [1, 0, 0], "toward": [1, 0], "tol_deg": 25, "keep_upright_deg": 30, "max_free_speed_m_s": 1.2, "final": True}]],
+    "01564": ["world_tablet", None, [reach("world_tablet"), {"name": "portrait", "check": "orientation", "obj": "world_tablet", "mode": "axis_away", "axis": [0, 0, 1], "ref": [0, 1, 0], "min_deg": 55, "max_free_speed_m_s": 1.2, "final": True, "release": False, "rest": True}]],  # long axis (local z, 30 cm) starts left-right (base y); portrait = long axis >= 55 deg away from that, flat or held upright; a half turn stays landscape
     # ---- shake / toss -------------------------------------------------------------------------------------
-    "00779": ["world_flask_02", None, [reach("world_flask_02"), grasp("world_flask_02"), {"name": "shaken", "check": "oscillation", "obj": "world_flask_02", "min_reversals": 3, "min_amp_m": 0.03, "end_rule": "not_dropped", "allow_drop": True, "end_upright_deg": 30, "final": True}]],
+    "00779": ["world_flask_02", None, [reach("world_flask_02"), grasp("world_flask_02"), {"name": "shaken", "check": "oscillation", "obj": "world_flask_02", "min_reversals": 3, "min_amp_m": 0.02, "end_rule": "not_dropped", "allow_drop": True, "max_free_speed_m_s": 1.0, "end_upright_deg": 30, "final": True}]],
     "01592": ["world_dice", None, [reach("world_dice"), grasp("world_dice", lift_m=0.02), {"name": "shaken", "check": "oscillation", "obj": "world_dice", "min_reversals": 3, "min_amp_m": 0.02, "end_rule": "not_dropped", "drop_rule": "hand_motion", "final": True}]],
-    "01605": ["world_nail_polish_bottle", None, [reach("world_nail_polish_bottle"), grasp("world_nail_polish_bottle"), {"name": "shaken", "check": "oscillation", "obj": "world_nail_polish_bottle", "min_reversals": 3, "min_amp_m": 0.03, "end_rule": "not_dropped", "allow_drop": True, "end_upright_deg": 30, "final": True}]],
+    "01605": ["world_nail_polish_bottle", None, [reach("world_nail_polish_bottle"), grasp("world_nail_polish_bottle"), {"name": "shaken", "check": "oscillation", "obj": "world_nail_polish_bottle", "min_reversals": 3, "min_amp_m": 0.02, "end_rule": "not_dropped", "allow_drop": True, "max_free_speed_m_s": 1.0, "end_upright_deg": 30, "final": True}]],
     "01652": ["world_coin", None, [reach("world_coin"), grasp("world_coin", lift_m=0.02), {"name": "tossed_caught", "check": "free_flight", "obj": "world_coin", "min_rise_m": 0.04, "min_rel_rise_m": 0.02, "catch_dist_m": 0.22, "end_rule": "in_hand", "final": True}]],
     # ---- pour (sim: grasp, carry over, tilt; judge: the pour itself) ----------------------------------------
     "00175": ["world_kettle", "world_mug_025", [reach("world_kettle"), grasp("world_kettle"), pour("world_kettle", "world_mug_025", spout=[-0.116, 0.0, 0.14], spout_dir=[-1.0, 0.0], spout_tol_deg=60, rim_slack_m=0.01, hold_s=0.1)]],
