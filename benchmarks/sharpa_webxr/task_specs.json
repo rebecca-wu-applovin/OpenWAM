@@ -1486,6 +1486,7 @@
     ],
     "min_deg": 55,
     "max_free_speed_m_s": 1.2,
+    "max_free_rot_deg": 40,
     "final": true,
     "release": false,
     "rest": true

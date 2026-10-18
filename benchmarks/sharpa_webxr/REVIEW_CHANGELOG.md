@@ -443,3 +443,11 @@ now graded at the end and adds the "not flung" rule (1.2 m/s), matching the revi
 ("brush drops in the end"). Sweep stages can also take the drop rule now.
 00051 state prefix (judge decides after it): recall 0.98 -> 1.000; failure_2031b10e and failure_e88912cc (eraser
 flung away at 2.1 / 2.4 m/s) now fail before the judge. State-only tasks unchanged (0.998 / 0.994).
+
+## 01564 tablet: not toppled after release (2026-10-18)
+
+Reviewer on failure_be78a36c: "it rotates but it drops in the end". The tablet is stood up on its edge (8 cm), the hand
+lets go and it tips over flat on its own, slowly (0.34 m/s), so "not flung" missed it. New `max_free_rot_deg` clause
+in `_not_flung`: after the last release the object may turn at most this much on its own. 01564 uses 40 deg (labelled
+successes turn <= 37 deg after release, be78a36c 45 deg). Not used on flips, where letting the object turn over is the
+task. 01564 all 01564 disagreements now resolved: recall 1.000, specificity 1.000. State-only tasks: 0.998 / 0.995.

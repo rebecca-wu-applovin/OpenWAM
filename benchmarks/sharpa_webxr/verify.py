@@ -456,17 +456,29 @@ def _not_flung(r: Replay, o: str, s, c: Conds) -> dict:
     max_free_speed_m_s (a put-down or a short slip stays slow; a throw, a toss or an object that falls far is fast).
     Only the last release counts, like the drop rule: an object that got away and was picked up again is a recover.
     Adds the condition when the stage sets max_free_speed_m_s."""
-    lim = s.get("max_free_speed_m_s")
-    if not lim:
+    lim, rlim = s.get("max_free_speed_m_s"), s.get("max_free_rot_deg")
+    if not lim and not rlim:
         return {}
     Cf = fill_gaps(r.hand_contact(o))
     free = np.zeros(r.n, bool)
+    out = {}
     if Cf.any():
         free[int(np.flatnonzero(Cf)[-1]) + 1:] = True
-    vf = np.where(free & np.roll(free, 1), r.speed(o), 0.0)
-    peak = np.maximum.accumulate(vf)
-    c.add(f"not flung: never faster than {lim} m/s while out of the hand (fastest so far {peak[-1]:.2f} m/s)", peak <= lim)
-    return {"max_free_speed_m_s": float(peak[-1])}
+    if lim:
+        vf = np.where(free & np.roll(free, 1), r.speed(o), 0.0)
+        peak = np.maximum.accumulate(vf)
+        c.add(f"not flung: never faster than {lim} m/s while out of the hand (fastest so far {peak[-1]:.2f} m/s)", peak <= lim)
+        out["max_free_speed_m_s"] = float(peak[-1])
+    if rlim:  # not toppled: an object stood up and let go must not tip over on its own (a slow fall the speed misses)
+        ang = np.zeros(r.n)
+        if free.any():
+            i0 = int(np.flatnonzero(free)[0])
+            R0 = rot(r.obj[o]["quat"][i0 - 1])
+            ang[i0:] = [np.degrees(Rotation.from_matrix(rot(q) @ R0.T).magnitude()) for q in r.obj[o]["quat"][i0:]]
+        peak_r = np.maximum.accumulate(ang)
+        c.add(f"not toppled: turned <= {rlim} deg on its own after the hand let go (so far {peak_r[-1]:.0f} deg)", peak_r <= rlim)
+        out["max_free_rot_deg"] = float(peak_r[-1])
+    return out
 
 
 def _not_dropped(r: Replay, o: str, s, c: Conds) -> dict:
