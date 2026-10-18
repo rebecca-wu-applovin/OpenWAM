@@ -1993,7 +1993,9 @@
     ],
     "xy_slack_m": 0.03,
     "z_above_m": 0.1,
-    "min_path_m": 0.15
+    "min_path_m": 0.12,
+    "max_free_speed_m_s": 1.0,
+    "final": true
    },
    {
     "name": "complete",

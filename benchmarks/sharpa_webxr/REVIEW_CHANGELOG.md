@@ -451,3 +451,13 @@ lets go and it tips over flat on its own, slowly (0.34 m/s), so "not flung" miss
 in `_not_flung`: after the last release the object may turn at most this much on its own. 01564 uses 40 deg (labelled
 successes turn <= 37 deg after release, be78a36c 45 deg). Not used on flips, where letting the object turn over is the
 task. 01564 all 01564 disagreements now resolved: recall 1.000, specificity 1.000. State-only tasks: 0.998 / 0.995.
+
+## 00787 scramble: path 12 cm, spatula not flung (2026-10-18)
+
+Reviewer on success_ccf05e19: "it is scrambled?". Its spatula path in the pan is 0.12 m; the stage asked 0.15 m. Now
+0.12 m (no labelled failure newly passes the state prefix), and the stage adds "not flung" at 1.0 m/s (labelled
+successes <= 0.87 m/s after release), which stops four labelled failures before the judge (4f5c7ea4, 5a0525fe,
+748fe4ce, c46dc186: spatula thrown down at 1.0-2.3 m/s). 00787 state prefix: recall 1.000, specificity 0.60 -> 0.71.
+Eight labelled failures still pass the prefix and go to the judge, which (cached verdicts) accepted all of them: the
+judge does not tell them apart either. The disagreement viewer does not list judge-task FPs (builder rule), so they
+were not shown for review.
