@@ -50,8 +50,9 @@ def place(o, t, **kw):
 
 def pour(o, t, **kw):
     # judged from state only (no liquid in the sim): lip over the opening while tilted and in hand, then set down upright;
-    # a pour of 0.1 s counts (reviewer, 01480 recover_305611be); pouring must not include a collision (the poured object touching the target while moving > 0.7 m/s)
-    return {"name": "poured", "check": "pour", "obj": o, "target": t, "min_tilt_deg": 30, "rim_slack_m": 0.02, "hold_s": 0.1,
+    # a pour of 0.1 s counts (reviewer, 01480 recover_305611be); the low rim must be inside the opening (no slack:
+    # a rim at the target's edge while the container slips out is not a pour, 01480 failure_617fef78); pouring must not include a collision (the poured object touching the target while moving > 0.7 m/s)
+    return {"name": "poured", "check": "pour", "obj": o, "target": t, "min_tilt_deg": 30, "rim_slack_m": 0.0, "hold_s": 0.1,
             "end_upright_deg": 20, "max_hit_speed_m_s": 0.7, "final": True, **DROP_END_GRADED, **kw}
 
 
@@ -141,7 +142,9 @@ S = {
     "00487": ["world_body_04", "world_bowl", [reach("world_body_04"), grasp("world_body_04"), pour("world_body_04", "world_bowl")]],
     # poured toward the pan: the low rim must be nearer the pan centre than the bowl's body (+3 cm), not a bowl tipped
     # sideways over the pan edge (reviewer, failure_358e3d99)
-    "01480": ["world_bowl", "world_pan", [reach("world_bowl"), grasp("world_bowl"), pour("world_bowl", "world_pan", toward_target_m=0.03)]],
+    # the pan's box includes the handle, so its centre is not the pan's: opening = pan body centre (x 0.07 m in the pan
+    # frame, where the rim is widest), radius 0.158 m, rim top z 0.034 m
+    "01480": ["world_bowl", "world_pan", [reach("world_bowl"), grasp("world_bowl"), pour("world_bowl", "world_pan", toward_target_m=0.03, opening=[0.07, 0.0, 0.034], opening_r=0.158)]],
     "01498": ["world_kettle", "world_teapot", [reach("world_kettle"), grasp("world_kettle"), pour("world_kettle", "world_teapot", spout=[-0.116, 0.0, 0.14], spout_dir=[-1.0, 0.0], spout_tol_deg=60, rim_slack_m=0.01, hold_s=0.1)]],
     # ---- tool use (sim: grasp tool, tool acts on target; judge: the effect) ---------------------------------
     "00051": ["world_eraser_07", "world_plate_05", [reach("world_eraser_07"), grasp("world_eraser_07", lift_m=0.01, carry_m=0.03), {"name": "brushed", "check": "sweep", "obj": "world_eraser_07", "target": "world_plate_05", "contact": True, "min_path_m": 0.05}, judge("plate brushed with the eraser")]],

@@ -1714,7 +1714,7 @@
     "obj": "world_beaker_01",
     "target": "world_flask_02",
     "min_tilt_deg": 30,
-    "rim_slack_m": 0.02,
+    "rim_slack_m": 0.0,
     "hold_s": 0.1,
     "end_upright_deg": 20,
     "max_hit_speed_m_s": 0.7,
@@ -1756,7 +1756,7 @@
     "obj": "world_body_04",
     "target": "world_bowl",
     "min_tilt_deg": 30,
-    "rim_slack_m": 0.02,
+    "rim_slack_m": 0.0,
     "hold_s": 0.1,
     "end_upright_deg": 20,
     "max_hit_speed_m_s": 0.7,
@@ -1798,7 +1798,7 @@
     "obj": "world_bowl",
     "target": "world_pan",
     "min_tilt_deg": 30,
-    "rim_slack_m": 0.02,
+    "rim_slack_m": 0.0,
     "hold_s": 0.1,
     "end_upright_deg": 20,
     "max_hit_speed_m_s": 0.7,
@@ -1809,7 +1809,13 @@
     "slip_fall_m_s": null,
     "tumble_deg": null,
     "end_tilt_deg": null,
-    "toward_target_m": 0.03
+    "toward_target_m": 0.03,
+    "opening": [
+     0.07,
+     0.0,
+     0.034
+    ],
+    "opening_r": 0.158
    }
   ],
   "needs_judge": false

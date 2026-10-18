@@ -422,3 +422,13 @@ Reviewer on 01480 recover_305611be: "0.1s is enough". `pour()` now needs the pou
 0.2 s; the kettle pours already used 0.1 s). 01480: recall 0.980 -> 1.000, specificity 1.000 -> 0.972: failure_617fef78
 now passes (it pours for 0.15 s; the operator also picked up the pan and moved it 0.25 m, within the 0.5 m
 "not pushed away" limit). 00475 / 00487 unchanged. State-only tasks: recall 0.998, specificity 0.992.
+
+## Pours: rim inside the opening, correct pan centre (2026-10-18)
+
+Reviewer on 01480 failure_617fef78: "how can this be judged success, it is not even poured". The bowl tips beside the
+pan while slipping out of the hand and falls next to it; for 0.15 s its low rim was 1 cm outside the pan rim, which the
+2 cm rim slack accepted. Two fixes:
+- `pour()` rim slack 2 cm -> 0: the low rim must be inside the opening (kettle pours keep their own 1 cm).
+- 01480 pan opening: the pan's box includes the handle, so its centre sat 7 cm toward the handle. The opening is now
+  the pan body (centre x 0.07 m in the pan frame, radius 0.158 m, rim top 0.034 m).
+01480: 1.000 / 1.000; 00475 and 00487 unchanged. State-only tasks: recall 0.998, specificity 0.994.
