@@ -132,17 +132,26 @@ class Replay:
         return W.min(0), W.max(0)
 
     def in_target(self, o: str, target: str, point=None, xy_margin=0.0, z_lo=None, z_hi=None, box=None,
-                  z_above=0.05) -> np.ndarray:
+                  z_above=0.05, oriented=False) -> np.ndarray:
         """Per frame: object point inside the target's world AABB footprint (shrunk by xy_margin; negative = grown)
-        with z in [bottom - 1 cm (or z_lo offset from bottom), top + z_above (or z_hi offset from top)]."""
+        with z in [bottom - 1 cm (or z_lo offset from bottom), top + z_above (or z_hi offset from top)].
+        oriented: the footprint is the target's own box (its two most horizontal local axes) instead of the world AABB,
+        which grows with the target's yaw (a case turned 45 deg covers the table beside it)."""
         pw = self.point(o, point)
         ok = np.zeros(self.n, bool)
+        blo, bhi = np.asarray(box, float) if box is not None else self.local_aabb[target]
         for i in range(self.n):
             lo, hi = self.target_box(target, i, box)
             zl = lo[2] + (-0.01 if z_lo is None else z_lo)
             zh = hi[2] + (z_above if z_hi is None else z_hi)
-            ok[i] = (lo[0] + xy_margin <= pw[i, 0] <= hi[0] - xy_margin and lo[1] + xy_margin <= pw[i, 1] <= hi[1] - xy_margin
-                     and zl <= pw[i, 2] <= zh)
+            if oriented:
+                Rm = rot(self.obj[target]["quat"][i])
+                loc = Rm.T @ (pw[i] - self.obj[target]["pos"][i])
+                ax = [a for a in np.argsort(np.abs(Rm[2]))[:2]]  # local axes least aligned with world z
+                fp = all(blo[a] + xy_margin <= loc[a] <= bhi[a] - xy_margin for a in ax)
+            else:
+                fp = lo[0] + xy_margin <= pw[i, 0] <= hi[0] - xy_margin and lo[1] + xy_margin <= pw[i, 1] <= hi[1] - xy_margin
+            ok[i] = fp and zl <= pw[i, 2] <= zh
         return ok
 
     def in_region(self, o: str, region: dict, point=None) -> np.ndarray:
@@ -611,7 +620,8 @@ def c_move_out(r: Replay, s):
     o = s["obj"]
     md = s.get("min_disp_m", 0.05)
     if "target" in s:  # inside = within the container's footprint and no higher than clear_m above its top
-        inside = r.in_target(o, s["target"], s.get("point"), -s.get("xy_margin_m", 0.02), -1.0, s.get("clear_m", 0.03), s.get("target_box"))
+        inside = r.in_target(o, s["target"], s.get("point"), -s.get("xy_margin_m", 0.02), -1.0, s.get("clear_m", 0.03), s.get("target_box"),
+                             oriented=s.get("oriented", False))
         where = f"out of the {s['target']} (outside its footprint or lifted > {s.get('clear_m', 0.03)} m above it)"
     elif "region" in s:
         inside = r.in_region(o, s["region"], s.get("point"))
@@ -621,7 +631,8 @@ def c_move_out(r: Replay, s):
         where = "away from where it started"
     c = Conds()
     c.add(f"{o} {where} (final {not bool(inside[-1])})", ~inside)
-    c.add(f"moved >= {md} m from its start (max {r.disp(o).max():.3f} m, final {r.disp(o)[-1]:.3f} m)", r.disp(o) >= md)
+    if md:  # 0 / None: "out of the container" alone decides
+        c.add(f"moved >= {md} m from its start (max {r.disp(o).max():.3f} m, final {r.disp(o)[-1]:.3f} m)", r.disp(o) >= md)
     hold_s = s.get("hold_s", DEFAULTS["hold_s"])
     if s.get("release", True):
         c.add(f"released (final contact {bool(r.hand_contact(o)[-1])})", ~r.hand_contact(o))

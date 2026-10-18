@@ -284,14 +284,16 @@
    {
     "name": "grasp",
     "check": "grasp",
-    "obj": "world_phone_01"
+    "obj": "world_phone_01",
+    "carry_m": 0.03
    },
    {
     "name": "out_of_case",
     "check": "move_out",
     "obj": "world_phone_01",
     "target": "world_phone_case",
-    "min_disp_m": 0.08,
+    "min_disp_m": 0,
+    "oriented": true,
     "clear_m": 0.1,
     "release": false,
     "rest": false,
