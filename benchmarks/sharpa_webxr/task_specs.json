@@ -2034,7 +2034,8 @@
       0.033
      ],
      "radius_m": 0.013,
-     "min_s": 0.1
+     "min_s": 0.2,
+     "steady_rad_s": 2.0
     },
     "final": true
    }

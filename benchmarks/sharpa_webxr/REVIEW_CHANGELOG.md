@@ -581,3 +581,12 @@ Scramble allows at most 2 (labelled successes drop and pick up the spatula at mo
   twice (6.8 s, 7.7 s) at up to 0.51 m/s; six labelled successes strike softer (0.37-0.47 m/s), so neither contact place
   nor speed separates it. Unchanged.
 State-only tasks: recall 0.997, specificity 0.990.
+
+## 01477 camera: the button is pressed while the camera is steady (2026-10-19)
+
+Reviewer on failure_0581ddb8: "the camera is just flying away, when the button is pressed the camera should be in a
+rather steady state". The press now counts only on frames where the camera turns <= 2 rad/s, and the steady press must
+last >= 0.2 s. 0581ddb8 presses the dot for 0.35 s but only 0.10 s of it steady (the camera spins at ~3.8 rad/s);
+failure_46410afe is caught too. Lost: success_b07c7e6d (presses while the camera spins at ~4 rad/s: to review).
+The four successes that never reach the dot were confirmed as failures by the reviewer. 01477: 0.978 / 1.000.
+State-only tasks: recall 0.998, specificity 0.992. Policy SR unchanged.
