@@ -389,7 +389,7 @@ def c_grasp(r: Replay, s):
     return c.all(r.n), {"max_lift_m": float(z.max()), "contact_s": float(r.hand_contact(o).sum() * DT)}, c
 
 
-def _release_event(r: Replay, o: str, s) -> tuple[bool, dict, str]:
+def _release_event(r: Replay, o: str, s, which: int | None = None) -> tuple[bool, dict, str]:
     """Universal accidental-drop detector, read from the hand at the last release of the object from a lifted state
     (hand contact lost while the origin was >= 0.03 m above its start). Returns (drop, info, text).
     A release is deliberate when the fingers are opening (<= -finger_open_rad_s) or the hand is lowering
@@ -407,7 +407,7 @@ def _release_event(r: Replay, o: str, s) -> tuple[bool, dict, str]:
     rel = [i for i in range(1, r.n) if Cf[i - 1] and not Cf[i] and zo[i - 1] >= 0.03]
     if not rel:
         return False, {"release_kind": "none"}, "ok: never released from a lifted state (origin >= 3 cm up)"
-    i = rel[-1]
+    i = rel[-1] if which is None else which  # which: judge a given release frame instead of the last one
     j = min(r.n, i + int(round(0.75 / DT)))
     fall_r, ds = float(vz[i:j].max()), s.get("drop_speed_m_s", 0.5)
     k = int(np.argmin(np.linalg.norm(r.wrist[i - 1] - r.obj[o]["pos"][i - 1], axis=1)))
@@ -482,6 +482,12 @@ def _release_event(r: Replay, o: str, s) -> tuple[bool, dict, str]:
     else:
         txt = "ok - " + "; ".join(t for _, t in clauses) + f". Release: {how}."
     return bool(drop), info, txt
+
+
+def _release_frames(r: Replay, o: str) -> list[int]:
+    """Frames where the hand lets go of the object while its origin is >= 3 cm up (every release, not only the last)."""
+    zo, Cf = r.lift(o), fill_gaps(r.hand_contact(o))
+    return [i for i in range(1, r.n) if Cf[i - 1] and not Cf[i] and zo[i - 1] >= 0.03]
 
 
 def _drop_rule_text(s) -> str:

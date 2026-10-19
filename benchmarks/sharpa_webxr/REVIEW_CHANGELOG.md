@@ -553,3 +553,16 @@ lowest point (the tip of a tilted spoon) and must reach >= 6 cm below the rim wh
 7-15 cm, this episode 4.6 cm (other shallow failures 5.0-5.4 cm). 00749: 1.000 / 0.938 -> 1.000 / 1.000.
 The stir / scramble / scoop explanation now lists each requirement with measured value and limit, failing ones first:
 "stirred - FAILED: reaching 0.046 m below the rim (needs >= 0.06 m). ok: bowl inside ... 3.90 s (needs >= 1.0 s); ...".
+
+## 00787 scramble: not dropped again and again while scrambling (2026-10-19)
+
+Reviewer: the two remaining false passes (failure_bcbdcd1c, failure_fe990300) failed "because it is dropped".
+New `max_drops_while_working` on the work checks: the hand-based drop rule is applied at every release between the
+first and last frame of work (`verify._release_frames`, `_release_event(..., which=i)`), not only the last one.
+Scramble allows at most 2 (labelled successes drop and pick up the spatula at most twice).
+- bcbdcd1c drops it 3 times while scrambling (6.1 s, 6.4 s, 10.9 s) and now fails: "scrambled - FAILED: dropped 3
+  times while working (at most 2)".
+- fe990300 is not caught. It lets go three times (7.4, 12.2, 13.4 s) while the blade tip rests in the pan, so the handle
+  falls 5-9 cm but the spatula's lowest point never leaves the pan (no drop by the rule); counting such handle falls
+  does not separate it either (three labelled successes have two handle falls while scrambling as well).
+00787: 1.000 / 0.929 -> 1.000 / 0.964.

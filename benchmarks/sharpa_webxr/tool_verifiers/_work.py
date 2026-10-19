@@ -28,6 +28,15 @@ def work_check(r, s, what: str):
         amp = s.get("reversal_amp_m", 0.02)
         n = w["reversals"][amp]
         reqs.append((np.full(r.n, n >= rv), f"{n} back-and-forth reversals of >= {amp} m (needs >= {rv})"))
+    kmax = s.get("max_drops_while_working")
+    if kmax is not None:  # dropped again and again while doing the work (between the first and last working frame)
+        m = w["mask"]
+        nd = 0
+        if m.any():
+            t0, t1 = int(np.flatnonzero(m)[0]), int(np.flatnonzero(m)[-1])
+            ds = {"drop_rule": "hand_motion", "drop_min_height_m": s.get("drop_min_height_m", 0.02)}
+            nd = sum(V._release_event(r, tool, ds, which=i)[0] for i in V._release_frames(r, tool) if t0 <= i <= t1)
+        reqs.append((np.full(r.n, nd <= kmax), f"dropped {nd} times while working (at most {kmax})"))
     done = np.ones(r.n, bool)
     for m, _ in reqs:
         done &= m
@@ -38,5 +47,7 @@ def work_check(r, s, what: str):
           np.maximum.accumulate(done))
     m = {"inside_s": w["inside_s"], "path_m": float(w["path_m"][-1]), "reversals_2cm": w["reversals"][0.02]}
     m.update(C.end_rules(r, tool, tgt, s, c))
+    if s.get("drop_rule") == "hand_motion":  # not dropped at the end: still in hand, or released low / deliberately
+        m.update(V._not_dropped(r, tool, s, c))
     m.update(C.handling(r, tool))
     return c.all(r.n), m, c
