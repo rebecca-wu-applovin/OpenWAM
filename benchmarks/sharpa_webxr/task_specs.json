@@ -571,7 +571,8 @@
     "question": "banana pieces transferred into the salad bowl (no banana bodies in the sim)"
    }
   ],
-  "needs_judge": true
+  "needs_judge": true,
+  "skip": "the benchmark scene has no banana (removed after the teleop recordings, which used revision jiangwei-2026-09-30 with a free world_banana); excluded until the banana is restored (2026-10-19)"
  },
  "01440_GigaHands_p022-plant-noodle_007_seg000": {
   "version": 1,

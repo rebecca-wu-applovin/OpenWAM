@@ -167,6 +167,7 @@ SKIP = {
     "01000": "burger box lid mesh is broken in the sim asset (flagged 2026-10-16); not gradable until the asset is fixed",
     "00381": "task flagged as broken during video review (2026-10-16): take the flower out of the box; excluded until the scene is fixed",
     "00636": "task flagged as broken during video review (2026-10-16): take the teapot lid off; excluded until the scene is fixed",
+    "01242": "the benchmark scene has no banana (removed after the teleop recordings, which used revision jiangwei-2026-09-30 with a free world_banana); excluded until the banana is restored (2026-10-19)",
 }
 
 

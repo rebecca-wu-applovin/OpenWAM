@@ -590,3 +590,11 @@ last >= 0.2 s. 0581ddb8 presses the dot for 0.35 s but only 0.10 s of it steady 
 failure_46410afe is caught too. Lost: success_b07c7e6d (presses while the camera spins at ~4 rad/s: to review).
 The four successes that never reach the dot were confirmed as failures by the reviewer. 01477: 0.978 / 1.000.
 State-only tasks: recall 0.998, specificity 0.992. Policy SR unchanged.
+
+## 01242 banana task skipped (2026-10-19)
+
+The 22 labelled recordings of "Transfer the banana pieces into the salad bowl" were made on scene revision
+jiangwei-2026-09-30, which has a free banana body (world_banana); the current benchmark scene has only the banana stand
+and the bowl, so the recordings never matched the scene (not verified, not in the viewer) and policies were graded by the
+judge on a task they cannot do. 01242 is now skipped like 00381 / 00636 until the banana is restored. No task is graded
+by the vision judge any more. Policy SR over 270 decided rollouts: xwam 25.6%, motus 20.4%, gwp 20.0%, cosmos3 3.3%.
