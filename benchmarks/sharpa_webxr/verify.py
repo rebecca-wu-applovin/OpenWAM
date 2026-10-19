@@ -406,7 +406,7 @@ def _release_event(r: Replay, o: str, s) -> tuple[bool, dict, str]:
     vz = np.minimum(np.concatenate([[0.0], np.diff(r.obj[o]["pos"][:, 2]) / DT]) * -1, np.concatenate([[0.0], np.diff(r.bottom_z(o)) / DT]) * -1)
     rel = [i for i in range(1, r.n) if Cf[i - 1] and not Cf[i] and zo[i - 1] >= 0.03]
     if not rel:
-        return False, {"release_kind": "none"}, "never released from a lifted state"
+        return False, {"release_kind": "none"}, "ok: never released from a lifted state (origin >= 3 cm up)"
     i = rel[-1]
     j = min(r.n, i + int(round(0.75 / DT)))
     fall_r, ds = float(vz[i:j].max()), s.get("drop_speed_m_s", 0.5)
@@ -433,9 +433,31 @@ def _release_event(r: Replay, o: str, s) -> tuple[bool, dict, str]:
     info = {"last_release_lift_m": float(zo[i - 1]), "last_release_fall_m_s": fall_r, "release_hand_vz_m_s": wvz,
             "release_finger_rate_rad_s": frate, "release_bottom_m": hb,
             "release_kind": "slip" if slip else ("deliberate" if deliberate else "n/a"), "tumbled_after": tumble, "toppled_end": toppled}
-    txt = (f"last release from {hb:.3f} m{' above where it ended' if s.get('drop_height_ref') == 'end' else ''}: fingers {'opening' if opening else 'not opening'} ({frate:+.2f} rad/s), hand "
-           f"{'lowering' if lowering else ('rising' if rising else 'level')} ({wvz:+.2f} m/s), then fell {fall_r:.2f} m/s; "
-           f"tumbled after: {'yes' if tumble else 'no'}; toppled at the end: {'yes' if toppled else 'no'}")
+    # explanation: the verdict first, then each clause as "measured vs limit", the one(s) that fired marked
+    tum = float((tilt[i:] - tilt[i - 1])[free].max()) if free.any() else 0.0
+    endt = float(tilt[-1] - tilt[0])
+    dmin, dh = s.get("drop_min_height_m", 0.02), s.get("drop_height_m", 0.20)
+    ref = " above where it ended" if s.get("drop_height_ref") == "end" else ""
+    how = (f"fingers {'opening' if opening else 'not opening'} ({frate:+.2f} rad/s; opening <= -{s.get('finger_open_rad_s', 0.10)}), "
+           f"hand {'lowering' if lowering else ('rising' if rising else 'level')} ({wvz:+.2f} m/s; lowering <= -{s.get('hand_lower_m_s', 0.06)}, "
+           f"rising >= {s.get('hand_rise_m_s', 0.15)}) -> {'deliberate release' if deliberate else 'NOT a deliberate release'}")
+    clauses = []  # (fired, text)
+    if sfall is not None:
+        clauses.append((slip, f"slipped out: released {hb:.3f} m{ref} up (counts from {dmin} m), not deliberately, and came down "
+                              f"{fall_r:.2f} m/s (limit {sfall} m/s)"))
+    clauses.append((high and lifted, f"let go too high: released {hb:.3f} m{ref} up (limit {dh} m) and fell {fall_r:.2f} m/s (limit {ds} m/s)"))
+    if tdeg is not None:
+        clauses.append((tumble and lifted, f"tumbled after release: turned {tum:.0f} deg (limit {tdeg} deg)"))
+    if edeg is not None:
+        clauses.append((toppled and lifted and not deliberate,
+                        f"ended tipped over: {endt:.0f} deg from its start tilt (limit {edeg} deg; only after a release that is not deliberate)"))
+    fired = [t for f, t in clauses if f]
+    if drop:
+        txt = "DROPPED: " + "; ".join(fired) + f". Release: {how}."
+    elif not lifted:
+        txt = (f"ok: released only {hb:.3f} m{ref} up (a drop counts from {dmin} m). Release: {how}.")
+    else:
+        txt = "ok: " + "; ".join(t.replace(":", " - no:", 1) for f, t in clauses) + f". Release: {how}."
     return bool(drop), info, txt
 
 
@@ -516,7 +538,7 @@ def _not_dropped(r: Replay, o: str, s, c: Conds) -> dict:
     if not held_end:  # not still in hand: must have been set back steadily (unless allow_drop: only the end pose counts)
         if not s.get("allow_drop"):
             if v2:
-                c.add(f"not dropped: {_drop_rule_text(s)} ({rel_txt})", np.full(r.n, not drop))
+                c.add(f"not dropped - {rel_txt}", np.full(r.n, not drop))
             else:
                 c.add(f"not dropped: drop = released >= {dl} m up and falling >= {ds} m/s, or any fall >= 1 m/s ({rel_txt})", np.full(r.n, not drop))
         c.add(f"not ended > {tol} m below its start height or off the table (final {zb[-1]:+.3f} m)", np.full(r.n, not (lower or fell)))
@@ -533,7 +555,7 @@ def _not_dropped_simple(r: Replay, o: str, s, c: Conds) -> dict:
     if s.get("drop_rule") != "hand_motion":
         return {}
     drop, info, txt = _release_event(r, o, s)
-    c.add(f"not dropped: {_drop_rule_text(s)} ({txt})", np.full(r.n, not drop))
+    c.add(f"not dropped - {txt}", np.full(r.n, not drop))
     return {"dropped": drop, **info}
 
 

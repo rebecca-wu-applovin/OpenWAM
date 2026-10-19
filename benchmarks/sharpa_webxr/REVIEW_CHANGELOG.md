@@ -524,3 +524,11 @@ Reviewer: failure_b616bd26 "it does not brush, how is the brush logic written"; 
   the end, or released low and deliberately.
 00051: 1.000 / 0.812 -> 0.980 / 1.000. Lost: success_9f222d15 (eraser let go 3 cm up with fingers opening, but it
 tumbles and ends tipped over, which the drop rule counts as a drop). Policy SR: motus 20.7% (was 21.1), others unchanged.
+
+## Drop explanation: verdict first, each clause as measured vs limit (2026-10-19)
+
+Reviewer: the "not dropped" text listed the whole rule and then the measurements, so it was hard to see which part
+failed. It now starts with the verdict and names the clause that fired, e.g. "not dropped - DROPPED: tumbled after
+release: turned 102 deg (limit 70 deg). Release: fingers opening (-0.40 rad/s; opening <= -0.1), hand level (+0.02
+m/s; ...) -> deliberate release." Passing cases say why they pass ("ok: released only 0.005 m up (a drop counts from
+0.02 m)"). Verdicts unchanged; all labelled recordings and policy rollouts re-verified.
