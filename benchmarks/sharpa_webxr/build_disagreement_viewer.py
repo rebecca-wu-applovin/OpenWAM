@@ -1,7 +1,7 @@
 """Static viewer of human-vs-verifier disagreements on data/webxr_episodes (re-runnable; skips already rendered videos).
 
 FN = verifier prefix failed on a human positive (success/recover); FP = verifier passed on a human failure.
-Scenes whose verifier.json has needs_judge are skipped except for FNs. Writes data/webxr_episodes/_viewer/index.html.
+Tasks ending in a judge: FPs (state checks passed on a labelled failure) carry the judge's cached verdict. Writes data/webxr_episodes/_viewer/index.html.
 Run: .venv_webxr/bin/python benchmarks/sharpa_webxr/build_disagreement_viewer.py [--cap 4] [--jobs 32] [--no-render]
 """
 import argparse
@@ -41,9 +41,7 @@ def scan():
             pos = r["outcome"] != "failure"
             if bool(v.get("sim_prefix_ok")) == pos:
                 continue
-            kind = "FN" if pos else "FP"
-            if v.get("needs_judge") and kind == "FP":
-                continue
+            kind = "FN" if pos else "FP"  # FPs of tasks ending in a judge are shown too: the judge decides next
             total[sd.name][kind] += 1
             sel[sd.name][kind].append((d, r, v))
     return sel, total
@@ -87,6 +85,18 @@ def card(d, r, v, kind, vid):
         f"{esc(json.dumps({k: (round(x, 4) if isinstance(x, float) else x) for k, x in s['metrics'].items()}))}</details>"
         for s in v["stages"] if not s["achieved"] and s["check"] != "judge")
     fallen = [k for k, x in (v.get("fallen") or {}).items() if x]
+    jtxt = ""
+    if v.get("needs_judge") and v.get("sim_prefix_ok"):  # state checks passed: the vision judge decides the episode
+        jf = d / "judge_gpt-6-luna_r3.json"
+        j = json.loads(jf.read_text()) if jf.exists() else None
+        if j is None:
+            jtxt = "<div class=judge><b>judge:</b> not called yet</div>"
+        elif "error" in j:
+            jtxt = f"<div class=judge><b>judge:</b> error {esc(j['error'])[:200]}</div>"
+        else:
+            stale = j.get("sim_context") != v.get("judge_context")
+            jtxt = (f"<div class=judge><b>judge (gpt-6-luna, r3): {'SUCCESS' if j.get('success') else 'FAIL'}</b>"
+                    f"{' <i>(made with an older sim summary)</i>' if stale else ''} &mdash; {esc(j.get('rationale', ''))}</div>")
     media = (f"<video controls loop muted preload=metadata src='{esc(vid)}'></video>" if vid else "<div class=novid>not rendered</div>")
     e = INDEX.get(r.get("episode_uuid"), {})
     orig = e.get("original_filename") or f"{r.get('episode_uuid', '')} ({r.get('user_id', '')})"
@@ -107,7 +117,7 @@ def card(d, r, v, kind, vid):
             f"<div class=orig><b>{esc(orig)}</b> by {esc(r.get('user_id', '?'))}, uploaded {esc(r.get('upload_date', '?'))}, {esc(r.get('source_num_steps', '?'))} steps"
             f"{(' <span class=gs>' + esc(src) + '</span>') if src else ''}</div>"
             f"<table><tr><th>stage</th><th>check</th><th>achieved</th><th>any_time</th><th>end_state</th><th>t_first_s</th></tr>{''.join(rows)}</table>"
-            f"{failing}{review}<div class=dn>local: {esc(d.name)}</div></div></div>")
+            f"{jtxt}{failing}{review}<div class=dn>local: {esc(d.name)}</div></div></div>")
 
 
 JS = r"""
@@ -218,7 +228,7 @@ def main():
            "video{width:100%}.novid{background:#eee;padding:30px;text-align:center}tr.ok td{background:#e8f6e8}tr.bad td{background:#fbe9e9}.m{font:12px monospace;margin:2px 0}"
            ".dn{font:11px monospace;color:#666;margin-top:4px;word-break:break-all}.orig{font:12px monospace;margin:4px 0;word-break:break-all}.gs{color:#888}"
            ".why{margin:6px 0;padding:6px;background:#fff3f0;border-left:4px solid #c04040;font-size:13px}.why ul{margin:4px 0 0 18px;padding:0}.m summary{cursor:pointer;color:#666}.m ul{margin:2px 0 4px 18px;color:#555}"
-           ".review{margin:6px 0;padding:6px;background:#f3f3f3;border:1px solid #ddd;font-size:12px}.review.done{background:#e6f0ff;border-color:#8ab}.review label{margin-right:8px;white-space:nowrap}"
+           ".judge{margin:6px 0;padding:6px;background:#fff6e0;border:1px solid #e0c080;font-size:12px}.review{margin:6px 0;padding:6px;background:#f3f3f3;border:1px solid #ddd;font-size:12px}.review.done{background:#e6f0ff;border-color:#8ab}.review label{margin-right:8px;white-space:nowrap}"
            ".review textarea{display:block;width:98%;margin:4px 0;font:12px monospace}.review .status{color:#555;margin-left:6px}#srv{color:#357;font-weight:bold}.task{margin:0 0 6px;color:#444}.b{padding:1px 5px;color:#fff;border-radius:3px}.b.FN{background:#e0a030}.b.FP{background:#c04040}"
            "body.hide-vr .card[data-dec=verifier]{display:none}.opt{margin-left:12px;padding:2px 6px;background:#eef;border:1px solid #aac;border-radius:3px;cursor:pointer;white-space:nowrap}")
     page = (f"<!doctype html><meta charset=utf-8><title>Human vs verifier disagreements</title><style>{css}</style><h1>Human vs verifier disagreements</h1>"

@@ -461,3 +461,14 @@ successes <= 0.87 m/s after release), which stops four labelled failures before 
 Eight labelled failures still pass the prefix and go to the judge, which (cached verdicts) accepted all of them: the
 judge does not tell them apart either. The disagreement viewer does not list judge-task FPs (builder rule), so they
 were not shown for review.
+
+## Judge re-run with the current sim summary; judge-task false passes shown (2026-10-19)
+
+The disagreement viewer now also lists labelled failures that pass the state checks of tasks ending in a judge, with
+the judge's verdict and rationale on the card (62 cards; 10 in the unscored self-gen folder). All judge verdicts were
+refreshed so the judge saw the current sim summary: 168 calls on labelled episodes (`judge_labeled.py`), 8 on policy
+rollouts (`score.py --grader hybrid`). On the labelled failures that reach it the judge still says success on 40 of 62.
+Judge on labelled episodes that passed the state checks: recall 0.921, specificity 0.338 (65 failures). Hybrid
+(state checks + judge) on the 8 judge tasks: recall 0.921, specificity 0.721. Per task the judge rejects nothing on
+00051, 00749, 00787, 01587, 01640 (specificity 0.000) and lets through only 52% of 01477 successes.
+Policy hybrid SR: xwam 25.4%, motus 22.2% (was 22.6), gwp 20.0% (20.4), cosmos3 4.0% (4.7).
