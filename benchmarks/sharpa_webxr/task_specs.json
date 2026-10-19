@@ -1903,6 +1903,10 @@
     "check": "brush",
     "obj": "world_eraser_07",
     "target": "world_plate_05",
+    "face_band_m": 0.012,
+    "reversal_amp_m": 0.01,
+    "drop_rule": "hand_motion",
+    "drop_min_height_m": 0.02,
     "final": true
    }
   ],

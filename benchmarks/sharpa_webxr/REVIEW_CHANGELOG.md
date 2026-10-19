@@ -511,3 +511,16 @@ table, is out of the hand and its lowest point is >= 3 cm above the table; not f
 Labels: recall 1.000, specificity 1.000 (50 / 11): every success ends hanging on the rack 6-13 cm up, every failure on
 the table. Only 01242 still ends in a judge. State-only tasks: n = 2967, recall 0.997, specificity 0.976. Policy SR
 unchanged (no policy rollout puts the cup on the rack).
+
+## 00051 brush: plate face only, not dropped at the end (2026-10-19)
+
+Reviewer: failure_b616bd26 "it does not brush, how is the brush logic written"; failure_4d0796d0 and failure_f961eb3d
+"the brush dropped from hand at last".
+- b616bd26 only ever touched the plate's rim (1.35 s, 0 s on its face); the rule counted any eraser-plate contact.
+  `brush.py` `face_band_m`: contact points must lie on the plate's top or bottom face (within 1.2 cm of it, 1.5 cm in
+  from the edge); back-and-forth strokes counted at 1 cm.
+- 4d0796d0 / f961eb3d release the eraser 10-19 cm up and it falls slowly (0.17-0.77 m/s), under the not-flung limit.
+  The brush stage now also takes the hand-based drop rule (`_not_dropped`, drop_rule hand_motion): still in hand at
+  the end, or released low and deliberately.
+00051: 1.000 / 0.812 -> 0.980 / 1.000. Lost: success_9f222d15 (eraser let go 3 cm up with fingers opening, but it
+tumbles and ends tipped over, which the drop rule counts as a drop). Policy SR: motus 20.7% (was 21.1), others unchanged.
