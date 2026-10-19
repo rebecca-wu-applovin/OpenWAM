@@ -159,7 +159,16 @@ def work_in_target(r, tool: str, point_local, target: str, z_below: float = 0.01
     Returns the per-frame mask, its cumulative time, the path the point travels inside (target frame, horizontal,
     summed over the visits) and the back-and-forth reversals of that motion along its main direction."""
     lo, hi = r.local_aabb[target]
-    P = point_in_frame(r, point_local, target, tool)
+    if isinstance(point_local, dict):  # {"lowest_in": box}: the tool's hull point inside box that is lowest in the target
+        H = r.hull(tool)  # frame, per frame (the dipping tip of a tilted spoon bowl, not its centre)
+        H = H[in_box(H, point_local["lowest_in"])]
+        P = np.zeros((r.n, 3))
+        for i in range(r.n):
+            w = (V.rot(r.obj[tool]["quat"][i]) @ H.T).T + r.obj[tool]["pos"][i]
+            L = (V.rot(r.obj[target]["quat"][i]).T @ (w - r.obj[target]["pos"][i]).T).T
+            P[i] = L[np.argmin(L[:, 2])]
+    else:
+        P = point_in_frame(r, point_local, target, tool)
     inside = (np.all(P[:, :2] >= lo[:2], axis=1) & np.all(P[:, :2] <= hi[:2], axis=1)
               & (P[:, 2] >= lo[2] - z_below) & (P[:, 2] <= hi[2] + z_above))
     held = V.fill_gaps(r.hand_contact(tool))

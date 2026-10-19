@@ -543,3 +543,13 @@ failure_f961eb3d (deliberate, 10 cm, tumbles 121 deg) still fails. 00051: 1.000 
 Each drop clause now states its own outcome: "SLIPPED OUT / LET GO TOO HIGH / TUMBLED / ENDED TIPPED OVER" when it
 fires, otherwise "no (measured, limit)" or "over the limit but excused: deliberate release ...", and for a drop the
 clause that fired comes first, the other checks after. Verdicts elsewhere unchanged (state-only 0.998 / 0.980).
+
+## 00749 stir: the spoon must dip into the pot (2026-10-19)
+
+Reviewer on failure_76f0789b: "it is never stirred, when the spoon head is in the pot, the hand already flew". The spoon
+was held by the end of its handle with the bowl hovering at the pot's opening (the rule allowed the bowl centre up to
+3 cm above the rim), then let go; the bowl only got into the pot after the release. The bowl is now tracked by its
+lowest point (the tip of a tilted spoon) and must reach >= 6 cm below the rim while held: every labelled success reaches
+7-15 cm, this episode 4.6 cm (other shallow failures 5.0-5.4 cm). 00749: 1.000 / 0.938 -> 1.000 / 1.000.
+The stir / scramble / scoop explanation now lists each requirement with measured value and limit, failing ones first:
+"stirred - FAILED: reaching 0.046 m below the rim (needs >= 0.06 m). ok: bowl inside ... 3.90 s (needs >= 1.0 s); ...".
