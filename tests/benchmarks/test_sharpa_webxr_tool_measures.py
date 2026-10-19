@@ -75,12 +75,20 @@ def test_strokes_counted_as_they_happen(C):
     assert cnt[5] == 0  # the first turn at frame 4 is only confirmed after travelling 2 cm back (frame 6)
 
 
-@pytest.mark.xfail(strict=True, reason="known limitation: moving between touches of one session counts as a stroke; "
-                   "requiring motion while touching fails 13 labelled brushing successes (brushing is touch, lift, move, "
-                   "touch back), so the rule is kept pending a decision by the reviewer")
 def test_stationary_touches_are_not_a_stroke(C):
+    # three touches at x = 0, 3 cm, 0 without sliding; between them the tool is lifted away (not near the surface)
     P = np.zeros((22, 2))
     P[10:12, 0] = 0.03
     mask = np.zeros(22, bool)
     mask[[0, 1, 10, 11, 20, 21]] = True
-    assert C.stroke_count(P, mask, 0.02)[-1] == 0
+    near = mask.copy()  # near the surface only while touching
+    assert C.stroke_count(P, mask, 0.02, near=near)[-1] == 0
+
+
+def test_sweeps_just_above_the_surface_are_strokes(C):
+    # touch, sweep 3 cm while hovering just above, touch, sweep back: the hover is near the surface, so it counts
+    x = np.array([0, 0.01, 0.02, 0.03, 0.03, 0.02, 0.01, 0.0, 0.0])
+    P = np.column_stack([x, np.zeros_like(x)])
+    mask = np.array([1, 0, 0, 1, 1, 0, 0, 1, 1], bool)
+    near = np.ones(len(x), bool)
+    assert C.stroke_count(P, mask, 0.02, near=near)[-1] == 1

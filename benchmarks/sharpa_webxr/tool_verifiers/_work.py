@@ -13,7 +13,7 @@ def work_check(r, s, what: str):
     V = C.V
     tool, tgt = s["obj"], s["target"]
     w = C.work_in_target(r, tool, s["point"], tgt, s.get("z_below_m", 0.01), s.get("z_above_m", 0.03),
-                         visit_gap_s=s.get("visit_gap_s", 3.0))
+                         visit_gap_s=s.get("visit_gap_s", 3.0), near_m=s.get("stroke_near_m"))
     part = s.get("part_name", "working end")
     t = C.cum_time(w["mask"])
     tmin, pmin = s.get("min_inside_s", 1.0), s.get("min_path_m", 0.2)

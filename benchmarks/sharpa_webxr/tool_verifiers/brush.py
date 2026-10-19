@@ -2,7 +2,9 @@
 
 Done = the eraser, held, touches the plate's FACE (top or bottom surface, 1.5 cm in from the edge; touching only the
 rim is not brushing) for >= 0.3 s in total with >= 1 back-and-forth reversal (in the plate's frame, while touching),
-whatever the plate's pose (it is often held up by the other hand); afterwards the eraser is still in the hand, or was
+whatever the plate's pose (it is often held up by the other hand). A stroke is motion made while the eraser touches
+the plate or hovers within 2 cm of its face (brushing in the labels is touch, sweep just above, touch back; dabbing at
+different spots with the eraser lifted away in between is not a stroke). Afterwards the eraser is still in the hand, or was
 released low and deliberately (hand-based drop rule), and not flung > 1.0 m/s. The plate itself is not limited: labelled successes tilt it up to
 148 deg and move it up to 0.7 m while holding it for brushing.
 """
@@ -30,7 +32,21 @@ def c_brush(r, s):
     t = C.cum_time(touch)
     P = C.point_in_frame(r, [0.0, 0.0, 0.0], tgt, tool)
     amp, kmin, tmin = s.get("reversal_amp_m", 0.02), s.get("min_reversals", 1), s.get("min_touch_s", 0.3)
-    cnt = C.stroke_count(P[:, :2], touch, amp, s.get("visit_gap_s", 3.0))  # per brushing session, so far
+    near = None
+    nm = s.get("stroke_near_m", 0.02)
+    if nm is not None:  # near the plate face: an eraser hull point over the plate's outline within nm of its face
+        lo, hi = r.local_aabb[tgt]
+        H = r.hull(tool)
+        near = np.zeros(r.n, bool)
+        for i in np.flatnonzero(held):
+            w = (V.rot(r.obj[tool]["quat"][i]) @ H.T).T + r.obj[tool]["pos"][i]
+            L = (V.rot(r.obj[tgt]["quat"][i]).T @ (w - r.obj[tgt]["pos"][i]).T).T
+            over = np.all((L[:, :2] >= lo[:2]) & (L[:, :2] <= hi[:2]), axis=1)
+            if over.any():
+                z = L[over, 2]
+                gap = min(np.abs(z - hi[2]).min(), np.abs(z - lo[2]).min())
+                near[i] = gap <= nm
+    cnt = C.stroke_count(P[:, :2], touch, amp, s.get("visit_gap_s", 3.0), near)  # per brushing session, so far
     n = int(cnt[-1])
     c = V.Conds()
     c.add(f"brushed: {tool} held against the {tgt}{' face (not its rim)' if face is not None else ''} >= {tmin} s ({touch.sum() * V.DT:.2f} s) with >= {kmin} "

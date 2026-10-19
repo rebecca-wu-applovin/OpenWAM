@@ -165,7 +165,7 @@ def reversals(x: np.ndarray, amp: float) -> int:
     return len(reversal_frames(x, amp))
 
 
-def stroke_count(P2: np.ndarray, mask: np.ndarray, amp: float, gap_s: float = 3.0) -> np.ndarray:
+def stroke_count(P2: np.ndarray, mask: np.ndarray, amp: float, gap_s: float = 3.0, near: np.ndarray | None = None) -> np.ndarray:
     """Per frame: back-and-forth reversals of >= amp so far, counted within each working session (runs of mask less
     than gap_s apart belong to the same session: brushing is a series of short touches ~1-1.5 s apart, touch, sweep,
     lift, touch back; 3 s is the shake check's window) along that session's main direction of motion, using only the
@@ -177,6 +177,19 @@ def stroke_count(P2: np.ndarray, mask: np.ndarray, amp: float, gap_s: float = 3.
         idx = np.arange(a, b)[mask[a:b]]
         if len(idx) < 4:
             continue
+        if near is not None:  # only motion made close to the surface counts: the session's track is the sum of the
+            # steps between two consecutive frames that are both near (touching or hovering just above it); moving
+            # away and coming back adds nothing, so dabbing at different spots is not a stroke
+            fr = np.arange(a, b)
+            step = np.diff(P2[a:b], axis=0)
+            step[~(near[fr[:-1]] & near[fr[1:]])] = 0.0
+            Q = np.concatenate([np.zeros((1, P2.shape[1])), np.cumsum(step, axis=0)])
+            if not np.any(Q):
+                continue
+            ax = np.linalg.svd(Q - Q.mean(0), full_matrices=False)[2][0]
+            for k in reversal_frames(Q @ ax, amp):
+                cnt[a + k:] += 1
+            continue
         Q = P2[idx]
         ax = np.linalg.svd(Q - Q.mean(0), full_matrices=False)[2][0]
         for k in reversal_frames(Q @ ax, amp):
@@ -185,7 +198,7 @@ def stroke_count(P2: np.ndarray, mask: np.ndarray, amp: float, gap_s: float = 3.
 
 
 def work_in_target(r, tool: str, point_local, target: str, z_below: float = 0.01, z_above: float = 0.03, mask=None,
-                   visit_gap_s: float = 3.0) -> dict:
+                   visit_gap_s: float = 3.0, near_m: float | None = None) -> dict:
     """The working point of a tool (a point fixed in the tool, e.g. the middle of a spoon bowl, or {"lowest_in": box}:
     the tool's lowest hull point within box) inside the target's own box (target frame, from z_below under its bottom
     to z_above over its top) while the tool is held.
@@ -212,7 +225,11 @@ def work_in_target(r, tool: str, point_local, target: str, z_below: float = 0.01
     both = work & np.concatenate([[False], work[:-1]])
     path = np.cumsum(np.where(both, step, 0.0))
     out = {"mask": work, "inside_s": float(work.sum() * V.DT), "path_m": path, "P": P}
-    out["rev_count"] = {a: stroke_count(P[:, :2], work, a, visit_gap_s) for a in (0.01, 0.02, 0.03)}  # per frame, causal
+    near = None
+    if near_m is not None:  # near the target: inside its box grown by near_m on every side, while held
+        near = (np.all(P[:, :2] >= lo[:2] - near_m, axis=1) & np.all(P[:, :2] <= hi[:2] + near_m, axis=1)
+                & (P[:, 2] >= lo[2] - z_below - near_m) & (P[:, 2] <= hi[2] + z_above + near_m) & held)
+    out["rev_count"] = {a: stroke_count(P[:, :2], work, a, visit_gap_s, near) for a in (0.01, 0.02, 0.03)}  # per frame, causal
     out["reversals"] = {a: int(c[-1]) for a, c in out["rev_count"].items()}
     return out
 

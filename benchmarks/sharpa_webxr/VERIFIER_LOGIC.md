@@ -132,11 +132,12 @@ counts: an object that got away and was picked up again is a recover.
 ## 4. Tool-use verifiers (`tool_verifiers/`)
 
 Shared measurements in [`tool_verifiers/common.py:1`](tool_verifiers/common.py#L1):
-- [`work_in_target() — tool_verifiers/common.py:187`](tool_verifiers/common.py#L187): the tool's working point (a point on the tool, or its **lowest**
+- [`work_in_target() — tool_verifiers/common.py:200`](tool_verifiers/common.py#L200): the tool's working point (a point on the tool, or its **lowest**
   point within a part, e.g. the tip of a tilted spoon bowl) inside the target's own box while held. Path = travel between
   consecutive working frames only (moving outside the pot, or while not held, earns nothing). Back-and-forth strokes are
-  counted **per visit** ([`stroke_count() — tool_verifiers/common.py:168`](tool_verifiers/common.py#L168)), along that visit's main direction, and as they
-  happen (the count at frame i only includes strokes confirmed by frame i).
+  counted per working session ([`stroke_count() — tool_verifiers/common.py:168`](tool_verifiers/common.py#L168)), along its main direction, from motion
+  made near the surface only (within `stroke_near_m`, 2 cm), and as they happen (the count at frame i only includes
+  strokes confirmed by frame i).
 - [`end_rules() — tool_verifiers/common.py:118`](tool_verifiers/common.py#L118): the shared ending: not flung (per-task speed), target not knocked over,
   not pushed away, not sent flying (each optional).
 - [`handling() — tool_verifiers/common.py:94`](tool_verifiers/common.py#L94): regrasps and spin, **reported only** (not a pass/fail condition).
@@ -152,7 +153,7 @@ Shared measurements in [`tool_verifiers/common.py:1`](tool_verifiers/common.py#L
 | 00749 stir | [`c_stir() — tool_verifiers/stir.py:18`](tool_verifiers/stir.py#L18) | bowl inside the pot >= 1 s, path >= 0.18 m, tip >= 6 cm below the rim | not flung > 1.2 m/s; pot tilt <= 100 deg |
 | 00787 scramble | [`c_scramble() — tool_verifiers/scramble.py:17`](tool_verifiers/scramble.py#L17) | blade in the pan >= 1.2 s, path >= 0.2 m, >= 2 strokes of 2 cm; <= 2 drops while working | not flung > 1.0 m/s; pan moved <= 0.4 m |
 | 01587 scoop | [`c_scoop() — tool_verifiers/scoop.py:14`](tool_verifiers/scoop.py#L14) | bowl in the plate region >= 0.2 s, path >= 0.07 m | not flung > 1.0 m/s; plate tilt <= 60 deg, not sent flying (> 1.5 m/s) |
-| 00051 brush | [`c_brush() — tool_verifiers/brush.py:18`](tool_verifiers/brush.py#L18) | eraser on the plate's **face** (not the rim) >= 0.3 s with >= 1 stroke of 1 cm | not flung; drop rule (low deliberate put-down that flops is fine) |
+| 00051 brush | [`c_brush() — tool_verifiers/brush.py:20`](tool_verifiers/brush.py#L20) | eraser on the plate's **face** (not the rim) >= 0.3 s with >= 1 stroke of 1 cm | not flung; drop rule (low deliberate put-down that flops is fine) |
 | 01477 camera | [`c_camera_button() — tool_verifiers/camera_button.py:21`](tool_verifiers/camera_button.py#L21) | held up >= 1.9 s; a fingertip on the button dot (camera frame) >= 0.2 s while the camera turns <= 2 rad/s | not flung > 1.0 m/s |
 | self-gen cup | [`c_on_rack() — tool_verifiers/rack.py:17`](tool_verifiers/rack.py#L17) | last 0.5 s: cup touching the rack, not the table, out of the hand, >= 3 cm up | not flung > 1.2 m/s |
 
@@ -177,18 +178,17 @@ How to read the table: each task has about 60-90 labelled recordings, and ±25% 
 threshold that changes 1-2 labels at ±25% sits in a gap between successes and failures; one that changes 3 or more
 has successes or failures close to it on both sides, so its exact value was fitted to these recordings.
 
-Of 53 tuned thresholds, 19 change no label at ±25%, 23 change 1-2 labels, 11 change 3 or more.
+Of 55 tuned thresholds, 18 change no label at ±25%, 27 change 1-2 labels, 10 change 3 or more.
 
 | task | threshold | at ×0.75 / ×1.25 (or ±1): labels that change vs current | verdict |
 |---|---|---|---|
 | 00787 | `max_free_speed_m_s` | 0.75: +4 miss · 1.25: +3 false pass | SENSITIVE (7 labels) |
 | 01477 | `button/radius_m` | 0.0097: +5 miss · 0.0163: +2 false pass | SENSITIVE (7 labels) |
 | 00863 | `max_free_speed_m_s` | 0.9: +4 miss · 1.5: +2 false pass | SENSITIVE (6 labels) |
-| 00787 | `min_reversals` | 1: no change · 3: +4 miss | SENSITIVE (4 labels) |
+| 00787 | `min_reversals` | 1: no change · 3: +5 miss | SENSITIVE (5 labels) |
 | 00749 | `min_depth_m` | 0.045: +2 false pass · 0.075: +1 miss | SENSITIVE (3 labels) |
 | 00749 | `max_free_speed_m_s` | 0.9: +2 miss · 1.5: +1 false pass | SENSITIVE (3 labels) |
 | 00787 | `min_path_m` | 0.15: no change · 0.25: +3 miss | SENSITIVE (3 labels) |
-| 00787 | `target_disp_m` | 0.3: +2 miss · 0.5: +1 false pass | SENSITIVE (3 labels) |
 | 01041 | `max_free_speed_m_s` | 1.35: +2 miss · 2.25: +1 false pass | SENSITIVE (3 labels) |
 | 01477 | `button/min_s` | 0.15: +1 false pass · 0.25: +2 miss | SENSITIVE (3 labels) |
 | 01587 | `target_max_speed_m_s` | 1.125: +2 miss · 1.875: +1 false pass | SENSITIVE (3 labels) |
@@ -197,14 +197,18 @@ Of 53 tuned thresholds, 19 change no label at ±25%, 23 change 1-2 labels, 11 ch
 | 00175 | `max_hit_speed_m_s` | 0.525: +2 miss · 0.875: no change | slightly sensitive (2 labels) |
 | 00779 | `max_free_speed_m_s` | 0.75: +2 miss · 1.25: no change | slightly sensitive (2 labels) |
 | 00787 | `min_inside_s` | 0.9: no change · 1.5: +2 miss | slightly sensitive (2 labels) |
+| 00787 | `target_disp_m` | 0.3: +2 miss · 0.5: no change | slightly sensitive (2 labels) |
 | 00863 | `min_strike_m_s` | 0.06: +1 false pass · 0.1: +1 miss | slightly sensitive (2 labels) |
 | 01477 | `min_held_up_s` | 1.425: no change · 2.375: +2 miss | slightly sensitive (2 labels) |
 | 01477 | `button/steady_rad_s` | 1.5: +1 miss · 2.5: +1 false pass | slightly sensitive (2 labels) |
 | 01587 | `min_path_m` | 0.0525: +1 false pass · 0.0875: +1 miss | slightly sensitive (2 labels) |
 | 01605 | `max_free_speed_m_s` | 0.75: no change · 1.25: +2 false pass | slightly sensitive (2 labels) |
 | 01640 | `max_free_speed_m_s` | 0.75: +1 miss · 1.25: +1 false pass | slightly sensitive (2 labels) |
+| 00051 | `stroke_near_m` | 0.015: +1 miss · 0.025: no change | slightly sensitive (1 labels) |
+| 00051 | `reversal_amp_m` | 0.0075: no change · 0.0125: +1 miss | slightly sensitive (1 labels) |
 | 00051 | `max_free_speed_m_s` | 0.75: +1 miss · 1.25: no change | slightly sensitive (1 labels) |
 | 00779 | `min_amp_m` | 0.015: no change · 0.025: +1 miss | slightly sensitive (1 labels) |
+| 00787 | `stroke_near_m` | 0.015: +1 miss · 0.025: no change | slightly sensitive (1 labels) |
 | 00787 | `max_drops_while_working` | 1: +1 miss · 3: no change | slightly sensitive (1 labels) |
 | 01032 | `max_free_speed_m_s` | 0.9: +1 miss · 1.5: no change | slightly sensitive (1 labels) |
 | 01246 | `max_free_speed_m_s` | 0.9: +1 miss · 1.5: no change | slightly sensitive (1 labels) |
@@ -216,7 +220,6 @@ Of 53 tuned thresholds, 19 change no label at ±25%, 23 change 1-2 labels, 11 ch
 | 01587 | `min_inside_s` | 0.15: no change · 0.25: +1 miss | slightly sensitive (1 labels) |
 | 01587 | `max_free_speed_m_s` | 0.75: +1 miss · 1.25: no change | slightly sensitive (1 labels) |
 | 00051 | `face_band_m` | 0.009: no change · 0.015: no change | robust (0 labels) |
-| 00051 | `reversal_amp_m` | 0.0075: no change · 0.0125: no change | robust (0 labels) |
 | 00051 | `tumble_deliberate_min_m` | 0.0375: no change · 0.0625: no change | robust (0 labels) |
 | 00475 | `max_hit_speed_m_s` | 0.525: no change · 0.875: no change | robust (0 labels) |
 | 00487 | `max_hit_speed_m_s` | 0.525: no change · 0.875: no change | robust (0 labels) |
@@ -263,13 +266,11 @@ the drop rule's clauses, the rack, brushing on the plate face, the scissors grip
   is fitted on the whole session; drops are retrospective (classified with what happened after the release, credited at
   the release frame) and bounded by the first and last working frames, known only at the end. The verdict is an
   end-state verdict.
-- Strokes include the motion between touches of one session (brushing in the labels is touch, lift, move, touch back:
-  requiring the motion to happen while touching fails 13 of 50 labelled brushing successes and 3 scrambling ones). So
-  three stationary touches at different places can count as a stroke (test
-  `tests/benchmarks/test_sharpa_webxr_tool_measures.py::test_stationary_touches_are_not_a_stroke`, marked xfail).
-  A middle ground to decide: count motion while the tool is near the surface (e.g. within 1-2 cm), not only in contact.
-- Accepted misses: 00787 failure_fe990300 (nothing in the state separates it), 01640 failure_d11597e0 (touches the
-  drumhead as softly as some successes). 01242 (banana) is skipped: the benchmark scene has no banana.
+- Strokes count only motion made near the surface (brush: an eraser point within 2 cm of the plate face; scramble:
+  the blade inside the pan box grown by 2 cm). Brushing in the labels is touch, sweep just above the plate, touch back,
+  so near-surface motion between touches counts; dabbing at different spots with the tool lifted away in between does
+  not (tests `test_stationary_touches_are_not_a_stroke`, `test_sweeps_just_above_the_surface_are_strokes`). Requiring
+  contact (0 cm) would fail 13 brushing and 3 scrambling successes; 2-5 cm change no label, 1 cm one each.
 
 ## 7. Appendix
 

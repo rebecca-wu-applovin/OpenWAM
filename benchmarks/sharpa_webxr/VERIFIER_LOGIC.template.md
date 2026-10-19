@@ -135,8 +135,9 @@ Shared measurements in {{tool_verifiers/common.py::^"""Shared measurements}}:
 - {{tool_verifiers/common.py::^def work_in_target}}: the tool's working point (a point on the tool, or its **lowest**
   point within a part, e.g. the tip of a tilted spoon bowl) inside the target's own box while held. Path = travel between
   consecutive working frames only (moving outside the pot, or while not held, earns nothing). Back-and-forth strokes are
-  counted **per visit** ({{tool_verifiers/common.py::^def stroke_count}}), along that visit's main direction, and as they
-  happen (the count at frame i only includes strokes confirmed by frame i).
+  counted per working session ({{tool_verifiers/common.py::^def stroke_count}}), along its main direction, from motion
+  made near the surface only (within `stroke_near_m`, 2 cm), and as they happen (the count at frame i only includes
+  strokes confirmed by frame i).
 - {{tool_verifiers/common.py::^def end_rules}}: the shared ending: not flung (per-task speed), target not knocked over,
   not pushed away, not sent flying (each optional).
 - {{tool_verifiers/common.py::^def handling}}: regrasps and spin, **reported only** (not a pass/fail condition).
@@ -206,13 +207,11 @@ the drop rule's clauses, the rack, brushing on the plate face, the scissors grip
   is fitted on the whole session; drops are retrospective (classified with what happened after the release, credited at
   the release frame) and bounded by the first and last working frames, known only at the end. The verdict is an
   end-state verdict.
-- Strokes include the motion between touches of one session (brushing in the labels is touch, lift, move, touch back:
-  requiring the motion to happen while touching fails 13 of 50 labelled brushing successes and 3 scrambling ones). So
-  three stationary touches at different places can count as a stroke (test
-  `tests/benchmarks/test_sharpa_webxr_tool_measures.py::test_stationary_touches_are_not_a_stroke`, marked xfail).
-  A middle ground to decide: count motion while the tool is near the surface (e.g. within 1-2 cm), not only in contact.
-- Accepted misses: 00787 failure_fe990300 (nothing in the state separates it), 01640 failure_d11597e0 (touches the
-  drumhead as softly as some successes). 01242 (banana) is skipped: the benchmark scene has no banana.
+- Strokes count only motion made near the surface (brush: an eraser point within 2 cm of the plate face; scramble:
+  the blade inside the pan box grown by 2 cm). Brushing in the labels is touch, sweep just above the plate, touch back,
+  so near-surface motion between touches counts; dabbing at different spots with the tool lifted away in between does
+  not (tests `test_stationary_touches_are_not_a_stroke`, `test_sweeps_just_above_the_surface_are_strokes`). Requiring
+  contact (0 cm) would fail 13 brushing and 3 scrambling successes; 2-5 cm change no label, 1 cm one each.
 
 ## 7. Appendix
 
