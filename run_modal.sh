@@ -5,9 +5,10 @@
 #   bash run_modal.sh              # detached: keeps running after the terminal closes
 #   bash run_modal.sh --debug      # tiny-model smoke test, 1 GPU, 5 steps
 #   bash run_modal.sh training.max_steps=50   # extra Hydra overrides are appended
-#   GPU_TYPE=B200 bash run_modal.sh           # 8xB200 instead of 8xH100
+#   GPU_TYPE=H200 bash run_modal.sh           # 8xH200 (or B200) instead of 8xH100
 #   ACTION_MODE=unify_abs bash run_modal.sh   # action-repr ablation arm (dim set automatically)
 #   BACKBONE=cosmos3_nano bash run_modal.sh   # video-backbone ablation arm: wan22_ti2v_5b | cosmos3_edge | cosmos3_nano
+#   bash scripts/modal/sparse_history/run_<backbone>.sh   # 07 sparse-history arms (5 backbones)
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./base.sh   # next_run_index
@@ -16,7 +17,7 @@ source ./base.sh   # next_run_index
 WANDB_PROJECT="${WANDB_PROJECT:-1008_wam_training}"
 WANDB_GROUP="${WANDB_GROUP:-1013_action_repr_ablation}"
 ACTION_MODE="${ACTION_MODE:-fingertips_rel}"   # fingertips_abs | fingertips_rel (dim 48); unify_abs | unify_rel (dim 80)
-BACKBONE="${BACKBONE:-wan22_ti2v_5b}"           # wan22_ti2v_5b | cosmos3_edge | cosmos3_nano
+BACKBONE="${BACKBONE:-wan22_ti2v_5b}"           # wan22_ti2v_5b | cosmos3_edge | cosmos3_nano | longlive2_robot_s | ge_base_fast | flux3_action_base
 # Non-default backbones get a name prefix so arms of one group stay distinguishable.
 if [[ "${BACKBONE}" == "wan22_ti2v_5b" ]]; then NAME_PREFIX=""; else NAME_PREFIX="${BACKBONE}_"; fi
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-${NAME_PREFIX}${ACTION_MODE}_b64}"   # env vars override all of these
@@ -34,9 +35,16 @@ case "${BACKBONE}" in
     wan22_ti2v_5b) BACKBONE_DIR=Wan2.2-TI2V-5B ;;
     cosmos3_edge)  BACKBONE_DIR=Cosmos3-Edge ;;
     cosmos3_nano)  BACKBONE_DIR=Cosmos3-Nano; BACKBONE_EXTRA="training.use_gradient_checkpointing=true" ;;
+    # 07 sparse-history arms (weights uploaded by scripts/modal/sparse_history/upload_weights.sh).
+    # LongLive = the Wan2.2 bundle + Robot-S DiT weights; GE reads VAE / T5 / tokenizer from an LTX-Video dir.
+    longlive2_robot_s) BACKBONE_DIR=Wan2.2-TI2V-5B
+                       BACKBONE_EXTRA="model.video_backbone.dit_weights_path=/assets/video_backbone_ckpt/LongLive2.0-Robot-S/model.pt" ;;
+    ge_base_fast)      BACKBONE_DIR=Genie-Envisioner-Base-fast
+                       BACKBONE_EXTRA="model.video_backbone.ltx_path=/assets/video_backbone_ckpt/LTX-Video" ;;
+    flux3_action_base) BACKBONE_DIR=flux-3-action-base ;;
     *) echo "[run_modal] unknown BACKBONE=${BACKBONE}" >&2; exit 1 ;;
 esac
-GPU_TYPE="${GPU_TYPE:-H100}"   # H100 | B200
+GPU_TYPE="${GPU_TYPE:-H100}"   # H100 | H200 | B200
 # Video decode is CPU-bound, but Modal caps one container at 64 cores (request > 64 is rejected).
 CPU="${CPU:-64}"
 MEMORY_GB="${MEMORY_GB:-512}"

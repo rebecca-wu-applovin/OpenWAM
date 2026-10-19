@@ -8,7 +8,7 @@ Usage (from the repo root):
     # smoke test: tiny random DiT, real data, 1 GPU, 5 steps, no wandb
     OPENWAM_GPU_COUNT=1 modal run scripts/modal/train.py --debug
 
-    # real run, 8 GPUs (OPENWAM_GPU_TYPE=H100|B200, default H100), detached
+    # real run, 8 GPUs (OPENWAM_GPU_TYPE=H100|H200|B200, default H100), detached
     OPENWAM_GPU_TYPE=B200 modal run --detach scripts/modal/train.py \
         --overrides "dataloader.action_mode=fingertips_rel model.architecture.action_dim=48 ..."
     # (normally launched via run_modal.sh, which sets these env vars)
@@ -57,6 +57,8 @@ image = (
         extra_index_url="https://download.pytorch.org/whl/cu128",
         extra_options="--index-strategy unsafe-best-match",
     )
+    # flux3_action_base's video VAE needs NATTEN; same build as the local .venv (no torch 2.7 wheel for 0.21.6).
+    .uv_pip_install("natten==0.21.0+torch270cu128", find_links="https://whl.natten.org")
     .env(
         {
             "PYTHONPATH": REMOTE_REPO,  # replaces `pip install -e .`
@@ -312,7 +314,7 @@ COMMON = dict(
 # GPU spec is fixed when the function is defined, so it comes from env vars read at import time
 # (run_modal.sh sets them). The Modal UI then shows the GPUs actually requested. Inside the
 # container the decorator values are not used, so the defaults there don't matter.
-GPU_TYPES = ("H100", "B200")  # B200: torch 2.7.1+cu128 ships sm_100 kernels
+GPU_TYPES = ("H100", "H200", "B200")  # H200: same sm_90 as H100, 141 GB; B200: torch 2.7.1+cu128 ships sm_100 kernels
 GPU_TYPE = os.environ.get("OPENWAM_GPU_TYPE", "H100")
 GPU_COUNT = int(os.environ.get("OPENWAM_GPU_COUNT", "8"))
 # Video decode in the dataloader is CPU-bound (64 cores: ~13.5 samples/s vs ~47 on the 208-core dev
