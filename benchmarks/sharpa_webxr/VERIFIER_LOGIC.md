@@ -141,7 +141,9 @@ Shared measurements in [`tool_verifiers/common.py:1`](tool_verifiers/common.py#L
   not pushed away, not sent flying (each optional).
 - [`handling() — tool_verifiers/common.py:94`](tool_verifiers/common.py#L94): regrasps and spin, **reported only** (not a pass/fail condition).
 - [`work_check() — tool_verifiers/_work.py:12`](tool_verifiers/_work.py#L12): stir / scramble / scoop: inside time, path, optional depth below the rim,
-  optional strokes, and optional "not dropped more than k times while working" (a separate condition).
+  optional strokes, and optional "not dropped more than k times while working" (a separate condition). Drops are
+  **retrospective counts indexed by release time**: a release is classified with what happened after it (its fall, a
+  tumble) up to the next regrasp, and the count is credited at the release frame.
 
 | task | file | done = | ending |
 |---|---|---|---|
@@ -257,9 +259,15 @@ the drop rule's clauses, the rack, brushing on the plate face, the scissors grip
 
 - Every threshold was chosen on the same labelled recordings it is evaluated on; there is no held-out set. The
   sensitivity table above is the main guard; a fresh batch of labelled recordings is the real test.
-- The "so far" masks are causal for strokes and drops, but a visit's stroke direction is fitted on the whole visit, and
-  `max_drops_while_working` uses the first and last working frames (known only at the end). The verdict is an end-state
-  verdict; the per-frame masks are not an online reward.
+- Per-frame masks are not an online reward. Strokes are counted as they are confirmed, but a session's stroke direction
+  is fitted on the whole session; drops are retrospective (classified with what happened after the release, credited at
+  the release frame) and bounded by the first and last working frames, known only at the end. The verdict is an
+  end-state verdict.
+- Strokes include the motion between touches of one session (brushing in the labels is touch, lift, move, touch back:
+  requiring the motion to happen while touching fails 13 of 50 labelled brushing successes and 3 scrambling ones). So
+  three stationary touches at different places can count as a stroke (test
+  `tests/benchmarks/test_sharpa_webxr_tool_measures.py::test_stationary_touches_are_not_a_stroke`, marked xfail).
+  A middle ground to decide: count motion while the tool is near the surface (e.g. within 1-2 cm), not only in contact.
 - Accepted misses: 00787 failure_fe990300 (nothing in the state separates it), 01640 failure_d11597e0 (touches the
   drumhead as softly as some successes). 01242 (banana) is skipped: the benchmark scene has no banana.
 
