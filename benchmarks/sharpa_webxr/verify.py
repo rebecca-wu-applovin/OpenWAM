@@ -46,6 +46,7 @@ class Replay:
         m, d = self.an.m, self.an.d
         self.n = len(qpos)
         self.q0 = np.array(qpos[0], float)
+        self.qpos = np.asarray(qpos, float)  # kept for checks that need extra per-frame physics (object-object contacts)
         # finger flexion per hand (mean of the flexion joints, 0 = open): tells a deliberate release (fingers opening)
         # from an object slipping out of a closed hand
         self.flex = np.zeros((self.n, 2))
@@ -1139,6 +1140,12 @@ CHECKS = {"reach": c_reach, "grasp": c_grasp, "hold_lifted": c_hold_lifted, "pla
           "relative_pose": c_relative_pose, "attached": c_attached, "orientation": c_orientation, "oscillation": c_oscillation,
           "free_flight": c_free_flight, "tilt_over": c_tilt_over, "pour": c_pour, "contact_events": c_contact_events,
           "sweep": c_sweep, "judge": c_judge}
+
+# task-specific verifiers for the tool-use tasks (tool_verifiers/<task>.py) register their checks here; they get this
+# module (not a second import of it) so Replay and the shared rules are the same objects when run as a script
+from tool_verifiers import register as _register_tool_verifiers  # noqa: E402
+
+_register_tool_verifiers(sys.modules[__name__])
 
 
 def verify(rollout_dir: Path, env: SharpaWebXREnv, spec: dict, max_steps: int | None = None) -> dict:

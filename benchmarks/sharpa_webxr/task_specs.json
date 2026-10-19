@@ -1898,22 +1898,13 @@
    },
    {
     "name": "brushed",
-    "check": "sweep",
+    "check": "brush",
     "obj": "world_eraser_07",
     "target": "world_plate_05",
-    "contact": true,
-    "min_path_m": 0.05,
-    "inside_box_m": 0.025,
-    "max_free_speed_m_s": 1.2,
     "final": true
-   },
-   {
-    "name": "complete",
-    "check": "judge",
-    "question": "plate brushed with the eraser"
    }
   ],
-  "needs_judge": true
+  "needs_judge": false
  },
  "00749_TACO_scrape_off__spoon__pan__20230926_026": {
   "version": 1,
@@ -1938,20 +1929,13 @@
    },
    {
     "name": "stirred",
-    "check": "sweep",
+    "check": "stir",
     "obj": "world_spoon_08",
     "target": "world_pan_06",
-    "xy_slack_m": 0.03,
-    "z_above_m": 0.12,
-    "min_path_m": 0.3
-   },
-   {
-    "name": "complete",
-    "check": "judge",
-    "question": "pot stirred with the spoon"
+    "final": true
    }
   ],
-  "needs_judge": true
+  "needs_judge": false
  },
  "00787_GigaHands_p048-sandwich_047_seg000": {
   "version": 1,
@@ -1976,34 +1960,13 @@
    },
    {
     "name": "scrambled",
-    "check": "sweep",
+    "check": "scramble",
     "obj": "world_spatula",
     "target": "world_pan_01",
-    "target_box": [
-     [
-      -0.076,
-      -0.097,
-      -0.019
-     ],
-     [
-      0.072,
-      0.09,
-      0.042
-     ]
-    ],
-    "xy_slack_m": 0.03,
-    "z_above_m": 0.1,
-    "min_path_m": 0.12,
-    "max_free_speed_m_s": 1.0,
     "final": true
-   },
-   {
-    "name": "complete",
-    "check": "judge",
-    "question": "egg scrambled by moving the spatula around the pan"
    }
   ],
-  "needs_judge": true
+  "needs_judge": false
  },
  "00863_TACO_hit__hammer__box__20231002_057": {
   "version": 1,
@@ -2028,19 +1991,15 @@
    },
    {
     "name": "hit",
-    "check": "contact_events",
+    "check": "hammer_hit",
     "obj": "world_hammer_03",
     "target": "world_box_13",
-    "min_events": 1,
-    "min_speed_m_s": 0.05
-   },
-   {
-    "name": "complete",
-    "check": "judge",
-    "question": "box hit with the hammer head"
+    "max_free_speed_m_s": 1.2,
+    "target_tilt_deg": null,
+    "final": true
    }
   ],
-  "needs_judge": true
+  "needs_judge": false
  },
  "01477_GigaHands_p006-gopro_045_seg000": {
   "version": 1,
@@ -2058,19 +2017,13 @@
     "obj": "world_camera"
    },
    {
-    "name": "lift_hold",
-    "check": "hold_lifted",
+    "name": "button",
+    "check": "camera_button",
     "obj": "world_camera",
-    "lift_m": 0.03,
-    "hold_s": 0.5
-   },
-   {
-    "name": "complete",
-    "check": "judge",
-    "question": "camera button clicked (no button in the sim)"
+    "final": true
    }
   ],
-  "needs_judge": true
+  "needs_judge": false
  },
  "01587_GigaHands_p051-fastfood_041_seg000": {
   "version": 1,
@@ -2095,20 +2048,13 @@
    },
    {
     "name": "scooped",
-    "check": "sweep",
+    "check": "scoop",
     "obj": "world_spoon",
     "target": "world_plate",
-    "xy_slack_m": 0.08,
-    "z_above_m": 0.15,
-    "min_path_m": 0.02
-   },
-   {
-    "name": "complete",
-    "check": "judge",
-    "question": "a piece of pudding scooped from the plate with the spoon"
+    "final": true
    }
   ],
-  "needs_judge": true
+  "needs_judge": false
  },
  "01640_GigaHands_p029-instrument_019_seg000": {
   "version": 1,
@@ -2133,18 +2079,12 @@
    },
    {
     "name": "hit",
-    "check": "contact_events",
+    "check": "drum_hit",
     "obj": "world_drumstick",
     "target": "world_drum",
-    "min_events": 1,
-    "min_speed_m_s": 0.15
-   },
-   {
-    "name": "complete",
-    "check": "judge",
-    "question": "drumhead hit with the drum stick"
+    "final": true
    }
   ],
-  "needs_judge": true
+  "needs_judge": false
  }
 }

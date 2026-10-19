@@ -472,3 +472,33 @@ Judge on labelled episodes that passed the state checks: recall 0.921, specifici
 (state checks + judge) on the 8 judge tasks: recall 0.921, specificity 0.721. Per task the judge rejects nothing on
 00051, 00749, 00787, 01587, 01640 (specificity 0.000) and lets through only 52% of 01477 successes.
 Policy hybrid SR: xwam 25.4%, motus 22.2% (was 22.6), gwp 20.0% (20.4), cosmos3 4.0% (4.7).
+
+## Tool-use tasks graded by their own state verifiers, no vision judge (2026-10-19)
+
+Why: the judge (gpt-6-luna, rubric r3) passed 40 of 62 labelled failures that reached it. Its rubric graded the best
+moment ("success = accomplished at some time"), never mentioned unstable handling, and told it to trust the sim summary
+("scrambled: yes") over the images, so dropped or thrown tools passed ("the spoon was later set down, but the stirring
+had already been performed"). A bigger model alone (gpt-6.1-sol) caught 2 of 14 such failures; a stricter rubric (r4,
+in score.py, not used for grading) caught 12-14 of 14 but also rejected 4-5 of 14 successes.
+
+New: `tool_verifiers/` (one module per task, registered into verify.CHECKS; shared measurements in common.py):
+tool-target contact points (which part of the tool touches which part of the target), the tool's working point in the
+target's own frame (time inside, path, back-and-forth reversals), handling (regrasps, spin) and a shared ending
+(not flung after the last release, target not knocked over / pushed away; per-task limits).
+- 01640 drum (drum.py): stick touches the drumhead (top face) while held, >= 1 hit; any part of the stick (labelled
+  successes often hit with the shaft); not flung > 1.0 m/s; drum not tipped > 45 deg.
+- 00863 hammer (hammer.py): head (x >= 8.5 cm of the hammer mesh) strikes the box at >= 0.08 m/s; not flung > 1.2 m/s;
+  the box may be knocked over (labelled successes tip it up to 130 deg).
+- 00749 stir (stir.py): spoon bowl inside the pot while held >= 1 s, path >= 0.18 m; not flung > 1.2 m/s; pot tilt <= 100.
+- 00787 scramble (scramble.py): blade inside the pan >= 1.2 s, path >= 0.2 m, >= 2 reversals of 2 cm; not flung > 1.0
+  m/s; pan moved <= 0.4 m.
+- 01587 scoop (scoop.py): spoon bowl in the plate region >= 0.2 s, path >= 0.07 m; not flung > 1.0 m/s; plate tilt <= 60.
+- 00051 brush (brush.py): eraser held against the plate >= 0.3 s with >= 1 back-and-forth of 2 cm, in the plate's
+  frame whatever its pose; not flung > 1.0 m/s.
+- 01477 camera (camera_button.py): held up >= 1.9 s and not flung > 1.0 m/s. The sim has no button and the press is not
+  visible in state (successes and failures touch the top face alike); fingertip time on the top face is reported only.
+
+On the labels (recall / specificity): 01640 0.980 / 0.929, 00863 1.000 / 1.000, 00749 0.980 / 0.933, 00787 1.000 /
+0.929, 01587 0.979 / 0.840, 00051 1.000 / 0.812, 01477 1.000 / 0.762. All 7: 0.991 / 0.884, against 0.921 / 0.721 for
+state prefix + judge. All state-only tasks: n = 2906, recall 0.997, specificity 0.975.
+Policy hybrid SR: xwam 26.2% (was 25.4), motus 21.1% (22.2), gwp 20.0% (20.0), cosmos3 3.6% (4.0).

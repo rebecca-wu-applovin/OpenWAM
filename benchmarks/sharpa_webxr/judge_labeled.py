@@ -27,7 +27,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--root", type=Path, default=HERE.parents[1] / "data/webxr_episodes")
     p.add_argument("--model", default="gpt-6-luna")
-    p.add_argument("--rubric", default="r3", choices=["r2", "r3"])
+    p.add_argument("--rubric", default="r3", choices=["r2", "r3", "r4"])
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--max-calls", type=int, default=None)
     p.add_argument("--no-calls", action="store_true", help="only use cached verdicts")

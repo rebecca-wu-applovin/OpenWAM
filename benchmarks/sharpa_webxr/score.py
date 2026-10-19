@@ -96,7 +96,27 @@ When simulator state checks are given before the images, they are ground truth f
 reported there as satisfied did happen even if the images are unclear. Use the images to judge the manner and the
 completeness of the motion, not to re-check those facts."""
 
-RUBRICS = {"r2": RUBRIC_R2, "r3": RUBRIC_R3}
+RUBRIC_R4 = RUBRIC_R3.split("When simulator state checks are given")[0].replace(
+    "success = the full task was accomplished at some time in the rollout.",
+    "success = the full task was accomplished AND the episode ended well (see \"The whole episode counts\" below).") + """
+
+The whole episode counts, not only its best moment. Answer success = false, even if the action itself was done, when:
+- the task object is dropped, thrown, slips out of the hand, or falls (onto the table, off it, or into something)
+  at any point after the action, instead of being held or put down deliberately. At the end it must be in the hand,
+  or resting where a person would put it, set down on purpose (lowered by the hand, not released from a height);
+- the handling is unstable: the object wobbles, flips or swings in the hand, is fumbled or caught again, is juggled
+  between hands to keep it from falling, or the hand repeatedly loses it;
+- another object (the pot, plate, box, drum, pan) is knocked over, tipped, flung or pushed far by the action.
+Compare consecutive frames: an object that is in the hand at one time and lying on the table, tilted or far away at
+the next, without a visible lowering motion, was dropped. Look closely at the last frames.
+
+Simulator measurements may be given before the images. They are exact facts about contacts and motion (distances,
+times, speeds) from the physics engine, measured with simple thresholds. They are NOT a verdict on the task: a "yes"
+there only means a threshold was crossed. Use them as facts, and decide the task, its manner and its ending from the
+images."""
+
+RUBRICS = {"r2": RUBRIC_R2, "r3": RUBRIC_R3, "r4": RUBRIC_R4}
+SIM_HEADERS = {"r4": "Simulator measurements (exact, but not a verdict on the task):"}
 STAGES = ("reach", "grasp", "move", "complete")
 SIM_STAGES = ("reach", "grasp", "move")
 
@@ -149,7 +169,7 @@ def judge_one(c: openai.OpenAI, model: str, d: Path, force: bool, rubric: str = 
         content = [{"type": "input_text", "text": f"Task: {meta['task']}\nScored span: {fr[-1][0]:.1f} s, "
                                                   f"{len(fr)} times x 2 cameras."}]
         if sim_context:
-            content.append({"type": "input_text", "text": f"{SIM_CONTEXT_HEADER}\n{sim_context.removeprefix('Simulator state checks: ')}"})
+            content.append({"type": "input_text", "text": f"{SIM_HEADERS.get(rubric, SIM_CONTEXT_HEADER)}\n{sim_context.removeprefix('Simulator state checks: ')}"})
         for t, head, chest in fr:
             content += [{"type": "input_text", "text": f"t = {t:.1f} s: head camera, then chest camera"}, img(head), img(chest)]
     content.append({"type": "input_text", "text": "Grade this rollout."})
@@ -350,7 +370,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("folder", type=Path)
     p.add_argument("--model", default="gpt-6-luna")
-    p.add_argument("--rubric", default="r3", choices=["r1", "r2", "r3"],
+    p.add_argument("--rubric", default="r3", choices=["r1", "r2", "r3", "r4"],
                    help="r3 (default): r2 plus the rigid-body-only note; verdict cache is per rubric (judge_<model>_<rubric>.json)")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--limit", type=int, default=None, help="score only the first N rollouts (pilot / cost check)")

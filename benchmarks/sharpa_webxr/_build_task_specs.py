@@ -149,16 +149,15 @@ S = {
     "01480": ["world_bowl", "world_pan", [reach("world_bowl"), grasp("world_bowl"), pour("world_bowl", "world_pan", toward_target_m=0.03, opening=[0.07, 0.0, 0.034], opening_r=0.158)]],
     "01498": ["world_kettle", "world_teapot", [reach("world_kettle"), grasp("world_kettle"), pour("world_kettle", "world_teapot", spout=[-0.116, 0.0, 0.14], spout_dir=[-1.0, 0.0], spout_tol_deg=60, rim_slack_m=0.01, hold_s=0.1)]],
     # ---- tool use (sim: grasp tool, tool acts on target; judge: the effect) ---------------------------------
-    # brushing counts on the plate's own box (+2.5 cm), whatever its pose: the plate is often held up or upside down
-    # while it is brushed (reviewer, success_03ac6849 "it is brushed"); the eraser must not be flung / fall fast at the end
-    "00051": ["world_eraser_07", "world_plate_05", [reach("world_eraser_07"), grasp("world_eraser_07", lift_m=0.01, carry_m=0.03), {"name": "brushed", "check": "sweep", "obj": "world_eraser_07", "target": "world_plate_05", "contact": True, "min_path_m": 0.05, "inside_box_m": 0.025, "max_free_speed_m_s": 1.2, "final": True}, judge("plate brushed with the eraser")]],
-    "00749": ["world_spoon_08", "world_pan_06", [reach("world_spoon_08"), grasp("world_spoon_08"), {"name": "stirred", "check": "sweep", "obj": "world_spoon_08", "target": "world_pan_06", "xy_slack_m": 0.03, "z_above_m": 0.12, "min_path_m": 0.30}, judge("pot stirred with the spoon")]],
-    # stir path >= 12 cm in the pan (reviewer, success_ccf05e19 "it is scrambled"); spatula not flung (> 1.0 m/s) at the end
-    "00787": ["world_spatula", "world_pan_01", [reach("world_spatula"), grasp("world_spatula"), {"name": "scrambled", "check": "sweep", "obj": "world_spatula", "target": "world_pan_01", "target_box": [[-0.076, -0.097, -0.019], [0.072, 0.09, 0.042]], "xy_slack_m": 0.03, "z_above_m": 0.10, "min_path_m": 0.12, "max_free_speed_m_s": 1.0, "final": True}, judge("egg scrambled by moving the spatula around the pan")]],
-    "00863": ["world_hammer_03", "world_box_13", [reach("world_hammer_03"), grasp("world_hammer_03"), {"name": "hit", "check": "contact_events", "obj": "world_hammer_03", "target": "world_box_13", "min_events": 1, "min_speed_m_s": 0.05}, judge("box hit with the hammer head")]],
-    "01477": ["world_camera", None, [reach("world_camera"), pick("world_camera", lift=0.03, hold=0.5, final=False), judge("camera button clicked (no button in the sim)")]],
-    "01587": ["world_spoon", "world_plate", [reach("world_spoon"), grasp("world_spoon"), {"name": "scooped", "check": "sweep", "obj": "world_spoon", "target": "world_plate", "xy_slack_m": 0.08, "z_above_m": 0.15, "min_path_m": 0.02}, judge("a piece of pudding scooped from the plate with the spoon")]],
-    "01640": ["world_drumstick", "world_drum", [reach("world_drumstick"), grasp("world_drumstick"), {"name": "hit", "check": "contact_events", "obj": "world_drumstick", "target": "world_drum", "min_events": 1, "min_speed_m_s": 0.15}, judge("drumhead hit with the drum stick")]],
+    # tool-use tasks graded by their own state verifiers (tool_verifiers/), no vision judge: the judge passed most
+    # labelled failures (dropped / thrown tools, unstable handling) because it graded the best moment only
+    "00051": ["world_eraser_07", "world_plate_05", [reach("world_eraser_07"), grasp("world_eraser_07", lift_m=0.01, carry_m=0.03), {"name": "brushed", "check": "brush", "obj": "world_eraser_07", "target": "world_plate_05", "final": True}]],  # tool_verifiers/brush.py
+    "00749": ["world_spoon_08", "world_pan_06", [reach("world_spoon_08"), grasp("world_spoon_08"), {"name": "stirred", "check": "stir", "obj": "world_spoon_08", "target": "world_pan_06", "final": True}]],  # tool_verifiers/stir.py
+    "00787": ["world_spatula", "world_pan_01", [reach("world_spatula"), grasp("world_spatula"), {"name": "scrambled", "check": "scramble", "obj": "world_spatula", "target": "world_pan_01", "final": True}]],  # tool_verifiers/scramble.py
+    "00863": ["world_hammer_03", "world_box_13", [reach("world_hammer_03"), grasp("world_hammer_03"), {"name": "hit", "check": "hammer_hit", "obj": "world_hammer_03", "target": "world_box_13", "max_free_speed_m_s": 1.2, "target_tilt_deg": None, "final": True}]],  # tool_verifiers/hammer.py
+    "01477": ["world_camera", None, [reach("world_camera"), {"name": "button", "check": "camera_button", "obj": "world_camera", "final": True}]],  # tool_verifiers/camera_button.py
+    "01587": ["world_spoon", "world_plate", [reach("world_spoon"), grasp("world_spoon"), {"name": "scooped", "check": "scoop", "obj": "world_spoon", "target": "world_plate", "final": True}]],  # tool_verifiers/scoop.py
+    "01640": ["world_drumstick", "world_drum", [reach("world_drumstick"), grasp("world_drumstick"), {"name": "hit", "check": "drum_hit", "obj": "world_drumstick", "target": "world_drum", "final": True}]],  # tool_verifiers/drum.py
 }
 
 
