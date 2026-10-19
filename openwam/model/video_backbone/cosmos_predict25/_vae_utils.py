@@ -94,11 +94,15 @@ def _move_cosmos_reason1(te: Any, *, dtype: torch.dtype, device: torch.device) -
 # ----------------------------------------------------------------------
 
 
-def _pil_video_to_tensor(frames: Any) -> "torch.Tensor":
-    """Convert ``list[list[PIL.Image]]`` → ``(B, 3, T, H, W)`` float in ``[-1, 1]``.
+def _pil_video_to_tensor(frames: Any, *, device) -> "torch.Tensor":
+    """Convert ``list[list[PIL.Image]]`` → ``(B, 3, T, H, W)`` float32 in ``[-1, 1]`` on ``device``.
 
-    uint8 RGB → ``float / 127.5 - 1``. Self-contained (no Wan imports) so
-    CosmosPredict25 works without the Wan backbone installed.
+    frames: B clips of T same-size PIL frames.
+    device: where the tensor is built; pass the encoder's GPU so only uint8 crosses PCIe and the
+        float conversion runs there (the CPU float32 path cost up to ~1 s/step on Modal, 13_modal_profile).
+    Returns: (B, 3, T, H, W) float32, uint8 RGB → ``float / 127.5 - 1``, bit-identical on any device
+        (14_pil_to_tensor_on_gpu).
+    Self-contained (no Wan imports) so CosmosPredict25 works without the Wan backbone installed.
     """
     import numpy as np
 
@@ -113,9 +117,12 @@ def _pil_video_to_tensor(frames: Any) -> "torch.Tensor":
         clip_arr = np.stack([np.asarray(f.convert("RGB"), dtype=np.uint8) for f in clip], axis=0)
         arrs.append(clip_arr)
     stack = np.stack(arrs, axis=0)  # (B, T, H, W, 3) uint8
-    t = torch.from_numpy(stack).to(dtype=torch.float32)
-    t = t / 127.5 - 1.0
-    t = t.permute(0, 4, 1, 2, 3).contiguous()  # (B, 3, T, H, W)
+    # The 256 possible values, computed on the CPU with the original formula. CUDA's scalar division
+    # can round differently (1 ulp), so the device only looks values up and never divides.
+    lut = (torch.arange(256, dtype=torch.float32) / 127.5 - 1.0).to(device)
+    # uint8 to the device first (4x less to copy than float32), then map it there.
+    idx = torch.from_numpy(stack).to(device, non_blocking=True).int()
+    t = lut[idx].permute(0, 4, 1, 2, 3).contiguous()  # (B, 3, T, H, W)
     return t
 
 

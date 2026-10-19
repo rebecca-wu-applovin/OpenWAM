@@ -141,13 +141,17 @@ class GEBaseFastVideoBackbone(VideoBackbone):
     # ================================================================
 
     @classmethod
-    def from_pretrained(cls, source: Any, *, external_encoder=None, text_dim: Optional[int] = None, **kw):
-        """Build from the model cfg (training path).
+    def from_pretrained(
+        cls, source: Any, *, external_encoder=None, text_dim: Optional[int] = None, ckpt_dir: Optional[str] = None, **kw
+    ):
+        """Build from the pretrained GE / LTX weights.
 
         Args:
-            source: dict / DictConfig holding ``video_backbone`` with ``model_path`` (GE ckpt dir),
+            source: training: dict / DictConfig of architecture params holding ``video_backbone``;
+                run-dir rebuild: that ``video_backbone`` cfg itself. It has ``model_path`` (GE ckpt dir),
                 ``ltx_path`` (LTX-Video dir: vae/, text_encoder/, tokenizer/) and optional
                 ``n_view``, ``text_max_length``, ``caption_dropout_p``, ``vae_sample``.
+            ckpt_dir: run dir being rebuilt from (resume / finetune); None for a fresh training build.
             external_encoder / text_dim: must be None / 4096 (native components only).
 
         Returns:
@@ -161,9 +165,13 @@ class GEBaseFastVideoBackbone(VideoBackbone):
 
         if external_encoder is not None:
             raise ValueError("ge_base_fast keeps the native LTX VAE; external encoders are not supported")
-        vb_cfg = source.get("video_backbone") if hasattr(source, "get") and "video_backbone" in source else None
-        if vb_cfg is None or _cfg(vb_cfg, "_source") is not None:
-            raise NotImplementedError("ge_base_fast: only the training build (model cfg) is supported for now")
+        if ckpt_dir is not None:
+            # Rebuild from a run dir (resume / finetune, ckpt_model_loader): `source` is that run's own
+            # video_backbone cfg. Build the same pretrained model from it; the caller then overwrites
+            # every weight (accelerate load_state / the safetensors load).
+            vb_cfg = source
+        else:
+            vb_cfg = source.get("video_backbone")
         model_path = str(_cfg(vb_cfg, "model_path"))
         ltx_path = str(_cfg(vb_cfg, "ltx_path"))
 
@@ -299,7 +307,7 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         """
         from openwam.model.video_backbone.cosmos_predict25._vae_utils import _pil_video_to_tensor
 
-        frames_t = frames if torch.is_tensor(frames) else _pil_video_to_tensor(frames)
+        frames_t = frames if torch.is_tensor(frames) else _pil_video_to_tensor(frames, device=self.device)
         n_hist = int(kw.get("num_history_frames", 0) or 0)
         n_fut = frames_t.shape[2] - n_hist
         if (n_fut - 1) % self._temporal_compression:

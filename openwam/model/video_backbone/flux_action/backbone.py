@@ -26,6 +26,7 @@ different lengths without padding them to each other).
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional, Tuple
 
 import torch
@@ -49,6 +50,9 @@ _LATENT_CHANNELS = 96
 _TEMPORAL_COMPRESSION = 4
 _SPATIAL_COMPRESSION = 32
 _DECODER_TEMPORAL_KERNEL = 5  # decoder NATTEN kernel along latent time; shorter latents cannot decode
+# Shortest clip the encoder runs on: its last Swin blocks see ceil(T/2) frames (after the first
+# TemporalMerging), which NATTEN needs >= the temporal kernel 5, so T >= 9 (and T = 1 mod 4).
+_ENCODER_MIN_FRAMES = 9
 _VIDEO_POSITION_FPS = 24.0  # PolicyConfig.video_position_fps: latent i sits at 4 i / 24 s
 _STATE_FPS = 1.0  # our 5 proprio frames are 1 s apart (07 layout)
 _VEC_DIM = 768  # pooled-vector width; flux feeds zeros
@@ -250,21 +254,31 @@ class FluxActionVideoBackbone(VideoBackbone):
 
     # ---------------------------------------------------------------- construction
     @classmethod
-    def from_pretrained(cls, source: Any, **kw) -> "FluxActionVideoBackbone":
-        """Build from the architecture params (training: ``video_backbone`` + ``state_dim``).
+    def from_pretrained(cls, source: Any, *, ckpt_dir: Optional[str] = None, **kw) -> "FluxActionVideoBackbone":
+        """Build from the pretrained flux weights.
 
         Args:
-            source: dict / DictConfig holding ``video_backbone`` (model_path, ...) and ``state_dim``.
+            source: training: dict / DictConfig of architecture params holding ``video_backbone``
+                (model_path, ...) and ``state_dim``; run-dir rebuild: that ``video_backbone`` cfg itself.
+            ckpt_dir: run dir being rebuilt from (resume / finetune); None for a fresh training build.
             kw: ignored (``text_dim`` etc.).
 
         Returns:
             FluxActionVideoBackbone with trunk, VAE and text encoder loaded.
         """
-        vb_cfg = source.get("video_backbone") if hasattr(source, "get") and "video_backbone" in source else None
-        if vb_cfg is None or vb_cfg.get("_source") is not None:
-            raise NotImplementedError("flux3_action_base: deploy rebuild from a checkpoint is not implemented yet")
+        if ckpt_dir is not None:
+            # Rebuild from a run dir (resume / finetune, ckpt_model_loader): `source` is that run's own
+            # video_backbone cfg. Build the same pretrained model from it; the caller then overwrites
+            # every weight (accelerate load_state / the safetensors load). state_dim sits on the
+            # architecture, so read it from the run's saved config.
+            from omegaconf import OmegaConf
+
+            vb_cfg = source
+            state_dim = int(OmegaConf.load(os.path.join(ckpt_dir, "config.yaml")).model.architecture.state_dim)
+        else:
+            vb_cfg = source.get("video_backbone")
+            state_dim = int(source.get("state_dim", 48))
         root = str(vb_cfg.get("model_path"))
-        state_dim = int(source.get("state_dim", 48))
         dit = build_flux_dit(f"{root}/flux-3-action-base.safetensors", state_dim=state_dim, head_seed=0)
         vae = build_flux_vae(f"{root}/video_vae.safetensors")
         from openwam.model.video_backbone.flux_action.text_encoder import Qwen3VLEmbedder
@@ -309,17 +323,27 @@ class FluxActionVideoBackbone(VideoBackbone):
         """``(N, 3, T, H, W)`` in [-1, 1] -> normalized latents ``(N, 96, 1 + (T-1)//4, H/32, W/32)``.
 
         A single frame is encoded alone (native ``encode_task`` / ``encode_frame``: the 2-D kernel path).
-        A clip is black-padded at the end to the 45-frame VAE chunk, encoded and cropped back
-        (native ``packing.encode_videos``, the DROID training path): its temporal NATTEN kernel is 5, so
-        short clips such as our 1+4 future cannot run unpadded.
+        A clip is black-padded at the end, encoded and cropped back (native ``packing.encode_videos``,
+        the DROID training path): its temporal NATTEN kernel is 5, so short clips such as our 1+4 future
+        cannot run unpadded. Native pads to the 45-frame chunk; we pad only to ``_ENCODER_MIN_FRAMES``.
+        The encoder is causal in time (per-frame patch embed, causal NATTEN, front-aligned
+        TemporalMerging), so trailing pad frames never reach the kept latents; only the cost changes.
+        Clips longer than one chunk still go through the native chunked encode.
+        Raises ValueError for a clip with T > 1 and T != 1 (mod 4) (the data layout must provide 1 + 4k frames).
         """
         from openwam.model.video_backbone.flux_action.video_vae import padded_chunk_length
 
         dtype = next(self.vae.parameters()).dtype
         n, c, t, hp, wp = video.shape
         if t > 1:
+            # The VAE takes T = 1 (mod 4) only (video_vae.VideoVAE); other lengths change how TemporalMerging
+            # pairs frames, so refuse them instead of silently padding: the data layout has to be fixed.
+            if (t - 1) % _TEMPORAL_COMPRESSION:
+                raise ValueError(
+                    f"flux3_action_base: a clip must have T = 1 (mod {_TEMPORAL_COMPRESSION}) frames, got T={t}"
+                )
             chunk = self.vae.chunk_size_frames
-            total = chunk if t < chunk else padded_chunk_length(t, chunk)
+            total = max(t, _ENCODER_MIN_FRAMES) if t <= chunk else padded_chunk_length(t, chunk)
             pad = torch.full((n, c, total - t, hp, wp), -1.0, dtype=video.dtype, device=video.device)
             video = torch.cat([video, pad], dim=2)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=video.device.type == "cuda"):
@@ -349,12 +373,11 @@ class FluxActionVideoBackbone(VideoBackbone):
         video = video[:, :, : _TEMPORAL_COMPRESSION * (t - 1) + 1]
         return _video_tensor_to_pil(video.float().clamp(-1, 1))
 
-    @staticmethod
-    def _pixels(frames) -> Tensor:
-        """list of B clips of PIL frames -> (B, 3, T, H, W) float in [-1, 1]."""
+    def _pixels(self, frames) -> Tensor:
+        """list of B clips of PIL frames -> (B, 3, T, H, W) float32 in [-1, 1], built on self.device."""
         from openwam.model.video_backbone.cosmos_predict25._vae_utils import _pil_video_to_tensor
 
-        return _pil_video_to_tensor(frames)
+        return _pil_video_to_tensor(frames, device=self.device)
 
     def encode_sparse(self, frames, num_history_frames: int) -> Tensor:
         """Each history frame alone, the future as one causal clip (flux history.encode_windows).
@@ -432,7 +455,7 @@ class FluxActionVideoBackbone(VideoBackbone):
             if n_hist > 0:
                 latents = self.encode_sparse(frames, n_hist)
             else:
-                latents = self._vae_encode(self._pixels(frames).to(self.device))
+                latents = self._vae_encode(self._pixels(frames))
             context, seq_lens = self.encode_text(prompts)
         latents = latents.to(device=self.device, dtype=self.dtype)
         n_clean = max(n_hist, 1)

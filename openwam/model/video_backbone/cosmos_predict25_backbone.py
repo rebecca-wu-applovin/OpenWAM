@@ -611,8 +611,8 @@ class CosmosPredict25VideoBackbone(VideoBackbone):
         """PIL frames → bf16 ``(B, 16, T_lat, H/8, W/8)`` Wan2pt1 latents."""
         if self._vae_iface is None:
             raise RuntimeError("CosmosPredict25VideoBackbone._encode_frames called without a configured VAE.")
-        video = _pil_video_to_tensor(frames)
-        video = video.to(device=_vae_device(self._vae_iface), dtype=torch.bfloat16)
+        video = _pil_video_to_tensor(frames, device=_vae_device(self._vae_iface))
+        video = video.to(dtype=torch.bfloat16)
         return self._vae_iface.encode(video)
 
     def decode_video(self, latents: Tensor, *, tiled: bool = True) -> list:

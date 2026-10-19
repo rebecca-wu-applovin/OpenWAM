@@ -275,7 +275,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
 
         if isinstance(frames, (list, tuple)) and frames and not isinstance(frames[0], (list, tuple)):
             frames = [frames]  # single clip → batch of one
-        return _pil_video_to_tensor(frames)
+        return _pil_video_to_tensor(frames, device=self.device)
 
     def _encode_frames(self, frames: Tensor) -> Tensor:
         """Pixel video ``(B, 3, T, H, W)`` in [-1, 1] → normalized latents
@@ -634,7 +634,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
 
         from openwam.model.video_backbone.cosmos_predict25._vae_utils import _pil_video_to_tensor
 
-        frame_t = _pil_video_to_tensor([[first_frame_image]]).to(self.device)
+        frame_t = _pil_video_to_tensor([[first_frame_image]], device=self.device)
         with torch.no_grad():
             first_frame_latents = self._encode_frames(frame_t)  # (1, 48, 1, h, w)
 
