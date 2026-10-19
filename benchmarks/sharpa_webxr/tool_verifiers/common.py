@@ -134,7 +134,13 @@ def end_rules(r, tool: str, target: str | None, s: dict, c) -> dict:
         disp = r.disp(target)
         if dl is not None:
             c.add(f"{target} not pushed away (moved <= {dl} m; max {disp.max():.2f} m)", ~np.maximum.accumulate(disp > dl))
-        m.update({"target_max_tilt_change_deg": float(np.abs(tilt - tilt0).max()), "target_max_disp_m": float(disp.max())})
+        tv = s.get("target_max_speed_m_s")
+        spd = r.speed(target)
+        if tv is not None:  # the target is not sent flying (pressed / flipped / knocked away by the tool)
+            peak = np.maximum.accumulate(spd)
+            c.add(f"{target} not sent flying (never faster than {tv} m/s; fastest {peak[-1]:.2f} m/s)", peak <= tv)
+        m.update({"target_max_tilt_change_deg": float(np.abs(tilt - tilt0).max()), "target_max_disp_m": float(disp.max()),
+                  "target_max_speed_m_s": float(spd.max())})
     return m
 
 

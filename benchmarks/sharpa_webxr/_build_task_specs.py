@@ -156,7 +156,7 @@ S = {
     "00749": ["world_spoon_08", "world_pan_06", [reach("world_spoon_08"), grasp("world_spoon_08"), {"name": "stirred", "check": "stir", "obj": "world_spoon_08", "target": "world_pan_06", "final": True}]],  # tool_verifiers/stir.py
     "00787": ["world_spatula", "world_pan_01", [reach("world_spatula"), grasp("world_spatula"), {"name": "scrambled", "check": "scramble", "obj": "world_spatula", "target": "world_pan_01", "final": True}]],  # tool_verifiers/scramble.py
     "00863": ["world_hammer_03", "world_box_13", [reach("world_hammer_03"), grasp("world_hammer_03"), {"name": "hit", "check": "hammer_hit", "obj": "world_hammer_03", "target": "world_box_13", "max_free_speed_m_s": 1.2, "target_tilt_deg": None, "final": True}]],  # tool_verifiers/hammer.py
-    "01477": ["world_camera", None, [reach("world_camera"), {"name": "button", "check": "camera_button", "obj": "world_camera", "final": True}]],  # tool_verifiers/camera_button.py
+    "01477": ["world_camera", None, [reach("world_camera"), {"name": "button", "check": "camera_button", "obj": "world_camera", "button": {"center": [-0.017, 0.003, 0.033], "radius_m": 0.013, "min_s": 0.1}, "final": True}]],  # tool_verifiers/camera_button.py
     "01587": ["world_spoon", "world_plate", [reach("world_spoon"), grasp("world_spoon"), {"name": "scooped", "check": "scoop", "obj": "world_spoon", "target": "world_plate", "final": True}]],  # tool_verifiers/scoop.py
     "01640": ["world_drumstick", "world_drum", [reach("world_drumstick"), grasp("world_drumstick"), {"name": "hit", "check": "drum_hit", "obj": "world_drumstick", "target": "world_drum", "final": True}]],  # tool_verifiers/drum.py
 }

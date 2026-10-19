@@ -566,3 +566,18 @@ Scramble allows at most 2 (labelled successes drop and pick up the spatula at mo
   falls 5-9 cm but the spatula's lowest point never leaves the pan (no drop by the rule); counting such handle falls
   does not separate it either (three labelled successes have two handle falls while scrambling as well).
 00787: 1.000 / 0.929 -> 1.000 / 0.964.
+
+## 01477 button dot, 01587 tray sent flying, 01640 light touch (2026-10-19)
+
+- 01477 camera, reviewer: "there is a black round dot on top right of the camera, the finger should press that". The
+  dot is drawn on the visual mesh at about (-1.7, +0.3, 3.3) cm in the camera frame (top-down render; successful
+  fingertips cluster there). `camera_button.py` now needs a fingertip within 1.3 cm of it for >= 0.1 s while the camera
+  is in hand. Catches failures 3fccb62e, 8ff7a93c, 99fc2ede. Fails four labelled successes whose fingertips never reach
+  the dot (54992654 and e0eaa60a closest 2.9 cm, 93136ff9 3.3 cm, 58d76246 one frame): to review. failure_0581ddb8 and
+  failure_46410afe do press the dot (0.35 s, 0.3 s) and still pass. 01477: 1.000 / 0.762 -> 0.920 / 0.905.
+- 01587 scoop, failure_eef37b05 "the spoon presses the tray to suddenly fly away in the end": new `target_max_speed_m_s`
+  in the shared ending (target not sent flying); scoop uses 1.5 m/s. Caught, no success lost. 01587: 1.000 / 0.958.
+- 01640 drum, failure_d11597e0 "it does not actually hit the drum": the stick tip touches the middle of the drumhead
+  twice (6.8 s, 7.7 s) at up to 0.51 m/s; six labelled successes strike softer (0.37-0.47 m/s), so neither contact place
+  nor speed separates it. Unchanged.
+State-only tasks: recall 0.997, specificity 0.990.

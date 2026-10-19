@@ -2027,6 +2027,15 @@
     "name": "button",
     "check": "camera_button",
     "obj": "world_camera",
+    "button": {
+     "center": [
+      -0.017,
+      0.003,
+      0.033
+     ],
+     "radius_m": 0.013,
+     "min_s": 0.1
+    },
     "final": true
    }
   ],
