@@ -706,7 +706,7 @@ def c_joint_goal(r: Replay, s):
     if s.get("release"):
         c.add(f"released (final hand contact {bool(r.hand_contact(s['obj'])[-1])})", ~r.hand_contact(s["obj"]))
     speed = np.concatenate([[0.0], np.abs(np.diff(q)) / DT])
-    peak = float(np.maximum.accumulate(speed).max())
+    peak = float(speed.max())
     if s.get("max_speed"):  # gentle: the joint never moved faster than this before the goal was reached
         c.add(f"joint speed never above {s['max_speed']} rad/s (peak {peak:.1f})", np.maximum.accumulate(speed) <= s["max_speed"])
     metrics = {"q0": float(q[0]), "q_min": float(q.min()), "q_max": float(q.max()), "q_final": float(q[-1]), "peak_speed": peak}
@@ -809,7 +809,6 @@ def c_orientation(r: Replay, s):
         c.add(f"flipped: start-up axis points down within {tol} deg (final {np.degrees(np.arccos(np.clip(-a[-1, 2] * up0, -1, 1))):.0f} deg from straight down)", a[:, 2] * up0 <= -np.cos(np.deg2rad(tol)))
         metric = {"min_axis_z_rel": float((a[:, 2] * up0).min()), "final_axis_z_rel": float(a[-1, 2] * up0)}
     elif mode == "rotate":
-        R0 = rot(r.obj[o]["quat"][0])
         if "about" in s:
             ax = np.asarray(s["about"], float)
             ang = []
@@ -818,7 +817,7 @@ def c_orientation(r: Replay, s):
                 ang.append(abs(rv @ ax) if s.get("world_axis", True) else np.linalg.norm(rv))
             ang = np.asarray(ang)
         else:
-            ang = np.array([Rotation.from_matrix(rot(q) @ R0.T).magnitude() for q in r.obj[o]["quat"]])
+            ang = total  # rotation from the start about any axis, computed above
         c.add(f"rotated >= {s['min_deg']} deg from the start{' about ' + str(s['about']) if 'about' in s else ''} (final {np.degrees(ang[-1]):.0f} deg, max {np.degrees(ang).max():.0f})", np.degrees(ang) >= s["min_deg"])
         if s.get("max_deg"):
             c.add(f"rotated <= {s['max_deg']} deg (final {np.degrees(ang[-1]):.0f} deg)", np.degrees(ang) <= s["max_deg"])
@@ -1032,9 +1031,7 @@ def c_pour(r: Replay, s):
         cosang = np.sum(spout_w * lean, axis=1) / np.maximum(np.linalg.norm(spout_w, axis=1) * np.linalg.norm(lean, axis=1), 1e-9)
         tol = s.get("spout_tol_deg", 60)
         toward = cosang >= np.cos(np.radians(tol))
-        best = float(np.degrees(np.arccos(np.clip(cosang[tilted].max(), -1, 1)))) if tilted.any() else float("nan")
-        c.add(f"leaned toward the spout (lean direction within {tol} deg of the spout direction; best {best:.0f} deg while tilted)", toward)
-        tilted = tilted & toward
+        tilted = tilted & toward  # the lean is part of "poured", not a condition of its own at the graded frame
     over = (lip_dxy <= rad + slack) & (lip_dz >= dz_lo) & (lip_dz <= dz_hi)
     over_only = over.copy()
     tt = s.get("toward_target_m")
@@ -1047,8 +1044,6 @@ def c_pour(r: Replay, s):
     pouring = fill_gaps(tilted & over & hand, 3)
     poured_by = np.maximum.accumulate(held(pouring, hold_s))
     off = (lip_dxy[tilted].min() - rad) if tilted.any() else float("nan")
-    if s.get("spout"):  # the lean condition is folded into "poured"; it must not also be required at the graded frame
-        lean_txt = c.popitem()[0]
     tw = " toward its spout" if s.get("spout") else ""
     req = [f"tilted >= {min_tilt} deg{tw} (max {tilt.max():.0f} deg; {tilted.sum() * DT:.1f} s)",
            f"{'spout tip' if s.get('spout') else 'low rim'} over the {tgt} opening: within its radius {rad:.2f} m + {slack} m, "
@@ -1059,7 +1054,6 @@ def c_pour(r: Replay, s):
                    f"({(tilted & over_only & toward_t).sum() * DT:.1f} s while tilted and over it)")
     req.append(f"in hand ({(tilted & over & hand).sum() * DT:.1f} s with all of the above)")
     c.add(f"poured at some time, all together for {hold_s} s (longest {run_length(pouring).max() * DT:.2f} s): " + "; ".join(req), poured_by)
-    free = ~hand
     end_up = s.get("end_upright_deg", 20)
     if r.table_z is not None:
         bt = r.bottom_z(o) - r.table_z
@@ -1076,9 +1070,8 @@ def c_pour(r: Replay, s):
     c.add(f"{tgt} not pushed away (moved <= {s.get('target_disp_m', 0.5)} m; now {t_disp[-1]:.2f})", t_disp <= s.get("target_disp_m", 0.5))
     hit_v = s.get("max_hit_speed_m_s")
     if hit_v:  # pouring must not include a collision: the poured object touching the target while moving fast
-        hv = np.where(r.touching(o, tgt), r.speed(o), 0.0)
-        c.add(f"{o} never hit the {tgt} (touching it while moving > {hit_v} m/s; fastest touch so far "
-              f"{np.maximum.accumulate(hv)[-1]:.2f} m/s)", np.maximum.accumulate(hv) <= hit_v)
+        hp = np.maximum.accumulate(np.where(r.touching(o, tgt), r.speed(o), 0.0))
+        c.add(f"{o} never hit the {tgt} (touching it while moving > {hit_v} m/s; fastest touch so far {hp[-1]:.2f} m/s)", hp <= hit_v)
     drop_info = _not_dropped_simple(r, o, s, c)
     i_p = first_true(poured_by)[0]
     return c.all(r.n), {"max_tilt_deg": float(tilt.max()), "lip_rim_offset_m": float(off), "pour_s": float(pouring.sum() * DT),
