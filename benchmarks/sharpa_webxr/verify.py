@@ -496,19 +496,6 @@ def _release_frames(r: Replay, o: str) -> list[int]:
     return [i for i in range(1, r.n) if Cf[i - 1] and not Cf[i] and zo[i - 1] >= 0.03]
 
 
-def _drop_rule_text(s) -> str:
-    ref = "above where it ended" if s.get("drop_height_ref") == "end" else "up"
-    parts = []
-    if s.get("slip_fall_m_s", 0.3) is not None:
-        parts.append(f"it slipped out (fingers not opening and hand not lowering, or hand rising >= {s.get('hand_rise_m_s', 0.15)} m/s, and the object came down >= {s.get('slip_fall_m_s', 0.3)} m/s)")
-    parts.append(f"it was let go from >= {s.get('drop_height_m', 0.20)} m {ref} and fell >= {s.get('drop_speed_m_s', 0.5)} m/s")
-    if s.get("tumble_deg", 70) is not None:
-        parts.append(f"it tumbled > {s.get('tumble_deg', 70)} deg afterwards")
-    if s.get("end_tilt_deg", 45) is not None:
-        parts.append(f"it ended > {s.get('end_tilt_deg', 45)} deg from its start tilt after slipping out")
-    return f"a release from >= {s.get('drop_min_height_m', 0.02)} m {ref} is a drop when " + ", or ".join(parts)
-
-
 def _not_flung(r: Replay, o: str, s, c: Conds) -> dict:
     """Not flung / flew away: after the hand lets go for the last time, the object never moves faster than
     max_free_speed_m_s (a put-down or a short slip stays slow; a throw, a toss or an object that falls far is fast).
@@ -905,6 +892,7 @@ def c_orientation(r: Replay, s):
         c.add(f"released (final hand contact {bool(r.hand_contact(o)[-1])})", ~r.hand_contact(o))
     if s.get("rest", True):
         c.add(f"at rest (final speed {r.speed(o)[-1]:.2f} m/s)", _rest(r, o, s))
+    n_pose = len(c)  # conditions so far describe the goal pose; the ones below are episode-wide movement guards
     # "not too brutal": the object was never thrown. Limits on peak speed, travel from the start and height of its
     # lowest point, each enforced from the moment it is exceeded onwards (a violent flip cannot pass later).
     if s.get("max_speed_m_s"):
@@ -913,14 +901,23 @@ def c_orientation(r: Replay, s):
         c.add(f"never moved > {s['max_disp_m']} m from where it started (max {r.disp(o).max():.2f} m)", ~np.maximum.accumulate(r.disp(o) > s["max_disp_m"]))
     if s.get("max_lift_m"):
         c.add(f"never lifted > {s['max_lift_m']} m (max {r.lift_bottom(o).max():.2f} m)", ~np.maximum.accumulate(r.lift_bottom(o) > s["max_lift_m"]))
-    if s.get("end_rule") == "not_dropped":  # rotate / flip tasks graded at the end: goal reached at some point, object not dropped afterwards
-        goal = c.all(r.n)
-        c.clear()
-        c.add("goal orientation reached at some point (see metrics)", np.maximum.accumulate(goal))
-        metric.update(_not_dropped(r, o, s, c))
-    else:
-        metric.update(_not_flung(r, o, s, c))
     hold_s = s.get("hold_s", DEFAULTS["hold_s"])
+    if s.get("end_rule") == "not_dropped":  # rotate / flip tasks graded at the end: the goal pose held for hold_s at
+        # some point, the movement guards never broken, and the object not dropped afterwards
+        items = list(c.items())
+        pose = np.ones(r.n, bool)
+        for _, m in items[:n_pose]:
+            pose &= m
+        c.clear()
+        c.add(f"goal orientation held for {hold_s} s at some point (longest {run_length(pose).max() * DT:.2f} s; see metrics)",
+              np.maximum.accumulate(held(pose, hold_s)))
+        for name, m in items[n_pose:]:
+            c[name] = m
+        metric.update(_not_dropped(r, o, s, c))
+        metric.update({"max_total_rot_deg": float(np.degrees(total).max()), "final_total_rot_deg": float(np.degrees(total[-1])),
+                       "yaw_base0_deg": float(yaw_base[0]), "final_yaw_base_deg": float(yaw_base[-1])})
+        return c.all(r.n), metric, c
+    metric.update(_not_flung(r, o, s, c))
     pre = c.all(r.n)
     c.add(f"all of the above for {hold_s} s continuously (longest {run_length(pre).max() * DT:.2f} s)", held(pre, hold_s))
     metric.update({"max_total_rot_deg": float(np.degrees(total).max()), "final_total_rot_deg": float(np.degrees(total[-1])),
