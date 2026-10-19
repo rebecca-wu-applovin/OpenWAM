@@ -123,7 +123,10 @@ counts: an object that got away and was picked up again is a recover.
 ### Rotations, flips, shakes, articulated objects
 - **orientation** ({{verify.py::^def c_orientation}}): flip (start-up axis points down), rotate (angle from start),
   face (an axis points toward a direction), axis_away (portrait). Flips limit in-hand speed and lift; travel from the
-  start is not limited (reviewer: "this should not be the condition of upturn").
+  start is not limited (reviewer: "this should not be the condition of upturn"). Rotations graded at the end
+  (`end_rule: not_dropped`, 01541) need the goal pose **held for 0.5 s** at some point, and the speed / travel / lift
+  limits stay episode-wide conditions, so moving the object too far after reaching the pose still fails
+  ({{verify.py::rotate / flip tasks graded at the end: the goal pose held}}).
 - **oscillation** ({{verify.py::^def c_oscillation}}): shake = >= 3 direction reversals of >= `min_amp_m` within 3 s
   while held, then the ending rules.
 - **joint goal** ({{verify.py::^def c_joint_goal}}): laptop, doors, lids: the joint reaches the goal, gently
@@ -136,10 +139,13 @@ Shared measurements in {{tool_verifiers/common.py::^"""Shared measurements}}:
   point within a part, e.g. the tip of a tilted spoon bowl) inside the target's own box while held. Path = travel between
   consecutive working frames only (moving outside the pot, or while not held, earns nothing). Back-and-forth strokes are
   counted per working session ({{tool_verifiers/common.py::^def stroke_count}}), along its main direction, from motion
-  made near the surface only (within `stroke_near_m`, 2 cm), and as they happen (the count at frame i only includes
-  strokes confirmed by frame i).
-- {{tool_verifiers/common.py::^def end_rules}}: the shared ending: not flung (per-task speed), target not knocked over,
-  not pushed away, not sent flying (each optional).
+  made near the surface only (`stroke_near_m` = 2 cm: brush, within 2 cm of the plate face; scramble, the working box
+  grown by 2 cm, i.e. 2 cm beside the pan and up to 5 cm above its rim, because labelled scrambling stirs 2-5 cm above
+  the rim), credited when confirmed (cumulative confirmations, with the session's axis fitted on the whole session).
+  Task overrides: brush counts strokes of 1 cm (`reversal_amp_m` in its spec), scramble 2 cm.
+- {{tool_verifiers/common.py::^def end_rules}}: the shared ending: not flung (a speed limit after the last release,
+  not the hand-motion drop rule), target not knocked over, not pushed away, not sent flying (each optional). Brush and
+  scramble add the hand-motion drop rule on top where their specs ask for it.
 - {{tool_verifiers/common.py::^def handling}}: regrasps and spin, **reported only** (not a pass/fail condition).
 - {{tool_verifiers/_work.py::^def work_check}}: stir / scramble / scoop: inside time, path, optional depth below the rim,
   optional strokes, and optional "not dropped more than k times while working" (a separate condition). Drops are

@@ -5,7 +5,7 @@ The button is not a separate body, but it is drawn on the mesh: a black round do
 camera is picked up and held up (lowest point >= 3 cm) for >= 1.9 s in total (labelled successes: >= 1.95 s), a
 fingertip is within 1.3 cm of the button for >= 0.2 s while the camera is in hand and steady (turning <= 2 rad/s;
 reviewer: "there is a black round dot on top right of the camera, the finger should press that" and "when the button is
-pressed the camera should be in a rather steady state"), and afterwards it is held or put down, not flung or dropped.
+pressed the camera should be in a rather steady state"), and afterwards it is not flung (never faster than 1.0 m/s after the last release).
 """
 from __future__ import annotations
 

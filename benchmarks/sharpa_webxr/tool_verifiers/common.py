@@ -116,9 +116,11 @@ def handling(r, o: str, lift_m: float = 0.03) -> dict:
 
 
 def end_rules(r, tool: str, target: str | None, s: dict, c) -> dict:
-    """The ending, shared by all tool tasks: the tool is in the hand at the end or was put down, not flung or dropped
-    after the last release (max_free_speed_m_s), and the target was not knocked over (target_tilt_deg) or pushed far
-    (target_disp_m). Adds named conditions to c, each true from the first frame on and false from the violation on."""
+    """The ending shared by the tool tasks: after the last release the tool never moves faster than max_free_speed_m_s
+    (not flung: a speed guard, not the hand-motion drop rule, which brush / stir / scramble / scoop add separately where
+    their specs ask for it), and the target is not knocked over (target_tilt_deg), pushed far (target_disp_m) or sent
+    flying (target_max_speed_m_s); each limit is optional. Adds named conditions to c, each true from the first frame
+    on and false from the violation on."""
     m = {}
     if s.get("max_free_speed_m_s", 1.0) is not None:
         m.update(V._not_flung(r, tool, {"max_free_speed_m_s": s.get("max_free_speed_m_s", 1.0)}, c))
@@ -166,12 +168,16 @@ def reversals(x: np.ndarray, amp: float) -> int:
 
 
 def stroke_count(P2: np.ndarray, mask: np.ndarray, amp: float, gap_s: float = 3.0, near: np.ndarray | None = None) -> np.ndarray:
-    """Per frame: back-and-forth reversals of >= amp so far, counted within each working session (runs of mask less
-    than gap_s apart belong to the same session: brushing is a series of short touches ~1-1.5 s apart, touch, sweep,
-    lift, touch back; 3 s is the shake check's window) along that session's main direction of motion, using only the
-    positions on working frames. Separate sessions are not joined, so moving from one to the next is not a stroke.
-    The count at frame i only includes reversals confirmed by frame i; a visit's direction is fitted on the whole
-    visit (the one look-ahead, within a visit)."""
+    """Per frame: cumulative back-and-forth reversals of >= amp confirmed so far, within each working session (runs of
+    mask less than gap_s apart belong to one session: brushing is a series of short touches ~1-1.5 s apart, touch,
+    sweep, lift, touch back; 3 s is the shake check's window), along the session's main direction of motion.
+    Two ways to build a session's track:
+      near given: the sum of the steps between two consecutive frames that are both near the surface, hovering frames
+        included; moving away from the surface adds nothing, so dabbing at different spots is not a stroke.
+      near None: the positions on the session's working frames only (a jump between two working frames counts).
+    Separate sessions are not joined. A reversal is credited at the frame where it is confirmed, but the session's axis
+    is fitted on the whole session and sessions bridge gaps with later frames: cumulative confirmations using a
+    whole-session fitted axis, not a causal signal."""
     cnt = np.zeros(len(mask), int)
     for a, b in events(mask, gap_s):
         idx = np.arange(a, b)[mask[a:b]]
@@ -226,10 +232,14 @@ def work_in_target(r, tool: str, point_local, target: str, z_below: float = 0.01
     path = np.cumsum(np.where(both, step, 0.0))
     out = {"mask": work, "inside_s": float(work.sum() * V.DT), "path_m": path, "P": P}
     near = None
-    if near_m is not None:  # near the target: inside its box grown by near_m on every side, while held
+    if near_m is not None:  # near the working region: the working box (the target's box from z_below under it to
+        # z_above over its top) grown by near_m on every side, while held. With the defaults that is 2 cm beside and
+        # 3 cm below the target and up to 5 cm above its rim: labelled scrambling stirs with the blade 2-5 cm above the
+        # pan rim between strokes (a band of 2 cm around the pan's own box fails 7 of 49 labelled successes)
         near = (np.all(P[:, :2] >= lo[:2] - near_m, axis=1) & np.all(P[:, :2] <= hi[:2] + near_m, axis=1)
                 & (P[:, 2] >= lo[2] - z_below - near_m) & (P[:, 2] <= hi[2] + z_above + near_m) & held)
-    out["rev_count"] = {a: stroke_count(P[:, :2], work, a, visit_gap_s, near) for a in (0.01, 0.02, 0.03)}  # per frame, causal
+    # cumulative confirmations per frame (whole-session fitted axis, see stroke_count)
+    out["rev_count"] = {a: stroke_count(P[:, :2], work, a, visit_gap_s, near) for a in (0.01, 0.02, 0.03)}
     out["reversals"] = {a: int(c[-1]) for a, c in out["rev_count"].items()}
     return out
 

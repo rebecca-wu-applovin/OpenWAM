@@ -626,3 +626,19 @@ lifted away in between is no longer a stroke; sweeping just above the plate betw
 Measured on the labels before applying: 1 cm loses one success in each task; 2, 3 and 5 cm change no label; strict
 contact-only would lose 13 brushing and 3 scrambling successes. Applied at 2 cm: no labelled verdict changes
 (143 recordings re-verified), 00051 1.000 / 1.000, 00787 1.000 / 0.963. Policy SR unchanged. Tests: 5 passed.
+
+## Rotation goal held before it counts; near band stated; readability (2026-10-19)
+
+Codex review 20261019-190522 / 190422.
+- Rotation graded at the end (01541, `end_rule: not_dropped`): the goal pose was latched first and the 0.5 s hold was
+  applied to the latch, so one frame in the goal pose passed, and the speed / travel / lift limits were folded into the
+  latch, so moving the box 0.79 m (> 0.55 m) after reaching the pose still passed. Now the pose must be held 0.5 s
+  before it counts, and the movement limits stay episode-wide conditions. Labels: no verdict changes (01541 1.000 /
+  1.000). Policy: gwp 01541 seed_2 now fails (held the pose 0.20 s); gwp SR 20.0% -> 19.6%.
+- Near band for scramble strokes: it is the working box (pan box with 3 cm allowed above the rim) grown by 2 cm, i.e.
+  up to 5 cm above the rim, not 2 cm around the pan's own box as first described. Kept as is (a 2 cm band around the
+  pan's own box fails 7 of 49 labelled successes, which stir 2-5 cm above the rim) and documented.
+- Readability, behaviour-identical (3125 labelled outputs identical): stroke_count docstring for both branches,
+  end_rules / hammer / drum / camera docstrings say "not flung" (the speed guard) instead of "not dropped", the
+  work-check failure message built from named parts, unused _drop_rule_text removed.
+- Tests: 8 passed (new: near-band boundary 4.5 vs 5.5 cm, one-frame vs held rotation pose, travel limit after the pose).

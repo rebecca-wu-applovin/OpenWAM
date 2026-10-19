@@ -1,7 +1,7 @@
 """01640 "Hit the drumhead with a drum stick".
 
 Done = the stick, held in the hand, touches the drumhead (the drum's top face) at least min_hits times; afterwards
-the stick is held or put down (not flung or dropped), and the drum is not knocked over or pushed away.
+the stick is not flung (never faster than 1.0 m/s after the last release), and the drum is not knocked over or pushed away.
 Labelled successes hit with any part of the stick (often the shaft), so no particular part is required.
 """
 from __future__ import annotations

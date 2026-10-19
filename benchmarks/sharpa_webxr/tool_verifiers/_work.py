@@ -32,11 +32,16 @@ def work_check(r, s, what: str):
     done = np.ones(r.n, bool)
     for m, _ in reqs:
         done &= m
-    bad = [txt for m, txt in reqs if not m[-1]]
-    good = [txt for m, txt in reqs if m[-1]]
+    failed_requirements = [txt for m, txt in reqs if not m[-1]]
+    met_requirements = [txt for m, txt in reqs if m[-1]]
+    if failed_requirements:
+        summary = "FAILED: " + "; ".join(failed_requirements)
+        if met_requirements:
+            summary += ". ok: " + "; ".join(met_requirements)
+    else:
+        summary = "ok: " + "; ".join(met_requirements)
     c = V.Conds()
-    c.add(f"{what} - " + (("FAILED: " + "; ".join(bad) + (". ok: " + "; ".join(good) if good else "")) if bad else "ok: " + "; ".join(good)),
-          np.maximum.accumulate(done))
+    c.add(f"{what} - {summary}", np.maximum.accumulate(done))
     kmax = s.get("max_drops_while_working")
     if kmax is not None:  # dropped again and again while doing the work: releases between the first and last working
         m = w["mask"]  # frame that the drop rule calls a drop, each judged up to the next regrasp

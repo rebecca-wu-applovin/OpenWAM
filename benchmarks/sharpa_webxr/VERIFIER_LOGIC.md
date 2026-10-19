@@ -25,11 +25,11 @@ Contents
   Small helpers build the common stages: [`reach() — _build_task_specs.py:20`](_build_task_specs.py#L20), [`grasp() — _build_task_specs.py:24`](_build_task_specs.py#L24),
   [`pick() — _build_task_specs.py:28`](_build_task_specs.py#L28), [`place() — _build_task_specs.py:46`](_build_task_specs.py#L46), [`pour() — _build_task_specs.py:51`](_build_task_specs.py#L51).
   Tasks that cannot be graded are listed in [`SKIP — _build_task_specs.py:166`](_build_task_specs.py#L166).
-- **Checks.** The registry [`CHECKS — verify.py:1195`](verify.py#L1195) maps names to functions. The tool-use checks live in
+- **Checks.** The registry [`CHECKS — verify.py:1192`](verify.py#L1192) maps names to functions. The tool-use checks live in
   `tool_verifiers/` and are added to the same registry at import ([`register() — tool_verifiers/__init__.py:15`](tool_verifiers/__init__.py#L15)).
   Every check returns `(mask, metrics, conds)`: a per-frame boolean "this stage is satisfied at frame i", raw numbers,
   and the named conditions whose AND is the mask.
-- **The chain.** [`verify() — verify.py:1208`](verify.py#L1208) runs the stages in order. A stage only counts from the frame its predecessor
+- **The chain.** [`verify() — verify.py:1205`](verify.py#L1205) runs the stages in order. A stage only counts from the frame its predecessor
   was first satisfied (retries are allowed: the chain restarts from the latest first-success frame). A stage with
   `final: True` is graded on the **last frame** (end state: still in the pan, lid still closed, not dropped); otherwise
   it is graded on **any time** after its predecessor. The episode passes when every stage passes and no object listed in
@@ -71,7 +71,7 @@ Contents
 - **reach** ([`c_reach() — verify.py:374`](verify.py#L374)): a hand within 3 cm of the object.
 - **grasp** ([`c_grasp() — verify.py:381`](verify.py#L381)): hand contact for 0.4 s while the object is lifted >= `lift_m` (default 3 cm)
   or carried >= `carry_m` (5 cm).
-- **hold lifted** ([`c_hold_lifted() — verify.py:597`](verify.py#L597)): lifted >= `lift_m` with contact for `hold_s` in a row. Options:
+- **hold lifted** ([`c_hold_lifted() — verify.py:584`](verify.py#L584)): lifted >= `lift_m` with contact for `hold_s` in a row. Options:
   `grasp_box` (contact must be on a handle region, e.g. the drill), `finger_holes` (scissors: thumb through one ring
   and the index through the other, [`fingers_in_holes() — verify.py:186`](verify.py#L186)).
 
@@ -95,7 +95,7 @@ The **last** release is judged to the end of the recording. When a task counts d
 count against an earlier release ([`verify.py:411`](verify.py#L411)). Releases are enumerated by
 [`_release_frames() — verify.py:493`](verify.py#L493).
 
-- **Not dropped at the end** ([`_not_dropped() — verify.py:542`](verify.py#L542)): if the object is still in the hand at the end (contact,
+- **Not dropped at the end** ([`_not_dropped() — verify.py:529`](verify.py#L529)): if the object is still in the hand at the end (contact,
   lowest point >= 2 cm up; shakes accept "touching for the last 0.5 s at any height") it passes; otherwise the last
   release must not be a drop, it must not end below its start height or off the table, and (where set) it must stand
   upright.
@@ -104,42 +104,48 @@ count against an earlier release ([`verify.py:411`](verify.py#L411)). Releases a
   and land inside as done.
 
 ### Not flung, not toppled (after the last release)
-[`_not_flung() — verify.py:512`](verify.py#L512): after the hand lets go for the last time the object never moves faster than
+[`_not_flung() — verify.py:499`](verify.py#L499): after the hand lets go for the last time the object never moves faster than
 `max_free_speed_m_s` (a throw, a toss, a box flying off, a tablet falling flat at speed), and, where set, never turns
 more than `max_free_rot_deg` on its own (a tablet stood on its edge that tips over slowly). Only the last release
 counts: an object that got away and was picked up again is a recover.
 
 ### Placements, removal, pours
-- **place in** ([`c_place_in() — verify.py:696`](verify.py#L696), shared logic in [`_placed_common() — verify.py:671`](verify.py#L671)): at the end the object
+- **place in** ([`c_place_in() — verify.py:683`](verify.py#L683), shared logic in [`_placed_common() — verify.py:658`](verify.py#L658)): at the end the object
   is inside the target (rotated footprint, height band), released, at rest, and (option) touching it.
-- **move out** ([`c_move_out() — verify.py:716`](verify.py#L716)): out of the container's rotated footprint; `min_disp_m: 0` = being out is
+- **move out** ([`c_move_out() — verify.py:703`](verify.py#L703)): out of the container's rotated footprint; `min_disp_m: 0` = being out is
   enough.
-- **pour** ([`c_pour() — verify.py:1064`](verify.py#L1064)): tilted >= 30 deg with the pouring lip (the rim on the low side,
+- **pour** ([`c_pour() — verify.py:1061`](verify.py#L1061)): tilted >= 30 deg with the pouring lip (the rim on the low side,
   [`lip() — verify.py:259`](verify.py#L259), or a spout tip) **inside** the target opening (no slack by default), within 5 cm below to 25 cm
   above it, in hand, for `hold_s` (0.1 s); optionally tipped **toward** the target (`toward_target_m`: the low rim nearer
   the opening's centre than the container's body). Afterwards held or set down upright, the target not knocked over or
   pushed away, and no collision (the poured object touching the target while moving > 0.7 m/s).
 
 ### Rotations, flips, shakes, articulated objects
-- **orientation** ([`c_orientation() — verify.py:851`](verify.py#L851)): flip (start-up axis points down), rotate (angle from start),
+- **orientation** ([`c_orientation() — verify.py:838`](verify.py#L838)): flip (start-up axis points down), rotate (angle from start),
   face (an axis points toward a direction), axis_away (portrait). Flips limit in-hand speed and lift; travel from the
-  start is not limited (reviewer: "this should not be the condition of upturn").
-- **oscillation** ([`c_oscillation() — verify.py:960`](verify.py#L960)): shake = >= 3 direction reversals of >= `min_amp_m` within 3 s
+  start is not limited (reviewer: "this should not be the condition of upturn"). Rotations graded at the end
+  (`end_rule: not_dropped`, 01541) need the goal pose **held for 0.5 s** at some point, and the speed / travel / lift
+  limits stay episode-wide conditions, so moving the object too far after reaching the pose still fails
+  ([`verify.py:905`](verify.py#L905)).
+- **oscillation** ([`c_oscillation() — verify.py:957`](verify.py#L957)): shake = >= 3 direction reversals of >= `min_amp_m` within 3 s
   while held, then the ending rules.
-- **joint goal** ([`c_joint_goal() — verify.py:752`](verify.py#L752)): laptop, doors, lids: the joint reaches the goal, gently
+- **joint goal** ([`c_joint_goal() — verify.py:739`](verify.py#L739)): laptop, doors, lids: the joint reaches the goal, gently
   (`max_approach_speed` near the closed position), upright, not lifted.
 
 ## 4. Tool-use verifiers (`tool_verifiers/`)
 
 Shared measurements in [`tool_verifiers/common.py:1`](tool_verifiers/common.py#L1):
-- [`work_in_target() — tool_verifiers/common.py:200`](tool_verifiers/common.py#L200): the tool's working point (a point on the tool, or its **lowest**
+- [`work_in_target() — tool_verifiers/common.py:206`](tool_verifiers/common.py#L206): the tool's working point (a point on the tool, or its **lowest**
   point within a part, e.g. the tip of a tilted spoon bowl) inside the target's own box while held. Path = travel between
   consecutive working frames only (moving outside the pot, or while not held, earns nothing). Back-and-forth strokes are
-  counted per working session ([`stroke_count() — tool_verifiers/common.py:168`](tool_verifiers/common.py#L168)), along its main direction, from motion
-  made near the surface only (within `stroke_near_m`, 2 cm), and as they happen (the count at frame i only includes
-  strokes confirmed by frame i).
-- [`end_rules() — tool_verifiers/common.py:118`](tool_verifiers/common.py#L118): the shared ending: not flung (per-task speed), target not knocked over,
-  not pushed away, not sent flying (each optional).
+  counted per working session ([`stroke_count() — tool_verifiers/common.py:170`](tool_verifiers/common.py#L170)), along its main direction, from motion
+  made near the surface only (`stroke_near_m` = 2 cm: brush, within 2 cm of the plate face; scramble, the working box
+  grown by 2 cm, i.e. 2 cm beside the pan and up to 5 cm above its rim, because labelled scrambling stirs 2-5 cm above
+  the rim), credited when confirmed (cumulative confirmations, with the session's axis fitted on the whole session).
+  Task overrides: brush counts strokes of 1 cm (`reversal_amp_m` in its spec), scramble 2 cm.
+- [`end_rules() — tool_verifiers/common.py:118`](tool_verifiers/common.py#L118): the shared ending: not flung (a speed limit after the last release,
+  not the hand-motion drop rule), target not knocked over, not pushed away, not sent flying (each optional). Brush and
+  scramble add the hand-motion drop rule on top where their specs ask for it.
 - [`handling() — tool_verifiers/common.py:94`](tool_verifiers/common.py#L94): regrasps and spin, **reported only** (not a pass/fail condition).
 - [`work_check() — tool_verifiers/_work.py:12`](tool_verifiers/_work.py#L12): stir / scramble / scoop: inside time, path, optional depth below the rim,
   optional strokes, and optional "not dropped more than k times while working" (a separate condition). Drops are

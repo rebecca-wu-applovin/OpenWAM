@@ -1,8 +1,8 @@
 """00863 "use hammer to hit box".
 
 Done = the hammer, held in the hand, strikes the box with its head (the wide end of the hammer mesh) at least
-min_hits times, the head moving >= min_strike_m_s just before contact; afterwards the hammer is held or put down
-(not flung or dropped) and the box is not pushed away. The box may be knocked over: labelled successes often tip it.
+min_hits times, the head moving >= min_strike_m_s just before contact; afterwards the hammer is not flung (never faster
+than 1.2 m/s after the last release) and the box is not pushed away. The box may be knocked over: labelled successes often tip it.
 """
 from __future__ import annotations
 
