@@ -508,6 +508,11 @@ class OpenWAMTrainer:
                     f"training.run_dir_name={fixed_name}: {existing} already exists; pick a new run name "
                     f"(or use training.resume_ckpt_path to continue that run)."
                 )
+        import torch.distributed as dist
+
+        # Every rank finishes the clash check before rank 0 writes config.yaml below; otherwise a slower
+        # rank sees rank 0's fresh config.yaml and raises (Modal runs 88/90, 2026-10-16).
+        dist.barrier()
 
         if is_main:
             from datetime import datetime
@@ -531,8 +536,6 @@ class OpenWAMTrainer:
                 save_normalization_stats(output_path, self.dataset)
         else:
             output_path = None
-        import torch.distributed as dist
-
         path_list = [output_path] if is_main else [None]
         dist.broadcast_object_list(path_list, src=0)
         output_path = path_list[0]
