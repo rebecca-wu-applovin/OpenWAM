@@ -184,6 +184,9 @@ How to read the table: each task has about 60-90 labelled recordings, and ±25% 
 threshold that changes 1-2 labels at ±25% sits in a gap between successes and failures; one that changes 3 or more
 has successes or failures close to it on both sides, so its exact value was fitted to these recordings.
 
+The table below preserves the previously recorded threshold sweep. Rebuilding this guide updates code pointers
+and task specifications; it does not rerun the sweep or the calibration table in the appendix.
+
 Of 55 tuned thresholds, 18 change no label at ±25%, 27 change 1-2 labels, 10 change 3 or more.
 
 | task | threshold | at ×0.75 / ×1.25 (or ±1): labels that change vs current | verdict |
@@ -244,7 +247,6 @@ Of 55 tuned thresholds, 18 change no label at ±25%, 27 change 1-2 labels, 10 ch
 | self-gen cup | `min_height_m` | 0.0225: no change · 0.0375: no change | robust (0 labels) |
 | self-gen cup | `hold_s` | 0.375: no change · 0.625: no change | robust (0 labels) |
 
-
 ### What the sensitive thresholds mean
 
 - **"Not flung" speed limits** (00787 scramble 1.0 m/s, 00863 hammer 1.2, 00749 stir 1.2, 01041 board flip 1.8,
@@ -272,11 +274,13 @@ the drop rule's clauses, the rack, brushing on the plate face, the scissors grip
   is fitted on the whole session; drops are retrospective (classified with what happened after the release, credited at
   the release frame) and bounded by the first and last working frames, known only at the end. The verdict is an
   end-state verdict.
-- Strokes count only motion made near the surface (brush: an eraser point within 2 cm of the plate face; scramble:
-  the blade inside the pan box grown by 2 cm). Brushing in the labels is touch, sweep just above the plate, touch back,
-  so near-surface motion between touches counts; dabbing at different spots with the tool lifted away in between does
-  not (tests `test_stationary_touches_are_not_a_stroke`, `test_sweeps_just_above_the_surface_are_strokes`). Requiring
-  contact (0 cm) would fail 13 brushing and 3 scrambling successes; 2-5 cm change no label, 1 cm one each.
+- Strokes count only motion made near the surface. Brush uses an eraser hull point within 2 cm of the plate face.
+  Scramble grows the working region, not the raw pan box, by `stroke_near_m`: with the defaults this is 2 cm beside,
+  3 cm below and up to 5 cm above the pan box. Motion between touches counts within that band; dabbing at different
+  spots with the tool lifted away does not (tests `test_stationary_touches_are_not_a_stroke`,
+  `test_sweeps_just_above_the_surface_are_strokes`, `test_near_band_is_the_working_box_grown`). Claude's replay report
+  found that a stricter band extending only 2 cm above the raw pan box rejected 7 of 49 labelled scramble successes;
+  the wider working-region band was retained. That replay result was not independently rerun during this doc rebuild.
 
 ## 7. Appendix
 
