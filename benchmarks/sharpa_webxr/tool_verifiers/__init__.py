@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from importlib import import_module
 
-MODULES = ("common", "drum", "hammer", "brush", "stir", "scramble", "scoop", "camera_button")
+MODULES = ("common", "drum", "hammer", "brush", "stir", "scramble", "scoop", "camera_button", "rack")
 
 
 def register(V) -> None:

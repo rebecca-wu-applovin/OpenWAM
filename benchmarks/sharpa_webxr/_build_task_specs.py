@@ -80,7 +80,8 @@ S = {
     "01089": ["world_dice", "world_game_board", [reach("world_dice"), grasp("world_dice"), place("world_dice", "world_game_board", contact="world_game_board")]],
     "01242": ["world_bowl", None, [judge("banana pieces transferred into the salad bowl (no banana bodies in the sim)")]],
     "01440": ["world_shovel", "world_pot", [reach("world_shovel"), grasp("world_shovel"), place("world_shovel", "world_pot", z_above_m=0.12, contact="world_pot")]],
-    "self-": ["synthesis_cup_cup_005_5e43862263a34727", None, [reach("synthesis_cup_cup_005_5e43862263a34727"), grasp("synthesis_cup_cup_005_5e43862263a34727"), judge("cup placed on the cup rack (rack not simulated)")]],
+    # the cup rack is the static body gigahands_stand_03 (collidable): cup hangs on it at the end (tool_verifiers/rack.py)
+    "self-": ["synthesis_cup_cup_005_5e43862263a34727", None, [reach("synthesis_cup_cup_005_5e43862263a34727"), grasp("synthesis_cup_cup_005_5e43862263a34727"), {"name": "on_rack", "check": "on_rack", "obj": "synthesis_cup_cup_005_5e43862263a34727", "rack": "gigahands_stand_03", "final": True}]],
     # ---- articulated open/close ----------------------------------------------------------------------------
     # "adjust for better viewing": screen faces the robot (laptop front = local -y), lid open ~92-146 deg (hinge q in
     # [-0.6, 0.35]; closed is q~2.0, start is q=0.32 ~ 94 deg), laptop upright, hands off, and something changed

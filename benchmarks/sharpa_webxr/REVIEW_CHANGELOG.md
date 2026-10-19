@@ -502,3 +502,12 @@ On the labels (recall / specificity): 01640 0.980 / 0.929, 00863 1.000 / 1.000, 
 0.929, 01587 0.979 / 0.840, 00051 1.000 / 0.812, 01477 1.000 / 0.762. All 7: 0.991 / 0.884, against 0.921 / 0.721 for
 state prefix + judge. All state-only tasks: n = 2906, recall 0.997, specificity 0.975.
 Policy hybrid SR: xwam 26.2% (was 25.4), motus 21.1% (22.2), gwp 20.0% (20.0), cosmos3 3.6% (4.0).
+
+## self-gen cup on the rack: state verifier (2026-10-19)
+
+The spec said "rack not simulated" and ended in the judge, but the rack is in the scene: the static, collidable body
+gigahands_stand_03. New `tool_verifiers/rack.py` (check `on_rack`): on the last 0.5 s the cup touches the rack, not the
+table, is out of the hand and its lowest point is >= 3 cm above the table; not flung > 1.2 m/s after the last release.
+Labels: recall 1.000, specificity 1.000 (50 / 11): every success ends hanging on the rack 6-13 cm up, every failure on
+the table. Only 01242 still ends in a judge. State-only tasks: n = 2967, recall 0.997, specificity 0.976. Policy SR
+unchanged (no policy rollout puts the cup on the rack).

@@ -634,12 +634,14 @@
     "obj": "synthesis_cup_cup_005_5e43862263a34727"
    },
    {
-    "name": "complete",
-    "check": "judge",
-    "question": "cup placed on the cup rack (rack not simulated)"
+    "name": "on_rack",
+    "check": "on_rack",
+    "obj": "synthesis_cup_cup_005_5e43862263a34727",
+    "rack": "gigahands_stand_03",
+    "final": true
    }
   ],
-  "needs_judge": true
+  "needs_judge": false
  },
  "00005_GigaHands_p005-laptop_007_seg000": {
   "version": 1,
