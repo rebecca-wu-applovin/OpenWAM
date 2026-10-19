@@ -142,6 +142,32 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python benchmarks/sharpa_webxr/check_policy_par
 .venv_webxr/bin/python benchmarks/sharpa_webxr/task_breakdown.py xwam=<tag>/scores_gpt-6-luna_r2.json motus=... --tasks
 ```
 
+## Scoring with the verifier
+
+`score.py --grader {judge,verifier,hybrid}` chooses who decides each rollout (default `judge`: unchanged).
+
+```bash
+# state verifier only: no OpenAI calls; needs_judge scenes are reported as ungradable, `skip` scenes as skipped
+.venv_webxr/bin/python benchmarks/sharpa_webxr/score.py <tag> --grader verifier
+# production: verifier decides sim-only scenes and gates the rest; the judge sees the sim facts for needs_judge scenes
+.venv_webxr/bin/python benchmarks/sharpa_webxr/score.py <tag> --grader hybrid
+# same, but never call the API: reuse existing judge_<model>_r2.json files (missing ones stay ungradable)
+.venv_webxr/bin/python benchmarks/sharpa_webxr/score.py <tag> --grader hybrid --no-judge-calls
+```
+
+- The verifier runs where `verifier.json` is missing (or `--force`, or it covers another window) and is cut at
+  `limits.limit(scene)` steps, the same window as the judge frames.
+- `hybrid`: a needs_judge scene whose sim stages failed is a failure and the judge is not called (source `gated`);
+  otherwise the judge decides, with the verifier's facts added to its prompt after the task line under
+  "Simulator state checks (ground truth from the physics engine, trust these over the images):".
+  A judge file made without those facts is re-judged (or, with `--no-judge-calls`, reused and flagged in `note`).
+  `--max-judge-calls N` caps real API calls.
+- Per rollout: `grade_<grader>.json` (verdict true/false/null, source `verifier|judge|gated|skipped|ungradable`,
+  stages, the failing stage's `why`, judge fields, `judge_context`). Per folder: `scores_<grader>.json/.tsv` with
+  success rate and Wilson CI over decided rollouts (ungradable and skipped are counted, never failures), per
+  category and per task, and the number of rollouts per source.
+- The verifier-only SR covers sim-only scenes, so it is not comparable with a judge-only SR over all scenes.
+
 ## Results
 
 - Table: `.venv/bin/python benchmarks/sharpa_webxr/aggregate.py <run>`. It prints stage rates, the all-three rate with a

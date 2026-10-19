@@ -89,6 +89,7 @@ class Analyzer:
         d.qvel[:] = 0
         mujoco.mj_forward(m, d)
         contact = {o: False for o in self.objects}
+        cpts = {o: [] for o in self.objects}  # world positions of hand-object contact points (where the hand holds it)
         pairs = set()
         for i in range(d.ncon):
             c = d.contact[i]
@@ -96,6 +97,7 @@ class Analyzer:
             for a, b in ((g1, g2), (g2, g1)):
                 if a in self.hand_set and b in self.geom_obj:
                     contact[self.geom_obj[b]] = True
+                    cpts[self.geom_obj[b]].append(np.array(c.pos, float))
             b1 = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, self.root[m.geom_bodyid[g1]]) or ""
             b2 = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, self.root[m.geom_bodyid[g2]]) or ""
             n1 = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, m.geom_bodyid[g1]) or ""
@@ -119,7 +121,7 @@ class Analyzer:
                       "joints": np.array([d.qpos[m.jnt_qposadr[j]] for j in v["joints"]]),
                       "contact": contact[o], "dist": float(dist)}
         wrist = np.stack([self.env.sim.wrist_pose(s)[0] for s in ("left", "right")])
-        return out, pairs, wrist
+        return out, pairs, wrist, cpts
 
 
 def snapshot(m, d, t, pairs):
@@ -152,7 +154,7 @@ def judge_frames(rollout_dir: Path, env: SharpaWebXREnv, k: int = 24, max_steps:
     (out / "COMPLETE").unlink(missing_ok=True)
     for old in out.glob("*.jpg"):
         old.unlink()
-    for verdict in rollout_dir.glob("judge_*_r2.json"):
+    for verdict in rollout_dir.glob("judge_*_r[0-9].json"):
         verdict.unlink()
     for t in sorted(set(np.linspace(0, len(qpos) - 1, k).round().astype(int).tolist())):
         env.sim.data.qpos[:] = qpos[t]
@@ -174,7 +176,7 @@ def analyze(rollout_dir: Path, env: SharpaWebXREnv, video: bool = True, keyframe
     frames, rows, keys = [], [], {}
     key_idx = set(np.linspace(0, len(qpos) - 1, keyframes).round().astype(int).tolist()) if keyframes else set()
     for t in range(len(qpos)):
-        o, pairs, wrist = an.frame(qpos[t])
+        o, pairs, wrist, _ = an.frame(qpos[t])
         rows.append(o)
         if ver is not None:
             snap = snapshot(an.m, an.d, t * DT, pairs)
