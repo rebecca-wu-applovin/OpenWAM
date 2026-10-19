@@ -29,15 +29,12 @@ def c_brush(r, s):
         touch = C.part_contact(r, tool, tgt) & held
     t = C.cum_time(touch)
     P = C.point_in_frame(r, [0.0, 0.0, 0.0], tgt, tool)
-    Q = P[touch][:, :2]
     amp, kmin, tmin = s.get("reversal_amp_m", 0.02), s.get("min_reversals", 1), s.get("min_touch_s", 0.3)
-    n = 0
-    if len(Q) > 3:
-        ax = np.linalg.svd(Q - Q.mean(0), full_matrices=False)[2][0]
-        n = C.reversals(Q @ ax, amp)
+    cnt = C.stroke_count(P[:, :2], touch, amp, s.get("visit_gap_s", 3.0))  # per brushing session, so far
+    n = int(cnt[-1])
     c = V.Conds()
     c.add(f"brushed: {tool} held against the {tgt}{' face (not its rim)' if face is not None else ''} >= {tmin} s ({touch.sum() * V.DT:.2f} s) with >= {kmin} "
-          f"back-and-forth reversals of >= {amp} m ({n})", np.maximum.accumulate((t >= tmin) & (n >= kmin)))
+          f"back-and-forth reversals of >= {amp} m ({n})", np.maximum.accumulate((t >= tmin) & (cnt >= kmin)))
     m = {"touch_s": float(touch.sum() * V.DT), "reversals": n}
     m.update(C.end_rules(r, tool, tgt, {"max_free_speed_m_s": 1.0, "target_tilt_deg": None, "target_disp_m": None, **s}, c))
     if s.get("drop_rule") == "hand_motion":  # not dropped at the end: still in hand, or released low / deliberately

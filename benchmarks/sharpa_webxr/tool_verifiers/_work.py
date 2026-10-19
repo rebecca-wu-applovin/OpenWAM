@@ -12,7 +12,8 @@ from . import common as C
 def work_check(r, s, what: str):
     V = C.V
     tool, tgt = s["obj"], s["target"]
-    w = C.work_in_target(r, tool, s["point"], tgt, s.get("z_below_m", 0.01), s.get("z_above_m", 0.03))
+    w = C.work_in_target(r, tool, s["point"], tgt, s.get("z_below_m", 0.01), s.get("z_above_m", 0.03),
+                         visit_gap_s=s.get("visit_gap_s", 3.0))
     part = s.get("part_name", "working end")
     t = C.cum_time(w["mask"])
     tmin, pmin = s.get("min_inside_s", 1.0), s.get("min_path_m", 0.2)
@@ -27,16 +28,7 @@ def work_check(r, s, what: str):
     if rv:
         amp = s.get("reversal_amp_m", 0.02)
         n = w["reversals"][amp]
-        reqs.append((np.full(r.n, n >= rv), f"{n} back-and-forth reversals of >= {amp} m (needs >= {rv})"))
-    kmax = s.get("max_drops_while_working")
-    if kmax is not None:  # dropped again and again while doing the work (between the first and last working frame)
-        m = w["mask"]
-        nd = 0
-        if m.any():
-            t0, t1 = int(np.flatnonzero(m)[0]), int(np.flatnonzero(m)[-1])
-            ds = {"drop_rule": "hand_motion", "drop_min_height_m": s.get("drop_min_height_m", 0.02)}
-            nd = sum(V._release_event(r, tool, ds, which=i)[0] for i in V._release_frames(r, tool) if t0 <= i <= t1)
-        reqs.append((np.full(r.n, nd <= kmax), f"dropped {nd} times while working (at most {kmax})"))
+        reqs.append((w["rev_count"][amp] >= rv, f"{n} back-and-forth reversals of >= {amp} m (needs >= {rv})"))
     done = np.ones(r.n, bool)
     for m, _ in reqs:
         done &= m
@@ -45,6 +37,19 @@ def work_check(r, s, what: str):
     c = V.Conds()
     c.add(f"{what} - " + (("FAILED: " + "; ".join(bad) + (". ok: " + "; ".join(good) if good else "")) if bad else "ok: " + "; ".join(good)),
           np.maximum.accumulate(done))
+    kmax = s.get("max_drops_while_working")
+    if kmax is not None:  # dropped again and again while doing the work: releases between the first and last working
+        m = w["mask"]  # frame that the drop rule calls a drop, each judged up to the next regrasp
+        drops = np.zeros(r.n, int)
+        if m.any():
+            t0, t1 = int(np.flatnonzero(m)[0]), int(np.flatnonzero(m)[-1])
+            # a release in the middle of the work is a drop if it slipped out, was let go too high or tumbled; how the
+            # tool lies before the next regrasp says nothing (a spatula lies on its side in the pan between strokes)
+            ds = {"drop_rule": "hand_motion", "drop_min_height_m": s.get("drop_min_height_m", 0.02), "end_tilt_deg": None}
+            for i in V._release_frames(r, tool):
+                if t0 <= i <= t1 and V._release_event(r, tool, ds, which=i)[0]:
+                    drops[i:] += 1
+        c.add(f"not dropped more than {kmax} times while working ({int(drops[-1])})", drops <= kmax)
     m = {"inside_s": w["inside_s"], "path_m": float(w["path_m"][-1]), "reversals_2cm": w["reversals"][0.02]}
     m.update(C.end_rules(r, tool, tgt, s, c))
     if s.get("drop_rule") == "hand_motion":  # not dropped at the end: still in hand, or released low / deliberately

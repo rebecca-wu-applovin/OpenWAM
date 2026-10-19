@@ -408,7 +408,11 @@ def _release_event(r: Replay, o: str, s, which: int | None = None) -> tuple[bool
     if not rel:
         return False, {"release_kind": "none"}, "ok: never released from a lifted state (origin >= 3 cm up)"
     i = rel[-1] if which is None else which  # which: judge a given release frame instead of the last one
-    j = min(r.n, i + int(round(0.75 / DT)))
+    # a release is judged up to the next regrasp (the object back in the hand), so a later release does not count
+    # against it; the last release is judged to the end of the recording, as before
+    nxt = np.flatnonzero(Cf[i:])
+    e = r.n if (which is None or not len(nxt)) else i + int(nxt[0])
+    j = min(e, i + int(round(0.75 / DT)))
     fall_r, ds = float(vz[i:j].max()), s.get("drop_speed_m_s", 0.5)
     k = int(np.argmin(np.linalg.norm(r.wrist[i - 1] - r.obj[o]["pos"][i - 1], axis=1)))
     a, b = max(0, i - 3), min(r.n - 1, i + 2)  # 5-frame window around the release
@@ -417,10 +421,12 @@ def _release_event(r: Replay, o: str, s, which: int | None = None) -> tuple[bool
     hb = float(zb[i - 1] - (zb[-1] if s.get("drop_height_ref") == "end" else 0.0))
     upz = r.axis(o, [0, 0, 1])[:, 2]
     tilt = np.degrees(np.arccos(np.clip(upz, -1, 1)))
-    free = ~Cf[i:]
+    free = ~Cf[i:e]
     tdeg, edeg, sfall = s.get("tumble_deg", 70), s.get("end_tilt_deg", 45), s.get("slip_fall_m_s", 0.3)  # None switches a clause off
-    tumble = bool(((tilt[i:] - tilt[i - 1]) > tdeg)[free].any()) if (free.any() and tdeg is not None) else False
-    toppled = bool(edeg is not None and not Cf[-1] and (tilt[-1] - tilt[0]) > edeg)  # relative to how it started (a ukulele lies flat)
+    tumble = bool(((tilt[i:e] - tilt[i - 1]) > tdeg)[free].any()) if (free.any() and tdeg is not None) else False
+    # ended tipped over: relative to how it started (a ukulele lies flat); for a release judged on its own, "ended" is
+    # the last frame before the regrasp
+    toppled = bool(edeg is not None and not Cf[e - 1] and (tilt[e - 1] - tilt[0]) > edeg)
     lifted = hb >= s.get("drop_min_height_m", 0.02)
     opening = frate <= -s.get("finger_open_rad_s", 0.10)
     lowering = wvz <= -s.get("hand_lower_m_s", 0.06)
@@ -438,8 +444,8 @@ def _release_event(r: Replay, o: str, s, which: int | None = None) -> tuple[bool
             "release_finger_rate_rad_s": frate, "release_bottom_m": hb,
             "release_kind": "slip" if slip else ("deliberate" if deliberate else "n/a"), "tumbled_after": tumble, "toppled_end": toppled}
     # explanation: the verdict first, then each clause as "measured vs limit", the one(s) that fired marked
-    tum = float((tilt[i:] - tilt[i - 1])[free].max()) if free.any() else 0.0
-    endt = float(tilt[-1] - tilt[0])
+    tum = float((tilt[i:e] - tilt[i - 1])[free].max()) if free.any() else 0.0
+    endt = float(tilt[e - 1] - tilt[0])
     dmin, dh = s.get("drop_min_height_m", 0.02), s.get("drop_height_m", 0.20)
     ref = " above where it ended" if s.get("drop_height_ref") == "end" else ""
     how = (f"fingers {'opening' if opening else 'not opening'} ({frate:+.2f} rad/s; opening <= -{s.get('finger_open_rad_s', 0.10)}), "

@@ -144,9 +144,10 @@ def end_rules(r, tool: str, target: str | None, s: dict, c) -> dict:
     return m
 
 
-def reversals(x: np.ndarray, amp: float) -> int:
-    """Number of direction reversals of a 1-D signal, each confirmed after travelling >= amp back (hysteresis)."""
-    n, direction, cand, a = 0, 0, 0, 0
+def reversal_frames(x: np.ndarray, amp: float) -> list[int]:
+    """Indices (into x) where a direction reversal of a 1-D signal is confirmed, i.e. once the signal has travelled
+    >= amp back from the turning point (hysteresis). The confirmation index is causal: it only uses x[:i + 1]."""
+    out, direction, cand, a = [], 0, 0, 0
     for i in range(1, len(x)):
         if direction == 0:
             if abs(x[i] - x[a]) >= amp:
@@ -154,16 +155,43 @@ def reversals(x: np.ndarray, amp: float) -> int:
         elif (x[i] - x[cand]) * direction > 0:
             cand = i
         elif abs(x[i] - x[cand]) >= amp:
-            n += 1
+            out.append(i)
             direction, cand = -direction, i
-    return n
+    return out
 
 
-def work_in_target(r, tool: str, point_local, target: str, z_below: float = 0.01, z_above: float = 0.03, mask=None) -> dict:
-    """The working point of a tool (a point fixed in the tool, e.g. the middle of a spoon bowl) inside the target's
-    own box (target frame, from z_below under its bottom to z_above over its top) while the tool is held.
-    Returns the per-frame mask, its cumulative time, the path the point travels inside (target frame, horizontal,
-    summed over the visits) and the back-and-forth reversals of that motion along its main direction."""
+def reversals(x: np.ndarray, amp: float) -> int:
+    """Number of direction reversals of a 1-D signal (see reversal_frames)."""
+    return len(reversal_frames(x, amp))
+
+
+def stroke_count(P2: np.ndarray, mask: np.ndarray, amp: float, gap_s: float = 3.0) -> np.ndarray:
+    """Per frame: back-and-forth reversals of >= amp so far, counted within each working session (runs of mask less
+    than gap_s apart belong to the same session: brushing is a series of short touches ~1-1.5 s apart, touch, sweep,
+    lift, touch back; 3 s is the shake check's window) along that session's main direction of motion, using only the
+    positions on working frames. Separate sessions are not joined, so moving from one to the next is not a stroke.
+    The count at frame i only includes reversals confirmed by frame i; a visit's direction is fitted on the whole
+    visit (the one look-ahead, within a visit)."""
+    cnt = np.zeros(len(mask), int)
+    for a, b in events(mask, gap_s):
+        idx = np.arange(a, b)[mask[a:b]]
+        if len(idx) < 4:
+            continue
+        Q = P2[idx]
+        ax = np.linalg.svd(Q - Q.mean(0), full_matrices=False)[2][0]
+        for k in reversal_frames(Q @ ax, amp):
+            cnt[idx[k]:] += 1
+    return cnt
+
+
+def work_in_target(r, tool: str, point_local, target: str, z_below: float = 0.01, z_above: float = 0.03, mask=None,
+                   visit_gap_s: float = 3.0) -> dict:
+    """The working point of a tool (a point fixed in the tool, e.g. the middle of a spoon bowl, or {"lowest_in": box}:
+    the tool's lowest hull point within box) inside the target's own box (target frame, from z_below under its bottom
+    to z_above over its top) while the tool is held.
+    Returns the per-frame mask, its cumulative time, the cumulative path the point travels between consecutive
+    working frames (target frame, horizontal), and the back-and-forth reversals counted per visit (rev_count: per
+    frame so far; reversals: total)."""
     lo, hi = r.local_aabb[target]
     if isinstance(point_local, dict):  # {"lowest_in": box}: the tool's hull point inside box that is lowest in the target
         H = r.hull(tool)  # frame, per frame (the dipping tip of a tilted spoon bowl, not its centre)
@@ -179,18 +207,13 @@ def work_in_target(r, tool: str, point_local, target: str, z_below: float = 0.01
               & (P[:, 2] >= lo[2] - z_below) & (P[:, 2] <= hi[2] + z_above))
     held = V.fill_gaps(r.hand_contact(tool))
     work = inside & held & (mask if mask is not None else True)
-    path = np.zeros(r.n)
-    for a, b in events(work, 0.3):
-        if b - a > 1:
-            path[a + 1:b] += np.linalg.norm(np.diff(P[a:b, :2], axis=0), axis=1)
-    path = np.cumsum(path)
+    # path: only steps whose both ends are working frames (travel outside the target, or while not held, earns nothing)
+    step = np.concatenate([[0.0], np.linalg.norm(np.diff(P[:, :2], axis=0), axis=1)])
+    both = work & np.concatenate([[False], work[:-1]])
+    path = np.cumsum(np.where(both, step, 0.0))
     out = {"mask": work, "inside_s": float(work.sum() * V.DT), "path_m": path, "P": P}
-    Q = P[work][:, :2]
-    if len(Q) > 3:
-        ax = np.linalg.svd(Q - Q.mean(0), full_matrices=False)[2][0]
-        out["reversals"] = {a: reversals(Q @ ax, a) for a in (0.01, 0.02, 0.03)}
-    else:
-        out["reversals"] = {a: 0 for a in (0.01, 0.02, 0.03)}
+    out["rev_count"] = {a: stroke_count(P[:, :2], work, a, visit_gap_s) for a in (0.01, 0.02, 0.03)}  # per frame, causal
+    out["reversals"] = {a: int(c[-1]) for a, c in out["rev_count"].items()}
     return out
 
 
