@@ -429,7 +429,11 @@ def _release_event(r: Replay, o: str, s) -> tuple[bool, dict, str]:
     slip = sfall is not None and lifted and not deliberate and fall_r >= sfall  # closed hand moved off and the object came down
     high = hb >= s.get("drop_height_m", 0.20) and fall_r >= ds  # let go from high up and it fell, however the hand moved
     # a toppled end pose only convicts a release that was not deliberate (a drill set down lying on its side is a put-down)
-    drop = slip or (lifted and (high or tumble or (toppled and not deliberate)))
+    # a deliberate put-down from low (< tumble_deliberate_min_m, default 0 = always counts) that then falls over is fine:
+    # a slab set down on its edge flops flat
+    tdm = s.get("tumble_deliberate_min_m", 0.0)
+    tumble_counts = tumble and (not deliberate or hb >= tdm)
+    drop = slip or (lifted and (high or tumble_counts or (toppled and not deliberate)))
     info = {"last_release_lift_m": float(zo[i - 1]), "last_release_fall_m_s": fall_r, "release_hand_vz_m_s": wvz,
             "release_finger_rate_rad_s": frate, "release_bottom_m": hb,
             "release_kind": "slip" if slip else ("deliberate" if deliberate else "n/a"), "tumbled_after": tumble, "toppled_end": toppled}
@@ -441,23 +445,42 @@ def _release_event(r: Replay, o: str, s) -> tuple[bool, dict, str]:
     how = (f"fingers {'opening' if opening else 'not opening'} ({frate:+.2f} rad/s; opening <= -{s.get('finger_open_rad_s', 0.10)}), "
            f"hand {'lowering' if lowering else ('rising' if rising else 'level')} ({wvz:+.2f} m/s; lowering <= -{s.get('hand_lower_m_s', 0.06)}, "
            f"rising >= {s.get('hand_rise_m_s', 0.15)}) -> {'deliberate release' if deliberate else 'NOT a deliberate release'}")
-    clauses = []  # (fired, text)
+    clauses = []  # (fired, text): each clause states its measurement, its limit and its outcome
     if sfall is not None:
-        clauses.append((slip, f"slipped out: released {hb:.3f} m{ref} up (counts from {dmin} m), not deliberately, and came down "
-                              f"{fall_r:.2f} m/s (limit {sfall} m/s)"))
-    clauses.append((high and lifted, f"let go too high: released {hb:.3f} m{ref} up (limit {dh} m) and fell {fall_r:.2f} m/s (limit {ds} m/s)"))
+        if slip:
+            t = f"SLIPPED OUT: let go {hb:.3f} m{ref} up without a deliberate release and it came down {fall_r:.2f} m/s (limit {sfall} m/s)"
+        elif deliberate:
+            t = "slipped out: no (deliberate release)"
+        else:
+            t = f"slipped out: no (came down {fall_r:.2f} m/s, limit {sfall} m/s)"
+        clauses.append((slip, t))
+    hi_f = high and lifted
+    clauses.append((hi_f, (f"LET GO TOO HIGH: {hb:.3f} m{ref} up (limit {dh} m) and fell {fall_r:.2f} m/s (limit {ds} m/s)" if hi_f
+                           else f"let go too high: no ({hb:.3f} m{ref} up, limit {dh} m; fell {fall_r:.2f} m/s, limit {ds} m/s)")))
     if tdeg is not None:
-        clauses.append((tumble and lifted, f"tumbled after release: turned {tum:.0f} deg (limit {tdeg} deg)"))
+        if tumble_counts and lifted:
+            t = f"TUMBLED after release: turned {tum:.0f} deg (limit {tdeg} deg)"
+        elif tumble:
+            t = (f"tumbled: turned {tum:.0f} deg (over the {tdeg} deg limit) but excused: deliberate release from only {hb:.3f} m "
+                 f"(counts from {tdm} m)")
+        else:
+            t = f"tumbled: no (turned {tum:.0f} deg, limit {tdeg} deg)"
+        clauses.append((tumble_counts and lifted, t))
     if edeg is not None:
-        clauses.append((toppled and lifted and not deliberate,
-                        f"ended tipped over: {endt:.0f} deg from its start tilt (limit {edeg} deg; only after a release that is not deliberate)"))
-    fired = [t for f, t in clauses if f]
+        tf = toppled and lifted and not deliberate
+        if tf:
+            t = f"ENDED TIPPED OVER: {endt:.0f} deg from its start tilt (limit {edeg} deg) after a release that was not deliberate"
+        elif toppled:
+            t = f"tipped over at the end: {endt:.0f} deg (over the {edeg} deg limit) but excused: deliberate release"
+        else:
+            t = f"tipped over at the end: no ({endt:.0f} deg from its start tilt, limit {edeg} deg)"
+        clauses.append((tf, t))
     if drop:
-        txt = "DROPPED: " + "; ".join(fired) + f". Release: {how}."
+        txt = "DROPPED - " + "; ".join(t for f, t in clauses if f) + f". Release: {how}. Other checks: " + "; ".join(t for f, t in clauses if not f)
     elif not lifted:
-        txt = (f"ok: released only {hb:.3f} m{ref} up (a drop counts from {dmin} m). Release: {how}.")
+        txt = f"ok - released only {hb:.3f} m{ref} up (a drop counts from {dmin} m). Release: {how}."
     else:
-        txt = "ok: " + "; ".join(t.replace(":", " - no:", 1) for f, t in clauses) + f". Release: {how}."
+        txt = "ok - " + "; ".join(t for _, t in clauses) + f". Release: {how}."
     return bool(drop), info, txt
 
 

@@ -532,3 +532,14 @@ failed. It now starts with the verdict and names the clause that fired, e.g. "no
 release: turned 102 deg (limit 70 deg). Release: fingers opening (-0.40 rad/s; opening <= -0.1), hand level (+0.02
 m/s; ...) -> deliberate release." Passing cases say why they pass ("ok: released only 0.005 m up (a drop counts from
 0.02 m)"). Verdicts unchanged; all labelled recordings and policy rollouts re-verified.
+
+## 00051 success_9f222d15: a low deliberate put-down that flops flat is not a drop; clearer drop clauses (2026-10-19)
+
+Reviewer: "I still don't understand the reason it failed, it said deliberate release". The eraser was held on its edge,
+set down 3 cm up with the fingers opening (deliberate), and then flopped flat (turned 102 deg). The tumble clause
+counted even after a deliberate release. New `tumble_deliberate_min_m` (default 0 = unchanged): after a deliberate
+release the tumble clause counts only when the release was at least this high. 00051 uses 5 cm: 9f222d15 (3 cm) passes,
+failure_f961eb3d (deliberate, 10 cm, tumbles 121 deg) still fails. 00051: 1.000 / 1.000.
+Each drop clause now states its own outcome: "SLIPPED OUT / LET GO TOO HIGH / TUMBLED / ENDED TIPPED OVER" when it
+fires, otherwise "no (measured, limit)" or "over the limit but excused: deliberate release ...", and for a drop the
+clause that fired comes first, the other checks after. Verdicts elsewhere unchanged (state-only 0.998 / 0.980).

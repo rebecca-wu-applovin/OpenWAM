@@ -1907,6 +1907,7 @@
     "reversal_amp_m": 0.01,
     "drop_rule": "hand_motion",
     "drop_min_height_m": 0.02,
+    "tumble_deliberate_min_m": 0.05,
     "final": true
    }
   ],
