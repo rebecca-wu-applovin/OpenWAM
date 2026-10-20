@@ -814,73 +814,78 @@ class WanBase(VideoBackbone):
     # ABC: Unified preprocessing (1)
     # ================================================================
 
-    def _encode_sparse_clips(self, frames, num_history_frames: int) -> Tensor:
-        """Sparse-history encode: each history frame alone, the future frames as one causal clip.
+    def _sparse_pixels(self, clip) -> Tensor:
+        """clip: list of T PIL frames. Returns: (1, 3, T, H_px, W_px) pixels in [-1, 1] on the device."""
+        return wan_encode.preprocess_video(clip, encoder=self.video_encoder, dtype=self.dtype, device=self.device)
+
+    def preprocess_sparse_condition(self, history_frames, text, *, num_future_frames: int) -> dict:
+        """Sparse-history conditioning (TI2V only): H history frames encoded one by one + the text context.
 
         Args:
-            frames: list of B clips, each H + F PIL frames (history first).
-            num_history_frames: int, H.
-
-        Returns:
-            (B, z, H + T_fut, h, w) latents; T_fut = 1 + (F - 1) // 4.
-        """
-        h = int(num_history_frames)
-
-        def _pixels(clip):
-            # (1, 3, T, H_px, W_px) in [-1, 1].
-            return wan_encode.preprocess_video(clip, encoder=self.video_encoder, dtype=self.dtype, device=self.device)
-
-        # History: (B*H, 3, 1, H_px, W_px) → B*H single-frame latents.
-        hist = torch.cat([_pixels(clip[:h]).transpose(1, 2).flatten(0, 1).unsqueeze(2) for clip in frames], dim=0)
-        hist_lat = wan_encode.encode_video(hist, vae=self.vae, encoder=self.video_encoder)
-        hist_lat = hist_lat.unflatten(0, (len(frames), h)).squeeze(3).transpose(1, 2)  # (B, z, H, h, w)
-        # Future: one causal clip per sample.
-        fut = torch.cat([_pixels(clip[h:]) for clip in frames], dim=0)
-        fut_lat = wan_encode.encode_video(fut, vae=self.vae, encoder=self.video_encoder)
-        return torch.cat([hist_lat.to(fut_lat.dtype), fut_lat], dim=2)
-
-    def _preprocess_sparse_history(self, frames, text, num_history_frames: int) -> dict:
-        """Train inputs for the sparse-history layout (TI2V only).
-
-        Args:
-            frames: list of B clips of H + F PIL frames.
+            history_frames: list of B clips, each H PIL frames (oldest first).
             text: list of B prompts.
-            num_history_frames: int, H.
+            num_future_frames: int F (1 + 4k), the future frames the clip covers.
 
         Returns:
-            preprocess dict; ``first_frame_latents`` holds the H clean history latents
-            and ``num_clean_prefix_frames`` = H (per-token t=0 on them, loss skips them).
+            preprocess dict without ``input_latents``; ``first_frame_latents`` (B, z, H, h, w) holds the H clean
+            history latents and ``num_clean_prefix_frames`` = H (per-token t=0 on them, loss skips them).
         """
         if not self._is_ti2v:
             raise NotImplementedError("sparse history is implemented for the TI2V variant only")
-        h = int(num_history_frames)
+        h, f = len(history_frames[0]), int(num_future_frames)
         height, width, _ = check_resize_height_width(
-            frames[0][0].size[1],
-            frames[0][0].size[0],
-            len(frames[0]) - h,
+            history_frames[0][0].size[1],
+            history_frames[0][0].size[0],
+            f,
             height_division_factor=self._height_division_factor,
             width_division_factor=self._width_division_factor,
             time_division_factor=self._time_division_factor,
             time_division_remainder=self._time_division_remainder,
         )
-        if (len(frames[0]) - h - 1) % self._time_division_factor:
-            raise ValueError(f"future frames must be 1 + {self._time_division_factor}k, got {len(frames[0]) - h}")
+        if (f - 1) % self._time_division_factor:
+            raise ValueError(f"future frames must be 1 + {self._time_division_factor}k, got {f}")
         context, seq_lens = self._encode_text(text)
-        input_latents = self._encode_sparse_clips(frames, h).to(dtype=self.dtype, device=self.device)
+        # History: (B*H, 3, 1, H_px, W_px) → B*H single-frame latents → (B, z, H, h, w).
+        hist = torch.cat([self._sparse_pixels(clip).transpose(1, 2).flatten(0, 1).unsqueeze(2) for clip in history_frames])
+        hist_lat = wan_encode.encode_video(hist, vae=self.vae, encoder=self.video_encoder)
+        hist_lat = hist_lat.unflatten(0, (len(history_frames), h)).squeeze(3).transpose(1, 2)
         return {
-            "input_latents": input_latents,
             "context": context,
             "seq_lens": seq_lens,
             "height": height,
             "width": width,
-            "num_frames": len(frames[0]),
+            "num_frames": h + f,
             "vace_context": None,
             "fuse_vae_embedding_in_latents": True,
             "num_clean_prefix_frames": h,
-            "first_frame_latents": input_latents[:, :, :h].clone(),
+            "first_frame_latents": hist_lat.to(dtype=self.dtype, device=self.device),
             "clip_feature": None,
             "y": None,
         }
+
+    def encode_sparse_future(self, future_frames) -> Tensor:
+        """future_frames: list of B clips of F PIL frames. Returns: (B, z, 1 + (F-1)//4, h, w), one causal clip each."""
+        fut = torch.cat([self._sparse_pixels(clip) for clip in future_frames], dim=0)
+        fut_lat = wan_encode.encode_video(fut, vae=self.vae, encoder=self.video_encoder)
+        return fut_lat.to(dtype=self.dtype, device=self.device)
+
+    def _preprocess_sparse_history(self, frames, text, num_history_frames: int) -> dict:
+        """Train inputs for the sparse-history layout: the shared condition + the future clip as target.
+
+        Args:
+            frames: list of B clips of H + F PIL frames (history first).
+            text: list of B prompts.
+            num_history_frames: int, H.
+
+        Returns:
+            :meth:`preprocess_sparse_condition` dict plus ``input_latents`` (B, z, H + T_fut, h, w).
+        """
+        h = int(num_history_frames)
+        cond = self.preprocess_sparse_condition(
+            [clip[:h] for clip in frames], text, num_future_frames=len(frames[0]) - h
+        )
+        fut_lat = self.encode_sparse_future([clip[h:] for clip in frames])
+        return {**cond, "input_latents": torch.cat([cond["first_frame_latents"], fut_lat], dim=2)}
 
     def preprocess_input_for_train(self, *, frames=None, text=None, **kw) -> dict:
         """Unified train preprocessing: raw data (``frames``/``text``, optional

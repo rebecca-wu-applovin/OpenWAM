@@ -16,4 +16,4 @@ shift_video: 1.0
 n_view: 2                 # cameras stacked top-to-bottom in the dataloader canvas
 text_max_length: 128      # GE get_text_conditions max_sequence_length
 caption_dropout_p: 0.06   # GE configs/ltx_model/video_model.yaml
-vae_sample: true          # GE get_latents samples the VAE posterior
+vae_sample: true          # GE get_latents samples the VAE posterior (training mode only; eval / deploy take its mode)

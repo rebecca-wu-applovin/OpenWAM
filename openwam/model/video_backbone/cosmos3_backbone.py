@@ -291,22 +291,18 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         std = self._latents_std.to(raw.device)
         return ((raw.float() - mean) / std).to(raw.dtype)
 
-    def _encode_sparse_frames(self, frames: Tensor, num_history_frames: int) -> Tensor:
-        """Sparse-history encode: each history frame alone, the future frames as one causal clip.
+    def _encode_history(self, frames: Tensor) -> Tensor:
+        """Sparse-history encode: each history frame alone (a 1-frame clip).
 
         Args:
-            frames: (B, 3, H + F, H_px, W_px) pixels in [-1, 1], history first.
-            num_history_frames: int, H.
+            frames: (B, 3, H, H_px, W_px) pixels in [-1, 1].
 
         Returns:
-            (B, 48, H + T_fut, h, w) normalized latents.
+            (B, 48, H, h, w) normalized latents.
         """
-        b, h = frames.shape[0], int(num_history_frames)
-        # (B*H, 3, 1, H_px, W_px): every history frame is its own 1-frame clip.
-        hist = frames[:, :, :h].transpose(1, 2).flatten(0, 1).unsqueeze(2)
-        hist_lat = self._encode_frames(hist).unflatten(0, (b, h)).squeeze(3).transpose(1, 2)
-        fut_lat = self._encode_frames(frames[:, :, h:])
-        return torch.cat([hist_lat, fut_lat], dim=2)
+        b, h = frames.shape[0], frames.shape[2]
+        hist = frames.transpose(1, 2).flatten(0, 1).unsqueeze(2)  # (B*H, 3, 1, H_px, W_px)
+        return self._encode_frames(hist).unflatten(0, (b, h)).squeeze(3).transpose(1, 2)
 
     def _unnormalize_latents(self, latents: Tensor) -> Tensor:
         mean = self._latents_mean.to(latents.device)
@@ -382,34 +378,84 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
     # Training preprocessing
     # ================================================================
 
-    def preprocess_input_for_train(self, *, frames=None, text=None, **kw) -> dict:
-        if frames is None or text is None:
-            raise ValueError("cosmos3_edge preprocess_input_for_train needs `frames` and `text`.")
-        frames_t = self._frames_to_tensor(frames)
-        b, _, t_pix, h_pix, w_pix = frames_t.shape
-
-        prompts = [text] * b if isinstance(text, str) else list(text)
-        if len(prompts) != b:
-            raise ValueError(f"cosmos3_edge got {len(prompts)} prompts for batch of {b}.")
+    def _prompts(self, text, batch_size: int) -> List[str]:
+        """text: one str or B prompts; batch_size: B. Returns: B prompts, caption-dropped in training mode."""
+        prompts = [text] * batch_size if isinstance(text, str) else list(text)
+        if len(prompts) != batch_size:
+            raise ValueError(f"cosmos3_edge got {len(prompts)} prompts for batch of {batch_size}.")
         if self.training and self._text_dropout_p > 0.0:
             prompts = [p if self._text_dropout_rng.random() >= self._text_dropout_p else "" for p in prompts]
+        return prompts
 
-        fps = float(kw.get("fps", self._clip_fps))
-        n_hist = int(kw.get("num_history_frames", 0) or 0)
+    def preprocess_sparse_condition(self, history_frames, text, *, num_future_frames: int, fps=None) -> dict:
+        """Sparse-history conditioning: H history frames encoded one by one + the und-tower text bundle.
+
+        Args:
+            history_frames: list of B clips (H PIL frames, oldest first), or (B, 3, H, H_px, W_px) in [-1, 1].
+            text: list of B prompts (or one str).
+            num_future_frames: int F (1 + 4k); the prompt metadata and vision positions cover H + T_fut latents.
+            fps: float clip fps for the prompt template / fps modulation; None = the configured clip fps.
+
+        Returns:
+            dict with ``first_frame_latents`` (B, 48, H, h, w), ``num_clean_prefix_frames`` = H, ``context``,
+            ``und_mask``, ``seq_lens``, ``und_kv``, ``vision_positions`` [3, 1, N], ``num_frames`` (pixel frames of
+            the equivalent contiguous clip), ``height``, ``width``.
+        """
+        frames_t = self._frames_to_tensor(history_frames)
+        b, _, h, h_pix, w_pix = frames_t.shape
+        prompts = self._prompts(text, b)
+        fps = float(fps if fps is not None else self._clip_fps)
         with torch.no_grad():
-            if n_hist > 0:
-                latents = self._encode_sparse_frames(frames_t, n_hist)
-                # Prompt metadata describes the equivalent contiguous clip of these latents (scheme (a)).
-                t_pix = 1 + self._temporal_compression * (latents.shape[2] - 1)
-            else:
-                latents = self._encode_frames(frames_t)
+            hist = self._encode_history(frames_t)
+            t_lat = h + self.num_future_latents(num_future_frames)
+            # Prompt metadata describes the equivalent contiguous clip of these latents (scheme (a)).
+            t_pix = 1 + self._temporal_compression * (t_lat - 1)
             enc = self._encode_prompts(prompts, num_frames=t_pix, height=h_pix, width=w_pix, fps=fps)
-
-        vision_pos = self._vision_positions(enc["und_len_padded"], tuple(latents.shape[2:]), fps)
+        vision_pos = self._vision_positions(enc["und_len_padded"], (t_lat,) + tuple(hist.shape[3:]), fps)
         # NOTE: no `context_mask` key — the architecture appends a proprio token
         # to `context` and derives the action-side mask from `seq_lens`; a
         # provided mask would be one column short. The und padding mask rides
         # the private `und_mask` key for the gen-attention prefix instead.
+        return {
+            "context": enc["context"],
+            "und_mask": enc["context_mask"],
+            "seq_lens": enc["seq_lens"],
+            "und_kv": enc["und_kv"],
+            "vision_positions": vision_pos,
+            "first_frame_latents": hist,
+            "num_clean_prefix_frames": h,
+            "num_frames": t_pix,
+            "height": h_pix,
+            "width": w_pix,
+        }
+
+    def encode_sparse_future(self, future_frames) -> Tensor:
+        """future_frames: list of B clips of F PIL frames (or the tensor form). Returns: (B, 48, 1 + (F-1)//4, h, w)."""
+        with torch.no_grad():
+            return self._encode_frames(self._frames_to_tensor(future_frames))
+
+    def preprocess_input_for_train(self, *, frames=None, text=None, **kw) -> dict:
+        if frames is None or text is None:
+            raise ValueError("cosmos3_edge preprocess_input_for_train needs `frames` and `text`.")
+        frames_t = self._frames_to_tensor(frames)
+        n_hist = int(kw.get("num_history_frames", 0) or 0)
+        if n_hist > 0:
+            # Sparse history = the shared condition (also built by deploy) + the future clip as target.
+            cond = self.preprocess_sparse_condition(
+                frames_t[:, :, :n_hist], text, num_future_frames=frames_t.shape[2] - n_hist, fps=kw.get("fps")
+            )
+            fut = self.encode_sparse_future(frames_t[:, :, n_hist:])
+            return {**cond, "input_latents": torch.cat([cond["first_frame_latents"], fut], dim=2)}
+
+        b, _, t_pix, h_pix, w_pix = frames_t.shape
+        prompts = self._prompts(text, b)
+        fps = float(kw.get("fps", self._clip_fps))
+        with torch.no_grad():
+            latents = self._encode_frames(frames_t)
+            enc = self._encode_prompts(prompts, num_frames=t_pix, height=h_pix, width=w_pix, fps=fps)
+
+        vision_pos = self._vision_positions(enc["und_len_padded"], tuple(latents.shape[2:]), fps)
+        # NOTE: no `context_mask` key (see preprocess_sparse_condition).
         return {
             "input_latents": latents,
             "context": enc["context"],
@@ -417,8 +463,8 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             "seq_lens": enc["seq_lens"],
             "und_kv": enc["und_kv"],
             "vision_positions": vision_pos,
-            "first_frame_latents": latents[:, :, : max(n_hist, 1)].clone(),
-            "num_clean_prefix_frames": max(n_hist, 1),
+            "first_frame_latents": latents[:, :, :1].clone(),
+            "num_clean_prefix_frames": 1,
             "num_frames": t_pix,
             "height": h_pix,
             "width": w_pix,

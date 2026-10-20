@@ -17,28 +17,46 @@ class _Sched:
         self.sigmas = torch.linspace(1, 0, num_inference_steps + 1)
 
 
-class _StubArch(torch.nn.Module):
-    """Records rollout_from_sample() calls; returns slightly-off frames + a zero action chunk.
+class _StubBackbone(torch.nn.Module):
+    """decode_video stub: one (w x h) frame of value 10 per latent frame."""
 
-    It also draws from the global torch RNG, which the hook must restore.
+    def __init__(self):
+        super().__init__()
+        self.size = None  # (w, h) of the frames to return, set by the arch stub
+
+    def decode_video(self, latents, *, tiled=True):
+        return [Image.new("RGB", self.size, (10, 10, 10)) for _ in range(latents.shape[2])]
+
+
+class _StubArch(torch.nn.Module):
+    """prepare_inputs / sample stubs (one latent frame per video frame); records sample() calls.
+
+    prepare_inputs also draws from the global torch RNG, which the hook must restore.
     """
 
     def __init__(self):
         super().__init__()
         self.dit = torch.nn.Linear(2, 2)  # trainable part (train mode)
         self.vae = torch.nn.Linear(2, 2).eval()  # frozen part (eval mode)
+        self.video_backbone = _StubBackbone()
         self.video_scheduler, self.action_scheduler = _Sched(), _Sched()
         self.calls = []
 
-    def rollout_from_sample(self, sample, schedule, *, seed):
-        self.eval()  # mirrors base.rollout_from_sample
+    def prepare_inputs(self, batch):
         torch.rand(3)  # consumes global RNG like prepare_inputs may
-        self.calls.append({"sample": sample, "schedule": schedule, "seed": seed})
-        h = int(sample.get("num_history_frames", 0) or 0)
-        w, hh = sample["video"][0].size
-        # Sparse layout decodes only the future frames; legacy decodes the whole clip.
-        frames = [Image.new("RGB", (w, hh), (10, 10, 10)) for _ in range(len(sample["video"]) - h)]
-        return {"video": frames, "actions": np.zeros((len(sample["action"]), 4), np.float32)}
+        s = batch[0]
+        self.video_backbone.size = s["video"][0].size
+        return {
+            "input_latents": torch.zeros(1, 2, len(s["video"]), 1, 1),
+            "actions": torch.zeros(1, len(s["action"]), 4),
+            "action_is_pad": torch.zeros(1, len(s["action"]), dtype=torch.bool),
+            "prompt_seen": s["prompt"],
+        }
+
+    def sample(self, inputs, schedule, *, latent_shape, action_shape, seed):
+        assert "input_latents" not in inputs and "actions" not in inputs and "action_is_pad" not in inputs
+        self.calls.append({"prompt": inputs["prompt_seen"], "schedule": schedule, "seed": seed})
+        return torch.zeros(latent_shape), torch.zeros(action_shape)
 
 
 class _Acc:
@@ -79,7 +97,7 @@ def test_rollout_logs_video_and_restores_modes(tmp_path):
 
     call = arch.calls[0]
     assert len(call["schedule"]) == 4  # denoise_steps + 1 points
-    assert call["seed"] == 42 and call["sample"]["prompt"] == "pick the cube"
+    assert call["seed"] == 42 and call["prompt"] == "pick the cube"
 
     step, logged = run.logged[0]
     assert step == 2000 and set(logged) == {"vis/rollout_0", "vis/video_mse", "vis/action_mse"}
@@ -105,7 +123,7 @@ def test_rollout_sparse_history_layout():
 
 def test_rollout_failure_does_not_raise(tmp_path):
     arch = _StubArch()
-    arch.rollout_from_sample = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("OOM"))
+    arch.sample = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("OOM"))
     run = _Run()
     TrainVisualizer(_dataset(), rank=0).run(_Acc(), arch, 5, run, str(tmp_path))
     assert run.logged == [] and arch.dit.training

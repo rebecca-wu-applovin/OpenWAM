@@ -200,6 +200,50 @@ class VideoBackbone(ABC, nn.Module):
         return torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
 
     # ================================================================
+    # Optional: sparse-history layout (H single-frame history latents + one future clip)
+    # ================================================================
+    # Training builds its inputs as condition + future; deploy builds the same condition from
+    # its own observation history and denoises the future from noise.
+
+    def preprocess_sparse_condition(self, history_frames, text, *, num_future_frames: int) -> dict:
+        """Conditioning inputs of the sparse-history layout: everything the forward needs except the future.
+
+        Args:
+            history_frames: list of B clips, each H PIL frames (oldest first, frame t last).
+            text: list of B prompts.
+            num_future_frames: int F, future frames the latents will cover (1 + temporal_compression * k).
+
+        Returns: forward kwargs dict with ``first_frame_latents`` (B, z, H, h, w) clean history latents
+            (each frame encoded alone), ``num_clean_prefix_frames`` = H, the text context entries, and the
+            clip geometry (``num_frames`` = H + F, ``height``, ``width``). No ``input_latents``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support the sparse-history layout.")
+
+    def encode_sparse_future(self, future_frames) -> Tensor:
+        """Clean latents of the sparse layout's future clip (training target).
+
+        Args:
+            future_frames: list of B clips, each F PIL frames.
+
+        Returns: (B, z, num_future_latents(F), h, w) latents, F frames encoded as one causal clip.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support the sparse-history layout.")
+
+    def num_future_latents(self, num_future_frames: int) -> int:
+        """Latent frames of a causally encoded F-frame future clip.
+
+        Args:
+            num_future_frames: int F.
+
+        Returns: int 1 + (F - 1) / temporal_compression. Raises ValueError unless F = 1 (mod temporal_compression).
+        """
+        tc = int(self.temporal_compression)
+        f = int(num_future_frames)
+        if f < 1 or (f - 1) % tc:
+            raise ValueError(f"{type(self).__name__}: future frames must be 1 + {tc}k, got {f}")
+        return 1 + (f - 1) // tc
+
+    # ================================================================
     # Optional: deploy preprocessing, decode, and compile
     # ================================================================
 

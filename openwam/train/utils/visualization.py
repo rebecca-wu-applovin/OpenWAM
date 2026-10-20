@@ -1,10 +1,11 @@
 """Periodic world-model rollouts during training, logged to wandb.
 
 Every ``training.vis_steps`` steps each rank denoises one fixed training sample:
-``architecture.rollout_from_sample`` builds the clean prefix (first frame, or the H
-sparse-history frames), prompt and proprio with the training input path, so it works
-for every video backbone, and runs the deploy denoising loop (``make_schedule``) on
-the future video latents + action chunk. Rank 0 gathers them and logs
+:func:`rollout_from_sample` builds the clean prefix (first frame, or the H
+sparse-history frames), prompt and proprio with the training input path
+(``architecture.prepare_inputs``), so it works for every video backbone and layout, and
+denoises the future video latents + action chunk with ``architecture.sample`` on a
+``make_schedule`` grid. Rank 0 gathers them and logs
 ``vis/rollout_<i>`` videos (GT | prediction side by side) plus ``vis/video_mse`` /
 ``vis/action_mse``. Everything the rollout touches (schedulers, RNG, train/eval
 flags, compiled-loop handle) is restored, so training continues unchanged.
@@ -72,6 +73,47 @@ def write_mp4(video: np.ndarray, path: str, fps: int) -> str:
     return path
 
 
+# prepare_inputs entries that are GT targets or training-only flags; never fed to the rollout forward.
+_TRAIN_ONLY_KEYS = (
+    "actions", "input_latents", "action_is_pad", "video_is_pad", "max_timestep_boundary", "min_timestep_boundary",
+    "use_gradient_checkpointing", "use_gradient_checkpointing_offload",
+)
+
+
+@torch.no_grad()
+def rollout_from_sample(arch, sample: dict, schedule, *, seed: int) -> dict:
+    """Denoise one training sample's future from its training-path inputs.
+
+    ``prepare_inputs`` builds the clean prefix (1 TI2V frame, or H sparse-history frames), text and proprio
+    exactly as training does, for every backbone. The GT video latents and actions only give the shapes; the
+    future latents and the action chunk start from seeded noise (``arch.sample``).
+
+    Args:
+        arch: unwrapped architecture.
+        sample: one dataset sample: ``video`` T PIL frames, ``prompt``, ``proprio``, ``action`` (K, A),
+            optional ``num_history_frames`` H (0 / absent = legacy contiguous clip).
+        schedule: (t_video, t_action) list from ``make_schedule``.
+        seed: int, seeds the video and action noise.
+
+    Returns: dict ``video``: decoded PIL frames, the F future frames when H > 0 (history is encoded frame
+        by frame, the future as its own clip), else all T frames (frame 0 = decoded condition);
+        ``actions``: (K, A) float32 numpy, normalized space (same space as ``sample["action"]``).
+    """
+    arch.eval()
+    inputs = arch.prepare_inputs([sample])
+    n_hist = int(sample.get("num_history_frames", 0) or 0)
+    latent_shape, action_shape = inputs["input_latents"].shape, inputs["actions"].shape
+    for key in _TRAIN_ONLY_KEYS:
+        inputs.pop(key, None)
+    # Same routing as compute_loss: the per-sample proprio mask rides an internal key into the forward.
+    proprio_mask = inputs.pop("proprio_mask", None)
+    if proprio_mask is not None:
+        inputs["_proprio_sample_mask"] = proprio_mask
+    latents, actions = arch.sample(inputs, schedule, latent_shape=latent_shape, action_shape=action_shape, seed=seed)
+    video = arch.video_backbone.decode_video(latents[:, :, n_hist:], tiled=True)
+    return {"video": video, "actions": actions.squeeze(0).float().cpu().numpy()}
+
+
 class TrainVisualizer:
     """Fixed-sample world-model rollouts for wandb.
 
@@ -106,7 +148,7 @@ class TrainVisualizer:
         """Denoise this rank's sample from its training-path inputs (any video backbone).
 
         Args:
-            arch: unwrapped architecture (``rollout_from_sample`` / ``video_scheduler`` / ``action_scheduler``).
+            arch: unwrapped architecture (``prepare_inputs`` / ``sample`` / ``video_scheduler`` / ``action_scheduler``).
 
         Returns:
             dict: ``video`` (T, H, 2W, 3) uint8, left GT | right prediction; with H sparse-history frames the
@@ -127,10 +169,9 @@ class TrainVisualizer:
             shift=shift,
             shift_video=getattr(vb, "shift_video", None),
         )
-        # Seed the global RNG too: some encoders sample (GE's LTX VAE uses latent_dist.sample()), so the
-        # conditioning would differ between vis steps. run() restores the training RNG afterwards.
+        # Seed the global RNG too, in case an encoder draws from it; run() restores the training RNG afterwards.
         torch.manual_seed(self.seed)
-        out = arch.rollout_from_sample(dict(s), schedule, seed=self.seed)
+        out = rollout_from_sample(arch, dict(s), schedule, seed=self.seed)
 
         n_hist = int(s.get("num_history_frames", 0) or 0)
         gt = _frames_to_array(s["video"])

@@ -262,35 +262,80 @@ class GEBaseFastVideoBackbone(VideoBackbone):
 
     @torch.no_grad()
     def _vae_encode(self, pixels: Tensor) -> Tensor:
-        """(N, 3, T, h_px, w_px) in [-1, 1] → normalized (N, 128, T_lat, h, w) latents (GE get_latents)."""
+        """(N, 3, T, h_px, w_px) in [-1, 1] → normalized (N, 128, T_lat, h, w) latents (GE get_latents).
+
+        The posterior is sampled only in training mode with ``vae_sample`` on (GE's training recipe); eval
+        (training vis, deploy) takes its mode, so inference is deterministic.
+        """
         vae = self.vae
         dist = vae.encode(pixels.to(device=self.device, dtype=next(vae.parameters()).dtype)).latent_dist
-        lat = dist.sample() if self._vae_sample else dist.mode()
+        lat = dist.sample() if (self._vae_sample and self.training) else dist.mode()
         mean = vae.latents_mean.view(1, -1, 1, 1, 1).to(lat.device, lat.dtype)
         std = vae.latents_std.view(1, -1, 1, 1, 1).to(lat.device, lat.dtype)
         return (lat - mean) * float(vae.config.scaling_factor) / std
 
-    def _encode_sparse(self, frames: Tensor, num_history_frames: int) -> Tensor:
-        """Sparse-history encode per view: history frames alone, the future as one causal clip.
+    def _encode_history(self, frames: Tensor) -> Tensor:
+        """Every history frame encoded alone (GE memory frames), per view.
 
         Args:
-            frames: (B, 3, H + F, V*h_px, W) canvas pixels in [-1, 1], history first.
-            num_history_frames: int, H (0 = encode the whole clip as one causal clip).
+            frames: (B, 3, H, V*h_px, W) canvas pixels in [-1, 1].
+
+        Returns: (B, 128, H, V*h, w) latents, views stacked along height.
+        """
+        b, h = frames.shape[0], frames.shape[2]
+        views = self._split_views(frames)  # (B*V, 3, H, h_px, W)
+        hist = views.transpose(1, 2).flatten(0, 1).unsqueeze(2)  # (B*V*H, 3, 1, h_px, W)
+        lat = self._vae_encode(hist).unflatten(0, (views.shape[0], h)).squeeze(3).transpose(1, 2)
+        return rearrange(lat, "(b v) c t h w -> b c t (v h) w", b=b)
+
+    def _encode_clip(self, frames: Tensor) -> Tensor:
+        """A clip encoded as one causal clip, per view.
+
+        Args:
+            frames: (B, 3, T, V*h_px, W) canvas pixels in [-1, 1], T = 1 + 8k.
+
+        Returns: (B, 128, 1 + (T-1)//8, V*h, w) latents, views stacked along height.
+        """
+        lat = self._vae_encode(self._split_views(frames))
+        return rearrange(lat, "(b v) c t h w -> b c t (v h) w", b=frames.shape[0])
+
+    def _to_pixels(self, frames) -> Tensor:
+        """frames: list of B clips of T PIL canvases, or (B, 3, T, H_px, W) in [-1, 1]. Returns: the tensor form."""
+        from openwam.model.video_backbone.cosmos_predict25._vae_utils import _pil_video_to_tensor
+
+        return frames if torch.is_tensor(frames) else _pil_video_to_tensor(frames, device=self.device)
+
+    def preprocess_sparse_condition(self, history_frames, text, *, num_future_frames: int) -> dict:
+        """Sparse-history conditioning: H history canvases encoded one by one + the T5 context.
+
+        Args:
+            history_frames: list of B clips (H PIL canvases, ego over chest), or (B, 3, H, H_px, W) in [-1, 1].
+            text: list of B prompts (or one str for all).
+            num_future_frames: int F (1 + 8k).
 
         Returns:
-            (B, 128, H + T_fut, V*h, w) latents, views stacked along height.
+            dict with ``first_frame_latents`` (B, 128, H, V*h, w), ``num_clean_prefix_frames`` = H, ``context``
+            (B, 128, 4096), ``context_mask``, ``seq_lens``, ``num_frames`` = H + F, ``height``, ``width``.
         """
-        b, h = frames.shape[0], int(num_history_frames)
-        views = self._split_views(frames)  # (B*V, 3, T, h_px, W)
-        parts = []
-        if h > 0:
-            # (B*V*H, 3, 1, h_px, W): every history frame is its own 1-frame clip (GE memory frames).
-            hist = views[:, :, :h].transpose(1, 2).flatten(0, 1).unsqueeze(2)
-            hist_lat = self._vae_encode(hist).unflatten(0, (views.shape[0], h)).squeeze(3).transpose(1, 2)
-            parts.append(hist_lat)
-        parts.append(self._vae_encode(views[:, :, h:]))
-        lat = torch.cat(parts, dim=2)  # (B*V, 128, T, h, w)
-        return rearrange(lat, "(b v) c t h w -> b c t (v h) w", b=b)
+        frames_t = self._to_pixels(history_frames)
+        self.num_future_latents(num_future_frames)  # validates F = 1 + 8k
+        latents = self._encode_history(frames_t).to(dtype=self.dtype)
+        prompts = [text] * len(frames_t) if isinstance(text, str) else list(text)
+        context, mask = self._encode_text(prompts)
+        return {
+            "first_frame_latents": latents,
+            "num_clean_prefix_frames": int(frames_t.shape[2]),
+            "context": context,
+            "context_mask": mask,
+            "seq_lens": mask.sum(dim=1).long(),
+            "num_frames": int(frames_t.shape[2]) + int(num_future_frames),
+            "height": int(frames_t.shape[3]),
+            "width": int(frames_t.shape[4]),
+        }
+
+    def encode_sparse_future(self, future_frames) -> Tensor:
+        """future_frames: list of B clips of F PIL canvases (or the tensor form). Returns: (B, 128, 1 + (F-1)//8, V*h, w)."""
+        return self._encode_clip(self._to_pixels(future_frames)).to(dtype=self.dtype)
 
     def preprocess_input_for_train(self, *, frames=None, text=None, **kw) -> dict:
         """Raw clips + prompts → denoising-loop inputs.
@@ -305,21 +350,23 @@ class GEBaseFastVideoBackbone(VideoBackbone):
             prefix), ``num_clean_prefix_frames``, ``context`` (B, 128, 4096), ``context_mask``,
             ``seq_lens``.
         """
-        from openwam.model.video_backbone.cosmos_predict25._vae_utils import _pil_video_to_tensor
-
-        frames_t = frames if torch.is_tensor(frames) else _pil_video_to_tensor(frames, device=self.device)
+        frames_t = self._to_pixels(frames)
         n_hist = int(kw.get("num_history_frames", 0) or 0)
         n_fut = frames_t.shape[2] - n_hist
         if (n_fut - 1) % self._temporal_compression:
             raise ValueError(f"ge_base_fast: future frames must be 1 + 8k, got {n_fut}")
-        latents = self._encode_sparse(frames_t, n_hist).to(dtype=self.dtype)
+        if n_hist > 0:
+            # Sparse history = the shared condition (also built by deploy) + the future clip as target.
+            cond = self.preprocess_sparse_condition(frames_t[:, :, :n_hist], text, num_future_frames=n_fut)
+            fut = self.encode_sparse_future(frames_t[:, :, n_hist:])
+            return {**cond, "input_latents": torch.cat([cond["first_frame_latents"], fut], dim=2)}
+        latents = self._encode_clip(frames_t).to(dtype=self.dtype)
         prompts = [text] * len(frames_t) if isinstance(text, str) else list(text)
         context, mask = self._encode_text(prompts)
-        n_clean = max(n_hist, 1)
         return {
             "input_latents": latents,
-            "first_frame_latents": latents[:, :, :n_clean].clone(),
-            "num_clean_prefix_frames": n_clean,
+            "first_frame_latents": latents[:, :, :1].clone(),
+            "num_clean_prefix_frames": 1,
             "context": context,
             "context_mask": mask,
             "seq_lens": mask.sum(dim=1).long(),

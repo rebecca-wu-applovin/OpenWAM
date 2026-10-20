@@ -379,23 +379,25 @@ class FluxActionVideoBackbone(VideoBackbone):
 
         return _pil_video_to_tensor(frames, device=self.device)
 
-    def encode_sparse(self, frames, num_history_frames: int) -> Tensor:
-        """Each history frame alone, the future as one causal clip (flux history.encode_windows).
+    def encode_history(self, frames) -> Tensor:
+        """Each history frame encoded alone (flux history.encode_windows).
 
         Args:
-            frames: list of B clips (H + F PIL frames), or (B, 3, H + F, Hp, Wp) in [-1, 1].
-            num_history_frames: int, H.
+            frames: list of B clips (H PIL frames), or (B, 3, H, Hp, Wp) in [-1, 1].
 
         Returns:
-            (B, 96, H + 1 + (F-1)//4, h, w) latents.
+            (B, 96, H, h, w) latents.
         """
         x = frames if torch.is_tensor(frames) else self._pixels(frames)
-        x = x.to(self.device)
-        b, h = x.shape[0], int(num_history_frames)
-        hist = x[:, :, :h].transpose(1, 2).flatten(0, 1).unsqueeze(2)  # (B*H, 3, 1, Hp, Wp)
-        hist_lat = self._vae_encode(hist).unflatten(0, (b, h)).squeeze(3).transpose(1, 2)
-        fut_lat = self._vae_encode(x[:, :, h:])
-        return torch.cat([hist_lat, fut_lat], dim=2)
+        b, h = x.shape[0], x.shape[2]
+        hist = x.transpose(1, 2).flatten(0, 1).unsqueeze(2)  # (B*H, 3, 1, Hp, Wp)
+        return self._vae_encode(hist).unflatten(0, (b, h)).squeeze(3).transpose(1, 2)
+
+    def encode_sparse_future(self, future_frames) -> Tensor:
+        """future_frames: list of B clips of F PIL frames, or (B, 3, F, Hp, Wp). Returns: (B, 96, 1 + (F-1)//4, h, w)."""
+        x = future_frames if torch.is_tensor(future_frames) else self._pixels(future_frames)
+        with torch.no_grad():
+            return self._vae_encode(x).to(device=self.device, dtype=self.dtype)
 
     @torch.no_grad()
     def build_text_cache(self, prompts: list, *, offload_device: str = "cpu") -> None:
@@ -437,6 +439,46 @@ class FluxActionVideoBackbone(VideoBackbone):
             ctx[i, : c.shape[1]] = c[0].to(device=self.device, dtype=self.dtype)
         return ctx, lens
 
+    # ---------------------------------------------------------------- sparse-history condition
+    def _prompts(self, text, batch_size: int) -> list:
+        """text: one str or B prompts; batch_size: B. Returns: B prompts, "" for caption-dropped ones (training mode)."""
+        prompts = [text] * batch_size if isinstance(text, str) else list(text)
+        if self.training and self._text_dropout_p > 0:
+            # Native caption dropout: the empty caption through the same chat template.
+            keep = torch.rand(len(prompts)) >= self._text_dropout_p
+            prompts = [p if k else "" for p, k in zip(prompts, keep.tolist())]
+        return prompts
+
+    def preprocess_sparse_condition(self, history_frames, text, *, num_future_frames: int) -> dict:
+        """Sparse-history conditioning: H history frames encoded one by one + the Qwen3-VL context.
+
+        Args:
+            history_frames: list of B clips (H PIL frames, oldest first).
+            text: list of B prompts (or one str).
+            num_future_frames: int F (1 + 4k).
+
+        Returns:
+            dict ``first_frame_latents`` (B, 96, H, h, w), ``num_clean_prefix_frames`` = H, ``context``
+            (B, L, 20480), ``seq_lens`` (B,), ``text_len`` (int L), ``height`` / ``width`` / ``num_frames`` (H + F).
+        """
+        h = len(history_frames[0])
+        self.num_future_latents(num_future_frames)  # validates F = 1 + 4k
+        prompts = self._prompts(text, len(history_frames))
+        with torch.no_grad():
+            latents = self.encode_history(history_frames)
+            context, seq_lens = self.encode_text(prompts)
+        w0, h0 = history_frames[0][0].size
+        return {
+            "first_frame_latents": latents.to(device=self.device, dtype=self.dtype),
+            "num_clean_prefix_frames": h,
+            "context": context,
+            "seq_lens": seq_lens,
+            "text_len": int(context.shape[1]),
+            "height": h0,
+            "width": w0,
+            "num_frames": h + int(num_future_frames),
+        }
+
     # ---------------------------------------------------------------- train preprocessing
     def preprocess_input_for_train(self, *, frames=None, text=None, **kw) -> dict:
         """Frames + prompts -> latents (sparse history when ``num_history_frames`` > 0) + text context.
@@ -446,24 +488,23 @@ class FluxActionVideoBackbone(VideoBackbone):
             ``context`` (B, L, 20480), ``seq_lens`` (B,), ``text_len`` (int L), ``height`` / ``width`` / ``num_frames``.
         """
         n_hist = int(kw.get("num_history_frames", 0) or 0)
-        prompts = [text] * len(frames) if isinstance(text, str) else list(text)
-        if self.training and self._text_dropout_p > 0:
-            # Native caption dropout: the empty caption through the same chat template.
-            keep = torch.rand(len(prompts)) >= self._text_dropout_p
-            prompts = [p if k else "" for p, k in zip(prompts, keep.tolist())]
+        if n_hist > 0:
+            # Sparse history = the shared condition (also built by deploy) + the future clip as target.
+            cond = self.preprocess_sparse_condition(
+                [c[:n_hist] for c in frames], text, num_future_frames=len(frames[0]) - n_hist
+            )
+            fut = self.encode_sparse_future([c[n_hist:] for c in frames])
+            return {**cond, "input_latents": torch.cat([cond["first_frame_latents"], fut], dim=2)}
+        prompts = self._prompts(text, len(frames))
         with torch.no_grad():
-            if n_hist > 0:
-                latents = self.encode_sparse(frames, n_hist)
-            else:
-                latents = self._vae_encode(self._pixels(frames))
+            latents = self._vae_encode(self._pixels(frames))
             context, seq_lens = self.encode_text(prompts)
         latents = latents.to(device=self.device, dtype=self.dtype)
-        n_clean = max(n_hist, 1)
         w0, h0 = frames[0][0].size
         return {
             "input_latents": latents,
-            "first_frame_latents": latents[:, :, :n_clean].clone(),
-            "num_clean_prefix_frames": n_clean,
+            "first_frame_latents": latents[:, :, :1].clone(),
+            "num_clean_prefix_frames": 1,
             "context": context,
             "seq_lens": seq_lens,
             "text_len": int(context.shape[1]),
