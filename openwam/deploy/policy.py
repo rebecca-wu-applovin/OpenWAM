@@ -10,6 +10,11 @@ observations) and the execution mechanism (which schedules engine calls):
 
 The executor is chosen once at construction from the normalized async
 config; per-step dispatch is plain delegation.
+
+Sparse-history checkpoints run without an executor: the robot / simulator sends
+an observation every K action steps, so every request is one plan. The policy
+records it in its :class:`ObsHistoryBuffer`, hands the H history observations to
+the engine as ``conditions["history"]`` and returns the first K actions of the chunk.
 """
 
 import numpy as np
@@ -30,15 +35,23 @@ class WAMPolicy:
         cfg: Root config, retained for policy-level consumers.
         execution_config: ExecutionConfig-like. ``inference_horizon`` applies
             to both modes; ``inference_delay_steps`` applies only to async.
+        history: :class:`ObsHistoryBuffer` for a sparse-history checkpoint (one observation per
+            plan, K = ``history.steps_per_obs`` actions returned per request), else None.
     """
 
-    def __init__(self, engine: BaseInferenceEngine, cfg, execution_config=None):
+    def __init__(self, engine: BaseInferenceEngine, cfg, execution_config=None, history=None):
         self.cfg = cfg
         self.engine = engine
+        self._history = history
 
         self._execution_config = normalize_execution_config(execution_config)
         self._async = self._execution_config.enabled
-        if self._async:
+        if history is not None:
+            # Every request is a plan; the robot executes the K returned actions before the next one.
+            if self._async:
+                raise ValueError("sparse-history checkpoints plan once per observation; inference_mode must be sync")
+            self._executor = None
+        elif self._async:
             self._executor = AsyncInferenceExecutor(
                 engine=engine,
                 inference_horizon=self._execution_config.inference_horizon,
@@ -51,7 +64,8 @@ class WAMPolicy:
             )
 
     def predict_action(self, obs: dict) -> np.ndarray:
-        """Return the next action for the given (already preprocessed) observation.
+        """Return the next action (D,) for the given (already preprocessed) observation; sparse-history
+        checkpoints return the next K actions (K, D).
 
         The final legality projection for two-point command dims
         (``architecture.binary_command_dims``, from the CKPT's dataloader.binary_action_dims) runs
@@ -60,7 +74,15 @@ class WAMPolicy:
         values between the two legal commands. Threshold 0.5 preserves the
         downstream command contract for the WS server and direct consumers.
         """
-        action = self._executor.predict_action(self._build_conditions(obs))
+        if self._history is not None:
+            # Sparse history: plan from this observation, return the K actions executed until the next one.
+            actions = np.asarray(self.engine.generate(self._build_conditions(obs))["actions"])
+            k = self._history.steps_per_obs
+            if k > len(actions):
+                raise ValueError(f"steps per plan K={k} exceeds the model's action chunk ({len(actions)} steps)")
+            action = actions[:k]
+        else:
+            action = self._executor.predict_action(self._build_conditions(obs))
         dims = getattr(getattr(self.engine, "architecture", None), "binary_command_dims", ()) or ()
         if dims:
             action = np.array(action)
@@ -74,12 +96,16 @@ class WAMPolicy:
         return action
 
     def reset(self):
-        """Clear executor state between episodes."""
-        self._executor.reset()
+        """Clear executor state (or the observation history) between episodes."""
+        if self._history is not None:
+            self._history.reset()
+        else:
+            self._executor.reset()
 
     def shutdown(self):
         """Release executor resources (background threads in async mode)."""
-        self._executor.shutdown()
+        if self._executor is not None:
+            self._executor.shutdown()
 
     def _build_conditions(self, obs: dict) -> dict:
         """Assemble inference conditions from the current observation.
@@ -91,6 +117,10 @@ class WAMPolicy:
         conditions = {
             "observation": obs,
         }
+        if self._history is not None:
+            # Record this plan's observation, then pass the H history observations (oldest first).
+            self._history.append(obs)
+            conditions["history"] = self._history.window()
         img = obs.get("image")
         if img is not None:
             # Single first frame — pipeline expects list[PIL.Image]

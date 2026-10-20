@@ -127,10 +127,12 @@ class PolicyServer:
         cfg: Config with policy and server settings.
     """
 
-    def __init__(self, engine, cfg, readiness_token: str | None = None):
+    def __init__(self, engine, cfg, readiness_token: str | None = None, history_offsets=None):
         self.engine = engine
         self.cfg = cfg
         self.readiness_token = readiness_token
+        # Sparse-history checkpoints: one observation per plan, buffered by the policy (see WAMPolicy).
+        self.history_offsets = history_offsets
 
         # Lazy imports at init time to validate availability
         self._policy = None
@@ -146,10 +148,25 @@ class PolicyServer:
         from openwam.deploy.policy import WAMPolicy
 
         execution_config = resolve_execution_config(self.cfg)
+        history = None
+        if self.history_offsets is not None:
+            from openwam.deploy.history_buffer import ObsHistoryBuffer
+
+            # K = inference_horizon: actions executed per plan = action steps between two observations.
+            k = execution_config.inference_horizon
+            action_fps = self.cfg.inference.get("action_fps")
+            if k is None or action_fps is None:
+                raise ValueError(
+                    "sparse-history checkpoint: set inference.inference_horizon (K, action steps executed per plan) "
+                    "and inference.action_fps (rate of the model's action chunk)"
+                )
+            history = ObsHistoryBuffer(self.history_offsets, action_fps=int(action_fps), steps_per_obs=k)
+            logger.info("[sparse] one observation per %d steps (%.1f Hz at %d fps)", k, action_fps / k, action_fps)
         self._policy = WAMPolicy(
             engine=self.engine,
             cfg=self.cfg,
             execution_config=execution_config,
+            history=history,
         )
 
         # Resolve obs preprocessing config from the saved checkpoint cfg so every
@@ -199,7 +216,8 @@ class PolicyServer:
 
         Returns:
             dict with "action" (list of floats in physical units),
-            "step", "latency_ms".
+            "step", "latency_ms". Sparse-history checkpoints: "actions" (K lists of floats), the actions
+            to execute before the next observation, instead of "action".
         """
         self._init_policy()
         t0 = time.monotonic()
@@ -211,8 +229,10 @@ class PolicyServer:
         self._request_count += 1
         self._total_latency += latency_ms
 
+        # Sparse-history checkpoints return the K actions to execute before the next observation.
+        key = "actions" if self.history_offsets is not None else "action"
         return {
-            "action": action.tolist(),
+            key: action.tolist(),
             "step": self._request_count,
             "latency_ms": round(latency_ms, 2),
         }
@@ -349,6 +369,11 @@ def build_server_from_config(
     and ``openwam-serve``): load the checkpoint (``config.yaml`` +
     ``checkpoint_step_*.safetensors``), merge deploy-side overrides on top via
     :func:`merge_deploy_cfg`, build the engine, and wrap it in a PolicyServer.
+
+    The engine is chosen here, once, from the CHECKPOINT's data layout: a ckpt trained on the
+    sparse-history layout (``dataloader.history_offsets`` set) gets the
+    :class:`SparseHistoryInferenceEngine` and a per-step observation buffer; every other ckpt the
+    first-frame :class:`JointInferenceEngine`.
     """
     from omegaconf import OmegaConf
 
@@ -360,8 +385,15 @@ def build_server_from_config(
     _normalize_compile_enabled_in_cfg(deploy_cfg)
     training_cfg, architecture = load_from_checkpoint_dir(ckpt_dir, device=device, ckpt_name=ckpt_name)
     merged = merge_deploy_cfg(training_cfg, deploy_cfg)
-    engine = JointInferenceEngine(cfg=merged, architecture=architecture)
-    return PolicyServer(engine=engine, cfg=merged, readiness_token=readiness_token)
+    history_offsets = OmegaConf.select(training_cfg, "dataloader.history_offsets", default=None)
+    if history_offsets is not None:
+        from openwam.deploy.sparse_engine import SparseHistoryInferenceEngine
+
+        history_offsets = [int(o) for o in history_offsets]
+        engine = SparseHistoryInferenceEngine(cfg=merged, architecture=architecture, history_offsets=history_offsets)
+    else:
+        engine = JointInferenceEngine(cfg=merged, architecture=architecture)
+    return PolicyServer(engine=engine, cfg=merged, readiness_token=readiness_token, history_offsets=history_offsets)
 
 
 _HALF_PRECISION_CUDA_ONLY = " (CUDA fp16/bf16 only; torch_sdpa otherwise)"

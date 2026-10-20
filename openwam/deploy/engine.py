@@ -25,6 +25,54 @@ logger = logging.getLogger(__name__)
 DEFAULT_PROMPT_EMBED_CACHE_MAXSIZE = 32
 
 
+def build_schedule(inf_cfg, architecture, conditions: dict):
+    """Denoise schedule of one request: deploy config, per-request overrides, the checkpoint's stream shifts.
+
+    Args:
+        inf_cfg: ``cfg.inference`` (``denoise_mode`` / ``denoise_steps`` / async controls).
+        architecture: the WAM architecture (``video_scheduler`` / ``action_scheduler`` / backbone shifts).
+        conditions: request dict; ``denoise_mode`` / ``denoise_steps`` / ``lead_modality`` /
+            ``variance_shift_alpha`` / ``linear_offset`` / ``shift`` / ``shift_video`` override the config.
+
+    Returns: (schedule list of (t_video, t_action), denoise_steps int, action shift float).
+    """
+    denoise_mode = conditions.get("denoise_mode", getattr(inf_cfg, "denoise_mode", "sync"))
+    denoise_steps = conditions.get("denoise_steps", inf_cfg.denoise_steps)
+    lead_modality = conditions.get("lead_modality", getattr(inf_cfg, "lead_modality", "video"))
+    variance_shift_alpha = conditions.get("variance_shift_alpha", getattr(inf_cfg, "variance_shift_alpha", 1.0))
+    linear_offset = conditions.get("linear_offset", getattr(inf_cfg, "linear_offset", 0.0))
+    # Single source of truth for each stream's α-shift is the backbone
+    # property — ``action_backbone.shift_action`` and
+    # ``video_backbone.shift_video`` — set via the model yaml and saved in
+    # the checkpoint, so the training sigma buffer (set by
+    # ``init_training_schedulers`` via the same properties) and the
+    # inference trajectory match. Deploy carries no independent shift knob.
+    # ``conditions[...]`` allows a per-request override (smoke tests /
+    # ablations). ``getattr`` guards lightweight stub architectures.
+    _ab = getattr(architecture, "action_backbone", None)
+    shift = conditions.get("shift", getattr(_ab, "shift_action", None) if _ab is not None else None)
+    if shift is None:
+        shift = 5.0
+    _vb = getattr(architecture, "video_backbone", None)
+    shift_video = conditions.get(
+        "shift_video",
+        getattr(_vb, "shift_video", None) if _vb is not None else None,
+    )
+
+    schedule = make_schedule(
+        denoise_mode,
+        video_scheduler=architecture.video_scheduler,
+        action_scheduler=architecture.action_scheduler,
+        num_steps=denoise_steps,
+        shift=shift,
+        shift_video=shift_video,
+        lead=lead_modality,
+        alpha=variance_shift_alpha,
+        offset=linear_offset,
+    )
+    return schedule, denoise_steps, shift
+
+
 class BaseInferenceEngine(ABC):
     """Inference engine base class.
 
@@ -281,41 +329,7 @@ class JointInferenceEngine(BaseInferenceEngine):
             dict with ``video`` (list of PIL images or None) and ``actions`` (numpy array).
         """
         inf_cfg = self.cfg.inference
-
-        denoise_mode = conditions.get("denoise_mode", getattr(inf_cfg, "denoise_mode", "sync"))
-        denoise_steps = conditions.get("denoise_steps", inf_cfg.denoise_steps)
-        lead_modality = conditions.get("lead_modality", getattr(inf_cfg, "lead_modality", "video"))
-        variance_shift_alpha = conditions.get("variance_shift_alpha", getattr(inf_cfg, "variance_shift_alpha", 1.0))
-        linear_offset = conditions.get("linear_offset", getattr(inf_cfg, "linear_offset", 0.0))
-        # Single source of truth for each stream's α-shift is the backbone
-        # property — ``action_backbone.shift_action`` and
-        # ``video_backbone.shift_video`` — set via the model yaml and saved in
-        # the checkpoint, so the training sigma buffer (set by
-        # ``init_training_schedulers`` via the same properties) and the
-        # inference trajectory match. Deploy carries no independent shift knob.
-        # ``conditions[...]`` allows a per-request override (smoke tests /
-        # ablations). ``getattr`` guards lightweight stub architectures.
-        _ab = getattr(self.architecture, "action_backbone", None)
-        shift = conditions.get("shift", getattr(_ab, "shift_action", None) if _ab is not None else None)
-        if shift is None:
-            shift = 5.0
-        _vb = getattr(self.architecture, "video_backbone", None)
-        shift_video = conditions.get(
-            "shift_video",
-            getattr(_vb, "shift_video", None) if _vb is not None else None,
-        )
-
-        schedule = make_schedule(
-            denoise_mode,
-            video_scheduler=self.architecture.video_scheduler,
-            action_scheduler=self.architecture.action_scheduler,
-            num_steps=denoise_steps,
-            shift=shift,
-            shift_video=shift_video,
-            lead=lead_modality,
-            alpha=variance_shift_alpha,
-            offset=linear_offset,
-        )
+        schedule, denoise_steps, shift = build_schedule(inf_cfg, self.architecture, conditions)
 
         # Reset dit cache for each generation
         if self._dit_cache is not None:

@@ -174,6 +174,12 @@ def load_from_checkpoint_dir(
                 # `from_pretrained` accepts a dict natively (via
                 # `_video_backbone_cfg`). Wan never hits this branch.
                 vb_params["_source"] = {k: v for k, v in vb_params.items() if not str(k).startswith("_")}
+            elif vb_name in ("ge_base_fast", "flux3_action_base"):
+                # No self-contained components: rebuild the pretrained skeleton from model_path the way the
+                # trainer's resume does (ckpt_model_loader: the run's video_backbone cfg + its ckpt dir); the
+                # load_checkpoint below then overwrites every weight.
+                vb_params["_source"] = OmegaConf.to_container(cfg.model.video_backbone, resolve=True)
+                vb_params["_ckpt_dir"] = ckpt_dir
             else:
                 vb_params["_source"] = str(model_path)
         else:

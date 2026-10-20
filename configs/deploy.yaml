@@ -18,7 +18,10 @@ inference:
   linear_offset: 0.0          # denoise_mode=async: lag start delay; 0 <= value < 1
 
   inference_mode: sync       # executor: sync | async; separate from denoise_mode
-  inference_horizon: null       # sync/async: actions executed per generated chunk; null = full chunk
+  inference_horizon: null       # sync/async: actions executed per generated chunk; null = full chunk.
+                                # Sparse-history ckpts: required, = K steps executed per plan (one obs every K steps);
+                                # must divide action_fps and every history offset.
+  action_fps: 20                # rate of the model's action chunk / robot control steps (yam_sharpa: 20)
   inference_delay_steps: null # inference_mode=async only: expected latency in action steps
 
 # --- Deploy-time optimizations (cfg.optimization) ---
