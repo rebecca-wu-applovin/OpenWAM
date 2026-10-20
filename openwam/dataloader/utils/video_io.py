@@ -5,8 +5,9 @@ every LeRobot v3 reader (the ``LeRobotV3Reader`` family). Kept as a leaf utility
 module so the shared base reader and the concrete readers depend on it instead
 of reaching into a sibling reader.
 
-This module is dependency-light (PIL + PyAV only, no project imports) so any
-reader can import it without triggering heavy module side-effects or import cycles.
+This module is dependency-light (PIL + PyAV, plus the PIL-only tile resize in
+``transforms.multiview``) so any reader can import it without triggering heavy
+module side-effects or import cycles.
 """
 
 from __future__ import annotations
@@ -217,9 +218,10 @@ def decode_video_frames(video_path: str, frame_indices: List[int], height: int, 
     missing = set(frame_indices) - idx_map.keys()
     if missing:
         raise RuntimeError(f"missing frames {missing} in {video_path}")
-    # PIL returns a copy for a same-size resize; skip it (identical pixels, fresh images either way).
-    return [im if im.size == (width, height) else im.resize((width, height), Image.LANCZOS)
-            for im in (idx_map[i] for i in frame_indices)]
+    # Same resize as the deploy server applies to live camera frames.
+    from openwam.dataloader.transforms.multiview import resize_camera_tile
+
+    return [resize_camera_tile(idx_map[i], height, width) for i in frame_indices]
 
 
 __all__ = ["decode_video_frames"]

@@ -41,6 +41,7 @@ from openwam.dataloader.bases import BaseDataset, LeRobotV3Reader
 from openwam.dataloader.transforms.multiview import assemble_vstack_layout
 from openwam.dataloader.utils import get_cfg
 from openwam.dataloader.utils.normalization import apply_normalization, load_stats_file
+from openwam.dataloader.utils.sparse_history import history_rows
 from openwam.dataloader.utils.video_io import decode_video_frames as _decode_video_frames
 from openwam.dataloader.utils.yam_sharpa_repr import (
     CAM_POSE_DIM,
@@ -327,8 +328,8 @@ class YamSharpaDataset(LeRobotV3Reader):
         prompt = self._resolve_prompt(row, win)
         action, action_mask = self._finalize_action(self._action_20d(win), self._num_frames)
 
-        # History rows clamp to the episode start (repeat the first frame).
-        hist_rows = np.maximum(offset + self._history_offsets, valid_start)
+        # History rows clamp to the episode start (repeat the first frame); deploy uses the same rule.
+        hist_rows = history_rows(offset, self._history_offsets, valid_start)
         lo = int(hist_rows.min())
         hist_tab = table.slice(ep_row0 + lo, offset - lo + 1).to_pandas()
         hist = hist_tab.iloc[hist_rows - lo]

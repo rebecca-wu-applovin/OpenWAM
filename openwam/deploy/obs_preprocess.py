@@ -75,7 +75,8 @@ class ObsPreprocessor:
       wrist fields are ignored.
     - ``multiview=True``: black-fill missing/None wrists, then compose the L-shape
       layout keyed by ``camera_layout``.
-    - ``multiview_layout="vstack"``: every camera in ``camera_layout`` is required
+    - ``multiview_layout="vstack"``: every camera in ``camera_layout`` is required,
+      LANCZOS-resized to its tile like the training decode (``resize_camera_tile``)
       and stacked top-to-bottom (``assemble_vstack_layout``). Each image is looked
       up under its camera name, falling back to the fixed key at the same
       position (``head_camera``, ``left_wrist_camera``, ``right_wrist_camera``).
@@ -144,6 +145,7 @@ class ObsPreprocessor:
             assemble_multiview_layout,
             assemble_vstack_layout,
             crop_and_resize,
+            resize_camera_tile,
         )
 
         def _as_pil(x, *, ctx: str) -> Image.Image:
@@ -185,8 +187,10 @@ class ObsPreprocessor:
                     raise ObsValidationError(
                         f"vstack server requires every camera in camera_layout={self.camera_layout}; missing {cam!r}{pos}."
                     )
-                frames[cam] = _as_pil(raw, ctx=f"images[{cam!r}]")
-            # Same composer as training, so the canvas matches byte-for-byte.
+                # Training decodes each camera straight to its tile with LANCZOS; do the same here.
+                tile_h = self.img_height // len(self.camera_layout)
+                frames[cam] = resize_camera_tile(_as_pil(raw, ctx=f"images[{cam!r}]"), tile_h, self.img_width)
+            # Same tile resize + composer as training, so the canvas matches byte-for-byte.
             obs["image"] = assemble_vstack_layout(
                 frames, self.camera_layout, out_h=self.img_height, out_w=self.img_width
             )

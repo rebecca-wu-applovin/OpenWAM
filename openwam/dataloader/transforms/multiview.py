@@ -36,6 +36,23 @@ def crop_and_resize(image: Image.Image, target_height: int, target_width: int) -
     return image.crop((left, top, left + target_width, top + target_height))
 
 
+def resize_camera_tile(image: Image.Image, height: int, width: int) -> Image.Image:
+    """Resize one camera frame to its tile, exactly as the vstack training decode does.
+
+    Direct LANCZOS stretch, no crop (``video_io.decode_video_frames``); the deploy server calls it too, so
+    deploy sees the training pixels.
+
+    Args:
+        image: PIL.Image, the native camera frame.
+        height, width: int, tile size in pixels.
+
+    Returns:
+        PIL.Image of size ``(width, height)``; the input itself when it already has that size.
+    """
+    # PIL returns a copy for a same-size resize; skip it (identical pixels).
+    return image if image.size == (width, height) else image.resize((width, height), Image.LANCZOS)
+
+
 def _stretch_resize(image: Image.Image, target_height: int, target_width: int) -> Image.Image:
     """Direct BILINEAR resize without aspect-ratio preservation.
 

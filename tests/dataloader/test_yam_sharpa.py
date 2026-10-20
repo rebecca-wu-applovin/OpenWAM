@@ -485,3 +485,21 @@ def test_deploy_obs_preprocess_vstack():
         assert (out[:240] == CAM_COLORS[EGO]).all() and (out[240:] == CAM_COLORS[CHEST]).all()
     with pytest.raises(ObsValidationError, match="requires every camera"):
         pre.preprocess({"images": {EGO: ego}})
+
+
+def test_deploy_obs_preprocess_vstack_matches_training_resize():
+    """Deploy canvas == training canvas: each camera LANCZOS-resized to its tile (as the decode does), then stacked."""
+    from openwam.dataloader.transforms.multiview import assemble_vstack_layout
+    from openwam.deploy.obs_preprocess import ObsPreprocessor
+
+    cfg = OmegaConf.create(
+        {"dataloader": {"multiview": True, "multiview_layout": "vstack", "camera_layout": [EGO, CHEST],
+                        "height": 384, "width": 224}}
+    )
+    rng = np.random.default_rng(0)
+    native = {c: Image.fromarray(rng.integers(0, 256, (480, 640, 3), dtype=np.uint8)) for c in (EGO, CHEST)}
+    deploy = np.asarray(ObsPreprocessor.from_cfg(cfg).preprocess({"images": dict(native), "state": [0.0] * 48})["image"])
+    # Training: decode_video_frames resizes each camera to (192, 224) with LANCZOS, then assemble_vstack_layout.
+    tiles = {c: im.resize((224, 192), Image.LANCZOS) for c, im in native.items()}
+    train = np.asarray(assemble_vstack_layout(tiles, [EGO, CHEST], out_h=384, out_w=224))
+    assert np.array_equal(deploy, train)
