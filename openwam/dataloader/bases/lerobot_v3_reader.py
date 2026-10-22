@@ -108,23 +108,35 @@ _NORMALIZE_MODE_UNSET = object()
 _CONFIG_MISSING = object()
 
 
-# Process-global LRU for decoded parquet shards, shared across all bucket
-# instances. A per-instance cache (the previous maxsize=32 design) is a memory
-# risk under shuffled training: bucket count, shard count, and DataLoader
-# workers multiply the number of retained tables while random access provides
-# little reuse. A small global cache keeps sequential scans fast with bounded
-# per-worker memory.
-@functools.lru_cache(maxsize=4)
-def _read_data_table_cached(path: str, columns: Tuple[str, ...]):
+def _read_data_table(path: str, columns: Tuple[str, ...], memory_map: bool = True):
+    """Read one LeRobot v3 data parquet shard.
+
+    path: parquet file. columns: column names to read.
+    memory_map: True maps the file (cheap for sequential scans); False reads it into
+        process memory (preload: buffers then live in anonymous memory that forked
+        DataLoader workers share copy-on-write instead of re-faulting the mapping).
+    Returns: pyarrow.Table with ``columns`` (all columns on the dotted-name fallback).
+    """
     try:
-        return pq.read_table(path, memory_map=True, columns=list(columns))
+        return pq.read_table(path, memory_map=memory_map, columns=list(columns))
     except pa.ArrowInvalid as exc:
         # Some pyarrow versions interpret flat LeRobot feature names containing
         # dots as nested-field paths. Keep the compatibility fallback inside
         # the process-global cache so affected shards are still read only once.
         if "Dot path" not in str(exc):
             raise
-        return pq.read_table(path, memory_map=True)
+        return pq.read_table(path, memory_map=memory_map)
+
+
+# Process-global LRU for decoded parquet shards, shared across all bucket
+# instances. A per-instance cache (the previous maxsize=32 design) is a memory
+# risk under shuffled training: bucket count, shard count, and DataLoader
+# workers multiply the number of retained tables while random access provides
+# little reuse. A small global cache keeps sequential scans fast with bounded
+# per-worker memory. Readers built with preload_data_tables=True bypass it.
+@functools.lru_cache(maxsize=4)
+def _read_data_table_cached(path: str, columns: Tuple[str, ...]):
+    return _read_data_table(path, columns)
 
 
 class LeRobotV3Reader(BaseDataset):
@@ -209,6 +221,11 @@ class LeRobotV3Reader(BaseDataset):
         # Optional data-budget knobs (None = use the full bucket).
         max_hours: Optional[float] = None,
         subsample_seed: int = 42,
+        # Read every data parquet shard into memory at construction (in the parent,
+        # before DataLoader workers fork) instead of the 4-entry LRU. For small
+        # tabular data under shuffled sampling, where the LRU misses on most
+        # samples and re-decodes a whole shard each time.
+        preload_data_tables: bool = False,
         **_unused: Any,
     ):
         self._dataset_dir = Path(dataset_dir)
@@ -227,6 +244,8 @@ class LeRobotV3Reader(BaseDataset):
         self._camera_layout_param = list(camera_layout) if camera_layout else None
         self._max_hours = max_hours
         self._subsample_seed = int(subsample_seed)
+        self._preload_data_tables = bool(preload_data_tables)
+        self._data_tables: Dict[Tuple[int, int], Any] = {}  # (chunk, file) -> pyarrow.Table, filled when preloading
 
         # ── load-time video augmentation ──────────────────────────────────
         # Color jitter is applied in _getitem_impl to the decoded clip (same
@@ -382,6 +401,8 @@ class LeRobotV3Reader(BaseDataset):
             self._select_episodes_by_hours(float(self._max_hours), self._subsample_seed)
 
         self._rebuild_episode_arrays()
+        if self._preload_data_tables:
+            self._preload_all_data_tables()
         if self._head_camera_choices:
             # Fail fast on a mistyped choice: a camera without video index
             # columns would otherwise surface as an opaque empty-head-decode
@@ -837,9 +858,32 @@ class LeRobotV3Reader(BaseDataset):
     def _video_offset_col(camera: str) -> str:
         return f"_video_frame_offset/{camera}"
 
+    def _data_table_path(self, chunk_idx: int, file_idx: int) -> str:
+        """chunk_idx, file_idx: data shard indices. Returns: the shard's parquet path (str)."""
+        return str(self._dataset_dir / self._data_path_template.format(chunk_index=chunk_idx, file_index=file_idx))
+
+    def _preload_all_data_tables(self) -> None:
+        """Read every data shard the kept episodes reference into ``self._data_tables``.
+
+        Runs in the process that builds the dataset, so DataLoader workers inherit the
+        tables through fork. Returns: None.
+        """
+        keys = sorted(set(zip(self._eps_df["data/chunk_index"].astype(int), self._eps_df["data/file_index"].astype(int))))
+        for chunk_idx, file_idx in keys:
+            # memory_map=False: buffers in anonymous memory, shared copy-on-write after fork.
+            self._data_tables[(chunk_idx, file_idx)] = _read_data_table(
+                self._data_table_path(chunk_idx, file_idx), tuple(self.NEEDED_COLS), memory_map=False
+            )
+        nbytes = sum(t.nbytes for t in self._data_tables.values())
+        logger.info(
+            "%s(%s): preloaded %d data shards (%.2f GB)", self.DATASET_NAME, self._dataset_id, len(keys), nbytes / 1e9
+        )
+
     def _load_data_table(self, chunk_idx: int, file_idx: int):
-        path = self._dataset_dir / self._data_path_template.format(chunk_index=chunk_idx, file_index=file_idx)
-        return _read_data_table_cached(str(path), tuple(self.NEEDED_COLS))
+        """chunk_idx, file_idx: data shard indices. Returns: pyarrow.Table of NEEDED_COLS for that shard."""
+        if self._preload_data_tables:
+            return self._data_tables[(chunk_idx, file_idx)]
+        return _read_data_table_cached(self._data_table_path(chunk_idx, file_idx), tuple(self.NEEDED_COLS))
 
     # ----- Dataset ----------------------------------------------------------
 
@@ -1167,6 +1211,7 @@ class LeRobotV3Reader(BaseDataset):
         "unify_action_map",
         "unify_state_map",
         "color_jitter",
+        "preload_data_tables",
     )
 
     @classmethod

@@ -34,6 +34,13 @@ video_stride: 4
 window_stride: 1
 split: train
 
+# ── Tabular data loading ─────────────────────────────────────────────────────
+# Read every data parquet shard into memory once (parent process, before the
+# DataLoader forks; ~2.7 GB per rank for the two default sources). The default
+# 4-shard LRU misses on most shuffled samples and re-decodes a whole shard,
+# which stalled Modal runs at ~4.8 s/step (see 11_dataloader_speed/).
+preload_data_tables: true
+
 # ── Rendering: cameras stacked top-to-bottom ─────────────────────────────────
 # 2 x (240x320) → 480x320 canvas (150 tokens per latent).
 height: 480

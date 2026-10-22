@@ -271,6 +271,21 @@ def test_unknown_mode_and_unify_keys_rejected(source):
         build_dataset(_cfg({"a": (root, 1.0)}, unify_action=True), "train")
 
 
+def test_preload_data_tables_matches_lru_and_never_rereads(source):
+    root, _ = source
+    lru = build_dataset(_cfg({"a": (root, 1.0)}), "train")
+    pre = build_dataset(_cfg({"a": (root, 1.0)}, preload_data_tables=True), "train")
+    # After construction the preloaded reader must not touch the shard reader again.
+    with patch("openwam.dataloader.bases.lerobot_v3_reader._read_data_table_cached") as cached, _mock_decoder():
+        got = [pre.datasets[0][i] for i in range(len(pre.datasets[0]))]
+    cached.assert_not_called()
+    with _mock_decoder():
+        want = [lru.datasets[0][i] for i in range(len(lru.datasets[0]))]
+    for g, w in zip(got, want):
+        for k in ("action", "action_mask", "proprio", "proprio_mask"):
+            assert np.array_equal(g[k].numpy(), w[k].numpy()), k
+
+
 # ── video layout ────────────────────────────────────────────────────────────
 
 
