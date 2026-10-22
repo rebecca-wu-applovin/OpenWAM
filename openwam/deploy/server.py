@@ -32,6 +32,9 @@ Server-side behavior:
 
 Messages:
     obs   → {"type": "action", "action": [floats], "step": int, "latency_ms": float}
+    plan  → {"type": "action", "actions": [K x [floats]], "step": int, "latency_ms": float}
+            (same payload as obs; plans from it and returns the K = inference_horizon actions to execute before the
+            next observation, for clients that observe every K steps themselves, e.g. a closed-loop simulator)
     reset → {"type": "reset_ack"}
     ping  → {"type": "pong"}
     error → {"type": "error", "code": str, "message": "<what went wrong>"}
@@ -45,6 +48,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -58,6 +62,7 @@ logger = logging.getLogger(__name__)
 # these string values are a frozen wire contract and must never change.
 # Client -> server
 OBS = "obs"
+PLAN = "plan"
 RESET = "reset"
 PING = "ping"
 # Server -> client
@@ -127,10 +132,12 @@ class PolicyServer:
         cfg: Config with policy and server settings.
     """
 
-    def __init__(self, engine, cfg, readiness_token: str | None = None, history_offsets=None):
+    def __init__(self, engine, cfg, readiness_token: str | None = None, history_offsets=None, ckpt: str | None = None):
         self.engine = engine
         self.cfg = cfg
         self.readiness_token = readiness_token
+        # Which weights are served (``<ckpt_dir>/<ckpt_name>``), advertised in the PONG for the client's records.
+        self.ckpt = ckpt
         # Sparse-history checkpoints: one observation per plan, buffered by the policy (see WAMPolicy).
         self.history_offsets = history_offsets
 
@@ -195,10 +202,38 @@ class PolicyServer:
         contract = getattr(getattr(self.engine, "architecture", None), "repr_contract", None)
         return dict(contract) if contract else {}
 
+    def _serving_contract(self) -> dict:
+        """What a ``plan`` request returns, advertised in the PONG so a closed-loop client can check it.
+
+        Returns:
+            dict: ``chunk`` H (actions generated per plan), ``inference_horizon`` K (actions a plan returns),
+            ``action_fps`` (their rate), ``ckpt`` (the weights served), ``obs_state`` (what the request's
+            ``state`` must hold: "proprio", the raw encoded proprio, or for sparse-history checkpoints
+            "observation.state", the 48-d hand pose, sent with ``camera_pose`` (16,) and ``joint_angles`` (56,)),
+            ``history_offsets``. Unknown values are None.
+        """
+        from omegaconf import OmegaConf
+
+        # merge_deploy_cfg: num_frames raw rows -> num_frames - 1 actions per generated chunk
+        num_frames = OmegaConf.select(self.cfg, "inference.num_frames", default=None)
+        chunk = int(num_frames) - 1 if num_frames is not None else None
+        k = self._policy.plan_steps or chunk
+        return {
+            "chunk": chunk,
+            "inference_horizon": int(k) if k is not None else None,
+            "action_fps": self.cfg.inference.get("action_fps"),
+            "ckpt": self.ckpt,
+            # SparseHistoryInferenceEngine encodes the history proprio itself (in the frame-t camera)
+            "obs_state": "observation.state" if self.history_offsets is not None else "proprio",
+            "history_offsets": self.history_offsets,
+        }
+
     def _pong_payload(self) -> dict:
         """Return checkpoint compatibility plus optional launch ownership."""
 
         result = self._ckpt_contract()
+        if self._policy is not None:   # the serving block describes the policy, which run() builds first
+            result["serving"] = self._serving_contract()
         if self.readiness_token is not None:
             result["readiness_token"] = self.readiness_token
         return result
@@ -236,6 +271,22 @@ class PolicyServer:
             "step": self._request_count,
             "latency_ms": round(latency_ms, 2),
         }
+
+    def plan(self, obs: dict) -> dict:
+        """One plan for an observation (``plan`` message): the K actions to execute before the next one.
+
+        Args:
+            obs: observation dict, as for :meth:`predict`.
+        Returns:
+            dict with "actions" (K lists of floats in physical units), "step", "latency_ms".
+        """
+        self._init_policy()
+        t0 = time.monotonic()
+        actions = self._policy.plan_actions(self._obs_preprocessor.preprocess(obs))
+        latency_ms = (time.monotonic() - t0) * 1000
+        self._request_count += 1
+        self._total_latency += latency_ms
+        return {"actions": actions.tolist(), "step": self._request_count, "latency_ms": round(latency_ms, 2)}
 
     def reset(self):
         """Reset policy state."""
@@ -277,6 +328,10 @@ class PolicyServer:
                             await websocket.send(json.dumps({"type": RESET_ACK}))
                         elif msg_type == OBS:
                             result = self.predict(data)
+                            result["type"] = ACTION
+                            await websocket.send(json.dumps(result))
+                        elif msg_type == PLAN:
+                            result = self.plan(data)
                             result["type"] = ACTION
                             await websocket.send(json.dumps(result))
                         elif msg_type == PING:
@@ -393,7 +448,8 @@ def build_server_from_config(
         engine = SparseHistoryInferenceEngine(cfg=merged, architecture=architecture, history_offsets=history_offsets)
     else:
         engine = JointInferenceEngine(cfg=merged, architecture=architecture)
-    return PolicyServer(engine=engine, cfg=merged, readiness_token=readiness_token, history_offsets=history_offsets)
+    return PolicyServer(engine=engine, cfg=merged, readiness_token=readiness_token, history_offsets=history_offsets,
+                        ckpt=os.path.join(ckpt_dir, ckpt_name or "<latest>"))
 
 
 _HALF_PRECISION_CUDA_ONLY = " (CUDA fp16/bf16 only; torch_sdpa otherwise)"

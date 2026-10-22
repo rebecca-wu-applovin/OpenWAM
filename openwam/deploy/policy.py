@@ -75,14 +75,37 @@ class WAMPolicy:
         downstream command contract for the WS server and direct consumers.
         """
         if self._history is not None:
-            # Sparse history: plan from this observation, return the K actions executed until the next one.
-            actions = np.asarray(self.engine.generate(self._build_conditions(obs))["actions"])
-            k = self._history.steps_per_obs
-            if k > len(actions):
-                raise ValueError(f"steps per plan K={k} exceeds the model's action chunk ({len(actions)} steps)")
-            action = actions[:k]
-        else:
-            action = self._executor.predict_action(self._build_conditions(obs))
+            # Sparse history: every request is a plan (the K actions executed until the next observation).
+            return self.plan_actions(obs)
+        return self._project_binary(self._executor.predict_action(self._build_conditions(obs)))
+
+    def plan_actions(self, obs: dict) -> np.ndarray:
+        """Plan from this observation and return the K actions to execute before the next one.
+
+        For a client that observes every K steps itself (a closed-loop simulator): one request per plan, no
+        receding-horizon buffer. Sparse-history checkpoints record the observation in their history first.
+
+        Args:
+            obs: dict, an already preprocessed observation (as for :meth:`predict_action`).
+        Returns:
+            (K, D) actions, K = :attr:`plan_steps`.
+        """
+        actions = np.asarray(self.engine.generate(self._build_conditions(obs))["actions"])
+        k = self.plan_steps or len(actions)
+        if k > len(actions):
+            raise ValueError(f"steps per plan K={k} exceeds the model's action chunk ({len(actions)} steps)")
+        return self._project_binary(actions[:k])
+
+    @property
+    def plan_steps(self):
+        """K, the actions executed per plan: the history's steps per observation (sparse), else the configured
+        ``inference_horizon`` (None = the whole generated chunk)."""
+        if self._history is not None:
+            return self._history.steps_per_obs
+        return self._execution_config.inference_horizon
+
+    def _project_binary(self, action: np.ndarray) -> np.ndarray:
+        """Snap the checkpoint's two-point command dims to +-1. action: (..., D). Returns: (..., D)."""
         dims = getattr(getattr(self.engine, "architecture", None), "binary_command_dims", ()) or ()
         if dims:
             action = np.array(action)
