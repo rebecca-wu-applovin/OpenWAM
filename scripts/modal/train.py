@@ -284,6 +284,9 @@ def _run_training(
                 _kill_training(proc)
                 print("[modal] TEST: killed training after first resume state", flush=True)
         rc = proc.returncode
+        if rc == 0 and run_dir is not None:
+            # Training-finished signal for the sim-eval watcher (scripts/modal/simeval_watch.py: --done-marker).
+            (run_dir / "TRAINING_DONE").write_text(time.strftime("%Y-%m-%d %H:%M:%S UTC\n", time.gmtime()))
     finally:
         if proc is not None:
             _kill_training(proc)  # no orphaned rank may keep writing the run dir after we return / retry

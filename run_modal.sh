@@ -9,6 +9,7 @@
 #   ACTION_MODE=unify_abs bash run_modal.sh   # action-repr ablation arm (dim set automatically)
 #   BACKBONE=cosmos3_nano bash run_modal.sh   # video-backbone ablation arm: wan22_ti2v_5b | cosmos3_edge | cosmos3_nano
 #   bash scripts/modal/sparse_history/run_<backbone>.sh   # 07 sparse-history arms (5 backbones)
+#   SIMEVAL=0 bash run_modal.sh   # no sim-policy-eval watch (default: every new run gets one, scripts/modal/simeval_watch.py)
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./base.sh   # next_run_index
@@ -50,6 +51,7 @@ CPU="${CPU:-64}"
 MEMORY_GB="${MEMORY_GB:-512}"
 NUM_WORKERS="${NUM_WORKERS:-8}"   # per rank; 8 x 8 = 64 workers on 64 cores
 MODAL="${MODAL:-.venv/bin/modal}"
+SIMEVAL="${SIMEVAL:-1}"   # 1: also launch the sim-policy-eval watch for a new run (needs the deployed openwam-yjw-simeval app)
 "${MODAL}" profile activate axon >/dev/null   # make sure we launch in the team workspace
 
 if [[ "${1:-}" == "--debug" ]]; then
@@ -106,4 +108,14 @@ OVERRIDES="dataloader=yam_sharpa \
 echo "[run_modal] run ${WANDB_RUN_NAME}  |  backbone ${BACKBONE} (/assets/video_backbone_ckpt/${BACKBONE_DIR})  |  ${GPU_TYPE}:8, ${CPU} CPU, ${MEMORY_GB} GB, ${NUM_WORKERS} workers/rank  |  Modal run name: ${MODAL_RUN_NAME}  |  run dir: openwam-runs:/yjw/${RUN_DIR}"
 # GPU spec goes in via env: Modal fixes it when train.py defines the function.
 export OPENWAM_GPU_TYPE="${GPU_TYPE}" OPENWAM_GPU_COUNT=8 OPENWAM_CPU="${CPU}" OPENWAM_MEMORY_GB="${MEMORY_GB}"
+# Sim eval of every checkpoint, started BEFORE the training call: `modal run --detach` keeps streaming the training
+# logs until training ends, so nothing after it would run. The watch polls until the trainer has written config.yaml.
+# Not on resume: the run's watch from its first launch is still going (it respawns itself until TRAINING_DONE).
+if [[ "${SIMEVAL}" == "1" && -n "${RUN_DIR_OVERRIDE}" ]]; then
+    echo "[run_modal] sim-policy-eval watch for ${RUN_DIR#outputs/}"
+    # A failed eval launch must not look like a failed training launch: warn and print the command to retry.
+    "${MODAL}" run scripts/modal/simeval_watch.py::launch --run "${RUN_DIR#outputs/}" \
+        || echo "[run_modal] WARNING: sim eval not launched; retry: ${MODAL} run scripts/modal/simeval_watch.py::launch --run ${RUN_DIR#outputs/}" >&2
+fi
+
 exec "${MODAL}" run --detach --name "${MODAL_RUN_NAME}" scripts/modal/train.py --overrides "${OVERRIDES}"
