@@ -19,7 +19,9 @@ Sparse-history layout (``history_offsets`` + ``future_offsets`` set; used by
 (clamped to the episode start, i.e. the first frame repeats) followed by the
 future rows ``t + future_offsets``; proprio = the history rows (H, D), each
 wrist re-expressed in the frame-t ego camera (the action's frame); action is unchanged.
-A window is only drawn where every future / action row exists.
+A window is only drawn where every future / action row exists. ``history_sampling: random`` (train split
+only) replaces the fixed history offsets per sample by H-1 random rows of the past ``history_window`` rows
+plus frame t; val keeps ``history_offsets`` (the layout deploy serves).
 
 Width D is 48 for ``fingertips_*`` (``unify_action`` off) and 80 for
 ``unify_*`` (raw 62 scattered by ``UNIFY_ACTION_MAP``). The unify switch is
@@ -41,7 +43,7 @@ from openwam.dataloader.bases import BaseDataset, LeRobotV3Reader
 from openwam.dataloader.transforms.multiview import assemble_vstack_layout
 from openwam.dataloader.utils import get_cfg
 from openwam.dataloader.utils.normalization import apply_normalization, load_stats_file
-from openwam.dataloader.utils.sparse_history import history_rows
+from openwam.dataloader.utils.sparse_history import history_rows, sample_history_offsets
 from openwam.dataloader.utils.video_io import decode_video_frames as _decode_video_frames
 from openwam.dataloader.utils.yam_sharpa_repr import (
     CAM_POSE_DIM,
@@ -129,6 +131,35 @@ def _validate_sparse_offsets(
     return h, f
 
 
+HISTORY_SAMPLING_MODES = ("fixed", "random")
+
+
+def _validate_history_sampling(mode: str, window: int, history_offsets: Optional[np.ndarray]) -> str:
+    """Check the history sampling mode against the fixed offsets.
+
+    Args:
+        mode: str, ``fixed`` | ``random``.
+        window: int, rows back the random history may reach (random mode only).
+        history_offsets: (H,) fixed offsets, or None when the sparse layout is off.
+
+    Returns:
+        the validated mode string.
+    """
+    if mode not in HISTORY_SAMPLING_MODES:
+        raise ValueError(f"yam_sharpa: history_sampling must be one of {HISTORY_SAMPLING_MODES}, got {mode!r}")
+    if mode == "fixed":
+        return mode
+    if history_offsets is None:
+        raise ValueError("yam_sharpa: history_sampling=random needs the sparse layout (history_offsets)")
+    # The fixed (val / deploy) offsets must be one of the layouts training can draw.
+    if window < len(history_offsets) - 1 or window < -int(history_offsets[0]):
+        raise ValueError(
+            f"yam_sharpa: history_window={window} must cover history_offsets {history_offsets.tolist()} "
+            f"(>= {max(len(history_offsets) - 1, -int(history_offsets[0]))})"
+        )
+    return mode
+
+
 class YamSharpaDataset(LeRobotV3Reader):
     """Single-source reader; built by :class:`MultiYamSharpaDataset`.
 
@@ -143,7 +174,8 @@ class YamSharpaDataset(LeRobotV3Reader):
     # unify_* keys are derived from action_mode, so they are not accepted from config.
     CONFIG_KEYS: ClassVar[Tuple[str, ...]] = tuple(
         k for k in LeRobotV3Reader.CONFIG_KEYS if k not in ("unify_action", "unify_action_map", "unify_state_map")
-    ) + ("action_mode", "normalization_stats_path", "history_offsets", "future_offsets", "min_rows_ahead")
+    ) + ("action_mode", "normalization_stats_path", "history_offsets", "future_offsets", "min_rows_ahead",
+          "history_sampling", "history_window")
 
     def __init__(
         self,
@@ -155,6 +187,8 @@ class YamSharpaDataset(LeRobotV3Reader):
         history_offsets: Optional[Sequence[int]] = None,
         future_offsets: Optional[Sequence[int]] = None,
         min_rows_ahead: int = 0,
+        history_sampling: str = "fixed",
+        history_window: int = 0,
         **kwargs: Any,
     ):
         """
@@ -168,6 +202,9 @@ class YamSharpaDataset(LeRobotV3Reader):
             future_offsets: list[int] of F increasing row offsets > 0 (e.g. [5,10,...,25]).
             min_rows_ahead: int, sparse layout only: row t + min_rows_ahead must exist too, so backbones with
                 shorter futures can share one sampling range (07: 45 for every backbone).
+            history_sampling: str, ``fixed`` (always ``history_offsets``) or ``random`` (train split only: per
+                sample, H-1 distinct random rows of the past ``history_window`` rows + frame t; val stays fixed).
+            history_window: int, random mode only: rows back the random history may reach (100 = 5 s at 20 Hz).
             **kwargs: forwarded to :class:`LeRobotV3Reader` (num_frames, video_stride, height, width, ...).
         """
         for key in ("unify_action", "unify_action_map", "unify_state_map"):
@@ -179,6 +216,10 @@ class YamSharpaDataset(LeRobotV3Reader):
         self._layout_cams = [str(c) for c in (camera_layout or DEFAULT_CAMERA_LAYOUT)]
         self._history_offsets, self._future_offsets = _validate_sparse_offsets(history_offsets, future_offsets)
         self._min_rows_ahead = int(min_rows_ahead or 0)
+        self._history_window = int(history_window or 0)
+        history_sampling = _validate_history_sampling(
+            str(history_sampling), self._history_window, self._history_offsets
+        )
 
         # Raw (pre-unify) width; the base class scatters it to 80 when unify is on.
         self.ACTION_DIM = raw_dim(self.action_mode)
@@ -193,6 +234,13 @@ class YamSharpaDataset(LeRobotV3Reader):
         if self.sparse_history:
             # The sampled video is history + future frames, not the video_stride grid.
             self._num_video_frames = len(self._history_offsets) + len(self._future_offsets)
+        # Resolved once: random history is a train-split augmentation; val keeps the deploy layout.
+        self._random_history = history_sampling == "random" and self._split == "train"
+        if self._random_history:
+            logger.info(
+                "YamSharpa(%s): random history, %d frames from the past %d rows + frame t",
+                self._dataset_id, len(self._history_offsets), self._history_window,
+            )
 
     @property
     def sparse_history(self) -> bool:
@@ -328,8 +376,14 @@ class YamSharpaDataset(LeRobotV3Reader):
         prompt = self._resolve_prompt(row, win)
         action, action_mask = self._finalize_action(self._action_20d(win), self._num_frames)
 
-        # History rows clamp to the episode start (repeat the first frame); deploy uses the same rule.
-        hist_rows = history_rows(offset, self._history_offsets, valid_start)
+        # Random mode draws this sample's offsets first; rows then clamp to the episode start (repeat the
+        # first frame), the same rule deploy uses.
+        hist_offsets = (
+            sample_history_offsets(len(self._history_offsets), self._history_window)
+            if self._random_history
+            else self._history_offsets
+        )
+        hist_rows = history_rows(offset, hist_offsets, valid_start)
         lo = int(hist_rows.min())
         hist_tab = table.slice(ep_row0 + lo, offset - lo + 1).to_pandas()
         hist = hist_tab.iloc[hist_rows - lo]

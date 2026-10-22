@@ -25,12 +25,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _build(history=None, future=None, rows_ahead=0):
+def _build(history=None, future=None, rows_ahead=0, **extra):
     """Build the readers (both sources, so the pooled stats file matches) without color jitter.
 
     Args:
         history / future: offset lists or None (legacy layout).
         rows_ahead: int, ``min_rows_ahead``.
+        **extra: more dataloader keys (e.g. ``history_sampling``, ``history_window``).
 
     Returns:
         YamSharpaDataset of the simteleop source.
@@ -41,6 +42,8 @@ def _build(history=None, future=None, rows_ahead=0):
     cfg.height, cfg.width = 384, 224
     cfg.color_jitter = None
     cfg.history_offsets, cfg.future_offsets, cfg.min_rows_ahead = history, future, rows_ahead
+    for key, value in extra.items():
+        cfg[key] = value
     multi = MultiYamSharpaDataset.from_config(cfg)
     return multi.datasets[multi.names.index("simteleop")]
 
@@ -51,6 +54,7 @@ def readers():
         "legacy": _build(),
         "fut4": _build(HIST, FUT4, rows_ahead=45),
         "fut8": _build(HIST, FUT8, rows_ahead=45),
+        "rand4": _build(HIST, FUT4, rows_ahead=45, history_sampling="random", history_window=100),
     }
 
 
@@ -156,3 +160,74 @@ def test_history_proprio_in_anchor_camera():
     np.testing.assert_allclose(out[:, 24:33], np.repeat(out[2:3, 24:33], 3, 0), atol=1e-6)
     np.testing.assert_allclose(out[:, 9:24], state[:, 9:24], atol=1e-6)
     np.testing.assert_allclose(out[2], state[2], atol=1e-6)  # anchor row itself is unchanged
+
+
+# ----- random history sampling (history_sampling=random) ------------------------------------------
+
+
+def test_sample_history_offsets():
+    import random
+
+    from openwam.dataloader.utils.sparse_history import sample_history_offsets
+
+    rng = random.Random(0)
+    seen = set()
+    for _ in range(2000):
+        o = sample_history_offsets(5, 100, rng)
+        # H offsets, strictly increasing, inside [-100, 0], ending at frame t.
+        assert o.shape == (5,) and o[-1] == 0 and (np.diff(o) > 0).all() and o[0] >= -100
+        seen.update(o[:-1].tolist())
+    assert seen == set(range(-100, 0))  # every past row of the window gets drawn
+    np.testing.assert_array_equal(sample_history_offsets(1, 100, rng), [0])  # H=1 = frame t only
+
+
+def test_history_sampling_validation():
+    from openwam.dataloader.yam_sharpa import _validate_history_sampling
+
+    h = np.asarray(HIST)
+    assert _validate_history_sampling("fixed", 0, None) == "fixed"
+    assert _validate_history_sampling("random", 80, h) == "random"
+    with pytest.raises(ValueError):
+        _validate_history_sampling("uniform", 100, h)  # unknown mode
+    with pytest.raises(ValueError):
+        _validate_history_sampling("random", 100, None)  # needs the sparse layout
+    with pytest.raises(ValueError):
+        _validate_history_sampling("random", 60, h)  # fixed offsets reach 80 rows back
+
+
+def _with_offsets(monkeypatch, offsets):
+    """Make the reader's random draw return ``offsets`` (a list of H ints)."""
+    import openwam.dataloader.yam_sharpa as ys
+
+    monkeypatch.setattr(ys, "sample_history_offsets", lambda h, w: np.asarray(offsets, dtype=np.int64))
+
+
+def test_random_history_matches_fixed_rows(readers, monkeypatch):
+    # Drawing the fixed offsets reproduces the fixed reader exactly (same rows, same clamp rule).
+    _with_offsets(monkeypatch, HIST)
+    for k in (0, 80, 2000):
+        r, f = readers["rand4"][k], readers["fut4"][k]
+        for a, b in zip(r["video"], f["video"]):
+            assert np.abs(_px(a) - _px(b)).max() == 0
+        np.testing.assert_allclose(r["proprio"].numpy(), f["proprio"].numpy())
+        np.testing.assert_allclose(r["action"].numpy(), f["action"].numpy())
+
+
+def test_random_history_rows_and_clamp(readers, monkeypatch):
+    # Window 80 = row 80 of its episode: offset -100 clamps to the episode start (sample, then clamp),
+    # the other drawn rows are read as is; frame t, future and action never change.
+    _with_offsets(monkeypatch, [-100, -80, -33, -1, 0])
+    r, f = readers["rand4"][80], readers["fut4"][80]
+    start = readers["fut4"][0]  # window 0 = the episode start, all history = row 0
+    assert np.abs(_px(r["video"][0]) - _px(start["video"][4])).max() == 0  # clamped to row 0
+    assert np.abs(_px(r["video"][1]) - _px(f["video"][0])).max() == 0  # row t-80 = fixed history 0
+    for j in (4, 5, 9):  # frame t, first and last future frame
+        assert np.abs(_px(r["video"][j]) - _px(f["video"][j])).max() == 0
+    np.testing.assert_allclose(r["proprio"][1].numpy(), f["proprio"][0].numpy())
+    np.testing.assert_allclose(r["action"].numpy(), f["action"].numpy())
+    assert not np.allclose(r["proprio"][2].numpy(), f["proprio"][2].numpy())  # row t-33 != t-40
+
+
+def test_random_history_train_split_only(readers):
+    # The flag is resolved once from (history_sampling, split); fixed readers never randomize.
+    assert readers["rand4"]._random_history and not readers["fut4"]._random_history
