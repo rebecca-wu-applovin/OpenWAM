@@ -222,7 +222,9 @@ def save_full_state(accelerator, output_path: str, global_step: int, opt_step: i
 
     ALL ranks enter (DeepSpeed shards optimizer state per-rank). rank-0 writes the
     ``trainer_state.json`` marker last (atomic) so a half-written dir is never picked
-    by ``find_latest_accel_state``.
+    by ``find_latest_accel_state``. The marker records ``world_size`` so a reader can also
+    check that every rank's optimizer shard arrived (multi-node: other nodes' files reach
+    shared storage on their own schedule).
     """
     import json
 
@@ -233,7 +235,8 @@ def save_full_state(accelerator, output_path: str, global_step: int, opt_step: i
     accelerator.save_state(state_dir)
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        meta = {"global_step": int(global_step), "opt_step": int(opt_step), "epoch": int(epoch)}
+        meta = {"global_step": int(global_step), "opt_step": int(opt_step), "epoch": int(epoch),
+                "world_size": int(accelerator.num_processes)}
         meta_path = os.path.join(state_dir, "trainer_state.json")
         tmp_path = meta_path + ".tmp"
         with open(tmp_path, "w") as f:
@@ -290,14 +293,43 @@ def find_latest_weights(run_dir: str) -> str:
     return latest_path
 
 
+def state_is_usable(state_dir: str, *, require_all_shards: bool = True) -> bool:
+    """Whether ``state_dir`` (an ``accel_state_step_N/``) can be resumed from.
+
+    Args:
+        state_dir: path of one ``accel_state_step_N/`` dir.
+        require_all_shards: also require one ZeRO optimizer shard per rank of the run (``world_size`` in the
+            marker; markers written before it existed count as complete). False = the marker alone, i.e. what
+            rank 0 can see of its own save before other nodes' files arrive.
+
+    Returns: True when ``trainer_state.json`` exists (written atomically AFTER ``accelerator.save_state``
+        returned, so its presence proves rank 0's part finished) and, if required, every rank's
+        ``pytorch_model/*zero_pp_rank_<r>_*optim_states.pt`` is present.
+    """
+    import json
+
+    meta_path = os.path.join(state_dir, "trainer_state.json")
+    if not os.path.isfile(meta_path):
+        return False
+    if not require_all_shards:
+        return True
+    try:
+        with open(meta_path) as f:
+            world = json.load(f).get("world_size")
+    except (OSError, ValueError):
+        return False
+    if world is None:
+        return True
+    shards = _glob.glob(os.path.join(state_dir, "pytorch_model", "*zero_pp_rank_*_optim_states.pt"))
+    return len(shards) >= int(world)
+
+
 def find_latest_accel_state(run_dir: str) -> str | None:
     """Return the highest-step *usable* ``accel_state_step_N/`` in *run_dir*, or None.
 
-    Usable = ``trainer_state.json`` present. ``save_full_state`` writes that marker
-    atomically AFTER ``accelerator.save_state`` returns, so its presence proves the
-    (possibly large / sharded) state finished writing. DeepSpeed's ``save_state``
-    writes a ``pytorch_model/`` dir and no ``random_states_*.pkl``, so the marker —
-    not RNG files — is the completion signal. Half-written dirs lack it and are skipped.
+    Usable = :func:`state_is_usable` (marker present and one optimizer shard per rank). Half-written
+    dirs, or a multi-node save whose other-node shards never reached shared storage, are skipped, so
+    resume falls back to the previous state (``keep_last_k`` >= 2 keeps one).
     """
     if not run_dir or not os.path.isdir(run_dir):
         return None
@@ -306,7 +338,7 @@ def find_latest_accel_state(run_dir: str) -> str | None:
         if not name.startswith("accel_state_step_"):
             continue
         state_dir = os.path.join(run_dir, name)
-        if not os.path.isfile(os.path.join(state_dir, "trainer_state.json")):
+        if not state_is_usable(state_dir):
             continue
         step = step_num(name, "accel_state_step_")
         if best is None or step > best[0]:
@@ -342,7 +374,8 @@ def manage_checkpoints(output_dir: str, keep_last_k: int):
 
     Prunes ``checkpoint_step_*`` (weights, files) and ``accel_state_step_*``
     (resume state, dirs) in lockstep so a kept weights file always retains its
-    sibling state dir.
+    sibling state dir. Called on every node's local main process: with per-node
+    storage views (Modal Volumes) each node must delete its own ranks' shards.
     """
     import shutil
 
@@ -369,7 +402,8 @@ def finalize_keep_weights_only(output_dir: str, keep_last_k: int = 1):
     """Training-complete cleanup: drop all resume state, keep recent weights.
 
     Removes every ``accel_state_step_*`` dir and every ``checkpoint_step_*.safetensors``
-    except the most recent *keep_last_k*. Rank-0 only — caller must guard.
+    except the most recent *keep_last_k*. One process per node (local main) — caller must guard;
+    with per-node storage views each node must drop its own ranks' shards.
     """
     import shutil
 

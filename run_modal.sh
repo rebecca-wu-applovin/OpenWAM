@@ -9,6 +9,7 @@
 #   ACTION_MODE=unify_abs bash run_modal.sh   # action-repr ablation arm (dim set automatically)
 #   BACKBONE=cosmos3_nano bash run_modal.sh   # video-backbone ablation arm: wan22_ti2v_5b | cosmos3_edge | cosmos3_nano
 #   bash scripts/modal/sparse_history/run_<backbone>.sh   # 07 sparse-history arms (5 backbones)
+#   NODES=2 bash run_modal.sh     # multi-node: a Modal cluster of 2 x 8 GPUs (RDMA), global batch = 16 x batch_size
 #   SIMEVAL=0 bash run_modal.sh   # no sim-policy-eval watch (default: every new run gets one, scripts/modal/simeval_watch.py)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -46,6 +47,7 @@ case "${BACKBONE}" in
     *) echo "[run_modal] unknown BACKBONE=${BACKBONE}" >&2; exit 1 ;;
 esac
 GPU_TYPE="${GPU_TYPE:-H100}"   # H100 | H200 | B200
+NODES="${NODES:-1}"            # 8-GPU nodes per run (> 1: scripts/modal/train.py::train_multinode)
 # Video decode is CPU-bound, but Modal caps one container at 64 cores (request > 64 is rejected).
 CPU="${CPU:-64}"
 MEMORY_GB="${MEMORY_GB:-512}"
@@ -105,9 +107,9 @@ OVERRIDES="dataloader=yam_sharpa \
   hydra.run.dir=${RUN_DIR}/hydra/\${now:%Y-%m-%d_%H-%M-%S} \
   $*"
 
-echo "[run_modal] run ${WANDB_RUN_NAME}  |  backbone ${BACKBONE} (/assets/video_backbone_ckpt/${BACKBONE_DIR})  |  ${GPU_TYPE}:8, ${CPU} CPU, ${MEMORY_GB} GB, ${NUM_WORKERS} workers/rank  |  Modal run name: ${MODAL_RUN_NAME}  |  run dir: openwam-runs:/yjw/${RUN_DIR}"
+echo "[run_modal] run ${WANDB_RUN_NAME}  |  backbone ${BACKBONE} (/assets/video_backbone_ckpt/${BACKBONE_DIR})  |  ${NODES} x ${GPU_TYPE}:8, ${CPU} CPU, ${MEMORY_GB} GB, ${NUM_WORKERS} workers/rank  |  Modal run name: ${MODAL_RUN_NAME}  |  run dir: openwam-runs:/yjw/${RUN_DIR}"
 # GPU spec goes in via env: Modal fixes it when train.py defines the function.
-export OPENWAM_GPU_TYPE="${GPU_TYPE}" OPENWAM_GPU_COUNT=8 OPENWAM_CPU="${CPU}" OPENWAM_MEMORY_GB="${MEMORY_GB}"
+export OPENWAM_GPU_TYPE="${GPU_TYPE}" OPENWAM_GPU_COUNT=8 OPENWAM_NODES="${NODES}" OPENWAM_CPU="${CPU}" OPENWAM_MEMORY_GB="${MEMORY_GB}"
 # Sim eval of every checkpoint, started BEFORE the training call: `modal run --detach` keeps streaming the training
 # logs until training ends, so nothing after it would run. The watch polls until the trainer has written config.yaml.
 # Not on resume: the run's watch from its first launch is still going (it respawns itself until TRAINING_DONE).

@@ -16,6 +16,7 @@ from openwam.train.utils.checkpointing import (
     load_full_state,
     manage_checkpoints,
     save_full_state,
+    state_is_usable,
     verify_resume_normalization_stats,
 )
 
@@ -66,6 +67,26 @@ def test_find_latest_accel_state_picks_highest_usable(tmp_path):
 
 def test_find_latest_accel_state_none_when_empty(tmp_path):
     assert find_latest_accel_state(str(tmp_path)) is None
+
+
+def _shards(state_dir: Path, ranks) -> None:
+    """Write the ZeRO optimizer shard files of `ranks` into state_dir/pytorch_model/."""
+    (state_dir / "pytorch_model").mkdir(exist_ok=True)
+    for r in ranks:
+        (state_dir / "pytorch_model" / f"bf16_zero_pp_rank_{r}_mp_rank_00_optim_states.pt").write_text("x")
+
+
+def test_multinode_state_needs_every_rank_shard(tmp_path):
+    """A 16-rank save whose node-1 shards never reached storage is skipped; resume falls back to the full one."""
+    full = _make_accel_state(tmp_path, 100, marker=False)
+    (full / "trainer_state.json").write_text('{"global_step": 100, "world_size": 16}')
+    _shards(full, range(16))
+    partial = _make_accel_state(tmp_path, 200, marker=False)
+    (partial / "trainer_state.json").write_text('{"global_step": 200, "world_size": 16}')
+    _shards(partial, range(8))  # node 0 only
+    assert not state_is_usable(str(partial))
+    assert state_is_usable(str(partial), require_all_shards=False)  # what rank 0 sees of its own save
+    assert find_latest_accel_state(str(tmp_path)).endswith("accel_state_step_100")
 
 
 # --- compute_resume_position (grad_accum alignment / off-by fix) ---
@@ -134,6 +155,7 @@ def test_manage_checkpoints_prunes_accel_state_in_lockstep(tmp_path):
 
 class _FakeAccelerator:
     is_main_process = True
+    num_processes = 1
 
     def wait_for_everyone(self):
         pass
@@ -152,7 +174,7 @@ def test_full_state_meta_round_trip(tmp_path):
     save_full_state(acc, str(tmp_path), global_step=42, opt_step=10, epoch=3)
     state_dir = tmp_path / "accel_state_step_42"
     assert (state_dir / "trainer_state.json").is_file()  # atomic completion marker present
-    assert load_full_state(acc, str(state_dir)) == {"global_step": 42, "opt_step": 10, "epoch": 3}
+    assert load_full_state(acc, str(state_dir)) == {"global_step": 42, "opt_step": 10, "epoch": 3, "world_size": 1}
 
 
 # --- verify_resume_normalization_stats ---

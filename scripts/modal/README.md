@@ -57,6 +57,16 @@ by the trainer. Resume with `bash run_modal.sh training.resume_ckpt_path=outputs
 Hydra logs get a new `hydra/<time>/` entry.
 `--debug` runs still go to `outputs/debug_checkpoints/` and Hydra's default `outputs/<date>/<time>/`.
 
+**Multi-node** (`NODES=2 bash run_modal.sh ...`): `train.py::train_multinode`, a Modal cluster
+(`@modal.clustered(size=NODES, rdma=True)`) of NODES x 8 GPUs on an image with `libibverbs1` + `ibverbs-providers`
+(NCCL over InfiniBand / GPUDirect RDMA, ~450 GB/s all-reduce across nodes). Each node stages the data and runs
+`scripts/train.sh` with `NNODES` / `NODE_RANK` / `MASTER_ADDR` = rank 0's IPv4 / `MASTER_PORT` 29500; global batch =
+8 x NODES x `batch_size`. Rank 0 owns the run dir. Modal retries restart the whole cluster (24 h cap, preemption, a
+failed node) and every node resumes from the newest state that holds one optimizer shard per rank; a heartbeat
+between the nodes (port 29501) stops a node whose peer died, so all containers are free for the retry. The norm stats
+file of the action mode must already exist on the runs Volume (run one single-node launch first). Checks: wandb group
+`debug`, runs 0109-0120, `outputs/investigations/22_multinode_speed`.
+
 Logs: `modal app logs <app id>` (find it in `modal app list` by the Modal run name), or the web UI.
 Pull a run with `modal volume get openwam-runs /yjw/outputs/<group>/<index>_<run_name> ./outputs/<group>/`.
 

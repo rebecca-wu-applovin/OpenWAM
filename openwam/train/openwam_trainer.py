@@ -395,7 +395,8 @@ class OpenWAMTrainer:
                     save_weights(self.accelerator, self.architecture, output_path, global_step, final=False)
                     if save_full_states_for_resume:
                         save_full_state(self.accelerator, output_path, global_step, opt_step, epoch)
-                    if is_main:
+                    # Every node's local main: each node prunes its own ranks' shards (per-node storage views).
+                    if self.accelerator.is_local_main_process:
                         manage_checkpoints(output_path, keep_last_k)
 
                 # Step 1 too: an early clip shows the hook works long before the first vis_steps.
@@ -757,12 +758,12 @@ class OpenWAMTrainer:
         Falsy ``save_steps`` = a profiling/no-write run, so no final artifact (matches the
         periodic-save gating). After the final weights land, ``finalize_keep_weights_only``
         removes every ``accel_state_step_*`` and retains the configured number of recent
-        weight checkpoints (rank-0, post-barrier).
+        weight checkpoints (each node's local main, post-barrier).
         """
         if save_steps:
             save_weights(self.accelerator, self.architecture, output_path, global_step, final=True)
         self.accelerator.wait_for_everyone()
-        if is_main:
+        if self.accelerator.is_local_main_process:  # each node drops its own ranks' resume shards
             finalize_keep_weights_only(output_path, keep_last_k)
         if wandb_run is not None:
             wandb_run.finish()
