@@ -372,6 +372,33 @@ def _reload_runs(timeout_s: int = 300) -> None:
             time.sleep(10)
 
 
+def _warm_assets(overrides: list[str], workers: int = 32) -> None:
+    """Read every backbone weight file the run points at (override values under /assets/) once, in parallel.
+
+    A cold container's 8 ranks loading Wan2.2-TI2V-5B straight from the Volume took ~10 min; after one parallel
+    pass (34 GB in ~30 s) the ranks' reads come from the page cache (8 concurrent re-reads in ~45 s), see
+    outputs/investigations/22_multinode_speed (assets_warm_test.py). Paths stay /assets/..., so the saved config
+    and deploy are unchanged.
+
+    overrides: Hydra CLI tokens. Returns: None.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    roots = {Path(tok.partition("=")[2]) for tok in overrides if tok.partition("=")[2].startswith("/assets/")}
+    files = [f for r in roots if r.exists() for f in ([r] if r.is_file() else r.rglob("*")) if f.is_file()]
+
+    def _read(f: Path) -> int:
+        with open(f, "rb") as h:
+            while h.read(64 << 20):
+                pass
+        return f.stat().st_size
+
+    t0 = time.time()
+    with ThreadPoolExecutor(workers) as ex:
+        nbytes = sum(ex.map(_read, files))
+    print(f"[modal] warmed {len(files)} weight files ({nbytes / 1e9:.1f} GB) in {time.time() - t0:.0f} s", flush=True)
+
+
 def _kill_training(proc: subprocess.Popen) -> None:
     """SIGKILL the launched process group and any surviving scripts/train.py workers.
 
@@ -440,6 +467,7 @@ def _run_training(
     start_step = _latest_state_step(run_dir, require_all_shards=False) if run_dir else -1
     if stage_data:
         overrides = _stage_data(overrides)
+        _warm_assets(overrides)  # same idea for the weights: no cold Volume reads by every rank
 
     # Record which GPUs this container actually got (H100 vs B200) in the run log.
     subprocess.run(["nvidia-smi", "-L"], check=False)
