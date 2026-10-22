@@ -238,9 +238,6 @@ class OpenWAMTrainer:
 
         output_path, resume_state_dir = self.setup_output_dir(debug, resume_path)
         optimizer, dataloader, scheduler = self.prepare_accelerate(optimizer, dataloader, scheduler)
-        # After prepare (DeepSpeed moves the whole module to the GPU): encode prompts once, park T5 on CPU.
-        if bool(cfg_get(t, "cache_text_embeddings", False)):
-            self.cache_text_embeddings()
 
         if self._run_seed is not None:
             from openwam.dataloader.mixture import MixtureDataset
@@ -308,6 +305,13 @@ class OpenWAMTrainer:
                     "for faithful mid-epoch resume.",
                     skip_first,
                 )
+
+        # Encode the prompts once and park T5 on CPU: after prepare (DeepSpeed moved the module to the GPU) AND after
+        # a resume's load_state. A self-contained resume builds the backbone with untrained weights and only
+        # load_state restores them (incl. the frozen T5), so a cache built earlier would hold garbage embeddings for
+        # the whole resumed run (investigation 23: video loss 0.2 -> 1.6 after every Wan / LongLive / Cosmos3 resume).
+        if bool(cfg_get(t, "cache_text_embeddings", False)):
+            self.cache_text_embeddings()
 
         _step_t0 = _time.monotonic()
         # Per-phase step timing (wandb timing/*); DeepSpeed's engine.step is hooked so
@@ -573,7 +577,7 @@ class OpenWAMTrainer:
         )
         return optimizer, dataloader, scheduler
 
-    # (7b) Called by train() after prepare when training.cache_text_embeddings is on.
+    # (7b) Called by train() after prepare and the resume load when training.cache_text_embeddings is on.
     def cache_text_embeddings(self) -> None:
         """Pre-encode the dataset's full prompt set; the frozen text encoder then sits on CPU.
 
