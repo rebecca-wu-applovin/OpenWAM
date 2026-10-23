@@ -199,6 +199,35 @@ class WanBase(VideoBackbone):
     def video_attention_mask_mode(self, mode: str) -> None:
         self._video_attention_mask_mode = mode
 
+    @property
+    def history_encoding(self) -> str:
+        """Sparse history -> latents: ``frames`` (each history frame alone, default) or ``clip`` (the H-1 past
+        frames as ONE causal clip, 1 + (H-2)/4 latents, then frame t alone: fewer, motion-only history latents)."""
+        return getattr(self, "_history_encoding", "frames")
+
+    @history_encoding.setter
+    def history_encoding(self, mode: str) -> None:
+        if mode not in ("frames", "clip"):
+            raise ValueError(f"{type(self).__name__}: history_encoding must be 'frames' or 'clip', got {mode!r}")
+        self._history_encoding = mode
+
+    def num_history_latents(self, num_history_frames: int) -> int:
+        """Clean history latents for H history frames.
+
+        Args:
+            num_history_frames: int H, history frames per sample (frame t last).
+
+        Returns: H (``frames``), or 1 + (H-2)/4 for the past clip + 1 for frame t (``clip``; H-1 past frames must
+            be 1 + 4k, e.g. H = 6 -> 3). Raises ValueError otherwise.
+        """
+        h = int(num_history_frames)
+        if self.history_encoding == "frames":
+            return h
+        tc, past = int(self._time_division_factor), h - 1
+        if past < 1 or (past - 1) % tc:
+            raise ValueError(f"history_encoding=clip: the {past} past frames must be 1 + {tc}k (H = 6 -> 5 past)")
+        return 1 + (past - 1) // tc + 1
+
     def reinit_for_from_scratch(self, *, external_encoder=None, source=None) -> None:
         """from_scratch DiT re-init, owning the Wan dit/patch-size internally.
 
@@ -819,7 +848,8 @@ class WanBase(VideoBackbone):
         return wan_encode.preprocess_video(clip, encoder=self.video_encoder, dtype=self.dtype, device=self.device)
 
     def preprocess_sparse_condition(self, history_frames, text, *, num_future_frames: int) -> dict:
-        """Sparse-history conditioning (TI2V only): H history frames encoded one by one + the text context.
+        """Sparse-history conditioning (TI2V only): H history frames encoded one by one (``history_encoding=clip``:
+        the past frames as one causal clip + frame t alone) + the text context.
 
         Args:
             history_frames: list of B clips, each H PIL frames (oldest first).
@@ -827,8 +857,9 @@ class WanBase(VideoBackbone):
             num_future_frames: int F (1 + 4k), the future frames the clip covers.
 
         Returns:
-            preprocess dict without ``input_latents``; ``first_frame_latents`` (B, z, H, h, w) holds the H clean
-            history latents and ``num_clean_prefix_frames`` = H (per-token t=0 on them, loss skips them).
+            preprocess dict without ``input_latents``; ``first_frame_latents`` (B, z, L, h, w) holds the L =
+            ``num_history_latents(H)`` clean history latents and ``num_clean_prefix_frames`` = L (per-token t=0 on
+            them, loss skips them).
         """
         if not self._is_ti2v:
             raise NotImplementedError("sparse history is implemented for the TI2V variant only")
@@ -845,10 +876,15 @@ class WanBase(VideoBackbone):
         if (f - 1) % self._time_division_factor:
             raise ValueError(f"future frames must be 1 + {self._time_division_factor}k, got {f}")
         context, seq_lens = self._encode_text(text)
-        # History: (B*H, 3, 1, H_px, W_px) → B*H single-frame latents → (B, z, H, h, w).
-        hist = torch.cat([self._sparse_pixels(clip).transpose(1, 2).flatten(0, 1).unsqueeze(2) for clip in history_frames])
-        hist_lat = wan_encode.encode_video(hist, vae=self.vae, encoder=self.video_encoder)
-        hist_lat = hist_lat.unflatten(0, (len(history_frames), h)).squeeze(3).transpose(1, 2)
+        if self.history_encoding == "clip":
+            hist_lat = self._encode_history_clip(history_frames)
+        else:
+            # History: (B*H, 3, 1, H_px, W_px) → B*H single-frame latents → (B, z, H, h, w).
+            hist = torch.cat(
+                [self._sparse_pixels(clip).transpose(1, 2).flatten(0, 1).unsqueeze(2) for clip in history_frames]
+            )
+            hist_lat = wan_encode.encode_video(hist, vae=self.vae, encoder=self.video_encoder)
+            hist_lat = hist_lat.unflatten(0, (len(history_frames), h)).squeeze(3).transpose(1, 2)
         return {
             "context": context,
             "seq_lens": seq_lens,
@@ -857,11 +893,26 @@ class WanBase(VideoBackbone):
             "num_frames": h + f,
             "vace_context": None,
             "fuse_vae_embedding_in_latents": True,
-            "num_clean_prefix_frames": h,
+            "num_clean_prefix_frames": int(hist_lat.shape[2]),
             "first_frame_latents": hist_lat.to(dtype=self.dtype, device=self.device),
             "clip_feature": None,
             "y": None,
         }
+
+    def _encode_history_clip(self, history_frames) -> Tensor:
+        """``history_encoding=clip``: the past frames as one causal clip, frame t alone.
+
+        Args:
+            history_frames: list of B clips, each H PIL frames (oldest first, frame t last; H-1 = 1 + 4k).
+
+        Returns: (B, z, num_history_latents(H), h, w): the past clip's latents, then frame t's.
+        """
+        self.num_history_latents(len(history_frames[0]))  # validates H-1 = 1 + 4k
+        past = torch.cat([self._sparse_pixels(clip[:-1]) for clip in history_frames], dim=0)  # (B, 3, H-1, ...)
+        cur = torch.cat([self._sparse_pixels(clip[-1:]) for clip in history_frames], dim=0)  # (B, 3, 1, ...)
+        past_lat = wan_encode.encode_video(past, vae=self.vae, encoder=self.video_encoder)
+        cur_lat = wan_encode.encode_video(cur, vae=self.vae, encoder=self.video_encoder)
+        return torch.cat([past_lat, cur_lat], dim=2)
 
     def encode_sparse_future(self, future_frames) -> Tensor:
         """future_frames: list of B clips of F PIL frames. Returns: (B, z, 1 + (F-1)//4, h, w), one causal clip each."""

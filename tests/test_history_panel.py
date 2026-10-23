@@ -54,3 +54,23 @@ def test_history_layout_validation():
     with pytest.raises(ValueError):
         _validate_history_layout("panel", None)  # needs the sparse layout
 
+
+def test_trainer_rejects_model_history_count_mismatch():
+    """A panel dataset emits 2 history frames; a model configured for 5 would mask the wrong frames."""
+    from omegaconf import OmegaConf
+
+    from openwam.train.openwam_trainer import OpenWAMTrainer
+
+    class _DS:
+        sparse_history, num_model_history_frames = True, 2
+
+    class _VB:  # history_encoding=frames: one latent per history frame
+        def num_history_latents(self, n):
+            return n
+
+    trainer = OpenWAMTrainer.__new__(OpenWAMTrainer)
+    trainer.dataset = type("_Multi", (), {"datasets": [_DS()]})()
+    trainer.architecture = type("_Arch", (), {"video_backbone": _VB()})()
+    trainer._check_history_frames(OmegaConf.create({"architecture": {"num_history_frames": 2}}))
+    with pytest.raises(ValueError, match="clean history latents"):
+        trainer._check_history_frames(OmegaConf.create({"architecture": {"num_history_frames": 5}}))

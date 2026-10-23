@@ -109,8 +109,10 @@ def rollout_from_sample(arch, sample: dict, schedule, *, seed: int) -> dict:
     proprio_mask = inputs.pop("proprio_mask", None)
     if proprio_mask is not None:
         inputs["_proprio_sample_mask"] = proprio_mask
+    # Clean history latents (= H frames, or fewer with history_encoding=clip); the future follows them.
+    n_clean = int(inputs["first_frame_latents"].shape[2]) if n_hist > 0 else 0
     latents, actions = arch.sample(inputs, schedule, latent_shape=latent_shape, action_shape=action_shape, seed=seed)
-    video = arch.video_backbone.decode_video(latents[:, :, n_hist:], tiled=True)
+    video = arch.video_backbone.decode_video(latents[:, :, n_clean:], tiled=True)
     return {"video": video, "actions": actions.squeeze(0).float().cpu().numpy()}
 
 

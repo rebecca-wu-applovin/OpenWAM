@@ -140,6 +140,8 @@ class OpenWAMTrainer:
             resolved_arch.canonical.variant,
         )
 
+        self._check_history_frames(m)
+
         # Device placement: skip .to(device) when initialize_model_on_cpu and a real
         # training Accelerator is present — DeepSpeed's prepare() then handles the move.
         _init_on_cpu = bool(t.get("initialize_model_on_cpu", False))
@@ -577,6 +579,32 @@ class OpenWAMTrainer:
             self.accelerator.device,
         )
         return optimizer, dataloader, scheduler
+
+    def _check_history_frames(self, model_cfg) -> None:
+        """Fail fast when the model's clean-history count differs from what the sparse data yields.
+
+        The model takes ``model.architecture.num_history_frames`` as its clean prefix (attention mask); a sparse
+        dataset emits ``num_model_history_frames`` history frames per sample (one per row, or 2 with
+        ``history_layout: panel``), which the video backbone turns into ``num_history_latents`` clean latents
+        (``history_encoding: clip``: the past frames as one causal clip). A mismatch would silently mask the wrong
+        latents.
+
+        Args:
+            model_cfg: the run's ``cfg.model``. Returns: None; raises ValueError on a mismatch.
+        """
+        have = int(cfg_get(model_cfg.architecture, "num_history_frames", 0) or 0)
+        vb = getattr(self.architecture, "video_backbone", None)
+        for ds in getattr(self.dataset, "datasets", None) or []:
+            if not getattr(ds, "sparse_history", False):
+                continue
+            frames = ds.num_model_history_frames
+            want = vb.num_history_latents(frames) if vb is not None else frames
+            if want != have:
+                raise ValueError(
+                    f"model.architecture.num_history_frames={have}, but the data yields {want} clean history latents "
+                    f"({frames} history frames per sample; history_layout=panel: 2 frames, "
+                    "history_encoding=clip: 6 frames -> 3 latents)"
+                )
 
     # (7b) Called by train() after prepare and the resume load when training.cache_text_embeddings is on.
     def cache_text_embeddings(self) -> None:

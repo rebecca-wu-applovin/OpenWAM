@@ -335,6 +335,11 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 vb_name, cfg, external_encoder=external_encoder, text_dim=text_dim
             )
 
+        # Sparse history -> latents (``frames`` | ``clip``), resolved once here from the architecture config; the
+        # backbone's condition encode (training and deploy alike) reads it.
+        if self.video_backbone is not None:
+            self.video_backbone.history_encoding = str(self._cfg_get(cfg, "history_encoding", "frames") or "frames")
+
         # Cross-check: yaml-declared temporal contract must match what the
         # backbone actually exposes (sourced from external encoder spec on the
         # external path, native VAE defaults otherwise). Drift here would let

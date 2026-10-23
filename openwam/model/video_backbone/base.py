@@ -229,6 +229,27 @@ class VideoBackbone(ABC, nn.Module):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support the sparse-history layout.")
 
+    @property
+    def history_encoding(self) -> str:
+        """How the sparse history frames become latents: ``frames`` (each alone; every backbone) or ``clip``
+        (Wan only, see Wan22Ti2v). Set once by the architecture from ``model.architecture.history_encoding``."""
+        return "frames"
+
+    @history_encoding.setter
+    def history_encoding(self, mode: str) -> None:
+        if mode != "frames":
+            raise NotImplementedError(f"{type(self).__name__} supports history_encoding='frames' only, got {mode!r}")
+
+    def num_history_latents(self, num_history_frames: int) -> int:
+        """Clean history latents the sparse condition yields for H history frames (the model's clean prefix).
+
+        Args:
+            num_history_frames: int H, history frames per sample (frame t included).
+
+        Returns: int; H with ``history_encoding='frames'`` (each frame its own latent).
+        """
+        return int(num_history_frames)
+
     def num_future_latents(self, num_future_frames: int) -> int:
         """Latent frames of a causally encoded F-frame future clip.
 

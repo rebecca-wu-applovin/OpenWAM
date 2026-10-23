@@ -46,12 +46,16 @@ class _StubArch(torch.nn.Module):
         torch.rand(3)  # consumes global RNG like prepare_inputs may
         s = batch[0]
         self.video_backbone.size = s["video"][0].size
-        return {
+        out = {
             "input_latents": torch.zeros(1, 2, len(s["video"]), 1, 1),
             "actions": torch.zeros(1, len(s["action"]), 4),
             "action_is_pad": torch.zeros(1, len(s["action"]), dtype=torch.bool),
             "prompt_seen": s["prompt"],
         }
+        n_hist = int(s.get("num_history_frames", 0) or 0)
+        if n_hist:  # sparse layout: one clean latent per history frame (history_encoding=frames)
+            out["first_frame_latents"] = torch.zeros(1, 2, n_hist, 1, 1)
+        return out
 
     def sample(self, inputs, schedule, *, latent_shape, action_shape, seed):
         assert "input_latents" not in inputs and "actions" not in inputs and "action_is_pad" not in inputs
