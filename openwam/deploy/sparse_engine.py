@@ -10,6 +10,9 @@ functions only; nothing from the training loop or the training visualization.
 Only yam_sharpa checkpoints have this layout. Each history observation needs ``image`` (the server-composed
 canvas), ``state`` (48,) ``observation.state``, ``camera_pose`` (16,) ``camera_pose.ego_view`` and, for
 ``unify_*`` action modes, ``joint_angles`` (56,).
+
+``dataloader.history_layout: panel`` checkpoints (5 history rows) see the 4 past canvases tiled into one 2x2
+panel (``compose_history_panel``, the dataset's function) followed by frame t; proprio keeps all 5 rows.
 """
 
 import logging
@@ -18,6 +21,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
+from openwam.dataloader.transforms.multiview import compose_history_panel
 from openwam.deploy.engine import BaseInferenceEngine, build_schedule
 
 logger = logging.getLogger(__name__)
@@ -52,12 +56,15 @@ class SparseHistoryInferenceEngine(BaseInferenceEngine):
         self.history_offsets = [int(o) for o in history_offsets]
         self.action_mode = str(dl.action_mode)
         self.num_future_frames = len(dl.future_offsets)
+        # The checkpoint's history layout, resolved once (dataset default: one history frame per row).
+        self.history_panel = OmegaConf.select(cfg, "dataloader.history_layout", default="frames") == "panel"
         # Action chunk = rows t .. t + num_frames - 2 (the dataset keeps num_frames - 1 targets).
         self.action_horizon = int(dl.num_frames) - 1
         self._decode_video = bool(OmegaConf.select(cfg, "optimization.decode_video", default=False))
         logger.info(
-            "[sparse] history_offsets=%s, future frames=%d, action chunk=%d, action_mode=%s",
-            self.history_offsets, self.num_future_frames, self.action_horizon, self.action_mode,
+            "[sparse] history_offsets=%s (%s), future frames=%d, action chunk=%d, action_mode=%s",
+            self.history_offsets, "2x2 panel + frame t" if self.history_panel else "one frame per row",
+            self.num_future_frames, self.action_horizon, self.action_mode,
         )
 
     def _proprio(self, history: list):
@@ -99,8 +106,11 @@ class SparseHistoryInferenceEngine(BaseInferenceEngine):
 
         raw, raw_t = self._proprio(history)
         proprio = arch.normalize_deploy_proprio(raw).unsqueeze(0)  # (1, H, D) normalized
+        frames = [o["image"] for o in history]
+        if self.history_panel:
+            frames = [compose_history_panel(frames[:4])] + frames[4:]  # as YamSharpaDataset (panel, frame t)
         cond = arch.prepare_sparse_condition(
-            [[o["image"] for o in history]],
+            [frames],
             [conditions.get("prompt", "") or ""],
             proprio,
             num_future_frames=self.num_future_frames,

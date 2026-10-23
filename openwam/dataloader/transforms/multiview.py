@@ -53,6 +53,32 @@ def resize_camera_tile(image: Image.Image, height: int, width: int) -> Image.Ima
     return image if image.size == (width, height) else image.resize((width, height), Image.LANCZOS)
 
 
+def compose_history_panel(frames: list) -> Image.Image:
+    """Tile 4 past canvases into one canvas of the same size: a 2x2 panel, each at half resolution.
+
+    Sparse-history ``history_layout: panel``: the past frames are one history latent (motion), frame t keeps
+    full resolution (space). Row-major, oldest first (top-left = oldest, bottom-right = newest past frame); each
+    tile is the whole canvas (all cameras) LANCZOS-resized to half height and width. Shared by the training
+    dataset and the deploy engine, so both feed the model the same pixels.
+
+    Args:
+        frames: list of 4 PIL.Image canvases of one size (W, H), oldest first; H and W even.
+
+    Returns:
+        PIL.Image of size (W, H).
+    """
+    if len(frames) != 4:
+        raise ValueError(f"history panel tiles exactly 4 past frames, got {len(frames)}")
+    w, h = frames[0].size
+    if w % 2 or h % 2 or any(f.size != (w, h) for f in frames):
+        raise ValueError(f"history panel needs 4 canvases of one even size, got {[f.size for f in frames]}")
+    panel = Image.new(frames[0].mode, (w, h))
+    for i, frame in enumerate(frames):
+        # i -> (row, col) = (i // 2, i % 2)
+        panel.paste(frame.resize((w // 2, h // 2), Image.LANCZOS), ((i % 2) * (w // 2), (i // 2) * (h // 2)))
+    return panel
+
+
 def _stretch_resize(image: Image.Image, target_height: int, target_width: int) -> Image.Image:
     """Direct BILINEAR resize without aspect-ratio preservation.
 
@@ -191,5 +217,6 @@ __all__ = [
     "crop_and_resize",
     "assemble_multiview_layout",
     "assemble_vstack_layout",
+    "compose_history_panel",
     "format_prompt_for_inference",
 ]

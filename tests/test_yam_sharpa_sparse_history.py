@@ -55,6 +55,7 @@ def readers():
         "fut4": _build(HIST, FUT4, rows_ahead=45),
         "fut8": _build(HIST, FUT8, rows_ahead=45),
         "rand4": _build(HIST, FUT4, rows_ahead=45, history_sampling="random", history_window=100),
+        "panel": _build(HIST, FUT4, rows_ahead=45, history_layout="panel"),
     }
 
 
@@ -231,3 +232,17 @@ def test_random_history_rows_and_clamp(readers, monkeypatch):
 def test_random_history_train_split_only(readers):
     # The flag is resolved once from (history_sampling, split); fixed readers never randomize.
     assert readers["rand4"]._random_history and not readers["fut4"]._random_history
+
+
+def test_panel_layout_tiles_the_fixed_history(readers):
+    # history_layout=panel: video = [2x2 panel of the 4 past rows, frame t] + future; proprio keeps 5 rows.
+    from openwam.dataloader.transforms.multiview import compose_history_panel
+
+    for k in (0, 80, 2000):
+        p, f = readers["panel"][k], readers["fut4"][k]
+        assert p["num_history_frames"] == 2 and len(p["video"]) == 2 + len(FUT4)
+        assert np.abs(_px(p["video"][0]) - _px(compose_history_panel(f["video"][:4]))).max() == 0
+        for a, b in zip(p["video"][1:], f["video"][4:]):  # frame t and the future are untouched
+            assert np.abs(_px(a) - _px(b)).max() == 0
+        np.testing.assert_allclose(p["proprio"].numpy(), f["proprio"].numpy())  # (5, D)
+        np.testing.assert_allclose(p["action"].numpy(), f["action"].numpy())
