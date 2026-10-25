@@ -18,10 +18,16 @@ representation (-> interface ``openwam_<action_mode>_v1``) and the W&B project /
     modal run scripts/modal/simeval_watch.py::smoke --run <group>/<index>_<name> [--step N] [--shards 2]   # 3 scenes
     modal run scripts/modal/simeval_watch.py::launch --run <group>/<index>_<name> [--shards 16] [--intermediate split=id]
         (run_modal.sh calls this for every new run; the watch waits for the run's config.yaml if it is not there yet)
+    modal run scripts/modal/simeval_watch.py::launch --run <group>/<run> --tag fix --wandb-group 1024_fix_eval \
+        --final none --extra "--once --only-steps 90000,93310 --exact-steps"
+        (a separate evaluation of an evaluated run: watch <run>_<tag>, W&B run <run>_<tag>_simeval,
+         exported to eval_step_<N>_<tag>/)
     modal app logs openwam-yjw-simeval
 
-``--run`` is relative to openwam-runs:/yjw/outputs (run_modal.sh's run dir). Results: Volume openwam-yjw-simeval-results,
-``watch/<run name>/`` (summary_<set>.tsv/json, per-checkpoint folders with result.json, videos, run report).
+``--run`` is relative to openwam-runs:/yjw/outputs (run_modal.sh's run dir). Results: every finished checkpoint is
+exported to ``<run_dir>/eval_step_<N>[_<tag>]/`` (videos + result.json per rollout, the summary) and its rollouts are
+then deleted from the Volume openwam-yjw-simeval-results (it caps inodes); that Volume keeps ``watch/<run name>/``
+(DONE markers, summary_<set>.tsv/json: what the watch resumes from and logs to W&B).
 """
 
 from __future__ import annotations
@@ -150,12 +156,15 @@ def wait_for_config(run: str) -> None:
         runs_vol.reload()   # the mount only shows files committed after the last reload
 
 
-def watch_command(settings: dict, intermediate: str, final: str, workers: int, extra: list[str]) -> list[str]:
+def watch_command(settings: dict, name: str, wandb_group: str | None, intermediate: str, final: str, workers: int,
+                  extra: list[str]) -> list[str]:
     """The ``sim-policy-eval watch`` argv for one run.
 
     Args:
-        settings: run_settings(); intermediate / final: scene sets (``split=id``, ``none``...); workers: parallel
-        evaluate processes; extra: more watch flags (e.g. ``--only-steps 5000 --once``).
+        settings: run_settings(); name: the watch's run name (its state folder watch/<name>/ and checkpoint ids;
+        W&B run <name>_simeval); wandb_group: W&B group (None: no group); intermediate / final: scene sets
+        (``split=id``, ``none``...); workers: parallel evaluate processes; extra: more watch flags
+        (e.g. ``--only-steps 5000 --once``).
     Returns:
         argv list.
     """
@@ -163,26 +172,27 @@ def watch_command(settings: dict, intermediate: str, final: str, workers: int, e
            "--model", "openwam", "--interface", settings["interface"], "--run-dir", str(settings["run_dir"]),
            "--openwam-root", REMOTE_REPO, "--server-python", sys.executable, "--results", RESULTS,
            "--scenes-dir", f"{SCENES}/scenes", "--settle-s", str(SETTLE_S), "--done-marker", DONE_MARKER,
-           "--idle-stop-s", str(IDLE_STOP_S),
+           "--idle-stop-s", str(IDLE_STOP_S), "--run-name", name,
            "--intermediate", intermediate, "--final", final, "--workers", str(workers), "--judge", "off",
            "--video-per-base", str(VIDEO_PER_BASE)]
     if settings["wandb_project"]:
         cmd += ["--wandb-project", settings["wandb_project"], "--wandb-mode", "online",
-                "--wandb-name", f"{settings['name']}_simeval"]
-        if settings["wandb_group"]:
-            cmd += ["--wandb-group", settings["wandb_group"]]
+                "--wandb-name", f"{name}_simeval"]
+        if wandb_group:
+            cmd += ["--wandb-group", wandb_group]
     return cmd + list(extra)
 
 
 def _run_watch(run: str, intermediate: str, final: str, workers: int, shards: int, extra: list[str],
-               attempt: int) -> int:
+               attempt: int, tag: str, wandb_group: str) -> int:
     """The watch under its supervisor (volume handshake, budgets, respawn); with ``shards`` > 0 every scene set runs
     on that many ``shard_worker`` GPUs, each with its own policy server, and this container only coordinates.
 
     Args:
         run: run dir relative to /runs/yjw/outputs; intermediate / final: scene sets; workers: evaluate processes
         per machine; shards: GPU machines per scene set (0: everything on this container's GPU); extra: more watch
-        flags; attempt: respawn counter.
+        flags; attempt: respawn counter; tag: "" for the run's own evaluation, else a separate evaluation of it
+        (watch <run name>_<tag>, exported to eval_step_<N>_<tag>/); wandb_group: "" = the run's W&B group.
     Returns:
         the watch's exit code (0 = finished).
     """
@@ -192,8 +202,11 @@ def _run_watch(run: str, intermediate: str, final: str, workers: int, shards: in
     runs_vol.reload()
     wait_for_config(run)   # returns at once if the run exists (always true on a respawn)
     settings = run_settings(run)
+    # The evaluation's identity, resolved once: watch run name (state folder, checkpoint ids, W&B run) and W&B group.
+    name = f"{settings['name']}_{tag}" if tag else settings["name"]
+    group = wandb_group or settings["wandb_group"]
     per_machine = ["--remote-shards", str(shards), "--shard-workers", str(workers)] if shards else []
-    cmd = watch_command(settings, intermediate, final, workers, per_machine + list(extra))
+    cmd = watch_command(settings, name, group, intermediate, final, workers, per_machine + list(extra))
     print(f"[simeval] attempt {attempt}: {' '.join(cmd)}", flush=True)
 
     def run_shards(payload: dict) -> list[dict]:
@@ -210,11 +223,12 @@ def _run_watch(run: str, intermediate: str, final: str, workers: int, shards: in
     env = {**os.environ, "PYTHONPATH": f"{SIM_EVAL}/src"}
     rc = supervise(cmd, sync_dir=Path("/tmp/volsync"), reload_runs=runs_vol.reload, commit_results=results_vol.commit,
                    budget_s=WATCH_BUDGET_S, hard_s=WATCH_HARD_S, cwd=Path(SIM_EVAL), env=env,
-                   **({"run_shards": run_shards, "on_reports": lambda: on_set_done(settings["name"], run)}
+                   **({"run_shards": run_shards, "on_reports": lambda: on_set_done(name, run, tag)}
                       if shards else {}))
-    export_eval.spawn(settings["name"], run)   # whatever finished last (also in single-container mode)
+    export_eval.spawn(name, run, tag)   # whatever finished last (also in single-container mode)
     if rc == WATCH_STOP:
-        (watcher_sharded if shards else watcher).spawn(run, intermediate, final, workers, shards, extra, attempt + 1)
+        (watcher_sharded if shards else watcher).spawn(run, intermediate, final, workers, shards, extra, attempt + 1,
+                                                       tag, wandb_group)
     elif rc == SYNC_FAILED:
         raise RuntimeError("openwam-runs could not be reloaded; the watch was stopped (relaunch it)")
     elif rc != 0:
@@ -222,10 +236,18 @@ def _run_watch(run: str, intermediate: str, final: str, workers: int, shards: in
     return rc
 
 
-def on_set_done(name: str, run: str) -> None:
-    """After every finished scene set (all shards committed): rebuild the reports and export into the run dir."""
+def on_set_done(name: str, run: str, tag: str) -> None:
+    """After every finished scene set (all shards committed): rebuild the reports and export into the run dir.
+
+    Args: name: the watch's run name; run: run dir relative to /runs/yjw/outputs; tag: the evaluation tag ("" = none).
+    """
     report_run.spawn(name)
-    export_eval.spawn(name, run)
+    export_eval.spawn(name, run, tag)
+
+
+def eval_dir_name(step: int, tag: str) -> str:
+    """step: checkpoint step; tag: evaluation tag ("" = the run's own). Returns: the export folder's name in the run dir."""
+    return f"eval_step_{step}_{tag}" if tag else f"eval_step_{step}"
 
 
 def export_rollouts(rollouts: Path, out: Path) -> list[dict]:
@@ -256,12 +278,9 @@ def export_rollouts(rollouts: Path, out: Path) -> list[dict]:
     return rows
 
 
-KEEP_AFTER_EXPORT = ("result.json", "rollout.json")   # what run-report reads; the rest is in the run dir or unused
-
-
 def prune_rollouts(rollouts: Path) -> int:
-    """Delete everything but KEEP_AFTER_EXPORT from one exported checkpoint's rollouts (the results Volume has an
-    inode cap: ~25 files per rollout, 16 of them keyframes; video.mp4 / result.json live on in the run dir).
+    """Delete one exported checkpoint's rollouts folder from the results Volume (it caps inodes; the videos and
+    result.json per rollout live on in the run dir, the summary in watch/<run>/).
 
     Args:
         rollouts: the runner's results folder of one checkpoint (``<benchmark_version>/<checkpoint id>``).
@@ -270,29 +289,22 @@ def prune_rollouts(rollouts: Path) -> int:
     """
     import shutil
 
-    removed = 0
-    for scene in rollouts.iterdir():
-        if not scene.is_dir():
-            continue
-        for p in scene.iterdir():
-            if p.name in KEEP_AFTER_EXPORT:
-                continue
-            # a directory (keyframes/) counts its files too: those are the inodes being freed
-            removed += sum(1 for _ in p.rglob("*")) + 1 if p.is_dir() else 1
-            shutil.rmtree(p) if p.is_dir() else p.unlink()
+    removed = sum(1 for _ in rollouts.rglob("*")) + 1
+    shutil.rmtree(rollouts)
     return removed
 
 
-def export_checkpoints(name: str, run_dir: Path, results: Path) -> list[str]:
+def export_checkpoints(name: str, run_dir: Path, results: Path, tag: str) -> list[str]:
     """Copy every finished (DONE) scene set of a watched run into the run dir, once per set.
 
-    ``<run_dir>/eval_step_<N>/<scene>/<seed>/{result.json, video.mp4}`` per rollout (``<scene>`` = the base scene for
+    ``<run_dir>/eval_step_<N>[_<tag>]/<scene>/<seed>/{result.json, video.mp4}`` per rollout (``<scene>`` = the base scene for
     ID, the scene id without its seed for OOD) and ``<run_dir>/eval_step_<N>/result.json``: per set the summary (the
     W&B numbers) and one row per rollout. ``EXPORTED_<set>`` marks a set as copied.
 
     Args:
-        name: the watch's run name (= the run dir's name); run_dir: the training run dir (writable);
-        results: the results root (holds watch/<name>/ and <benchmark_version>/<checkpoint id>/).
+        name: the watch's run name; run_dir: the training run dir (writable);
+        results: the results root (holds watch/<name>/ and <benchmark_version>/<checkpoint id>/);
+        tag: the evaluation tag ("" = none), names the export folders (eval_dir_name).
     Returns:
         "<step>/<set>" of the sets exported now.
     """
@@ -304,7 +316,7 @@ def export_checkpoints(name: str, run_dir: Path, results: Path) -> list[str]:
         rollouts = next(iter(results.glob(f"*/{name}_{step_dir.name}")), None)   # <benchmark_version>/<checkpoint id>
         for marker in sorted(step_dir.glob("DONE_*")):
             set_name = marker.name.removeprefix("DONE_")
-            out = run_dir / f"eval_step_{step}"
+            out = run_dir / eval_dir_name(step, tag)
             summary_file = step_dir / f"summary_{set_name}.json"
             if (out / f"EXPORTED_{set_name}").exists() or rollouts is None or not summary_file.exists():
                 continue
@@ -319,19 +331,20 @@ def export_checkpoints(name: str, run_dir: Path, results: Path) -> list[str]:
     return done
 
 
-def prune_exported(name: str, run_dir: Path, results: Path) -> list[Path]:
+def prune_exported(name: str, run_dir: Path, results: Path, tag: str) -> list[Path]:
     """The checkpoints whose every DONE set is exported and not yet pruned: prune their rollouts on the results
-    Volume to KEEP_AFTER_EXPORT. Run it after the copies are committed; mark the returned folders (``PRUNED``) only
+    Volume (prune_rollouts). Run it after the copies are committed; mark the returned folders (``PRUNED``) only
     after the results commit, so a failed commit leaves them to the next export.
 
     Args:
-        name: the watch's run name; run_dir: the training run dir; results: the results root.
+        name: the watch's run name; run_dir: the training run dir; results: the results root;
+        tag: the evaluation tag ("" = none).
     Returns:
-        the ``<run_dir>/eval_step_<N>`` folders pruned now (to be marked).
+        the ``<run_dir>/eval_step_<N>[_<tag>]`` folders pruned now (to be marked).
     """
     pruned = []
     for step_dir in sorted((results / "watch" / name).glob("step*")):
-        out = run_dir / f"eval_step_{int(step_dir.name.removeprefix('step'))}"
+        out = run_dir / eval_dir_name(int(step_dir.name.removeprefix("step")), tag)
         rollouts = next(iter(results.glob(f"*/{name}_{step_dir.name}")), None)
         sets = [m.name.removeprefix("DONE_") for m in step_dir.glob("DONE_*")]
         if (not sets or rollouts is None or (out / "PRUNED").exists()
@@ -344,18 +357,19 @@ def prune_exported(name: str, run_dir: Path, results: Path) -> list[Path]:
 
 
 @app.function(cpu=4, memory=16 * 1024, volumes=EXPORT_VOLUMES, timeout=2 * 3600)
-def export_eval(name: str, run: str) -> list[str]:
+def export_eval(name: str, run: str, tag: str = "") -> list[str]:
     """export_checkpoints + prune_exported on the Volumes. Order: copies committed (runs), then the deletions
     (results; a full Volume frees inodes only then), then the PRUNED markers (runs).
 
-    Args: name: the watch's run name; run: run dir relative to /runs/yjw/outputs. Returns: the sets exported.
+    Args: name: the watch's run name; run: run dir relative to /runs/yjw/outputs; tag: the evaluation tag ("" = none).
+    Returns: the sets exported.
     """
     results_vol.reload()
     runs_vol.reload()
     run_dir = Path(RUNS, RUNS_SUBDIR, "outputs", run)
-    done = export_checkpoints(name, run_dir, Path(RESULTS))
+    done = export_checkpoints(name, run_dir, Path(RESULTS), tag)
     runs_vol.commit()
-    pruned = prune_exported(name, run_dir, Path(RESULTS))
+    pruned = prune_exported(name, run_dir, Path(RESULTS), tag)
     if pruned:
         results_vol.commit()
         for out in pruned:
@@ -368,17 +382,18 @@ def export_eval(name: str, run: str) -> list[str]:
 @app.function(gpu=GPU, cpu=24, memory=96 * 1024, volumes=VOLUMES, timeout=24 * 3600,
               secrets=[modal.Secret.from_name("wandb-yjw")])
 def watcher(run: str, intermediate: str = "split=id", final: str = "split=id", workers: int = 12, shards: int = 0,
-            extra: list[str] | None = None, attempt: int = 1) -> int:
+            extra: list[str] | None = None, attempt: int = 1, tag: str = "", wandb_group: str = "") -> int:
     """One container does everything: checkpoint discovery, the policy server, the rollouts, videos, W&B."""
-    return _run_watch(run, intermediate, final, workers, 0, extra or [], attempt)
+    return _run_watch(run, intermediate, final, workers, 0, extra or [], attempt, tag, wandb_group)
 
 
 @app.function(cpu=4, memory=16 * 1024, volumes=VOLUMES, timeout=24 * 3600,
               secrets=[modal.Secret.from_name("wandb-yjw")])
 def watcher_sharded(run: str, intermediate: str = "split=id", final: str = "split=id", workers: int = 4,
-                    shards: int = 16, extra: list[str] | None = None, attempt: int = 1) -> int:
+                    shards: int = 16, extra: list[str] | None = None, attempt: int = 1, tag: str = "",
+                    wandb_group: str = "") -> int:
     """The coordinator of ``--remote-shards`` (no GPU): checkpoint discovery, snapshots, summaries, markers, W&B."""
-    return _run_watch(run, intermediate, final, workers, shards, extra or [], attempt)
+    return _run_watch(run, intermediate, final, workers, shards, extra or [], attempt, tag, wandb_group)
 
 
 @app.function(gpu=GPU, cpu=8, memory=64 * 1024, volumes=VOLUMES, timeout=12 * 3600, max_containers=MAX_GPUS)
@@ -456,13 +471,15 @@ def _deployed(shards: int):
 
 @app.local_entrypoint()
 def launch(run: str, intermediate: str = "split=id", final: str = "split=id", shards: int = 16, workers: int = 4,
-           extra: str = ""):
+           extra: str = "", tag: str = "", wandb_group: str = ""):
     """Start watching a run on the deployed app; returns at once (follow: modal app logs openwam-yjw-simeval).
     The run may not exist yet: the watch polls for its config.yaml (up to CONFIG_WAIT_S), so it can be launched
     together with the training run. ``shards`` GPUs per scene set (0: one container), ``workers`` evaluate processes
-    per GPU."""
-    call = _deployed(shards).spawn(run, intermediate, final, workers, shards, extra.split() if extra else None)
-    print(f"[simeval] watching {run} on {shards or 1} x {GPU}: call {call.object_id}")
+    per GPU. ``tag``: a separate evaluation of an already evaluated run (watch <run>_<tag>, W&B run <run>_<tag>_simeval,
+    exported to eval_step_<N>_<tag>/); ``wandb_group``: W&B group instead of the run's."""
+    call = _deployed(shards).spawn(run, intermediate, final, workers, shards, extra.split() if extra else None,
+                                   tag=tag, wandb_group=wandb_group)
+    print(f"[simeval] watching {run} on {shards or 1} x {GPU}{f' (tag {tag})' if tag else ''}: call {call.object_id}")
 
 
 @app.local_entrypoint()
