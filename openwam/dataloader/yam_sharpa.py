@@ -33,9 +33,11 @@ derived from ``action_mode``; do not set ``unify_action`` in the config.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
+import zlib
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple
 
@@ -185,6 +187,14 @@ def _validate_history_sampling(mode: str, window: int, history_offsets: Optional
     return mode
 
 
+def _episode_task(tasks, episode_index: int) -> str:
+    """The single task string of one episode (``meta/episodes`` ``tasks`` cell: a 1-element list / array)."""
+    values = [tasks] if isinstance(tasks, str) else list(tasks)
+    if len(values) != 1:
+        raise ValueError(f"yam_sharpa: episode {episode_index} has {len(values)} tasks; per-task subsampling needs 1")
+    return str(values[0])
+
+
 class YamSharpaDataset(LeRobotV3Reader):
     """Single-source reader; built by :class:`MultiYamSharpaDataset`.
 
@@ -215,6 +225,8 @@ class YamSharpaDataset(LeRobotV3Reader):
         history_sampling: str = "fixed",
         history_window: int = 0,
         history_layout: str = "frames",
+        episode_fraction: float = 1.0,
+        episode_seed: int = 42,
         **kwargs: Any,
     ):
         """
@@ -233,6 +245,9 @@ class YamSharpaDataset(LeRobotV3Reader):
             history_window: int, random mode only: rows back the random history may reach (100 = 5 s at 20 Hz).
             history_layout: str, ``frames`` (one history frame per row) or ``panel`` (needs 5 rows: the 4 past
                 ones tiled into one half-resolution 2x2 canvas, then frame t; the model sees 2 history frames).
+            episode_fraction: float in (0, 1], this source's ``sources.<name>.episode_fraction``: keep this share of
+                each task's episodes (random, at least 1 per task; 1 = all); see :meth:`_filter_episodes`.
+            episode_seed: int, seed of that per-task draw (the dataloader ``seed``).
             **kwargs: forwarded to :class:`LeRobotV3Reader` (num_frames, video_stride, height, width, ...).
         """
         for key in ("unify_action", "unify_action_map", "unify_state_map"):
@@ -249,6 +264,10 @@ class YamSharpaDataset(LeRobotV3Reader):
             str(history_sampling), self._history_window, self._history_offsets
         )
         self._history_panel = _validate_history_layout(str(history_layout), self._history_offsets) == "panel"
+        # Read by _filter_episodes, which the base __init__ calls before building the window index.
+        if not 0.0 < float(episode_fraction) <= 1.0:
+            raise ValueError(f"yam_sharpa: episode_fraction must be in (0, 1], got {episode_fraction}")
+        self._episode_fraction, self._episode_seed = float(episode_fraction), int(episode_seed)
 
         # Raw (pre-unify) width; the base class scatters it to 80 when unify is on.
         self.ACTION_DIM = raw_dim(self.action_mode)
@@ -283,6 +302,40 @@ class YamSharpaDataset(LeRobotV3Reader):
         return 2 if self._history_panel else len(self._history_offsets)
 
     # ----- hooks ------------------------------------------------------------
+
+    def _filter_episodes(self, eps_df):
+        """Keep ``episode_fraction`` of each task's episodes (identity at 1).
+
+        Runs once at construction, before the window index is built from ``eps_df``, so every sample index maps to
+        a kept episode. Per task (the episode's single ``tasks`` entry), ``max(1, round(n * fraction))`` of its n
+        episodes are drawn without replacement by an RNG seeded with (``episode_seed``, crc32 of the task text):
+        the same episodes in every rank, worker and resume, independent of the other tasks.
+
+        Args:
+            eps_df: DataFrame, one row per episode (``episode_index``, ``tasks``, offsets ...).
+
+        Returns:
+            DataFrame of the kept rows (original order, index reset).
+        """
+        eps_df = super()._filter_episodes(eps_df)
+        if self._episode_fraction >= 1.0:
+            return eps_df
+        tasks = [_episode_task(v, int(e)) for v, e in zip(eps_df["tasks"], eps_df["episode_index"])]
+        keep = np.zeros(len(eps_df), dtype=bool)
+        for task in sorted(set(tasks)):
+            rows = np.flatnonzero(np.asarray(tasks) == task)
+            rows = rows[np.argsort(eps_df["episode_index"].to_numpy()[rows])]  # draw order = episode order
+            k = max(1, int(len(rows) * self._episode_fraction + 0.5))
+            rng = np.random.default_rng([self._episode_seed, zlib.crc32(task.encode())])
+            keep[rows[rng.choice(len(rows), size=k, replace=False)]] = True
+        out = eps_df[keep].reset_index(drop=True)
+        kept = ",".join(str(int(e)) for e in sorted(out["episode_index"]))
+        logger.info(
+            "YamSharpa(%s): episode_fraction=%.3f keeps %d/%d episodes over %d tasks (episode_index sha1 %s)",
+            self._dataset_id, self._episode_fraction, len(out), len(eps_df), len(set(tasks)),
+            hashlib.sha1(kept.encode()).hexdigest()[:12],
+        )
+        return out
 
     def _min_window_len(self) -> int:
         """Sparse layout: every future frame and every action row must exist (train and val alike)."""
@@ -633,13 +686,14 @@ class MultiYamSharpaDataset(BaseDataset):
         if not sources:
             raise ValueError("yam_sharpa: config needs a non-empty 'sources' mapping {name: {dataset_dir, weight}}")
         entries = [
-            (str(name), str(get_cfg(src, "dataset_dir")), float(get_cfg(src, "weight", 1.0)))
+            (str(name), str(get_cfg(src, "dataset_dir")), float(get_cfg(src, "weight", 1.0)),
+             float(get_cfg(src, "episode_fraction", 1.0)))
             for name, src in sources.items()
             if get_cfg(src, "enabled", True)
         ]
         if not entries:
             raise ValueError("yam_sharpa: every source is disabled")
-        dirs = [d for _, d, _ in entries]
+        dirs = [d for _, d, _, _ in entries]
         num_frames = int(get_cfg(config, "num_frames", 33))
 
         # Shared reader kwargs; explicit normalize_mode=null must survive (disables normalization).
@@ -665,12 +719,17 @@ class MultiYamSharpaDataset(BaseDataset):
         else:
             kwargs.pop("normalization_stats_path", None)
 
-        datasets = [YamSharpaDataset(dataset_dir=d, dataset_id=name, **kwargs) for name, d, _ in entries]
+        # episode_fraction is per source (sources.<name>.episode_fraction); its draw uses the dataloader seed.
+        seed = int(get_cfg(config, "seed", 42))
+        datasets = [
+            YamSharpaDataset(dataset_dir=d, dataset_id=name, episode_fraction=frac, episode_seed=seed, **kwargs)
+            for name, d, _, frac in entries
+        ]
         return cls(
             datasets,
-            names=[n for n, _, _ in entries],
-            weights=[w for _, _, w in entries],
-            seed=int(get_cfg(config, "seed", 42)),
+            names=[n for n, _, _, _ in entries],
+            weights=[w for _, _, w, _ in entries],
+            seed=seed,
             normalization_stats_path=str(stats_path) if stats_path else None,
         )
 
