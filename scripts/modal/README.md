@@ -19,6 +19,14 @@ Everything else is already on Modal:
 | `/runs` | `openwam-runs` | writes go **only** under `/runs/yjw/`: `norm_stats_modal/`, `outputs/` |
 | secret | `wandb-yjw` | own **public wandb.ai** `WANDB_API_KEY` → runs land in `wandb.ai/jiangwei-yu-applovin/1008_wam_training`, NOT the company server `cbf-wandb.alcfd.com` (it resolves to the internal IP 10.132.0.109 and Modal can't reach it). Local runs via `run_dual.sh` also log to wandb.ai (it sets `WANDB_BASE_URL=https://api.wandb.ai`; key from `~/.netrc`, same entity), so local and Modal arms share one project. The teammate's `wandb-secret` gets "permission denied" on `1008_wam_training`. |
 
+**Code shipping.** Every launch first uploads the checkout's code files (`openwam/ benchmarks/ scripts/ configs/`
++ root `*.sh *.toml Makefile`; `.py .sh .yaml .json .md ...` only, no tests / docker / outputs, ~3.6 MB) to
+`<run dir>/code/` on `openwam-runs`. The image holds no source: the container copies that `code/` dir to
+`/opt/openwam` and trains from it, so `code/` is exactly the code the run used (uncommitted edits included).
+A resume (`training.resume_ckpt_path=...`) runs the run's own `code/` again, not the local checkout: to train
+with new code, start a new run. Runs without a fixed dir (`--debug` without `training.run_dir_name`) ship to
+`outputs/_code/<UTC time>/`.
+
 Inside the container `/opt/openwam/outputs` is a symlink to `/runs/yjw/outputs`. Relative
 `outputs/...` paths in `configs/train.yaml` (run dirs, checkpoints, wandb) end up on the Volume.
 The local-only absolute paths are remapped by `PATH_OVERRIDES` in `train.py`. If you pass an
