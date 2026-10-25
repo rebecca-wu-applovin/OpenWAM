@@ -126,3 +126,48 @@ def test_server_sparse_requires_k_and_fps():
     srv = PolicyServer(_Engine(), cfg, history_offsets=OFFSETS)
     srv._init_policy()
     assert srv._policy._history.steps_per_obs == 10
+
+
+def test_server_keeps_one_history_per_connection():
+    """Concurrent clients (sim-policy-eval's evaluate processes on one server) each get their own observation
+    history: interleaved plans never mix episodes, and one client's reset leaves the other's history alone."""
+    import asyncio
+    import json
+    import socket
+    import threading
+
+    from websockets.sync.client import connect
+
+    from openwam.deploy.server import PolicyServer
+
+    cfg = OmegaConf.create({"inference": {"denoise_steps": 10, "inference_mode": "sync", "inference_horizon": 10,
+                                          "action_fps": 20}})
+    eng = _Engine()
+    srv = PolicyServer(eng, cfg, history_offsets=[-20, -10, 0])
+    srv._init_policy()
+    srv._obs_preprocessor = type("_Identity", (), {"preprocess": staticmethod(lambda obs: obs)})()
+    with socket.socket() as s:  # a free port
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    threading.Thread(target=srv.run, kwargs={"host": "127.0.0.1", "port": port}, daemon=True).start()
+
+    def history_of(ws, obs) -> list:
+        """ws: client; obs: tag. Returns: the history tags the engine saw for this plan."""
+        ws.send(json.dumps({"type": "plan", "obs": obs, "prompt": "p"}))
+        assert json.loads(ws.recv(timeout=10))["type"] == "action"
+        return [o["obs"] for o in eng.calls[-1]["history"]]
+
+    for _ in range(100):  # wait for the listener
+        try:
+            a, b = connect(f"ws://127.0.0.1:{port}"), connect(f"ws://127.0.0.1:{port}")
+            break
+        except OSError:
+            asyncio.run(asyncio.sleep(0.05))
+    with a, b:
+        assert history_of(a, "a0") == ["a0", "a0", "a0"]
+        assert history_of(b, "b0") == ["b0", "b0", "b0"]
+        assert history_of(a, "a1") == ["a0", "a0", "a1"]
+        b.send(json.dumps({"type": "reset"}))
+        assert json.loads(b.recv(timeout=10))["type"] == "reset_ack"
+        assert history_of(a, "a2") == ["a0", "a1", "a2"]  # b's reset did not clear a's episode
+        assert history_of(b, "b1") == ["b1", "b1", "b1"]

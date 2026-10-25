@@ -124,8 +124,25 @@ def _normalize_compile_enabled_arg(value: str) -> bool:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+class _Session:
+    """One client's episode state: its policy (sparse observation history / receding-horizon executor) and counters.
+
+    The model (engine) is shared by every session; the episode state is not, so concurrent clients (sim-policy-eval
+    runs several evaluate processes against one server) never see each other's observations or resets.
+    """
+
+    def __init__(self, policy):
+        """policy: this session's WAMPolicy."""
+        self.policy = policy
+        self.request_count = 0
+        self.total_latency = 0.0
+
+
 class PolicyServer:
     """WebSocket policy server for WAM deployment.
+
+    Each WebSocket connection gets its own :class:`_Session` (policy + history); the direct methods
+    (``predict`` / ``plan`` / ``reset``, for in-process callers) share one default session.
 
     Args:
         engine: Inference engine (BaseInferenceEngine).
@@ -142,15 +159,33 @@ class PolicyServer:
         self.history_offsets = history_offsets
 
         # Lazy imports at init time to validate availability
-        self._policy = None
-        self._request_count = 0
-        self._total_latency = 0.0
+        self._policy = None    # the default session's policy (also what the PONG's serving block describes)
+        self._session = None   # default session of the direct predict / plan / reset calls
 
     def _init_policy(self):
-        """Initialize the receding-horizon policy."""
+        """Build the observation preprocessor and the default session (once)."""
         if self._policy is not None:
             return
+        self._policy = self._new_policy()
+        self._session = _Session(self._policy)
 
+        # Resolve obs preprocessing config from the saved checkpoint cfg so every
+        # predict() validates + preprocesses without re-reading it per request.
+        self._obs_preprocessor = ObsPreprocessor.from_cfg(self.cfg, self.engine)
+        d = self._obs_preprocessor
+        logger.info(
+            "[obs] View config: multiview=%s, camera_layout=%s, canvas=%dx%d",
+            d.multiview,
+            d.camera_layout if d.multiview else "[unused]",
+            d.img_height,
+            d.img_width,
+        )
+
+    def _new_policy(self):
+        """A fresh receding-horizon policy over the shared engine, with its own executor / observation history.
+
+        Returns: WAMPolicy.
+        """
         from openwam.deploy.executors import resolve_execution_config
         from openwam.deploy.policy import WAMPolicy
 
@@ -169,23 +204,11 @@ class PolicyServer:
                 )
             history = ObsHistoryBuffer(self.history_offsets, action_fps=int(action_fps), steps_per_obs=k)
             logger.info("[sparse] one observation per %d steps (%.1f Hz at %d fps)", k, action_fps / k, action_fps)
-        self._policy = WAMPolicy(
+        return WAMPolicy(
             engine=self.engine,
             cfg=self.cfg,
             execution_config=execution_config,
             history=history,
-        )
-
-        # Resolve obs preprocessing config from the saved checkpoint cfg so every
-        # predict() validates + preprocesses without re-reading it per request.
-        self._obs_preprocessor = ObsPreprocessor.from_cfg(self.cfg, self.engine)
-        d = self._obs_preprocessor
-        logger.info(
-            "[obs] View config: multiview=%s, camera_layout=%s, canvas=%dx%d",
-            d.multiview,
-            d.camera_layout if d.multiview else "[unused]",
-            d.img_height,
-            d.img_width,
         )
 
     def _ckpt_contract(self) -> dict:
@@ -239,7 +262,7 @@ class PolicyServer:
         return result
 
     def predict(self, obs: dict) -> dict:
-        """Synchronous prediction for a single observation.
+        """Synchronous prediction for a single observation, in the default session.
 
         Args:
             obs: Observation dict with ``images`` (dict of camera name →
@@ -255,25 +278,11 @@ class PolicyServer:
             to execute before the next observation, instead of "action".
         """
         self._init_policy()
-        t0 = time.monotonic()
-
-        obs = self._obs_preprocessor.preprocess(obs)
-        action = self._policy.predict_action(obs)
-
-        latency_ms = (time.monotonic() - t0) * 1000
-        self._request_count += 1
-        self._total_latency += latency_ms
-
-        # Sparse-history checkpoints return the K actions to execute before the next observation.
-        key = "actions" if self.history_offsets is not None else "action"
-        return {
-            key: action.tolist(),
-            "step": self._request_count,
-            "latency_ms": round(latency_ms, 2),
-        }
+        return self._predict(self._session, obs)
 
     def plan(self, obs: dict) -> dict:
-        """One plan for an observation (``plan`` message): the K actions to execute before the next one.
+        """One plan for an observation (``plan`` message) in the default session: the K actions to execute
+        before the next one.
 
         Args:
             obs: observation dict, as for :meth:`predict`.
@@ -281,19 +290,46 @@ class PolicyServer:
             dict with "actions" (K lists of floats in physical units), "step", "latency_ms".
         """
         self._init_policy()
-        t0 = time.monotonic()
-        actions = self._policy.plan_actions(self._obs_preprocessor.preprocess(obs))
-        latency_ms = (time.monotonic() - t0) * 1000
-        self._request_count += 1
-        self._total_latency += latency_ms
-        return {"actions": actions.tolist(), "step": self._request_count, "latency_ms": round(latency_ms, 2)}
+        return self._plan(self._session, obs)
 
     def reset(self):
-        """Reset policy state."""
-        if self._policy is not None:
-            self._policy.reset()
-        self._request_count = 0
-        self._total_latency = 0.0
+        """Reset the default session's policy state."""
+        if self._session is not None:
+            self._reset(self._session)
+
+    def _predict(self, session: _Session, obs: dict) -> dict:
+        """``predict`` in ``session``. session: the client's state; obs: as for :meth:`predict`. Returns: as it."""
+        t0 = time.monotonic()
+
+        obs = self._obs_preprocessor.preprocess(obs)
+        action = session.policy.predict_action(obs)
+
+        latency_ms = (time.monotonic() - t0) * 1000
+        session.request_count += 1
+        session.total_latency += latency_ms
+
+        # Sparse-history checkpoints return the K actions to execute before the next observation.
+        key = "actions" if self.history_offsets is not None else "action"
+        return {
+            key: action.tolist(),
+            "step": session.request_count,
+            "latency_ms": round(latency_ms, 2),
+        }
+
+    def _plan(self, session: _Session, obs: dict) -> dict:
+        """``plan`` in ``session``. session: the client's state; obs: as for :meth:`predict`. Returns: as :meth:`plan`."""
+        t0 = time.monotonic()
+        actions = session.policy.plan_actions(self._obs_preprocessor.preprocess(obs))
+        latency_ms = (time.monotonic() - t0) * 1000
+        session.request_count += 1
+        session.total_latency += latency_ms
+        return {"actions": actions.tolist(), "step": session.request_count, "latency_ms": round(latency_ms, 2)}
+
+    def _reset(self, session: _Session) -> None:
+        """Clear ``session``'s executor state / observation history and its counters. Returns: None."""
+        session.policy.reset()
+        session.request_count = 0
+        session.total_latency = 0.0
 
     def shutdown(self):
         """Clean up async resources."""
@@ -315,8 +351,9 @@ class PolicyServer:
         self._init_policy()
 
         async def ws_handler(websocket):
-            """Handle WebSocket connections."""
+            """Handle one WebSocket connection, in its own session (policy + observation history)."""
             logger.info("Client connected: %s", websocket.remote_address)
+            session = _Session(self._new_policy())
             try:
                 async for message in websocket:
                     try:
@@ -324,14 +361,14 @@ class PolicyServer:
                         msg_type = data.get("type", OBS)
 
                         if msg_type == RESET:
-                            self.reset()
+                            self._reset(session)
                             await websocket.send(json.dumps({"type": RESET_ACK}))
                         elif msg_type == OBS:
-                            result = self.predict(data)
+                            result = self._predict(session, data)
                             result["type"] = ACTION
                             await websocket.send(json.dumps(result))
                         elif msg_type == PLAN:
-                            result = self.plan(data)
+                            result = self._plan(session, data)
                             result["type"] = ACTION
                             await websocket.send(json.dumps(result))
                         elif msg_type == PING:
@@ -372,6 +409,8 @@ class PolicyServer:
                         )
             except websockets.exceptions.ConnectionClosed:
                 logger.info("Client disconnected")
+            finally:
+                session.policy.shutdown()  # async executors own a background thread
 
         async def serve():
             # ping_interval=None: slow inference (notably torch.compile warmup on
