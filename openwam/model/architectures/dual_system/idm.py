@@ -949,7 +949,6 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
         shift: float = 5.0,
         tile_size: tuple = None,
         tile_stride: tuple = None,
-        dit_cache=None,
         decode_video: bool = True,
         profile: bool = False,
         vace_cache: Optional[dict] = None,
@@ -1047,25 +1046,20 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
 
             v_timestep = torch.tensor([t_v], dtype=dtype, device=device)
 
-            if dit_cache is not None and not dit_cache.should_recompute(sigma_v):
-                noise_pred = dit_cache.get_cached()
-            else:
-                # Video-only forward. We already appended proprio to the context
-                # at generate() scope because stage 2 bypasses forward(), so
-                # stage 1 must drive the video backbone directly instead of
-                # re-entering self.forward(), which would try to append proprio a
-                # second time.
-                torch.compiler.cudagraph_mark_step_begin()
-                noise_pred = self._run_video_only_backbone(
-                    {
-                        **inputs_shared_with_proprio,
-                        "timestep": v_timestep,
-                    },
-                    use_gradient_checkpointing=False,
-                    use_gradient_checkpointing_offload=False,
-                )
-                if dit_cache is not None:
-                    dit_cache.update(noise_pred, sigma_v)
+            # Video-only forward. We already appended proprio to the context
+            # at generate() scope because stage 2 bypasses forward(), so
+            # stage 1 must drive the video backbone directly instead of
+            # re-entering self.forward(), which would try to append proprio a
+            # second time.
+            torch.compiler.cudagraph_mark_step_begin()
+            noise_pred = self._run_video_only_backbone(
+                {
+                    **inputs_shared_with_proprio,
+                    "timestep": v_timestep,
+                },
+                use_gradient_checkpointing=False,
+                use_gradient_checkpointing_offload=False,
+            )
 
             new_latents = inputs_shared_with_proprio["latents"] + noise_pred * (sigma_v_next - sigma_v)
             ref_latents = inputs_shared_with_proprio.get("first_frame_latents")

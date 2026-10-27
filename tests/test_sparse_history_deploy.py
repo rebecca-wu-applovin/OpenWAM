@@ -1,17 +1,29 @@
-"""Sparse-history deploy plumbing (CPU, no weights): history buffer, per-step recording in WAMPolicy, engine choice."""
+"""Sparse-history deploy (CPU, no weights): history buffer, per-episode sessions of the InferenceEngine with a stub
+architecture, the startup checks of the deploy cfg, and the hand-target split of the returned actions."""
+
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 from omegaconf import OmegaConf
+from omegaconf.errors import ReadonlyConfigError
+from scipy.spatial.transform import Rotation
 
+from openwam.dataloader.utils import yam_sharpa_repr as R
 from openwam.dataloader.utils.sparse_history import history_rows
+from openwam.deploy.config import DEPLOY_YAML, build_deploy_cfg, check_deploy
+from openwam.deploy.engine import EngineSpec, InferenceEngine
 from openwam.deploy.history_buffer import ObsHistoryBuffer
-from openwam.deploy.policy import WAMPolicy
 
 OFFSETS = [-80, -60, -40, -20, 0]
 
 
+# ── ObsHistoryBuffer ────────────────────────────────────────────────────────
+
+
 def test_history_rows_clamps_to_episode_start():
+    """history_rows clamps every offset to the episode's first row."""
     assert history_rows(150, OFFSETS, 0).tolist() == [70, 90, 110, 130, 150]
     assert history_rows(30, OFFSETS, 0).tolist() == [0, 0, 0, 10, 30]
     assert history_rows(30, OFFSETS, 25).tolist() == [25, 25, 25, 25, 30]
@@ -39,6 +51,7 @@ def test_buffer_rejects_k_that_misses_history_frames():
 
 
 def test_buffer_reset_starts_a_new_episode():
+    """reset() drops the episode: the next window repeats the first new observation."""
     buf = ObsHistoryBuffer(OFFSETS, action_fps=20, steps_per_obs=10)
     for j in range(20):
         buf.append({"step": j})
@@ -49,125 +62,282 @@ def test_buffer_reset_starts_a_new_episode():
         ObsHistoryBuffer(OFFSETS, action_fps=20, steps_per_obs=10).window()
 
 
-class _Engine:
-    """Records generate() conditions; returns a 32-step chunk whose rows are their index."""
+# ── InferenceEngine / Session with a stub architecture ──────────────────────
+
+EGO, CHEST = "observation.images.ego_view", "observation.images.chest_view"
+CHUNK, K = 32, 20
+# One absolute fingertips_abs action row: per hand wrist at the origin with identity rot6d, fingertips 0.
+_ACTION_ROW = np.zeros(48)
+_ACTION_ROW[[3, 7, 27, 31]] = 1.0
+
+
+class _StubArchitecture:
+    """No model: records the proprio of every plan's history and returns a constant identity-wrist action chunk."""
+
+    action_dim = 48
 
     def __init__(self):
-        self.calls = []
-        self.architecture = None
+        self.seen = []  # per plan: history tags (proprio dim 0 = the tag the test put in state[0])
+        self.seeds = []
+        self.video_backbone = SimpleNamespace(num_future_latents=lambda num_future_frames: 1)
 
-    def generate(self, conditions):
-        self.calls.append(conditions)
-        return {"actions": np.repeat(np.arange(32, dtype=np.float32)[:, None], 2, axis=1)}
+    def normalize_deploy_proprio(self, raw):
+        """raw: (H, D) raw proprio. Returns: (H, D) float32 tensor (identity normalization)."""
+        self.seen.append(np.asarray(raw)[:, 0].round().astype(int).tolist())
+        return torch.from_numpy(np.asarray(raw, dtype=np.float32))
 
+    def prepare_sparse_condition(self, frames, prompts, proprio, *, num_future_frames):
+        """frames: [[H PIL canvases]]. Returns: cond with (1, z, H, h, w) first-frame latents."""
+        assert len(frames[0]) == proprio.shape[1]  # one canvas per history row
+        return {"first_frame_latents": torch.zeros(1, 2, len(frames[0]), 2, 2)}
 
-def test_policy_plans_every_observation_and_returns_k_actions():
-    """K = 10: every request is one plan with its own history, and returns the chunk's first 10 actions."""
-    eng = _Engine()
-    buf = ObsHistoryBuffer([-20, -10, 0], action_fps=20, steps_per_obs=10)
-    policy = WAMPolicy(eng, OmegaConf.create({}), history=buf)
-    for j in range(4):
-        out = policy.predict_action({"obs": j, "prompt": "p"})
-        assert out.shape == (10, 2) and out[:, 0].tolist() == list(range(10))
-    assert [[o["obs"] for o in c["history"]] for c in eng.calls] == [[0, 0, 0], [0, 0, 1], [0, 1, 2], [1, 2, 3]]
-    policy.reset()
-    policy.predict_action({"obs": "a", "prompt": "p"})
-    assert [o["obs"] for o in eng.calls[-1]["history"]] == ["a", "a", "a"]
-    with pytest.raises(ValueError, match="sync"):
-        WAMPolicy(eng, OmegaConf.create({}), execution_config={"mode": "async"}, history=buf)
+    def sample(self, cond, schedule, *, latent_shape, action_shape, seed):
+        """Returns: zero latents of latent_shape and an action_shape chunk of _ACTION_ROW."""
+        self.seeds.append(seed)
+        actions = torch.from_numpy(np.broadcast_to(_ACTION_ROW, action_shape).copy())
+        return torch.zeros(latent_shape), actions
 
 
-def test_policy_without_history_sends_no_history():
-    eng = _Engine()
-    action = WAMPolicy(eng, OmegaConf.create({})).predict_action({"prompt": "p"})
-    assert "history" not in eng.calls[0] and action.shape == (2,)
+class _IdentityNormalizer:
+    """unnormalize: (..., D) -> the same values as float64 numpy."""
+
+    @staticmethod
+    def unnormalize(x):
+        return np.asarray(x, dtype=np.float64)
 
 
-def test_server_picks_engine_from_checkpoint_layout(monkeypatch):
-    """build_server_from_config: dataloader.history_offsets in the ckpt config -> sparse engine + buffered policy."""
-    import openwam.deploy.model_loader as model_loader
-    import openwam.deploy.server as server
-    import openwam.deploy.sparse_engine as sparse_engine
-    from openwam.deploy import engine as engine_mod
-
-    made = {}
-
-    class _Sparse:
-        def __init__(self, cfg, architecture, *, history_offsets):
-            made["sparse"] = history_offsets
-
-    class _Joint:
-        def __init__(self, cfg, architecture):
-            made["joint"] = True
-
-    monkeypatch.setattr(sparse_engine, "SparseHistoryInferenceEngine", _Sparse)
-    monkeypatch.setattr(engine_mod, "JointInferenceEngine", _Joint)
-    monkeypatch.setattr("openwam.deploy.JointInferenceEngine", _Joint)
-    for ckpt_dl, want in (({"history_offsets": OFFSETS, "num_frames": 33}, "sparse"), ({"num_frames": 33}, "joint")):
-        made.clear()
-        ckpt_cfg = OmegaConf.create({"dataloader": ckpt_dl})
-        monkeypatch.setattr(model_loader, "load_from_checkpoint_dir", lambda *a, _c=ckpt_cfg, **k: (_c, object()))
-        srv = server.build_server_from_config(OmegaConf.create({"inference": {"denoise_steps": 10}}), "/ckpt")
-        assert list(made) == [want]
-        assert srv.history_offsets == (OFFSETS if want == "sparse" else None)
+def _engine(history_offsets=(-40, -20, 0)) -> InferenceEngine:
+    """An InferenceEngine over the stub architecture: fingertips_abs, K=20, fps=20, 2-camera vstack 64x32."""
+    spec = EngineSpec(
+        ckpt="stub/checkpoint_step_1.safetensors",
+        action_mode="fingertips_abs",
+        action_dim=48,
+        hand_targets="tips",
+        chunk=CHUNK,
+        steps_per_plan=K,
+        action_fps=20,
+        history_offsets=tuple(history_offsets),
+        history_layout="frames",
+        camera_layout=(EGO, CHEST),
+    )
+    return InferenceEngine(
+        _StubArchitecture(),
+        _IdentityNormalizer(),
+        schedule=None,
+        spec=spec,
+        height=64,
+        width=32,
+        num_future_frames=4,
+        seed=42,
+        decode_video=False,
+    )
 
 
-def test_server_sparse_requires_k_and_fps():
-    """A sparse server builds its buffer from inference.inference_horizon (K) and inference.action_fps."""
-    from openwam.deploy.server import PolicyServer
-
-    base = {"denoise_steps": 10, "inference_mode": "sync"}
-    with pytest.raises(ValueError, match="inference_horizon"):
-        PolicyServer(_Engine(), OmegaConf.create({"inference": base}), history_offsets=OFFSETS)._init_policy()
-    with pytest.raises(ValueError, match="divide"):
-        cfg = OmegaConf.create({"inference": {**base, "inference_horizon": 8, "action_fps": 20}})
-        PolicyServer(_Engine(), cfg, history_offsets=OFFSETS)._init_policy()
-    cfg = OmegaConf.create({"inference": {**base, "inference_horizon": 10, "action_fps": 20}})
-    srv = PolicyServer(_Engine(), cfg, history_offsets=OFFSETS)
-    srv._init_policy()
-    assert srv._policy._history.steps_per_obs == 10
+def _obs(tag: int) -> dict:
+    """tag: int written into state[0] (identity camera: proprio dim 0 == tag). Returns: one client observation."""
+    state = np.zeros(48)
+    state[0] = tag
+    state[[3, 7, 27, 31]] = 1.0  # identity wrist rotations
+    img = np.zeros((48, 64, 3), np.uint8)
+    return {EGO: img, CHEST: img, "observation.state": state, "camera_pose.ego_view": np.eye(4).reshape(-1), "task": "p"}
 
 
-def test_server_keeps_one_history_per_connection():
-    """Concurrent clients (sim-policy-eval's evaluate processes on one server) each get their own observation
-    history: interleaved plans never mix episodes, and one client's reset leaves the other's history alone."""
-    import asyncio
-    import json
-    import socket
-    import threading
+def test_two_sessions_of_one_engine_keep_independent_histories():
+    """Interleaved plans of two sessions never mix episodes: each window is that session's own history rule."""
+    engine = _engine()
+    arch = engine.architecture
+    a, b = engine.new_session(), engine.new_session(seed=7)
+    a.plan(_obs(100))
+    b.plan(_obs(200))
+    a.plan(_obs(101))
+    a.plan(_obs(102))
+    b.plan(_obs(201))
+    a.plan(_obs(103))
+    # Offsets [-40, -20, 0] at K = 20 = one observation per offset step, clamped to each episode's start.
+    assert arch.seen == [
+        [100, 100, 100],
+        [200, 200, 200],
+        [100, 100, 101],
+        [100, 101, 102],
+        [200, 200, 201],
+        [101, 102, 103],
+    ]
+    assert arch.seeds == [42, 7, 42, 42, 7, 42]  # default deploy seed vs the session's own
 
-    from websockets.sync.client import connect
 
-    from openwam.deploy.server import PolicyServer
+def test_session_plan_returns_k_actions_and_hand_targets():
+    """A plan returns the first K absolute actions plus their wrist / fingertip split."""
+    out = _engine().new_session().plan(_obs(0))
+    assert out["actions"].shape == (K, 48)
+    np.testing.assert_allclose(out["actions"], np.broadcast_to(_ACTION_ROW, (K, 48)))
+    assert out["wrist"].shape == (K, 2, 4, 4) and out["tips"].shape == (K, 2, 5, 3)
+    np.testing.assert_allclose(out["wrist"], np.broadcast_to(np.eye(4), (K, 2, 4, 4)))
+    assert "video" not in out
 
-    cfg = OmegaConf.create({"inference": {"denoise_steps": 10, "inference_mode": "sync", "inference_horizon": 10,
-                                          "action_fps": 20}})
-    eng = _Engine()
-    srv = PolicyServer(eng, cfg, history_offsets=[-20, -10, 0])
-    srv._init_policy()
-    srv._obs_preprocessor = type("_Identity", (), {"preprocess": staticmethod(lambda obs: obs)})()
-    with socket.socket() as s:  # a free port
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    threading.Thread(target=srv.run, kwargs={"host": "127.0.0.1", "port": port}, daemon=True).start()
 
-    def history_of(ws, obs) -> list:
-        """ws: client; obs: tag. Returns: the history tags the engine saw for this plan."""
-        ws.send(json.dumps({"type": "plan", "obs": obs, "prompt": "p"}))
-        assert json.loads(ws.recv(timeout=10))["type"] == "action"
-        return [o["obs"] for o in eng.calls[-1]["history"]]
+# ── build_deploy_cfg / check_deploy ─────────────────────────────────────────
 
-    for _ in range(100):  # wait for the listener
-        try:
-            a, b = connect(f"ws://127.0.0.1:{port}"), connect(f"ws://127.0.0.1:{port}")
-            break
-        except OSError:
-            asyncio.run(asyncio.sleep(0.05))
-    with a, b:
-        assert history_of(a, "a0") == ["a0", "a0", "a0"]
-        assert history_of(b, "b0") == ["b0", "b0", "b0"]
-        assert history_of(a, "a1") == ["a0", "a0", "a1"]
-        b.send(json.dumps({"type": "reset"}))
-        assert json.loads(b.recv(timeout=10))["type"] == "reset_ack"
-        assert history_of(a, "a2") == ["a0", "a1", "a2"]  # b's reset did not clear a's episode
-        assert history_of(b, "b1") == ["b1", "b1", "b1"]
+_CKPT = "checkpoint_step_1.safetensors"
+
+
+def _ckpt_dir(tmp_path, **dataloader):
+    """Write a small sparse-history checkpoint dir (config.yaml + empty checkpoint file).
+
+    Args:
+        tmp_path: pytest tmp dir.
+        dataloader: overrides of the checkpoint's dataloader block (value None deletes the key).
+    Returns:
+        str, the run dir.
+    """
+    dl = {
+        "type": "yam_sharpa",
+        "multiview": True,
+        "multiview_layout": "vstack",
+        "normalize_mode": "min-max",
+        "action_mode": "fingertips_abs",
+        "history_offsets": [-40, -20, 0],
+        "history_layout": "frames",
+        "fps": 20,
+        "num_frames": 33,
+        "height": 384,
+        "width": 224,
+    }
+    dl.update(dataloader)
+    dl = {k: v for k, v in dl.items() if v is not None}
+    OmegaConf.save(OmegaConf.create({"dataloader": dl}), tmp_path / "config.yaml")
+    (tmp_path / _CKPT).write_bytes(b"")
+    return str(tmp_path)
+
+
+def _overrides(run_dir, *extra, k=20):
+    """run_dir: str; extra: more dotlist entries; k: steps_per_plan. Returns: the deploy dotlist."""
+    return [f"deploy.ckpt.dir={run_dir}", f"deploy.ckpt.name={_CKPT}", f"deploy.policy.steps_per_plan={k}", *extra]
+
+
+def test_build_deploy_cfg_accepts_a_sparse_history_checkpoint(tmp_path):
+    """The happy path: checkpoint cfg + one deploy block, frozen."""
+    cfg = build_deploy_cfg(_overrides(_ckpt_dir(tmp_path)))
+    assert cfg.dataloader.fps == 20 and cfg.deploy.policy.steps_per_plan == 20
+    assert cfg.deploy.sampler.denoise_mode == "sync"
+    with pytest.raises(ReadonlyConfigError):
+        cfg.deploy.policy.seed = 0
+
+
+def test_build_deploy_cfg_rejects_non_deploy_overrides(tmp_path):
+    """The checkpoint's model / data config is fixed: only deploy.* overrides are allowed."""
+    with pytest.raises(ValueError, match="must start with 'deploy.'"):
+        build_deploy_cfg(_overrides(_ckpt_dir(tmp_path), "dataloader.fps=10"))
+
+
+def test_build_deploy_cfg_requires_ckpt_and_file(tmp_path):
+    """No ckpt dir / name, or a name with no file behind it, is rejected."""
+    with pytest.raises(ValueError, match="deploy.ckpt.dir"):
+        build_deploy_cfg(["deploy.policy.steps_per_plan=20"])
+    run = _ckpt_dir(tmp_path)
+    with pytest.raises(ValueError, match="no checkpoint file"):
+        build_deploy_cfg(
+            [
+                f"deploy.ckpt.dir={run}",
+                "deploy.ckpt.name=checkpoint_step_9.safetensors",
+                "deploy.policy.steps_per_plan=20",
+            ]
+        )
+
+
+@pytest.mark.parametrize("key", ["fps", "history_layout", "history_offsets"])
+def test_build_deploy_cfg_requires_sparse_history_keys(tmp_path, key):
+    """Checkpoints trained without fps / history_layout / history_offsets are rejected, never defaulted."""
+    with pytest.raises(ValueError, match=f"dataloader.{key} is missing"):
+        build_deploy_cfg(_overrides(_ckpt_dir(tmp_path, **{key: None})))
+
+
+@pytest.mark.parametrize("key, value", [("num_frames", 49), ("height", 480), ("width", 320)])
+def test_build_deploy_cfg_rejects_data_shape_mismatch(tmp_path, key, value):
+    """deploy.data.* states the expected shape; it must equal the checkpoint's dataloader values."""
+    with pytest.raises(ValueError, match=f"deploy.data.{key}"):
+        build_deploy_cfg(_overrides(_ckpt_dir(tmp_path), f"deploy.data.{key}={value}"))
+
+
+def test_build_deploy_cfg_rejects_k_that_misses_fps_or_an_offset(tmp_path):
+    """K must divide fps (K=8 vs 20) and every history offset (K=10 vs -15)."""
+    with pytest.raises(ValueError, match="must divide"):
+        build_deploy_cfg(_overrides(_ckpt_dir(tmp_path), k=8))
+    with pytest.raises(ValueError, match="must divide"):
+        build_deploy_cfg(_overrides(_ckpt_dir(tmp_path, history_offsets=[-30, -15, 0]), k=10))
+
+
+def test_build_deploy_cfg_rejects_k_above_chunk(tmp_path):
+    """K cannot exceed the action chunk (num_frames - 1 = 32)."""
+    with pytest.raises(ValueError, match=r"in \[1, 32\]"):
+        build_deploy_cfg(_overrides(_ckpt_dir(tmp_path), k=40))
+
+
+@pytest.mark.parametrize(
+    "override, match",
+    [
+        ("deploy.sampler.denoise_mode=unsupported", "Unsupported denoise mode"),
+        ("deploy.sampler.variance_shift_alpha=9.0", "denoise_mode='async'"),
+    ],
+)
+def test_build_deploy_cfg_validates_sampler(tmp_path, override, match):
+    """The sampler block is validated at startup (async-only knobs need denoise_mode=async)."""
+    with pytest.raises(ValueError, match=match):
+        build_deploy_cfg(_overrides(_ckpt_dir(tmp_path), override))
+
+
+def test_check_deploy_rejects_non_yam_sharpa(tmp_path):
+    """check_deploy on an assembled cfg: only yam_sharpa vstack checkpoints are served."""
+    cfg = OmegaConf.merge(
+        OmegaConf.load(f"{_ckpt_dir(tmp_path, type='robotwin')}/config.yaml"),
+        {"deploy": OmegaConf.load(DEPLOY_YAML)},
+        {"deploy": {"ckpt": {"dir": str(tmp_path), "name": _CKPT}, "policy": {"steps_per_plan": 20}}},
+    )
+    with pytest.raises(ValueError, match="yam_sharpa checkpoints only"):
+        check_deploy(cfg)
+
+
+# ── split_hand_targets ──────────────────────────────────────────────────────
+
+
+def _rot6d(Rm):
+    """Rm: (3, 3) rotation. Returns: (6,) rot6d = its first two columns."""
+    return np.concatenate([Rm[:, 0], Rm[:, 1]])
+
+
+def test_split_hand_targets_fingertips():
+    """fingertips_*: wrist (K, 2, 4, 4) camera_from_wrist and tips (K, 2, 5, 3) in the order they were packed."""
+    rng = np.random.default_rng(0)
+    k = 3
+    rots = Rotation.random(2, random_state=0).as_matrix()
+    a = np.zeros((k, 48))
+    pos = rng.normal(size=(k, 2, 3))
+    tips = rng.normal(size=(k, 2, 5, 3))
+    for side, o in enumerate((0, 24)):
+        a[:, o : o + 3] = pos[:, side]
+        a[:, o + 3 : o + 9] = _rot6d(rots[side])
+        a[:, o + 9 : o + 24] = tips[:, side].reshape(k, 15)
+    out = R.split_hand_targets("fingertips_rel", a)
+    assert set(out) == {"wrist", "tips"}
+    assert out["wrist"].shape == (k, 2, 4, 4) and out["tips"].shape == (k, 2, 5, 3)
+    np.testing.assert_allclose(out["wrist"][:, :, :3, 3], pos)
+    np.testing.assert_allclose(out["wrist"][:, :, :3, :3], np.broadcast_to(rots, (k, 2, 3, 3)), atol=1e-12)
+    np.testing.assert_allclose(out["wrist"][:, :, 3], np.broadcast_to([0, 0, 0, 1], (k, 2, 4)))
+    np.testing.assert_allclose(out["tips"], tips)
+
+
+def test_split_hand_targets_unify():
+    """unify_*: rot6d of identity -> eye(3), finger joints (K, 2, 22); a wrong-width chunk is rejected."""
+    k = 2
+    a = np.zeros((k, 62))
+    fingers = np.arange(k * 2 * 22, dtype=np.float64).reshape(k, 2, 22)
+    for side, o in enumerate((0, 31)):
+        a[:, o : o + 3] = [side, 0.5, -0.5]
+        a[:, o + 3 : o + 9] = [1, 0, 0, 0, 1, 0]  # rot6d of the identity
+        a[:, o + 9 : o + 31] = fingers[:, side]
+    out = R.split_hand_targets("unify_abs", a)
+    assert set(out) == {"wrist", "fingers"}
+    np.testing.assert_allclose(out["wrist"][:, :, :3, :3], np.broadcast_to(np.eye(3), (k, 2, 3, 3)))
+    np.testing.assert_allclose(out["wrist"][:, 1, :3, 3], np.broadcast_to([1, 0.5, -0.5], (k, 3)))
+    np.testing.assert_allclose(out["fingers"], fingers)
+    with pytest.raises(ValueError, match=r"\(K, 62\)"):
+        R.split_hand_targets("unify_abs", np.zeros((k, 48)))

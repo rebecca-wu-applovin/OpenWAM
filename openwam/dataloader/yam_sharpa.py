@@ -209,7 +209,7 @@ class YamSharpaDataset(LeRobotV3Reader):
     # unify_* keys are derived from action_mode, so they are not accepted from config.
     CONFIG_KEYS: ClassVar[Tuple[str, ...]] = tuple(
         k for k in LeRobotV3Reader.CONFIG_KEYS if k not in ("unify_action", "unify_action_map", "unify_state_map")
-    ) + ("action_mode", "normalization_stats_path", "history_offsets", "future_offsets", "min_rows_ahead",
+    ) + ("action_mode", "fps", "normalization_stats_path", "history_offsets", "future_offsets", "min_rows_ahead",
           "history_sampling", "history_window", "history_layout")
 
     def __init__(
@@ -217,6 +217,7 @@ class YamSharpaDataset(LeRobotV3Reader):
         dataset_dir: str,
         *,
         action_mode: str,
+        fps: int,
         normalization_stats_path: Optional[str] = None,
         camera_layout: Optional[Sequence[str]] = None,
         history_offsets: Optional[Sequence[int]] = None,
@@ -233,6 +234,8 @@ class YamSharpaDataset(LeRobotV3Reader):
         Args:
             dataset_dir: str, LeRobot v3 root (holds ``meta/info.json``).
             action_mode: str, one of ``ACTION_REPRS``.
+            fps: int, the data rate the config states (rows per second; history / future offsets and deploy's
+                action rate are in these rows); must equal the source's ``meta/info.json`` fps.
             normalization_stats_path: str, pooled stats file (required when normalization is on).
             camera_layout: list[str] of camera feature keys, top-to-bottom; default ego over chest.
             history_offsets: list[int] of H row offsets <= 0 ending at 0 (e.g. [-80,-60,-40,-20,0]); enables the
@@ -279,6 +282,9 @@ class YamSharpaDataset(LeRobotV3Reader):
             unify_action_map=unify_action_map(self.action_mode),
             **kwargs,
         )
+        # The config's data rate is what deploy serves at: it must be the recorded one.
+        if self._fps != float(fps):
+            raise ValueError(f"yam_sharpa: dataloader.fps={fps} but {dataset_dir}/meta/info.json records fps={self._fps}")
         if self.sparse_history:
             # The decoded video is one frame per history row + the future frames, not the video_stride grid
             # (the panel layout tiles the decoded past rows afterwards, in _getitem_impl).

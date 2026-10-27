@@ -279,7 +279,7 @@ def test_model_loader_detects_reason1_state_component_through_omegaconf(tmp_path
     ``text_encoder_path`` so the empty-shell path picks up the in-state-dict
     Reason1 weights.
     """
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import MagicMock
 
     from omegaconf import OmegaConf
 
@@ -323,19 +323,17 @@ def test_model_loader_detects_reason1_state_component_through_omegaconf(tmp_path
     resolved.canonical.variant = "single_system_vanilla"
     resolved.params = {"video_backbone": dict(saved_cfg.model.video_backbone)}
 
+    import torch
+
+    import openwam.model as _openwam_model
     from openwam.deploy import model_loader
 
-    with (
-        patch.object(model_loader, "build_architecture", _fake_build_architecture, create=True),
-        patch.object(model_loader, "resolve_architecture_config", lambda _m: resolved, create=True),
-        patch.object(model_loader, "_build_normalizer", lambda *_a, **_kw: None),
-    ):
-        # Patch the deferred imports inside load_from_checkpoint_dir.
-        import openwam.model as _openwam_model
-
-        monkeypatch.setattr(_openwam_model, "build_architecture", _fake_build_architecture, raising=True)
-        monkeypatch.setattr(_openwam_model, "resolve_architecture_config", lambda _m: resolved, raising=True)
-        model_loader.load_from_checkpoint_dir(str(ckpt_dir), device="cpu")
+    # load_architecture imports both builders from openwam.model inside the function.
+    monkeypatch.setattr(_openwam_model, "build_architecture", _fake_build_architecture, raising=True)
+    monkeypatch.setattr(_openwam_model, "resolve_architecture_config", lambda _m: resolved, raising=True)
+    model_loader.load_architecture(
+        saved_cfg.model, str(ckpt_dir), "checkpoint_step_1.safetensors", dtype=torch.float32, device="cpu"
+    )
 
     source = captured["params"]["video_backbone"]["_source"]
     assert isinstance(source, dict), f"Expected plain dict source, got {type(source).__name__}"

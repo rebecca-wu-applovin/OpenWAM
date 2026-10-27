@@ -67,7 +67,7 @@ for H in ${NHISTS}; do
       dataloader.height=384 dataloader.width=224 \
       "+dataloader.history_offsets=${OFFSETS}" '+dataloader.future_offsets=[5,10,15,20,25]' +dataloader.min_rows_ahead=45 \
       "+dataloader.history_sampling=${HIST_SAMPLING}" "+dataloader.history_window=${HIST_WINDOW}" \
-      "+dataloader.history_layout=${HIST_LAYOUT}" "+model.architecture.history_encoding=${HIST_ENCODING}" \
+      "dataloader.history_layout=${HIST_LAYOUT}" "+model.architecture.history_encoding=${HIST_ENCODING}" \
       "+model.architecture.num_history_frames=${MODEL_H}" "+model.architecture.num_proprio_tokens=${H}" \
       model.architecture.video_attention_mask_mode=first_frame_causal \
       training.batch_size=${BS} training.num_epochs=${EPOCHS} training.use_gradient_checkpointing=false \

@@ -1,3 +1,9 @@
+> **Not usable on this branch (`yjw/1008_our_data`, since the 2026-10-27 deploy refactor).** The WebSocket policy
+> server and the first-frame engine these clients talk to were removed (`docs/1027_deploy_refactor/design.md`); the
+> upstream benchmarks below (libero, libero-plus, robotwin, robocasa365, robocasa_gr1, vlabench, ebench) and
+> `benchmarks/utils/` are kept only for reference. To run them, check out commit 3973dfa. Their tests are skipped
+> (`tests/benchmarks/conftest.py`). The one live benchmark here is `benchmarks/simeval/`.
+
 # OpenWAM Client Integration Guide
 
 For users wiring their own robot or benchmark to an OpenWAM policy server.

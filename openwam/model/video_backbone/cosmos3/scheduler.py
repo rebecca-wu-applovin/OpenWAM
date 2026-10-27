@@ -2,7 +2,7 @@
 
 Reuses :class:`CosmosFlowSchedulerAdapter` verbatim — the α-shift sigma grid and
 ``timesteps = sigmas × num_train_timesteps`` linear relation are hard constraints
-(``generate()`` / ``deploy/denoise_schedule.py`` invert ``σ = t / num_train_ts``
+(``generate()`` / ``model/denoise_schedule.py`` invert ``σ = t / num_train_ts``
 outside the adapter), and Cosmos3's rectified-flow training uses the same
 ``(1−σ)x₀ + σε`` interpolant with velocity target ``ε − x₀``.
 

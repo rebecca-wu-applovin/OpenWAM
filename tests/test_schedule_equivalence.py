@@ -30,7 +30,7 @@ def _two_stub_schedulers():
 
 
 def test_schedule_sync():
-    from openwam.deploy.denoise_schedule import schedule_sync
+    from openwam.model.denoise_schedule import schedule_sync
 
     v, a = _two_schedulers()
     result = schedule_sync(v, a, num_steps=20, shift=5.0)
@@ -39,7 +39,7 @@ def test_schedule_sync():
 
 
 def test_make_schedule_sync():
-    from openwam.deploy.denoise_schedule import make_schedule
+    from openwam.model.denoise_schedule import make_schedule
 
     v, a = _two_schedulers()
     result = make_schedule("sync", v, a, num_steps=20, shift=5.0)
@@ -48,7 +48,7 @@ def test_make_schedule_sync():
 
 
 def test_make_schedule_rejects_invalid_mode():
-    from openwam.deploy.denoise_schedule import make_schedule
+    from openwam.model.denoise_schedule import make_schedule
 
     v, a = _two_stub_schedulers()
     with pytest.raises(ValueError, match="Unsupported denoise mode"):
@@ -67,7 +67,7 @@ def test_make_schedule_rejects_invalid_mode():
     ],
 )
 def test_make_schedule_rejects_invalid_async_parameters(kwargs, match):
-    from openwam.deploy.denoise_schedule import make_schedule
+    from openwam.model.denoise_schedule import make_schedule
 
     v, a = _two_stub_schedulers()
     with pytest.raises(ValueError, match=match):
@@ -76,7 +76,7 @@ def test_make_schedule_rejects_invalid_async_parameters(kwargs, match):
 
 def test_make_schedule_sync_ignores_inactive_async_parameters():
     """Per-request path builds what it is handed; the shape check lives at startup."""
-    from openwam.deploy.denoise_schedule import make_schedule, schedule_sync
+    from openwam.model.denoise_schedule import make_schedule, schedule_sync
 
     v, a = _two_schedulers()
     expected = schedule_sync(v, a, num_steps=20, shift=5.0)
@@ -86,14 +86,14 @@ def test_make_schedule_sync_ignores_inactive_async_parameters():
 
 
 def test_normalize_denoise_config_rejects_inactive_controls_by_default():
-    from openwam.deploy.denoise_schedule import normalize_denoise_config
+    from openwam.model.denoise_schedule import normalize_denoise_config
 
     with pytest.raises(ValueError, match="denoise_mode='async'"):
         normalize_denoise_config({"denoise_mode": "sync", "variance_shift_alpha": 9.0})
 
 
 def test_normalize_denoise_config_reset_inactive_drops_async_controls():
-    from openwam.deploy.denoise_schedule import DenoiseConfig, normalize_denoise_config
+    from openwam.model.denoise_schedule import DenoiseConfig, normalize_denoise_config
 
     resolved = normalize_denoise_config(
         {"denoise_mode": "sync", "lead_modality": "action", "variance_shift_alpha": 9.0, "linear_offset": 0.3},
@@ -113,13 +113,13 @@ def test_normalize_denoise_config_reset_inactive_drops_async_controls():
     ],
 )
 def test_denoise_async_is_noop(cfg, expected):
-    from openwam.deploy.denoise_schedule import denoise_async_is_noop, normalize_denoise_config
+    from openwam.model.denoise_schedule import denoise_async_is_noop, normalize_denoise_config
 
     assert denoise_async_is_noop(normalize_denoise_config(cfg)) is expected
 
 
 def test_make_schedule_async_structure():
-    from openwam.deploy.denoise_schedule import make_schedule
+    from openwam.model.denoise_schedule import make_schedule
 
     v, a = _two_stub_schedulers()
     result = make_schedule("async", v, a, num_steps=20, lead="action", alpha=9.0)
@@ -128,7 +128,7 @@ def test_make_schedule_async_structure():
 
 
 def test_schedule_variance_shift_lead_is_cleaner_and_monotonic():
-    from openwam.deploy.denoise_schedule import schedule_variance_shift
+    from openwam.model.denoise_schedule import schedule_variance_shift
 
     v, a = _two_stub_schedulers()
     result = schedule_variance_shift(v, a, num_steps=20, lead="action", alpha=9.0)
@@ -142,7 +142,7 @@ def test_schedule_variance_shift_lead_is_cleaner_and_monotonic():
 
 
 def test_schedule_variance_shift_alpha1_is_diagonal():
-    from openwam.deploy.denoise_schedule import schedule_variance_shift
+    from openwam.model.denoise_schedule import schedule_variance_shift
 
     v, a = _two_stub_schedulers()
     result = schedule_variance_shift(v, a, num_steps=16, lead="action", alpha=1.0)
@@ -151,7 +151,7 @@ def test_schedule_variance_shift_alpha1_is_diagonal():
 
 
 def test_variance_shift_alpha1_matches_sync_bitwise():
-    from openwam.deploy.denoise_schedule import make_schedule
+    from openwam.model.denoise_schedule import make_schedule
 
     v, a = _two_schedulers()
     sync = make_schedule("sync", v, a, num_steps=50, shift=5.0, shift_video=3.0)
@@ -161,7 +161,7 @@ def test_variance_shift_alpha1_matches_sync_bitwise():
 
 
 def test_schedule_variance_shift_lead_direction_flips():
-    from openwam.deploy.denoise_schedule import schedule_variance_shift
+    from openwam.model.denoise_schedule import schedule_variance_shift
 
     v, a = _two_stub_schedulers()
     res_a = schedule_variance_shift(v, a, num_steps=12, lead="action", alpha=9.0)
@@ -172,7 +172,7 @@ def test_schedule_variance_shift_lead_direction_flips():
 
 @pytest.mark.parametrize("lead", ["action", "video"])
 def test_schedule_variance_shift_offset_delays_lag(lead):
-    from openwam.deploy.denoise_schedule import schedule_variance_shift
+    from openwam.model.denoise_schedule import schedule_variance_shift
 
     v, a = _two_stub_schedulers()
     # Dyadic num_steps/offset: s[k] and s/(1-off) are exact in float32, so the
@@ -199,7 +199,7 @@ def test_schedule_variance_shift_offset_delays_lag(lead):
 
 
 def test_schedule_variance_shift_offset_zero_is_noop_bitwise():
-    from openwam.deploy.denoise_schedule import make_schedule
+    from openwam.model.denoise_schedule import make_schedule
 
     v, a = _two_schedulers()
     default = make_schedule("async", v, a, num_steps=50, shift=5.0, lead="action", alpha=9.0)
@@ -208,7 +208,7 @@ def test_schedule_variance_shift_offset_zero_is_noop_bitwise():
 
 
 def test_schedule_variance_shift_offset_lead_flip_swaps_streams():
-    from openwam.deploy.denoise_schedule import schedule_variance_shift
+    from openwam.model.denoise_schedule import schedule_variance_shift
 
     v, a = _two_stub_schedulers()
     res_a = schedule_variance_shift(v, a, num_steps=12, lead="action", alpha=9.0, offset=0.3)

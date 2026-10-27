@@ -28,11 +28,17 @@ normalize_mode: min-max
 normalization_stats_path: /root/projects/2610_policy_model/norm_stats/yam_sharpa_${.action_mode}.npy
 
 # ── Frame sampling (OpenWAM contract) ────────────────────────────────────────
+# fps: the data rate (rows per second), checked against each source's meta/info.json. Row offsets and the action
+# chunk are in these rows; deploy serves actions at this rate.
+fps: 20
 # 33 raw rows → 32 actions; video every 4th row → 9 frames.
 num_frames: 33
 video_stride: 4
 window_stride: 1
 split: train
+# Sparse-history layout (set +dataloader.history_offsets / future_offsets to turn it on): frames = one history
+# frame per row; panel = the 4 past rows tiled into one 2x2 canvas + frame t (needs 5 history rows).
+history_layout: frames
 
 # ── Tabular data loading ─────────────────────────────────────────────────────
 # Read every data parquet shard into memory once (parent process, before the

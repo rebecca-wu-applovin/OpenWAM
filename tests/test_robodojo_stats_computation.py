@@ -8,7 +8,6 @@ import h5py
 import numpy as np
 import pytest
 import yaml
-from omegaconf import OmegaConf
 
 from openwam.dataloader.robodojo import (
     GRIPPER_CONVENTION,
@@ -228,13 +227,13 @@ def test_atomic_build_writes_deploy_payload_and_leaves_no_partial_file(
     assert np.load(direct, allow_pickle=True).item()["metadata"] == loaded["metadata"]
 
 
-def test_generated_stats_are_compatible_with_generic_deploy_normalizer(
+def test_generated_stats_are_compatible_with_unify_deploy_normalizer(
     tmp_path: Path,
 ):
-    from openwam.deploy.model_loader import (
-        _build_normalizer,
-        _UnifyAwareNormalizer,
-    )
+    """The saved eef block feeds a Normalizer + the deploy-side _UnifyAwareNormalizer: 20-D eef <-> 80-D round-trip."""
+    from openwam.dataloader.transforms.normalize import Normalizer, load_mode_stats
+    from openwam.dataloader.utils.unify_action import UNIFY_DIM, parse_unify_spec
+    from openwam.deploy.model_loader import _UnifyAwareNormalizer
 
     write_episode(tmp_path, T=4)
     output = tmp_path / "normalization_stats.npy"
@@ -243,19 +242,11 @@ def test_generated_stats_are_compatible_with_generic_deploy_normalizer(
         output=output,
         reservoir_cap=100,
     )
-    config = OmegaConf.create(
-        {
-            "dataloader": {
-                "normalize_mode": "min-max",
-                "action_mode": "eef",
-                "unify_action": True,
-                "unify_action_map": ["0-9", "34-43"],
-            }
-        }
-    )
-
-    normalizer = _build_normalizer(config, str(tmp_path))
-    assert isinstance(normalizer, _UnifyAwareNormalizer)
+    # What the deploy builds for a unify checkpoint: raw-space Normalizer from the file, wrapped with the scatter map.
+    stats = load_mode_stats(str(output), "eef")
+    assert stats is not None
+    dst = parse_unify_spec(["0-9", "34-43"], UNIFY_DIM)
+    normalizer = _UnifyAwareNormalizer(Normalizer(mode="min_max", stats=stats), dst, UNIFY_DIM)
     assert normalizer._dst_index.tolist() == [
         *range(10),
         *range(34, 44),

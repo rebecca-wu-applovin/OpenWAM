@@ -1181,3 +1181,51 @@ def test_from_config_via_registry():
     assert "tasks" not in captured
     assert "task_name" not in captured
     assert captured["action_mode"] == "eef"
+
+
+# ---------------------------------------------------------------------------
+# Prompt template contract (moved from the deleted tests/test_obs_preprocess.py)
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_wrap_plain_instruction():
+    """format_prompt_for_inference prepends the fixed robot-POV preamble."""
+    from openwam.dataloader.transforms.multiview import format_prompt_for_inference
+
+    assert format_prompt_for_inference("pick up the bottle") == (
+        "A video recorded from a robot's point of view executing the following instruction: pick up the bottle"
+    )
+
+
+def test_prompt_wrap_keeps_trailing_period():
+    """A trailing period in the instruction is kept verbatim."""
+    from openwam.dataloader.transforms.multiview import format_prompt_for_inference
+
+    assert format_prompt_for_inference("pick up the bottle.") == (
+        "A video recorded from a robot's point of view executing the following instruction: pick up the bottle."
+    )
+
+
+def test_prompt_wrap_empty_instruction():
+    """An empty instruction yields the bare preamble."""
+    from openwam.dataloader.transforms.multiview import format_prompt_for_inference
+
+    assert format_prompt_for_inference("") == (
+        "A video recorded from a robot's point of view executing the following instruction: "
+    )
+
+
+def test_prompt_wrap_matches_dataset_training_output():
+    """Regression guard: inference-side wrapping must equal the dataset's
+    training-time prompt byte-for-byte."""
+    from openwam.dataloader.robotwin import _resolve_prompt
+    from openwam.dataloader.transforms.multiview import format_prompt_for_inference
+
+    base = "pick up the red bottle"
+    training_output = _resolve_prompt(
+        instructions={"episode0.json": {"seen": [base]}},
+        ep_file="episode0.hdf5",
+        split="val",  # deterministic: picks pool[0]
+        task_name="dummy",
+    )
+    assert training_output == format_prompt_for_inference(base)

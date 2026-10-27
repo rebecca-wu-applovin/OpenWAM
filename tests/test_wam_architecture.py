@@ -1618,68 +1618,6 @@ def test_base_generate_signature_takes_extra_pipeline_inputs():
         )
 
 
-def test_base_generate_dit_cache_reuses_joint_action_prediction(monkeypatch):
-    """A joint cache hit must skip the whole video/action forward."""
-
-    from openwam.deploy.optimizations.dit_cache import DiTVelocityCache
-    from openwam.model.architectures.base import BaseWAMArchitecture
-
-    monkeypatch.setattr(torch.compiler, "cudagraph_mark_step_begin", lambda: None)
-
-    class _Scheduler:
-        num_train_timesteps = 1000
-
-        @staticmethod
-        def flow_step(model_output, sigma, sigma_next, sample):
-            return sample + model_output * (sigma_next - sigma)
-
-    class _VideoBackbone(torch.nn.Module):
-        scheduler = _Scheduler()
-        external_encoder = None
-
-        @staticmethod
-        def preprocess_input_for_inference(**_kwargs):
-            return {"latents": torch.zeros(1, 1, 1, 1, 1)}
-
-    class _ActionBackbone(torch.nn.Module):
-        scheduler = _Scheduler()
-        action_dim = 3
-        bridge_layers = ()
-        uses_proprioception = False
-
-    class _Arch(BaseWAMArchitecture):
-        def __init__(self):
-            super().__init__(cfg=None)
-            self._device = torch.device("cpu")
-            self._dtype = torch.float32
-            self.video_backbone = _VideoBackbone()
-            self.action_backbone = _ActionBackbone()
-            self.forward_calls = 0
-
-        def forward(self, noisy_actions, action_timestep, **kwargs):  # noqa: ARG002
-            self.forward_calls += 1
-            return torch.ones_like(kwargs["latents"]), torch.ones_like(noisy_actions) * 2
-
-    arch = _Arch()
-    cache = DiTVelocityCache(cosine_threshold=0.0)
-    schedule = [(1000, 1000), (800, 800), (600, 600), (400, 400)]
-
-    result = arch.generate(
-        schedule=schedule,
-        prompt="",
-        num_frames=4,
-        action_num_frames=4,
-        seed=0,
-        dit_cache=cache,
-        decode_video=False,
-    )
-
-    assert arch.forward_calls == 2
-    assert cache.stats["total_steps"] == 3
-    assert cache.stats["total_skips"] == 1
-    assert result["actions"].shape == (3, 3)
-
-
 def test_base_generate_frozen_lag_stream_stays_in_forward_context(monkeypatch):
     """A sigma plateau (linear_offset delay) freezes a stream's *update* only: its
     tokens/timestep must stay in every forward, because v→a-visible attention
@@ -1726,20 +1664,9 @@ def test_base_generate_frozen_lag_stream_stays_in_forward_context(monkeypatch):
             forward_inputs.append((noisy_actions is not None, float(action_timestep.item())))
             return torch.zeros_like(kwargs["latents"]), torch.zeros_like(noisy_actions)
 
-    class _RecordingCache:
-        def __init__(self):
-            self.action_updates = []
-
-        def should_recompute(self, sigma, *, require_action=False):  # noqa: ARG002
-            return True
-
-        def update(self, velocity, sigma, action_velocity=None):  # noqa: ARG002
-            self.action_updates.append(action_velocity is not None)
-
     # linear_offset=0.5 shape: sigma_a plateaus at 1.0 for the first
     # two transitions, then catches up.
     schedule = [(1000.0, 1000.0), (750.0, 1000.0), (500.0, 1000.0), (250.0, 500.0), (0.0, 0.0)]
-    cache = _RecordingCache()
 
     result = _Arch().generate(
         schedule=schedule,
@@ -1747,7 +1674,6 @@ def test_base_generate_frozen_lag_stream_stays_in_forward_context(monkeypatch):
         num_frames=4,
         action_num_frames=4,
         seed=0,
-        dit_cache=cache,
         decode_video=False,
     )
 
@@ -1756,8 +1682,6 @@ def test_base_generate_frozen_lag_stream_stays_in_forward_context(monkeypatch):
     assert forward_inputs == [(True, 1000.0), (True, 1000.0), (True, 1000.0), (True, 500.0)]
     # The plateau gates only the update: action flow_steps once it moves.
     assert flow_steps == [(1.0, 0.5), (0.5, 0.0)]
-    # Plateau-step predictions are cached with the action branch present.
-    assert cache.action_updates == [True, True, True, True]
     assert result["actions"].shape == (3, 3)
 
 

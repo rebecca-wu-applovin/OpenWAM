@@ -1,390 +1,239 @@
-"""Deploy-side inference engine: the deployment adapter around ``architecture.generate``.
+"""InferenceEngine: one sparse-history yam_sharpa checkpoint behind a plain observation -> action-plan interface.
 
-``BaseInferenceEngine`` declares the engine interface; ``JointInferenceEngine``
-is the production implementation. The engine translates deploy config +
-per-request conditions into ``architecture.generate(...)`` arguments, builds
-the denoise schedule, and owns server-lifetime caches (prompt embeddings,
-VACE context). The actual denoising loop lives on the model side
-(``BaseWAMArchitecture.generate``).
+The engine owns the model and all of its I/O; callers (a server, an in-process script) never see tensors, the
+normalizer or the action representation. One :class:`Session` is one episode: it keeps that episode's observation
+history (:class:`ObsHistoryBuffer`), so sessions never share state.
+
+Per plan (``Session.plan``), the same functions the training dataset uses:
+Observations use the LeRobot dataset's feature names (what the model was trained on, and what a simulator's
+LeRobot-style preprocessor emits), one flat dict per step:
+    ``observation.images.<camera>`` uint8 (H, W, 3) for every camera of ``dataloader.camera_layout``,
+    ``observation.state`` (48,), ``camera_pose.ego_view`` (16,) row-major base_from_camera, ``joint_angles`` (56,)
+    (read for ``unify_*`` only), ``task`` str (the prompt, verbatim).
+
+  1. camera images -> one vstack canvas (``resize_camera_tile`` LANCZOS tiles + ``assemble_vstack_layout``);
+  2. record it in the history; take the H history observations (``history_rows``: clamped to the episode start);
+     ``history_layout: panel`` tiles the 4 past canvases into one 2x2 panel (``compose_history_panel``);
+  3. proprio of every history row in the frame-t camera (``encode_proprio_in_anchor_cam``), normalized;
+  4. ``prepare_sparse_condition`` + seeded ``sample`` -> the normalized action chunk;
+  5. unnormalize, decode ``*_rel`` chunks to absolute targets with the frame-t proprio, keep the first K steps;
+  6. split into wrist poses + fingertips / finger joints (``split_hand_targets``).
 """
 
-import inspect
 import logging
-import os
-from abc import ABC, abstractmethod
-from collections import OrderedDict
-from typing import Any, Optional
+from dataclasses import dataclass
 
+import numpy as np
 import torch
 
-from openwam.deploy.denoise_schedule import make_schedule, normalize_denoise_config
-from openwam.model.architectures.base import BaseWAMArchitecture
+from openwam.deploy.history_buffer import ObsHistoryBuffer
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PROMPT_EMBED_CACHE_MAXSIZE = 32
+# Action α-shift of backbones that leave ``shift_action`` unset: the pre-refactor deploy's value.
+DEFAULT_ACTION_SHIFT = 5.0
 
 
-def build_schedule(inf_cfg, architecture, conditions: dict):
-    """Denoise schedule of one request: deploy config, per-request overrides, the checkpoint's stream shifts.
+@dataclass(frozen=True)
+class EngineSpec:
+    """What a checkpoint serves; plain values only, so ``dataclasses.asdict`` can cross a process boundary."""
 
-    Args:
-        inf_cfg: ``cfg.inference`` (``denoise_mode`` / ``denoise_steps`` / async controls).
-        architecture: the WAM architecture (``video_scheduler`` / ``action_scheduler`` / backbone shifts).
-        conditions: request dict; ``denoise_mode`` / ``denoise_steps`` / ``lead_modality`` /
-            ``variance_shift_alpha`` / ``linear_offset`` / ``shift`` / ``shift_video`` override the config.
-
-    Returns: (schedule list of (t_video, t_action), denoise_steps int, action shift float).
-    """
-    denoise_mode = conditions.get("denoise_mode", getattr(inf_cfg, "denoise_mode", "sync"))
-    denoise_steps = conditions.get("denoise_steps", inf_cfg.denoise_steps)
-    lead_modality = conditions.get("lead_modality", getattr(inf_cfg, "lead_modality", "video"))
-    variance_shift_alpha = conditions.get("variance_shift_alpha", getattr(inf_cfg, "variance_shift_alpha", 1.0))
-    linear_offset = conditions.get("linear_offset", getattr(inf_cfg, "linear_offset", 0.0))
-    # Single source of truth for each stream's α-shift is the backbone
-    # property — ``action_backbone.shift_action`` and
-    # ``video_backbone.shift_video`` — set via the model yaml and saved in
-    # the checkpoint, so the training sigma buffer (set by
-    # ``init_training_schedulers`` via the same properties) and the
-    # inference trajectory match. Deploy carries no independent shift knob.
-    # ``conditions[...]`` allows a per-request override (smoke tests /
-    # ablations). ``getattr`` guards lightweight stub architectures.
-    _ab = getattr(architecture, "action_backbone", None)
-    shift = conditions.get("shift", getattr(_ab, "shift_action", None) if _ab is not None else None)
-    if shift is None:
-        shift = 5.0
-    _vb = getattr(architecture, "video_backbone", None)
-    shift_video = conditions.get(
-        "shift_video",
-        getattr(_vb, "shift_video", None) if _vb is not None else None,
-    )
-
-    schedule = make_schedule(
-        denoise_mode,
-        video_scheduler=architecture.video_scheduler,
-        action_scheduler=architecture.action_scheduler,
-        num_steps=denoise_steps,
-        shift=shift,
-        shift_video=shift_video,
-        lead=lead_modality,
-        alpha=variance_shift_alpha,
-        offset=linear_offset,
-    )
-    return schedule, denoise_steps, shift
+    ckpt: str                    # <run dir>/<checkpoint file>
+    action_mode: str             # dataloader.action_mode
+    action_dim: int              # D of the returned physical actions (48 fingertips_* / 62 unify_*)
+    hand_targets: str            # the plan's hand key: "tips" (fingertips_*) or "fingers" (unify_*)
+    chunk: int                   # actions the model generates per plan (dataloader.num_frames - 1)
+    steps_per_plan: int          # K, actions returned per plan = steps executed between two observations
+    action_fps: int              # dataloader.fps, rate of the actions (and of the robot's control steps)
+    history_offsets: tuple       # dataloader.history_offsets, in action steps
+    history_layout: str          # dataloader.history_layout (frames | panel)
+    camera_layout: tuple         # dataloader.camera_layout: the image keys of an observation, top to bottom
 
 
-class BaseInferenceEngine(ABC):
-    """Inference engine base class.
-
-    Concrete engines implement ``generate`` which accepts observation
-    conditions and produces video frames and/or action trajectories.
+class InferenceEngine:
+    """The loaded model + its I/O. Build with :meth:`from_config`; plan through :meth:`new_session`.
 
     Args:
-        cfg: Hydra config.
-        architecture: WAM architecture wrapping the action backbone.
-        action_backbone: Optional action backbone reference for implementations that still expose one.
+        architecture: the loaded WAM architecture (normalizer attached), eval mode.
+        normalizer: the checkpoint's action / proprio normalizer (``model_loader.build_normalizer``).
+        schedule: (t_video, t_action) denoise schedule (``make_schedule``), fixed for the engine's life.
+        spec: :class:`EngineSpec`.
+        height, width: canvas size (dataloader.height / width).
+        num_future_frames: F, future video frames the sampled latents cover (len(dataloader.future_offsets)).
+        seed: default episode seed (deploy.policy.seed).
+        decode_video: also decode the future video of every plan (debugging).
     """
 
-    require_architecture = False
+    def __init__(self, architecture, normalizer, schedule, spec: EngineSpec, *, height: int, width: int,
+                 num_future_frames: int, seed: int, decode_video: bool):
+        from openwam.dataloader.utils.yam_sharpa_repr import is_relative, is_unify
 
-    def __init__(self, cfg, architecture: Optional[BaseWAMArchitecture] = None, action_backbone=None):
-        if self.require_architecture and architecture is None:
-            raise ValueError("architecture is required")
-        self.cfg = cfg
-        self.architecture = architecture
-        self.action_backbone = action_backbone
+        self.architecture, self.normalizer, self.schedule, self.spec = architecture, normalizer, schedule, spec
+        self.height, self.width, self.num_future_frames = int(height), int(width), int(num_future_frames)
+        self.default_seed, self.decode_video = int(seed), bool(decode_video)
+        # Representation switches, resolved once from action_mode.
+        self.unify, self.relative = is_unify(spec.action_mode), is_relative(spec.action_mode)
+        self.panel = spec.history_layout == "panel"
 
-    @abstractmethod
-    def generate(self, conditions: dict) -> dict:
-        """Generate video and/or actions from conditions.
+    @classmethod
+    def from_config(cls, cfg) -> "InferenceEngine":
+        """Load the checkpoint named by ``cfg.deploy.ckpt``.
 
         Args:
-            conditions: dict with keys like ``prompt``, ``reference_image``,
-                ``context_video``, ``seed``, etc.
-
+            cfg: frozen cfg from :func:`openwam.deploy.config.build_deploy_cfg` (checkpoint cfg + ``deploy``).
         Returns:
-            dict with ``video`` (Tensor) and ``actions`` (Tensor).
+            InferenceEngine on ``cfg.deploy.server.device``.
         """
-        ...
+        from openwam.deploy.model_loader import DTYPES, build_normalizer, load_architecture
+        from openwam.model.denoise_schedule import make_schedule
 
+        dl, dep = cfg.dataloader, cfg.deploy
+        arch = load_architecture(cfg.model, dep.ckpt.dir, dep.ckpt.name,
+                                 dtype=DTYPES[str(cfg.training.mixed_precision)], device=dep.server.device)
+        normalizer = build_normalizer(dl, dep.ckpt.dir)
+        arch.attach_normalizer(normalizer)  # normalize_deploy_proprio reads it
+        # Both streams' α-shifts come from the checkpoint's backbones; the sampler config sets the trajectory.
+        shift = arch.action_backbone.shift_action
+        sm = dep.sampler
+        schedule = make_schedule(
+            sm.denoise_mode, video_scheduler=arch.video_scheduler, action_scheduler=arch.action_scheduler,
+            num_steps=sm.denoise_steps, shift=DEFAULT_ACTION_SHIFT if shift is None else shift,
+            shift_video=arch.video_backbone.shift_video, lead=sm.lead_modality, alpha=sm.variance_shift_alpha,
+            offset=sm.linear_offset)
+        spec = EngineSpec(
+            ckpt=f"{dep.ckpt.dir}/{dep.ckpt.name}", action_mode=str(dl.action_mode),
+            action_dim=_raw_dim(dl.action_mode), hand_targets=_hand_targets(dl.action_mode),
+            chunk=int(dl.num_frames) - 1,
+            steps_per_plan=int(dep.policy.steps_per_plan), action_fps=int(dl.fps),
+            history_offsets=tuple(int(o) for o in dl.history_offsets), history_layout=str(dl.history_layout),
+            camera_layout=tuple(str(c) for c in dl.camera_layout))
+        logger.info("[engine] %s", spec)
+        return cls(arch, normalizer, schedule, spec, height=dl.height, width=dl.width,
+                   num_future_frames=len(dl.future_offsets), seed=dep.policy.seed,
+                   decode_video=sm.decode_video)
 
-class _BoundedPromptEmbedCache(OrderedDict):
-    """LRU-bounded dict for ``prompt -> inputs_posi``."""
+    def new_session(self, seed=None) -> "Session":
+        """A new episode. seed: int sampling seed of every plan of the episode; None = ``deploy.policy.seed``."""
+        return Session(self, self.default_seed if seed is None else int(seed))
 
-    def __init__(self, maxsize: int = DEFAULT_PROMPT_EMBED_CACHE_MAXSIZE):
-        super().__init__()
-        self._maxsize = max(1, int(maxsize))
-        self._evict_warned = False
+    # -- one plan, called by Session ------------------------------------------------------------------------------
 
-    def __getitem__(self, key: Any) -> Any:
-        value = super().__getitem__(key)
-        self.move_to_end(key)
-        return value
+    def observation(self, obs: dict) -> dict:
+        """Client observation -> the record the history keeps.
 
-    def __setitem__(self, key: Any, value: Any) -> None:
-        if key in self:
-            self.move_to_end(key)
-        super().__setitem__(key, value)
-        while len(self) > self._maxsize:
-            # ``OrderedDict.popitem`` retrieves the value through ``self[key]``.
-            # Since ``__getitem__`` updates recency, that lookup runs after the
-            # key has been removed from the ordering map and raises ``KeyError``.
-            # Delete through the base implementation to bypass the override.
-            evicted_key = next(iter(self))
-            super().__delitem__(evicted_key)
-            if not self._evict_warned:
-                self._evict_warned = True
-                logger.warning("prompt_embed_cache exceeded maxsize=%d; evicted %r", self._maxsize, evicted_key)
-
-
-class JointInferenceEngine(BaseInferenceEngine):
-    """Joint video-action inference engine.
-
-    Wraps the package-native joint generation loop through the
-    :class:`BaseInferenceEngine` interface.
-
-    Args:
-        cfg: Hydra config (must contain ``cfg.inference``).
-        architecture: WAM architecture wrapping the action backbone.
-        action_backbone: Optional action backbone reference retained for base-class storage.
-    """
-
-    require_architecture = True
-
-    def __init__(
-        self,
-        cfg,
-        architecture: Optional[BaseWAMArchitecture] = None,
-        action_backbone=None,
-    ):
-        super().__init__(cfg, architecture=architecture, action_backbone=action_backbone)
-        normalize_denoise_config(getattr(cfg, "inference", None))
-
-        self._architecture_generate_accepts_extra_kwargs: Optional[bool] = None
-        self._architecture_generate_kwarg_names: Optional[set[str]] = None
-        self._architecture_generate_warned_dropped_kwargs: set[tuple[str, tuple[str, ...]]] = set()
-        self._init_optimizations()
-        self._init_cfg()
-
-    def _filter_architecture_generate_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
-        """Drop deploy-only kwargs the architecture's generate() cannot consume."""
-
-        if getattr(self, "_architecture_generate_kwarg_names", None) is None:
-            params = inspect.signature(self.architecture.generate).parameters
-            self._architecture_generate_accepts_extra_kwargs = any(
-                param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
-            )
-            self._architecture_generate_kwarg_names = {
-                name
-                for name, param in params.items()
-                if param.kind
-                in (
-                    inspect.Parameter.POSITIONAL_ONLY,
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    inspect.Parameter.KEYWORD_ONLY,
-                )
-            }
-        if self._architecture_generate_accepts_extra_kwargs:
-            return kwargs
-        accepted = self._architecture_generate_kwarg_names
-        dropped = {name: value for name, value in kwargs.items() if name not in accepted}
-        meaningful_dropped = tuple(
-            sorted(name for name, value in dropped.items() if not self._is_noop_dropped_generate_kwarg(name, value))
-        )
-        if meaningful_dropped:
-            warned = getattr(self, "_architecture_generate_warned_dropped_kwargs", set())
-            architecture_name = type(self.architecture).__name__
-            warning_key = (architecture_name, meaningful_dropped)
-            if warning_key not in warned:
-                warned.add(warning_key)
-                self._architecture_generate_warned_dropped_kwargs = warned
-                logger.warning(
-                    "%s.generate does not accept deploy kwarg(s) %s; dropping them for this request. "
-                    "Check deploy config for unsupported features such as CFG on specialized architectures.",
-                    architecture_name,
-                    ", ".join(meaningful_dropped),
-                )
-        return {name: value for name, value in kwargs.items() if name in accepted}
-
-    @staticmethod
-    def _is_noop_dropped_generate_kwarg(name: str, value: Any) -> bool:
-        """Return whether dropping an unsupported deploy kwarg preserves default behavior."""
-
-        if name == "cfg_scale":
-            try:
-                return float(value) == 1.0
-            except (TypeError, ValueError):
-                return False
-        if name == "cfg_merge":
-            return value is False
-        if name == "decode_video":
-            return value is True
-        if name == "profile":
-            return value is False
-        if name == "vace_cache":
-            return not bool(value)
-        if name == "prompt_embed_cache":
-            # None means the cache was disabled by config — dropping it is a no-op.
-            return value is None or (
-                isinstance(value, _BoundedPromptEmbedCache)
-                and len(value) == 0
-                and value._maxsize == DEFAULT_PROMPT_EMBED_CACHE_MAXSIZE
-            )
-        return value is None
-
-    def _init_optimizations(self):
-        """Read cfg.optimization and instantiate optimization components."""
-        optimization = getattr(self.cfg, "optimization", None)
-
-        # DiT velocity cache
-        self._dit_cache = None
-        if optimization and getattr(optimization, "dit_cache", None):
-            dc = optimization.dit_cache
-            if getattr(dc, "enabled", False):
-                from openwam.deploy.optimizations import DiTVelocityCache
-
-                self._dit_cache = DiTVelocityCache(
-                    cosine_threshold=getattr(dc, "cosine_threshold", 0.99),
-                    max_consecutive_skips=getattr(dc, "max_skips", 3),
-                )
-                logger.info("DiT velocity cache enabled (threshold=%.3f)", dc.cosine_threshold)
-
-        # torch.compile — ActionDiT, Video DiT, VAE
-        if optimization and getattr(optimization, "compile", None):
-            try:
-                self.architecture.apply_compile_optimizations(optimization.compile)
-            except Exception as e:
-                logger.warning("torch.compile optimization failed, continuing without: %s", e)
-
-        # VAE decode skip
-        self._decode_video = True
-        if optimization:
-            self._decode_video = getattr(optimization, "decode_video", True)
-
-        # Profiling
-        self._profile = os.environ.get("WAM_PROFILE", "0") == "1"
-
-        # VACE context cache for closed-loop reuse
-        self._vace_cache: dict = {}
-
-        # Prompt-keyed text embedding cache (bounded LRU). enabled: false turns
-        # it off entirely: the backbones treat a None cache as "never cache".
-        cache_enabled = True
-        cache_maxsize = DEFAULT_PROMPT_EMBED_CACHE_MAXSIZE
-        if optimization is not None:
-            cache_cfg = getattr(optimization, "prompt_embed_cache", None)
-            if cache_cfg is not None:
-                cache_enabled = bool(getattr(cache_cfg, "enabled", True))
-                cache_maxsize = int(getattr(cache_cfg, "maxsize", cache_maxsize))
-        if cache_enabled:
-            self._prompt_embed_cache = _BoundedPromptEmbedCache(maxsize=cache_maxsize)
-        else:
-            self._prompt_embed_cache = None
-            logger.info("prompt_embed_cache disabled by config")
-
-    def _init_cfg(self):
-        """Resolve Classifier-Free Guidance from cfg.inference (CosmosPredict25 only; cfg_scale=1.0 is a no-op).
-
-        The uncond embedding is built by the backbone's live encoder
-        (``_build_uncond_context`` → ``text_encoder("")``).
+        Args:
+            obs: LeRobot-named features: ``observation.images.<camera>`` uint8 (H, W, 3) for every
+                ``camera_layout`` key, ``observation.state`` (48,), ``camera_pose.ego_view`` (16,), ``joint_angles``
+                (56,) (``unify_*`` only), ``task`` str.
+        Returns:
+            dict ``canvas`` PIL (width x height), ``state`` (48,) float64, ``camera_pose`` (16,) float64,
+            ``joint_angles`` (56,) float64 (``unify_*``).
         """
-        inf_cfg = getattr(self.cfg, "inference", None)
-        self._cfg_scale: float = float(getattr(inf_cfg, "cfg_scale", 1.0)) if inf_cfg else 1.0
-        self._cfg_merge: bool = bool(getattr(inf_cfg, "cfg_merge", False)) if inf_cfg else False
-        if self._cfg_scale < 1.0:
-            raise ValueError(f"inference.cfg_scale must be >= 1.0; got {self._cfg_scale}.")
-        if self._cfg_scale > 1.0:
-            logger.info("CFG enabled: cfg_scale=%.3f cfg_merge=%s", self._cfg_scale, self._cfg_merge)
+        from PIL import Image
+
+        from openwam.dataloader.transforms.multiview import assemble_vstack_layout, resize_camera_tile
+
+        cams = self.spec.camera_layout
+        missing = [c for c in cams if c not in obs]
+        if missing:
+            raise ValueError(f"observation lacks {missing}; the checkpoint's cameras are {list(cams)}")
+        # Each camera straight to its tile with LANCZOS, then the training composer: byte-equal to training.
+        tile_h = self.height // len(cams)
+        tiles = {c: resize_camera_tile(Image.fromarray(np.asarray(obs[c], dtype=np.uint8)), tile_h,
+                                       self.width) for c in cams}
+        rec = {
+            "canvas": assemble_vstack_layout(tiles, list(cams), out_h=self.height, out_w=self.width),
+            # observation.state is float32 data; the pre-refactor server rounded it to float32 as well.
+            "state": np.asarray(obs["observation.state"], dtype=np.float32).astype(np.float64).reshape(-1),
+            "camera_pose": np.asarray(obs["camera_pose.ego_view"], dtype=np.float64).reshape(-1),
+        }
+        if self.unify:
+            rec["joint_angles"] = np.asarray(obs["joint_angles"], dtype=np.float64).reshape(-1)
+        return rec
 
     @torch.no_grad()
-    def generate(self, conditions: dict) -> dict:
-        """Generate video and/or actions from conditions.
+    def plan(self, window: list, prompt: str, seed: int) -> dict:
+        """Plan from the H history records of one step.
 
         Args:
-            conditions: dict with keys:
-                - prompt (str): text prompt
-                - vace_video (list[PIL.Image], optional): VACE conditioning video (Wan2.1-VACE only)
-                - first_frame_image (list[PIL.Image], optional): first frame of the
-                  observation window; used as TI2V first-frame condition on Wan2.2-TI2V
-                  or as VACE spatial reference on Wan2.1-VACE
-                - num_frames (int, optional): raw state/action window length;
-                  generated action chunk length is ``num_frames - 1``
-                - video_num_frames (int, optional): Wan video length after any
-                  training-time video_stride sub-sampling; defaults from cfg,
-                  then falls back to ``num_frames``
-                - height (int, optional): defaults from cfg
-                - width (int, optional): defaults from cfg
-                - seed (int, optional): random seed, default 42
-                - tiled (bool, optional): tiled VAE decoding, default True
-                - input_video_latents (Tensor, optional): precomputed video latents
-                - denoise_mode (str, optional): "sync" or "async"; "sync" ignores
-                  the three async controls below, including any inherited from cfg,
-                  so a request can downgrade to the sync trajectory on its own
-                - lead_modality (str, optional): "async" only; "action" or "video"
-                - variance_shift_alpha (float, optional): "async" only; lead curve shift
-                - linear_offset (float, optional): "async" only; lag start delay
-                - denoise_steps (int, optional): override num denoising steps
-
+            window: H records from :meth:`observation`, oldest first (``ObsHistoryBuffer.window()``).
+            prompt: str, the task prompt (fed to the model verbatim).
+            seed: int, seeds the video and action noise.
         Returns:
-            dict with ``video`` (list of PIL images or None) and ``actions`` (numpy array).
+            dict ``actions`` (K, D) physical absolute targets, ``wrist`` (K, 2, 4, 4) and ``tips`` (K, 2, 5, 3) or
+            ``fingers`` (K, 2, 22) (``split_hand_targets``); plus ``video`` (F future PIL canvases) with
+            ``deploy.sampler.decode_video``.
         """
-        inf_cfg = self.cfg.inference
-        schedule, denoise_steps, shift = build_schedule(inf_cfg, self.architecture, conditions)
-
-        # Reset dit cache for each generation
-        if self._dit_cache is not None:
-            self._dit_cache.reset()
-
-        # Deploy proprio: array-like in, normalized model-space tensor out.
-        proprio = conditions.get("proprio")
-        if proprio is None:
-            observation = conditions.get("observation") or {}
-            proprio = observation.get("state") if isinstance(observation, dict) else None
-        raw_proprio = proprio  # kept for action_decoder (relative → absolute)
-        if proprio is not None:
-            proprio = self.architecture.normalize_deploy_proprio(proprio)
-
-        action_num_frames = int(conditions.get("num_frames", getattr(inf_cfg, "num_frames", 49)))
-        video_num_frames = int(
-            conditions.get(
-                "video_num_frames",
-                getattr(inf_cfg, "video_num_frames", action_num_frames),
-            )
+        from openwam.dataloader.transforms.multiview import compose_history_panel
+        from openwam.dataloader.utils.yam_sharpa_repr import (
+            decode_action,
+            encode_proprio,
+            encode_proprio_in_anchor_cam,
+            split_hand_targets,
         )
 
-        generate_kwargs = self._filter_architecture_generate_kwargs(
-            {
-                "schedule": schedule,
-                "prompt": conditions.get("prompt", ""),
-                "vace_video": conditions.get("vace_video", None),
-                "first_frame_image": conditions.get("first_frame_image", None),
-                "num_frames": video_num_frames,
-                "action_num_frames": action_num_frames,
-                "height": conditions.get("height", getattr(inf_cfg, "height", 384)),
-                "width": conditions.get("width", getattr(inf_cfg, "width", 320)),
-                "seed": conditions.get("seed", 42),
-                "tiled": conditions.get("tiled", True),
-                "input_video_latents": conditions.get("input_video_latents", None),
-                "num_inference_steps": denoise_steps,
-                "shift": shift,
-                "dit_cache": self._dit_cache,
-                "decode_video": self._decode_video,
-                "profile": self._profile,
-                "vace_cache": self._vace_cache,
-                "prompt_embed_cache": self._prompt_embed_cache,
-                "proprio": proprio,
-                "cfg_scale": self._cfg_scale,
-                "cfg_merge": self._cfg_merge,
-            }
-        )
-        result = self.architecture.generate(**generate_kwargs)
-        # Optional raw-space post-processing (set by model_loader, e.g. yam_sharpa *_rel).
-        decoder = getattr(self.architecture, "action_decoder", None)
-        if decoder is not None and result.get("actions") is not None:
-            result["actions"] = decoder(result["actions"], raw_proprio)
+        arch, mode = self.architecture, self.spec.action_mode
+        state = np.stack([r["state"] for r in window])
+        cam = np.stack([r["camera_pose"] for r in window])
+        joints = np.stack([r["joint_angles"] for r in window]) if self.unify else None
+        # Proprio of every history row in the frame-t camera (the action's frame), as the dataset builds it.
+        raw = encode_proprio_in_anchor_cam(mode, state, joints, cam, cam[-1])
+        proprio = arch.normalize_deploy_proprio(raw).unsqueeze(0)  # (1, H, D')
+        frames = [r["canvas"] for r in window]
+        if self.panel:
+            frames = [compose_history_panel(frames[:4])] + frames[4:]  # (2x2 panel of the past, frame t)
+        cond = arch.prepare_sparse_condition([frames], [prompt], proprio, num_future_frames=self.num_future_frames)
+        b, z, h, hl, wl = cond["first_frame_latents"].shape
+        t_lat = h + arch.video_backbone.num_future_latents(self.num_future_frames)
+        latents, actions = arch.sample(cond, self.schedule, latent_shape=(b, z, t_lat, hl, wl),
+                                       action_shape=(1, self.spec.chunk, arch.action_dim), seed=seed)
 
-        # Attach optimization stats if profiling
-        if self._profile and self._dit_cache is not None:
-            result["dit_cache_stats"] = self._dit_cache.stats
+        actions = self.normalizer.unnormalize(actions[0].float().cpu().numpy())
+        if self.relative:
+            # Deltas w.r.t. frame t -> absolute targets, composed with the frame-t raw proprio.
+            raw_t = encode_proprio(mode, state[-1], None if joints is None else joints[-1])[0]
+            actions = decode_action(mode, actions, raw_t)
+        actions = actions[: self.spec.steps_per_plan]
+        out = {"actions": actions, **split_hand_targets(mode, actions)}
+        if self.decode_video:
+            out["video"] = arch.video_backbone.decode_video(latents[:, :, h:])
+        return out
 
-        return result
+
+class Session:
+    """One episode of one client: its observation history and seed. Never shared between clients.
+
+    Args:
+        engine: the :class:`InferenceEngine`.
+        seed: int, sampling seed of every plan of this episode.
+    """
+
+    def __init__(self, engine: InferenceEngine, seed: int):
+        self.engine, self.seed = engine, int(seed)
+        s = engine.spec
+        self.history = ObsHistoryBuffer(s.history_offsets, action_fps=s.action_fps, steps_per_obs=s.steps_per_plan)
+
+    def plan(self, obs: dict) -> dict:
+        """Record this step's observation and plan the K actions to execute before the next one.
+
+        Args:
+            obs: one observation (:meth:`InferenceEngine.observation`).
+        Returns:
+            as :meth:`InferenceEngine.plan`.
+        """
+        self.history.append(self.engine.observation(obs))
+        return self.engine.plan(self.history.window(), str(obs["task"]), self.seed)
+
+
+def _hand_targets(action_mode) -> str:
+    """action_mode: str. Returns: the key ``split_hand_targets`` puts the hand under ("fingers" / "tips")."""
+    from openwam.dataloader.utils.yam_sharpa_repr import is_unify
+
+    return "fingers" if is_unify(str(action_mode)) else "tips"
+
+
+def _raw_dim(action_mode) -> int:
+    """action_mode: str. Returns: D, width of the physical action (``yam_sharpa_repr.raw_dim``)."""
+    from openwam.dataloader.utils.yam_sharpa_repr import raw_dim
+
+    return raw_dim(str(action_mode))

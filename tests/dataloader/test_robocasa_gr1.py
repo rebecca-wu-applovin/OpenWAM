@@ -31,7 +31,7 @@ from openwam.dataloader.utils.stats_computation.robocasa_gr1_stats_computation i
     _compute_global_stats,
     _iter_bucket_arrays,
 )
-from openwam.deploy.model_loader import _build_normalizer, _UnifyAwareNormalizer
+from openwam.deploy.model_loader import _UnifyAwareNormalizer
 from openwam.train.utils.checkpointing import save_normalization_stats, verify_resume_normalization_stats
 
 EP_LENGTH = 8
@@ -238,23 +238,17 @@ def test_unify_normalizes_raw_eef_before_mapping(tmp_path: Path):
     deploy_stats = np.load(ds.normalization_stats_path, allow_pickle=True).item()
     assert {"eef", "eef_state", "robocasa_gr1_stats_schema"} <= set(deploy_stats)
     assert deploy_stats["eef"]["mean"].shape == (EEF33_DIM,)
-    cfg = OmegaConf.create(
-        {
-            "dataloader": {
-                "normalize_mode": "min-max",
-                "action_mode": "eef",
-                "unify_action": True,
-                "unify_action_map": ["0-8", "10-15", "34-42", "44-49", "68-70"],
-            }
-        }
-    )
+    from openwam.dataloader.transforms.normalize import Normalizer, load_mode_stats
+    from openwam.dataloader.utils.unify_action import UNIFY_DIM, parse_unify_spec
     from openwam.train.utils.checkpointing import save_normalization_stats
 
     ckpt_dir = tmp_path / "fake_ckpt"
     ckpt_dir.mkdir()
     save_normalization_stats(str(ckpt_dir), ds)
-    normalizer = _build_normalizer(cfg, str(ckpt_dir))
-    assert isinstance(normalizer, _UnifyAwareNormalizer)
+    # The deploy inverse of a unify checkpoint: the saved eef block (+ eef_state) wrapped with the scatter map.
+    stats = load_mode_stats(str(ckpt_dir / "normalization_stats.npy"), "eef")
+    dst = parse_unify_spec(["0-8", "10-15", "34-42", "44-49", "68-70"], UNIFY_DIM)
+    normalizer = _UnifyAwareNormalizer(Normalizer(mode="min_max", stats=stats), dst, UNIFY_DIM)
     raw = ds._raw_action(ds._load_data_table(0, 0).to_pandas())[:4]
     np.testing.assert_allclose(normalizer.unnormalize(sample["action"].numpy()), np.clip(raw, 0, 1), atol=1e-5)
     np.testing.assert_allclose(normalizer.normalize(np.array([[0.1] * EEF33_DIM]))[0, 0], -0.8, atol=1e-6)

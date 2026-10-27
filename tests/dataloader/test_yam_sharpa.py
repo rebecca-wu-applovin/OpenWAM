@@ -153,6 +153,7 @@ def _cfg(sources: dict, **overrides):
         "height": 480,
         "width": 320,
         "camera_layout": [EGO, CHEST],
+        "fps": 20,  # must equal the synthetic source's meta/info.json fps
         "seed": 0,
     }
     cfg.update(overrides)
@@ -435,12 +436,13 @@ def test_repo_config_resolves_stats_path_per_mode():
 
 @pytest.mark.parametrize("mode", R.ACTION_REPRS)
 def test_deploy_normalizer_and_decoder(source, tmp_path, mode):
-    from openwam.deploy.model_loader import _build_action_decoder, _build_normalizer, _UnifyAwareNormalizer
+    """Train-time normalized sample -> deploy build_normalizer + decode_action == the absolute target."""
+    from openwam.deploy.model_loader import _UnifyAwareNormalizer, build_normalizer
 
     root, eps = source
     save_stats(compute_yam_sharpa_stats([root], mode, num_frames=5, workers=1), tmp_path / "normalization_stats.npy")
-    cfg = OmegaConf.create({"dataloader": {"type": "yam_sharpa", "action_mode": mode, "normalize_mode": "min-max"}})
-    norm = _build_normalizer(cfg, str(tmp_path))
+    dl = OmegaConf.create({"type": "yam_sharpa", "action_mode": mode, "normalize_mode": "min-max"})
+    norm = build_normalizer(dl, str(tmp_path))
     D = R.raw_dim(mode)
     if R.is_unify(mode):
         assert isinstance(norm, _UnifyAwareNormalizer)
@@ -460,10 +462,9 @@ def test_deploy_normalizer_and_decoder(source, tmp_path, mode):
     raw_proprio = R.encode_proprio(mode, ep["state"][0], ep["joints"][0])[0]
     np.testing.assert_allclose(norm.normalize(raw_proprio), s["proprio"][0].numpy(), atol=1e-5)
     actions = norm.unnormalize(s["action"].numpy())
-    decoder = _build_action_decoder(cfg)
-    assert (decoder is None) == (not R.is_relative(mode))
-    if decoder is not None:
-        actions = decoder(actions, raw_proprio)
+    if R.is_relative(mode):
+        # *_rel: deltas w.r.t. frame t, composed with the frame-t raw proprio (as InferenceEngine.plan does).
+        actions = R.decode_action(mode, actions, raw_proprio)
     abs_mode = mode.replace("_rel", "_abs")
     want = R.encode_action_pairs(
         abs_mode,
@@ -477,44 +478,60 @@ def test_deploy_normalizer_and_decoder(source, tmp_path, mode):
     np.testing.assert_allclose(actions, want, atol=1e-4)
 
 
-def test_deploy_obs_preprocess_vstack():
-    from openwam.deploy.obs_preprocess import ObsPreprocessor, ObsValidationError
+def _deploy_engine(height: int, width: int):
+    """An InferenceEngine with no model: enough for ``observation`` (canvas + state record), which never runs it.
 
-    cfg = OmegaConf.create(
-        {
-            "dataloader": {
-                "multiview": True,
-                "multiview_layout": "vstack",
-                "camera_layout": [EGO, CHEST],
-                "height": 480,
-                "width": 320,
-            }
-        }
+    Args:
+        height, width: canvas size (dataloader.height / width).
+    Returns:
+        InferenceEngine over the [EGO, CHEST] vstack layout, fingertips_abs.
+    """
+    from openwam.deploy.engine import EngineSpec, InferenceEngine
+
+    spec = EngineSpec(
+        ckpt="",
+        action_mode="fingertips_abs",
+        action_dim=48,
+        hand_targets="tips",
+        chunk=4,
+        steps_per_plan=4,
+        action_fps=20,
+        history_offsets=(0,),
+        history_layout="frames",
+        camera_layout=(EGO, CHEST),
     )
-    pre = ObsPreprocessor.from_cfg(cfg)
-    ego = Image.new("RGB", (640, 480), CAM_COLORS[EGO])
-    chest = Image.new("RGB", (640, 480), CAM_COLORS[CHEST])
-    for imgs in ({EGO: ego, CHEST: chest}, {"head_camera": ego, "left_wrist_camera": chest}):
-        out = np.asarray(pre.preprocess({"images": dict(imgs), "state": [0.0] * 48})["image"])
-        assert out.shape == (480, 320, 3)
-        assert (out[:240] == CAM_COLORS[EGO]).all() and (out[240:] == CAM_COLORS[CHEST]).all()
-    with pytest.raises(ObsValidationError, match="requires every camera"):
-        pre.preprocess({"images": {EGO: ego}})
+    return InferenceEngine(
+        None, None, None, spec, height=height, width=width, num_future_frames=1, seed=0, decode_video=False
+    )
 
 
-def test_deploy_obs_preprocess_vstack_matches_training_resize():
+def _obs(images: dict) -> dict:
+    """images: {camera: uint8 (H, W, 3)}. Returns: one client observation around them (zero state / camera pose)."""
+    return {**images, "observation.state": np.zeros(48), "camera_pose.ego_view": np.eye(4).reshape(-1), "task": "p"}
+
+
+def test_deploy_observation_vstack():
+    """observation(): each layout camera fills its vstack tile; a missing layout camera is rejected."""
+    engine = _deploy_engine(480, 320)
+    ego = np.full((480, 640, 3), CAM_COLORS[EGO], np.uint8)
+    chest = np.full((480, 640, 3), CAM_COLORS[CHEST], np.uint8)
+    rec = engine.observation(_obs({EGO: ego, CHEST: chest}))
+    out = np.asarray(rec["canvas"])
+    assert out.shape == (480, 320, 3)
+    assert (out[:240] == CAM_COLORS[EGO]).all() and (out[240:] == CAM_COLORS[CHEST]).all()
+    assert rec["state"].shape == (48,) and rec["camera_pose"].shape == (16,) and "joint_angles" not in rec
+    with pytest.raises(ValueError, match="lacks"):
+        engine.observation(_obs({EGO: ego}))
+
+
+def test_deploy_observation_vstack_matches_training_resize():
     """Deploy canvas == training canvas: each camera LANCZOS-resized to its tile (as the decode does), then stacked."""
     from openwam.dataloader.transforms.multiview import assemble_vstack_layout
-    from openwam.deploy.obs_preprocess import ObsPreprocessor
 
-    cfg = OmegaConf.create(
-        {"dataloader": {"multiview": True, "multiview_layout": "vstack", "camera_layout": [EGO, CHEST],
-                        "height": 384, "width": 224}}
-    )
     rng = np.random.default_rng(0)
-    native = {c: Image.fromarray(rng.integers(0, 256, (480, 640, 3), dtype=np.uint8)) for c in (EGO, CHEST)}
-    deploy = np.asarray(ObsPreprocessor.from_cfg(cfg).preprocess({"images": dict(native), "state": [0.0] * 48})["image"])
+    native = {c: rng.integers(0, 256, (480, 640, 3), dtype=np.uint8) for c in (EGO, CHEST)}
+    deploy = np.asarray(_deploy_engine(384, 224).observation(_obs(dict(native)))["canvas"])
     # Training: decode_video_frames resizes each camera to (192, 224) with LANCZOS, then assemble_vstack_layout.
-    tiles = {c: im.resize((224, 192), Image.LANCZOS) for c, im in native.items()}
+    tiles = {c: Image.fromarray(im).resize((224, 192), Image.LANCZOS) for c, im in native.items()}
     train = np.asarray(assemble_vstack_layout(tiles, [EGO, CHEST], out_h=384, out_w=224))
     assert np.array_equal(deploy, train)

@@ -158,7 +158,7 @@ class TrainVisualizer:
             the predicted frames only (pixels in [0, 1]; legacy layout skips the conditioning frame 0),
             ``action_mse`` float and ``pred_actions`` (K, A) in normalized space, ``caption`` str.
         """
-        from openwam.deploy.denoise_schedule import make_schedule
+        from openwam.model.denoise_schedule import make_schedule
 
         s = self.sample
         ab, vb = getattr(arch, "action_backbone", None), getattr(arch, "video_backbone", None)

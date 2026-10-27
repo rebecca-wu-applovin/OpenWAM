@@ -23,8 +23,8 @@ from __future__ import annotations
 
 import torch
 
-from openwam.deploy.denoise_schedule import make_schedule, schedule_sync
 from openwam.model.action_backbone.scheduler import ActionScheduler
+from openwam.model.denoise_schedule import make_schedule, schedule_sync
 from openwam.model.video_backbone.wan.shared.diffusion import FlowMatchScheduler
 
 

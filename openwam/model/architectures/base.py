@@ -1432,7 +1432,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
         shift: float = 5.0,
         tile_size: tuple = None,
         tile_stride: tuple = None,
-        dit_cache=None,
         decode_video: bool = True,
         profile: bool = False,
         vace_cache: Optional[dict] = None,
@@ -1479,17 +1478,11 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         t0 = time.time()
 
-        # §15 — validate CFG up front. CFG vs dit_cache (§15.D6): cond/uncond
-        # use the same cache key, so re-running uncond off a cond-tagged hit
-        # would silently corrupt the velocity prediction. MVP keeps it simple
-        # — disable the cache whenever CFG is on; future work can add a
-        # (cond, uncond) slot. CFG is applied by the denoising loop below, not
+        # §15 — validate CFG up front. CFG is applied by the denoising loop below, not
         # forwarded to the backbone preprocess (Wan does no CFG at inference).
         cfg_scale_f = float(cfg_scale)
         if cfg_scale_f < 1.0:
             raise ValueError(f"cfg_scale must be >= 1.0; got {cfg_scale!r}.")
-        if cfg_scale_f > 1.0:
-            dit_cache = None
 
         action_num_frames = int(action_num_frames if action_num_frames is not None else num_frames)
 
@@ -1561,7 +1554,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
             inputs_shared,
             action_latents,
             inactive_action_dims=inactive_action_dims,
-            dit_cache=dit_cache,
             cfg_scale=cfg_scale_f,
             cfg_merge=bool(cfg_merge),
         )
@@ -1594,7 +1586,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
         action_latents: Tensor,
         *,
         inactive_action_dims: Optional[Tensor] = None,
-        dit_cache=None,
         cfg_scale: float = 1.0,
         cfg_merge: bool = False,
     ) -> Tensor:
@@ -1606,7 +1597,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 in the dict, the ``first_frame_latents`` clean prefix (B, C, H, h, w) is re-imposed each step.
             action_latents: (B, K, A) initial action noise.
             inactive_action_dims: (A,) index of unified-action dims kept on the analytic noise path, or None.
-            dit_cache / cfg_scale / cfg_merge: as in :meth:`generate`.
+            cfg_scale / cfg_merge: as in :meth:`generate`.
 
         Returns: (B, K, A) denoised actions (normalized space); the final video latents are in
             ``inputs_shared["latents"]``.
@@ -1642,38 +1633,25 @@ class BaseWAMArchitecture(ABC, nn.Module):
             v_timestep = torch.tensor([t_v], dtype=dtype, device=device)
             a_timestep = torch.tensor([t_a], dtype=dtype, device=device)
 
-            if (
-                dit_cache is not None
-                and video_stepping
-                and not dit_cache.should_recompute(sigma_v, require_action=action_stepping)
-            ):
-                # Reuse cached predictions from the previous joint forward.
-                # Joint denoising can only skip the whole DiT call when the
-                # action prediction was cached together with video prediction.
-                noise_pred = dit_cache.get_cached()
-                action_noise_pred = dit_cache.get_cached_action() if action_stepping else None
+            if cfg_scale_f > 1.0:
+                # _forward_with_cfg runs its own cudagraph_mark_step_begin()
+                # before each inner forward (1 for cfg_merge, 2 for sequential).
+                noise_pred, action_noise_pred = self._forward_with_cfg(
+                    action_latents=action_latents,
+                    a_timestep=a_timestep,
+                    inputs_shared=inputs_shared,
+                    v_timestep=v_timestep,
+                    cfg_scale=cfg_scale_f,
+                    cfg_merge=bool(cfg_merge),
+                )
             else:
-                if cfg_scale_f > 1.0:
-                    # _forward_with_cfg runs its own cudagraph_mark_step_begin()
-                    # before each inner forward (1 for cfg_merge, 2 for sequential).
-                    noise_pred, action_noise_pred = self._forward_with_cfg(
-                        action_latents=action_latents,
-                        a_timestep=a_timestep,
-                        inputs_shared=inputs_shared,
-                        v_timestep=v_timestep,
-                        cfg_scale=cfg_scale_f,
-                        cfg_merge=bool(cfg_merge),
-                    )
-                else:
-                    torch.compiler.cudagraph_mark_step_begin()
-                    noise_pred, action_noise_pred = self.forward(
-                        action_latents,
-                        a_timestep,
-                        **inputs_shared,
-                        timestep=v_timestep,
-                    )
-                if dit_cache is not None and video_stepping:
-                    dit_cache.update(noise_pred, sigma_v, action_noise_pred)
+                torch.compiler.cudagraph_mark_step_begin()
+                noise_pred, action_noise_pred = self.forward(
+                    action_latents,
+                    a_timestep,
+                    **inputs_shared,
+                    timestep=v_timestep,
+                )
 
             if video_stepping:
                 new_latents = inputs_shared["latents"] + noise_pred * (sigma_v_next - sigma_v)

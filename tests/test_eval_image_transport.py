@@ -10,7 +10,6 @@ import pytest
 from PIL import Image
 
 from benchmarks.utils import encode_numpy_b64, resize_for_lshape_slot
-from openwam.deploy.obs_preprocess import ObsPreprocessor
 
 
 def _random_rgb(height: int, width: int, seed: int) -> np.ndarray:
@@ -42,32 +41,6 @@ def test_eval_slot_resize_is_exact_pillow_lanczos(slot, expected_size):
     expected = np.asarray(Image.fromarray(source).resize(expected_size, Image.Resampling.LANCZOS))
     assert actual.shape == (expected_size[1], expected_size[0], 3)
     np.testing.assert_array_equal(actual, expected)
-
-
-def test_lanczos_png_server_composition_is_pixel_exact_for_two_views():
-    head = resize_for_lshape_slot(_random_rgb(256, 256, seed=1), "head_camera")
-    wrist = resize_for_lshape_slot(_random_rgb(256, 256, seed=2), "left_wrist_camera")
-    preprocessor = ObsPreprocessor(
-        multiview=True,
-        camera_layout=["head", "left", "right"],
-        img_height=384,
-        img_width=320,
-    )
-    result = preprocessor.preprocess(
-        {
-            "images": {
-                "head_camera": encode_numpy_b64(head),
-                "left_wrist_camera": encode_numpy_b64(wrist),
-                "right_wrist_camera": None,
-            },
-            "prompt": "native prompt",
-        }
-    )
-
-    expected = np.zeros((384, 320, 3), dtype=np.uint8)
-    expected[:256, :] = head
-    expected[256:, :160] = wrist
-    np.testing.assert_array_equal(np.asarray(result["image"]), expected)
 
 
 def test_slot_resize_rejects_unknown_slot():

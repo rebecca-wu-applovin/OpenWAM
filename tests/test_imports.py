@@ -42,30 +42,29 @@ def test_import_data_init():
     )
 
 
-def test_import_inference_base():
-    from openwam.deploy.engine import BaseInferenceEngine  # noqa: F401
+def test_import_inference_engine():
+    """The deploy engine module exposes the engine, its spec and the per-episode session."""
+    from openwam.deploy.engine import EngineSpec, InferenceEngine, Session  # noqa: F401
 
-    assert hasattr(BaseInferenceEngine, "generate")
+    assert hasattr(InferenceEngine, "from_config") and hasattr(Session, "plan")
 
 
 def test_import_inference_schedule():
-    from openwam.deploy.denoise_schedule import (  # noqa: F401
+    from openwam.model.denoise_schedule import (  # noqa: F401
         Schedule,
         make_schedule,
         schedule_sync,
     )
 
 
-def test_import_inference_joint_engine():
-    from openwam.deploy.engine import JointInferenceEngine  # noqa: F401
-
-
 def test_import_inference_init():
+    """The deploy package re-exports the engine and the deploy-config builders."""
     from openwam.deploy import (  # noqa: F401
-        BaseInferenceEngine,
-        JointInferenceEngine,
-        Schedule,
-        make_schedule,
+        EngineSpec,
+        InferenceEngine,
+        Session,
+        build_deploy_cfg,
+        check_deploy,
     )
 
 
