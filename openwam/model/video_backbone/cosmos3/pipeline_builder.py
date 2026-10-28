@@ -436,6 +436,12 @@ def build_cosmos3_pipeline(
     max_text_tokens = int(_cfg_get(cfg, "max_text_tokens", 512))
     if max_text_tokens < 8:
         raise ValueError(f"cosmos3_edge max_text_tokens must be >= 8, got {max_text_tokens}.")
+    # Fixed und pad length; null (and configs saved before this key) pads to the batch max.
+    text_pad_length = _cfg_get(cfg, "text_pad_length")
+    if text_pad_length is not None:
+        text_pad_length = int(text_pad_length)
+        if text_pad_length < 8:
+            raise ValueError(f"cosmos3_edge text_pad_length must be >= 8 or null, got {text_pad_length}.")
     text_dropout = float(_cfg_get(cfg, "text_encoder_dropout", 0.0))
     if not 0.0 <= text_dropout <= 1.0:
         raise ValueError(f"cosmos3_edge text_encoder_dropout must be in [0, 1], got {text_dropout!r}.")
@@ -575,6 +581,7 @@ def build_cosmos3_pipeline(
         duration_template=duration_template,
         clip_fps=clip_fps,
         max_text_tokens=max_text_tokens,
+        text_pad_length=text_pad_length,
         text_dropout_p=text_dropout,
         text_dropout_seed=dropout_seed,
         **geometry,

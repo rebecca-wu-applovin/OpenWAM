@@ -19,6 +19,10 @@ shift_video: 5.0
 use_system_prompt: false
 prompt_templates: true    # duration + resolution metadata sentences in the prompt
 max_text_tokens: 512
+# Every prompt is right-padded (and masked) to this many und tokens in training, vis
+# and deploy, so the vision mRoPE t-offset (pad length + 15000) never depends on the
+# batch. A longer prompt raises. null pads to the batch max (runs before 2026-10-28).
+text_pad_length: 128
 
 # Assumed clip frame rate for the duration sentence + vision mRoPE temporal
 # scaling (inert while it equals the model's base_fps of 24). Set the real rate

@@ -5,15 +5,16 @@ assembly (``_tokenize`` / ``_add_special_tokens`` / ``get_3d_mrope_ids_*`` /
 ``_prepare_text_segment`` / ``_prepare_vision_segment`` at diffusers @6ad35739),
 reshaped for OpenWAM's uniform-shape batches:
 
-- One prompt per batch item; und token lists are right-padded to the batch max
+- One prompt per batch item; und token lists are right-padded to one length
   and masked (the und stream is causal, so right padding never contaminates
   real tokens, and padded keys are masked out of both attention pathways).
+  The backbone picks that length: the fixed ``text_pad_length`` from config, or
+  the batch max when it is null.
 - The vision temporal offset is uniform across the batch:
-  ``max(und_len) + unified_3d_mrope_temporal_modality_margin``. The native
-  pipeline uses each sample's own ``und_len``; with the 15000-token margin the
-  difference is a batch-constant shift of a few tokens on the T axis and it
-  makes the gen rotary shareable across the batch. For B=1 (deploy and the
-  golden-parity replay) this is exactly the native offset.
+  ``padded und_len + unified_3d_mrope_temporal_modality_margin``. The native
+  pipeline uses each sample's own ``und_len``. With a fixed pad length the
+  offset is the same in training, vis and deploy for every batch; with the
+  batch max it shifts by a few tokens with the batch (native only at B=1).
 
 Pure torch + stdlib — the tokenizer object is passed in, so importing this
 module stays CPU-CI safe.
@@ -193,9 +194,14 @@ def vision_mrope_positions(
 
 
 def pad_und_batch(
-    ids_per_sample: Sequence[Sequence[int]], *, pad_token_id: int
+    ids_per_sample: Sequence[Sequence[int]], *, pad_token_id: int, length: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Right-pad per-sample und token lists to the batch max.
+    """Right-pad per-sample und token lists to ``length``.
+
+    Args:
+        ids_per_sample: B token-id lists, each at most ``length`` long.
+        pad_token_id: id written into the padded slots.
+        length: L, the padded length of every row.
 
     Returns ``(input_ids (B, L) long, und_mask (B, L) bool — True at real tokens,
     seq_lens (B,) long)``.
@@ -203,9 +209,11 @@ def pad_und_batch(
     if not ids_per_sample:
         raise ValueError("pad_und_batch needs at least one sample.")
     lens = [len(ids) for ids in ids_per_sample]
-    max_len = max(lens)
-    batch = torch.full((len(ids_per_sample), max_len), int(pad_token_id), dtype=torch.long)
-    mask = torch.zeros((len(ids_per_sample), max_len), dtype=torch.bool)
+    # Truncating here would silently drop prompt text; the caller must size L.
+    if max(lens) > length:
+        raise ValueError(f"pad_und_batch: a prompt has {max(lens)} und tokens, more than the pad length {length}.")
+    batch = torch.full((len(ids_per_sample), length), int(pad_token_id), dtype=torch.long)
+    mask = torch.zeros((len(ids_per_sample), length), dtype=torch.bool)
     for i, ids in enumerate(ids_per_sample):
         batch[i, : len(ids)] = torch.tensor(list(ids), dtype=torch.long)
         mask[i, : len(ids)] = True

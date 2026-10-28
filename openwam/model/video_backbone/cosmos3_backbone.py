@@ -75,6 +75,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         duration_template: bool = True,
         clip_fps: float = _DEFAULT_FPS,
         max_text_tokens: int = 512,
+        text_pad_length: Optional[int] = None,
         text_dropout_p: float = 0.0,
         text_dropout_seed: Optional[int] = None,
     ) -> None:
@@ -112,6 +113,9 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         # per call via the ``fps`` kwarg.
         self._clip_fps = float(clip_fps)
         self._max_text_tokens = int(max_text_tokens)
+        # Fixed und pad length (None = pad to the batch max). It also sets the vision
+        # mRoPE t-offset, so a fixed value keeps that offset batch-independent.
+        self._text_pad_length = None if text_pad_length is None else int(text_pad_length)
         if not 0.0 <= float(text_dropout_p) <= 1.0:
             raise ValueError(f"text_dropout_p must be in [0, 1]; got {text_dropout_p!r}.")
         self._text_dropout_p = float(text_dropout_p)
@@ -250,6 +254,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             duration_template=getattr(holder, "duration_template", True),
             clip_fps=getattr(holder, "clip_fps", _DEFAULT_FPS),
             max_text_tokens=holder.max_text_tokens,
+            text_pad_length=holder.text_pad_length,
             text_dropout_p=holder.text_dropout_p,
             text_dropout_seed=holder.text_dropout_seed,
         )
@@ -336,14 +341,15 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             for t in texts
         ]
         pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-        input_ids, und_mask, seq_lens = text_pack.pad_und_batch(ids, pad_token_id=int(pad_id))
+        pad_len = self._text_pad_length if self._text_pad_length is not None else max(len(i) for i in ids)
+        input_ids, und_mask, seq_lens = text_pack.pad_und_batch(ids, pad_token_id=int(pad_id), length=pad_len)
         input_ids = input_ids.to(self.device)
         # Whether any prompt is padded is host-side knowledge (Python list
         # lengths), so decide it here and hand ``None`` down when there is no
         # padding — that is what keeps SDPA on a fused kernel and keeps the
-        # compiled MoT graph free of a ``.all()`` device sync. Every B=1 request
-        # and any uniform-length batch takes this path.
-        und_mask = und_mask.to(self.device) if len(set(len(i) for i in ids)) > 1 else None
+        # compiled MoT graph free of a ``.all()`` device sync. With the batch-max
+        # pad, every B=1 request and any uniform-length batch takes this path.
+        und_mask = und_mask.to(self.device) if any(len(i) < pad_len for i in ids) else None
 
         net = self.dit
         float_pos = bool(net.config.enable_fps_modulation)

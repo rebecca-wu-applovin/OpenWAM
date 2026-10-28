@@ -402,7 +402,7 @@ def test_padding_gate_changes_the_padded_sample_only():
     net = vb.dit
     tok = vb._require_tokenizer()
     ids_list = [text_pack.tokenize_prompt(tok, t, max_length=512) for t in ("abcd", "ef")]
-    input_ids, real_gate, _ = text_pack.pad_und_batch(ids_list, pad_token_id=int(tok.pad_token_id))
+    input_ids, real_gate, _ = text_pack.pad_und_batch(ids_list, pad_token_id=int(tok.pad_token_id), length=max(map(len, ids_list)))
     und_len = input_ids.shape[1]
     torch.manual_seed(3)
     lat = torch.randn(2, MINI["latent_channel"], 2, 2, 2)
