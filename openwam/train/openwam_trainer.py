@@ -106,8 +106,8 @@ class OpenWAMTrainer:
         if self._ckpt_source_dir is not None:
             from openwam.train.utils.ckpt_model_loader import (
                 build_architecture_from_ckpt_dir,
+                check_resume_cfg,
                 propagate_component_specs,
-                warn_live_model_cfg_ignored,
             )
 
             # Finetune starts a NEW run: the ckpt config is only the
@@ -116,7 +116,7 @@ class OpenWAMTrainer:
             # the architecture built here and the config save_config() writes to
             # the new run dir are the same one. Resume continues ONE run whose
             # config.yaml is already on disk and is reused untouched, so there the
-            # ckpt config stays authoritative and divergence is only reported.
+            # ckpt config stays authoritative and any divergence raises.
             resolved_arch, self.architecture, ckpt_cfg = build_architecture_from_ckpt_dir(
                 self._ckpt_source_dir,
                 weights_required=finetune_path is not None,
@@ -128,7 +128,9 @@ class OpenWAMTrainer:
                 # and the architecture logging below read from it.
                 m = cfg.model
             else:
-                warn_live_model_cfg_ignored(ckpt_cfg, cfg, self._ckpt_source_dir)
+                # scripts/train.py already swapped in the saved config (load_resume_cfg); this guards
+                # direct constructions: a resume must run its own config.yaml, any difference raises.
+                check_resume_cfg(ckpt_cfg, cfg, os.path.join(self._ckpt_source_dir, "config.yaml"))
                 propagate_component_specs(ckpt_cfg, cfg)
         else:
             resolved_arch = resolve_architecture_config(m)

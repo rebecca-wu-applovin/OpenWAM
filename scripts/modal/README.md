@@ -63,6 +63,10 @@ This layout comes from `training.output_path=outputs/<group>` plus `training.run
 already holds a `config.yaml` is refused twice: once by `run_modal.sh` before launch, and once
 by the trainer. Resume with `bash run_modal.sh training.resume_ckpt_path=outputs/<group>/<index>_<run_name>`. This takes no new index, reuses that dir, and its
 Hydra logs get a new `hydra/<time>/` entry.
+A resume runs the run's own `config.yaml`. Its launch must compose the same config: the same `run_modal.sh` env
+(`BACKBONE`, `ACTION_MODE`, ...) and overrides as the first launch, or the arm script it came from. Only
+`resume_ckpt_path` / `output_path` / `run_dir_name` may differ. Any other difference raises before training starts
+(`ckpt_model_loader.load_resume_cfg`).
 `--debug` runs still go to `outputs/debug_checkpoints/` and Hydra's default `outputs/<date>/<time>/`.
 
 **Multi-node** (`NODES=2 bash run_modal.sh ...`): `train.py::train_multinode`, a Modal cluster

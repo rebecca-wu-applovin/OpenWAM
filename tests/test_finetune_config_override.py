@@ -214,19 +214,6 @@ def test_resume_keeps_the_ckpt_config(tmp_path, capture):
     assert "loaded" not in capture, "resume must not load safetensors"
 
 
-def test_resume_reports_the_live_keys_it_discards(tmp_path, caplog):
-    """Ckpt-wins on resume must not be silent."""
-    ckpt_dir = _write_ckpt_cfg(tmp_path)
-    ckpt_cfg = OmegaConf.load(tmp_path / "config.yaml")
-    cfg = _live_cfg(architecture__attention_mask_mode="isolated")
-
-    with caplog.at_level("WARNING"):
-        cml.warn_live_model_cfg_ignored(ckpt_cfg, cfg, ckpt_dir)
-
-    assert "model.architecture.attention_mask_mode" in caplog.text
-    assert "'mutual'" in caplog.text and "'isolated'" in caplog.text
-
-
 def test_ckpt_config_without_a_model_section_raises(tmp_path, capture):
     """Not a run dir written by this trainer — say so instead of an AttributeError."""
     OmegaConf.save(OmegaConf.create({"training": {"batch_size": 4}}), tmp_path / "config.yaml")
