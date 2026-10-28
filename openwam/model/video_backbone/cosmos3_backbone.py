@@ -76,6 +76,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         clip_fps: float = _DEFAULT_FPS,
         max_text_tokens: int = 512,
         text_pad_length: Optional[int] = None,
+        proprio_in_und_prefix: bool = False,
         text_dropout_p: float = 0.0,
         text_dropout_seed: Optional[int] = None,
     ) -> None:
@@ -116,6 +117,9 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         # Fixed und pad length (None = pad to the batch max). It also sets the vision
         # mRoPE t-offset, so a fixed value keeps that offset batch-independent.
         self._text_pad_length = None if text_pad_length is None else int(text_pad_length)
+        # True: the architecture's proprio tokens run through the und tower after the
+        # text, so the gen stream reads them in its und prefix (not only the ActionDiT).
+        self._proprio_in_und_prefix = bool(proprio_in_und_prefix)
         if not 0.0 <= float(text_dropout_p) <= 1.0:
             raise ValueError(f"text_dropout_p must be in [0, 1]; got {text_dropout_p!r}.")
         self._text_dropout_p = float(text_dropout_p)
@@ -189,6 +193,11 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         return self._context_dim
 
     @property
+    def reads_proprio_tokens(self) -> bool:
+        """Config ``proprio_in_und_prefix``: prepare() needs ``proprio_tokens`` / ``proprio_token_mask``."""
+        return self._proprio_in_und_prefix
+
+    @property
     def video_attention_mask_mode(self) -> str:
         return self._video_attention_mask_mode
 
@@ -255,6 +264,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             clip_fps=getattr(holder, "clip_fps", _DEFAULT_FPS),
             max_text_tokens=holder.max_text_tokens,
             text_pad_length=holder.text_pad_length,
+            proprio_in_und_prefix=holder.proprio_in_und_prefix,
             text_dropout_p=holder.text_dropout_p,
             text_dropout_seed=holder.text_dropout_seed,
         )
@@ -355,12 +365,13 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         float_pos = bool(net.config.enable_fps_modulation)
         text_pos = text_pack.text_mrope_positions(input_ids.shape[1], float_positions=float_pos)
         cos_und, sin_und = dit_forward.compute_rotary(net, text_pos.unsqueeze(1), self.device, self.dtype)
-        context, und_kv = dit_forward.run_und_tower(net, input_ids, und_mask, cos_und, sin_und)
+        context, und_kv, und_k = dit_forward.run_und_tower_cached(net, input_ids, und_mask, cos_und, sin_und)
         return {
             "context": context,
             "context_mask": und_mask,
             "seq_lens": seq_lens.to(self.device),
             "und_kv": und_kv,
+            "und_k": und_k,
             "und_len_padded": int(input_ids.shape[1]),
         }
 
@@ -427,6 +438,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             "und_mask": enc["context_mask"],
             "seq_lens": enc["seq_lens"],
             "und_kv": enc["und_kv"],
+            "und_k": enc["und_k"],
             "vision_positions": vision_pos,
             "first_frame_latents": hist,
             "num_clean_prefix_frames": h,
@@ -468,6 +480,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             "und_mask": enc["context_mask"],
             "seq_lens": enc["seq_lens"],
             "und_kv": enc["und_kv"],
+            "und_k": enc["und_k"],
             "vision_positions": vision_pos,
             "first_frame_latents": latents[:, :, :1].clone(),
             "num_clean_prefix_frames": 1,
@@ -481,7 +494,47 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
     # ================================================================
 
     def prepare(self, **pipeline_inputs) -> BlockLoopState:
+        if self._proprio_in_und_prefix:
+            pipeline_inputs = self._append_proprio_to_und_prefix(pipeline_inputs)
         return dit_forward.prepare_block_loop(self.dit, **pipeline_inputs)
+
+    def _append_proprio_to_und_prefix(self, inputs: dict) -> dict:
+        """Run the proprio tokens through the und tower after the text and append their K/V.
+
+        Args:
+            inputs: prepare() kwargs; reads ``und_kv`` / ``und_k`` / ``und_mask`` (text, L keys) and
+                ``proprio_tokens`` (B, N, 2048) + ``proprio_token_mask`` (B, N) bool from the architecture.
+
+        Returns:
+            a copy of ``inputs`` whose ``und_kv`` holds L + N keys per layer and ``und_mask`` is (B, L + N).
+            The suffix sits at und positions L..L+N-1, inside the 15000 margin before the vision t-offset.
+        """
+        if "proprio_tokens" not in inputs:
+            raise ValueError(
+                "cosmos3 proprio_in_und_prefix=true needs `proprio_tokens` from a dual/tri-system architecture "
+                "with use_proprioception=true; set model.video_backbone.proprio_in_und_prefix=false otherwise."
+            )
+        out = dict(inputs)
+        tokens = out.pop("proprio_tokens")
+        token_mask = out.pop("proprio_token_mask").to(device=tokens.device, dtype=torch.bool)
+        und_kv, und_k, und_mask = out["und_kv"], out.pop("und_k"), out.get("und_mask")
+        b, n = tokens.shape[:2]
+        length = und_k[0].shape[1]
+        if und_k[0].shape[0] == 1 and b > 1:
+            raise ValueError("cosmos3 proprio_in_und_prefix: und K/V must be per-sample (batch 1 vs proprio batch %d)." % b)
+
+        # Suffix positions continue the text axis: L .. L+N-1.
+        net = self.dit
+        pos = text_pack.text_mrope_positions(length + n, float_positions=bool(net.config.enable_fps_modulation))[:, length:]
+        cos_p, sin_p = dit_forward.compute_rotary(net, pos.unsqueeze(1), tokens.device, und_k[0].dtype)
+        suffix_kv = dit_forward.run_und_suffix(
+            net, tokens.to(und_k[0].dtype), token_mask, und_k, und_kv, und_mask, cos_p, sin_p
+        )
+
+        out["und_kv"] = [(torch.cat([k, sk], dim=1), torch.cat([v, sv], dim=1)) for (k, v), (sk, sv) in zip(und_kv, suffix_kv)]
+        text_mask = und_mask if und_mask is not None else torch.ones((b, length), dtype=torch.bool, device=tokens.device)
+        out["und_mask"] = torch.cat([text_mask.to(tokens.device), token_mask], dim=1)
+        return out
 
     def apply_compile_optimizations(self, compile_cfg) -> None:
         """Keep layers as arguments so compilation does not change checkpoint keys."""
@@ -720,6 +773,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             "und_mask": enc["context_mask"],
             "seq_lens": enc["seq_lens"],
             "und_kv": enc["und_kv"],
+            "und_k": enc["und_k"],
             "vision_positions": self._vision_positions(enc["und_len_padded"], (t_lat, h_lat, w_lat), fps),
             "first_frame_latents": first_frame_latents,
             "num_clean_prefix_frames": 1,

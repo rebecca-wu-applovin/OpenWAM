@@ -442,6 +442,9 @@ def build_cosmos3_pipeline(
         text_pad_length = int(text_pad_length)
         if text_pad_length < 8:
             raise ValueError(f"cosmos3_edge text_pad_length must be >= 8 or null, got {text_pad_length}.")
+    # Proprio tokens through the und tower after the text (gen reads them); configs saved before
+    # this key keep the old path, where only the ActionDiT reads proprio.
+    proprio_in_und_prefix = bool(_cfg_get(cfg, "proprio_in_und_prefix", False))
     text_dropout = float(_cfg_get(cfg, "text_encoder_dropout", 0.0))
     if not 0.0 <= text_dropout <= 1.0:
         raise ValueError(f"cosmos3_edge text_encoder_dropout must be in [0, 1], got {text_dropout!r}.")
@@ -582,6 +585,7 @@ def build_cosmos3_pipeline(
         clip_fps=clip_fps,
         max_text_tokens=max_text_tokens,
         text_pad_length=text_pad_length,
+        proprio_in_und_prefix=proprio_in_und_prefix,
         text_dropout_p=text_dropout,
         text_dropout_seed=dropout_seed,
         **geometry,

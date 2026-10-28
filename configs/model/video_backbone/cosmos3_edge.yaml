@@ -23,6 +23,11 @@ max_text_tokens: 512
 # and deploy, so the vision mRoPE t-offset (pad length + 15000) never depends on the
 # batch. A longer prompt raises. null pads to the batch max (runs before 2026-10-28).
 text_pad_length: 128
+# The architecture's proprio tokens run through the und tower after the (padded) text, so
+# the video stream reads them in its und prefix like the text. Needs a dual/tri-system
+# architecture with use_proprioception=true. false = only the ActionDiT reads proprio
+# (runs before 2026-10-28).
+proprio_in_und_prefix: true
 
 # Assumed clip frame rate for the duration sentence + vision mRoPE temporal
 # scaling (inert while it equals the model's base_fps of 24). Set the real rate

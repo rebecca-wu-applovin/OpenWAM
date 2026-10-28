@@ -630,6 +630,11 @@ class BaseWAMArchitecture(ABC, nn.Module):
         updated = dict(pipeline_inputs)
         updated["context"] = torch.cat([context, proprio_token], dim=1)
         updated["context_mask"] = torch.cat([context_mask, sample_mask], dim=1)
+        # Backbones whose video stream reads the proprio tokens themselves (Cosmos3's und prefix).
+        # (VideoBackbone.reads_proprio_tokens; getattr keeps duck-typed test backbones working.)
+        if getattr(getattr(self, "video_backbone", None), "reads_proprio_tokens", False):
+            updated["proprio_tokens"] = proprio_token
+            updated["proprio_token_mask"] = sample_mask
         # The appended proprio token can sit after padded text tokens, so the
         # resulting valid tokens are not necessarily a contiguous prefix.
         # Keep the original text seq_lens and make context_mask authoritative.

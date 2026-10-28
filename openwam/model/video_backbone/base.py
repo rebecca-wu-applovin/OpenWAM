@@ -149,6 +149,13 @@ class VideoBackbone(ABC, nn.Module):
         return getattr(self, "_shift_video", None)
 
     @property
+    def reads_proprio_tokens(self) -> bool:
+        """True when ``prepare()`` takes the architecture's proprio tokens into its own video stream
+        (``proprio_tokens`` (B, N, text_dim) + ``proprio_token_mask`` (B, N) bool). Default False:
+        the video stream reads proprio only through ``context``, if at all."""
+        return False
+
+    @property
     def external_encoder(self):
         """The swapped-in external :class:`VideoEncoder`, or ``None`` for the
         native VAE path."""
