@@ -1,7 +1,7 @@
 """Resume smoke + text-cache ordering (train_debug: tiny random Wan, single GPU, DeepSpeed ZeRO-2).
 
-Run 1 trains one step and saves weights + the resumable accel state. Run 2 resumes from it and trains a second
-step. The trainer must build the text cache only after the resumed weights are in place
+Run 1 (max_steps=2) saves weights + the resumable accel state at step 1 and is stopped there, like a timeout.
+Run 2 resumes it with the same config (a resume must run the run's own config.yaml) and trains the second step. The trainer must build the text cache only after the resumed weights are in place
 (prepare -> load_full_state -> build_text_cache): the resumed run starts from an empty (meta) checkpoint shell, so
 a cache built before ``load_full_state`` would encode prompts with an uninitialized text encoder. The frozen
 encoder is identical in both runs, so every cached prompt embedding must match bitwise.
@@ -21,11 +21,12 @@ from tests._assets import asset_path
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
-def _run(cache_out: str, overrides: list[str], log: str, *, keep_state: bool) -> None:
+def _run(cache_out: str, overrides: list[str], log: str, *, keep_state: bool, stop_after_step: int = 0) -> None:
     """Launch tests/_train_driver.py in a fresh single-rank process (env as scripts/train_debug.sh sets it).
 
     Args: cache_out: where the driver dumps the text cache. overrides: Hydra overrides. log: stdout/stderr file.
         keep_state: keep the accel_state dirs a finished run would drop.
+        stop_after_step: stop the run right after it saves this step's state (0 = run to max_steps).
     Returns: None. Fails the test (with the log tail) on a non-zero exit.
     """
     env = dict(
@@ -44,6 +45,7 @@ def _run(cache_out: str, overrides: list[str], log: str, *, keep_state: bool) ->
         os.path.join(REPO, "tests", "_train_driver.py"),
         cache_out,
         *(["--keep-resume-state"] if keep_state else []),
+        *([f"--stop-after-step={stop_after_step}"] if stop_after_step else []),
         *overrides,
     ]
     with open(log, "w") as f:
@@ -76,13 +78,15 @@ def test_text_cache_after_resume(tmp_path):
     ]
     _run(
         os.path.join(out, "cache_fresh.pt"),
-        [*common, "training.max_steps=1"],
+        [*common, "training.max_steps=2"],
         os.path.join(out, "fresh.log"),
         keep_state=True,
+        stop_after_step=1,
     )
     assert os.path.isdir(os.path.join(run_dir, "accel_state_step_1"))
     _run(
         os.path.join(out, "cache_resume.pt"),
+        # Same config as run 1; only the resume path is added.
         [*common, "training.max_steps=2", f"training.resume_ckpt_path={run_dir}"],
         os.path.join(out, "resume.log"),
         keep_state=False,

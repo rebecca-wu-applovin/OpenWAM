@@ -215,20 +215,20 @@ def test_architecture_framework_mismatch_raises(tmp_path, capture):
 
 
 def test_resume_keeps_the_ckpt_config(tmp_path, capture):
-    """Resume continues ONE run whose config.yaml is reused untouched, so the
-    ckpt config stays authoritative — a live override there would make that
-    file lie about the model being trained. Its shell gets storage instead of a
-    safetensors load (accelerate's load_state fills it after prepare)."""
+    """Resume continues ONE run whose config.yaml is reused untouched, so the run config IS the ckpt
+    config (scripts/train.py swaps it in) and a launch that differs raises instead of being ignored.
+    Its shell gets storage instead of a safetensors load (accelerate's load_state fills it after prepare)."""
     ckpt_dir = _write_ckpt_cfg(tmp_path)
-    cfg = resolve_config(_live_cfg(architecture__clean_attention="causal"))
+    with pytest.raises(ValueError, match=r"model\.architecture\.clean_attention: saved='bidirectional' launch='causal'"):
+        cml.build_for_resume(ckpt_dir, resolve_config(_live_cfg(architecture__clean_attention="causal")), TEST_TRAIN_OPTIONS)
 
+    cfg = resolve_config(OmegaConf.load(tmp_path / "config.yaml"))
     _, ckpt_cfg = cml.build_for_resume(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
 
     model = capture["model_cfg"]
     assert model is ckpt_cfg.model and capture["layout"] is ckpt_cfg.common.layout
     assert model.architecture.clean_attention == "bidirectional"
     assert model.video_backbone.shift_video == 5.0
-    assert cfg.model.architecture.clean_attention == "causal", "resume must not rewrite the live cfg"
     assert capture["materialized"] == "cpu"
     assert "loaded" not in capture, "resume must not load safetensors"
 
@@ -280,19 +280,6 @@ def test_resume_rejects_layout_source_value_change(tmp_path, capture, key, value
 
     assert repr(value) in str(err.value) or str(value) in str(err.value)
     assert "model_cfg" not in capture, "the check runs before the shell is built"
-
-
-def test_resume_reports_the_live_keys_it_discards(tmp_path, caplog):
-    """Ckpt-wins on resume must not be silent."""
-    ckpt_dir = _write_ckpt_cfg(tmp_path)
-    ckpt_cfg = OmegaConf.load(tmp_path / "config.yaml")
-    cfg = _live_cfg(architecture__attention_mask_mode="isolated")
-
-    with caplog.at_level("WARNING"):
-        cml.warn_live_model_cfg_ignored(ckpt_cfg, cfg, ckpt_dir)
-
-    assert "model.architecture.attention_mask_mode" in caplog.text
-    assert "'mutual'" in caplog.text and "'isolated'" in caplog.text
 
 
 @pytest.mark.parametrize("build", [cml.build_for_finetune, cml.build_for_resume])
@@ -389,9 +376,9 @@ def test_trainer_reads_freeze_from_the_merged_cfg(tmp_path, monkeypatch):
     assert list(cfg.model.freeze) == ["video_backbone.vae"], "save_config() must record the same list"
 
 
-def test_trainer_resume_reads_model_decisions_from_the_ckpt_cfg(tmp_path, monkeypatch):
-    """Resume builds the architecture from the ckpt config, so every model-side decision of the trainer (freeze
-    list, text cache) must come from that same config, never from the live one."""
+def test_trainer_resume_rejects_a_differing_live_cfg(tmp_path, monkeypatch):
+    """Resume builds the architecture from the ckpt config, so a trainer handed a live config whose model-side
+    decisions (freeze list, text cache) differ from it must refuse to start rather than mix the two."""
     import torch.nn as nn
 
     ckpt_dir = _write_ckpt_cfg(tmp_path)
@@ -433,12 +420,9 @@ def test_trainer_resume_reads_model_decisions_from_the_ckpt_cfg(tmp_path, monkey
 
     from openwam.train.openwam_trainer import OpenWAMTrainer
 
-    # The training entry resolves the live config before the trainer (scripts/train.py).
-    trainer = OpenWAMTrainer(resolve_config(cfg), accelerator=None, dataset=None)
-
-    assert frozen["names"] == ["video_backbone.vae"], "freeze must come from the ckpt cfg on resume"
-    assert trainer.model_cfg.video_backbone.text_cache is True, "text_cache must come from the ckpt cfg on resume"
-    assert cfg.model.video_backbone.text_cache is False  # the live cfg is untouched
+    with pytest.raises(ValueError, match=r"model\.video_backbone\.text_cache: saved=True launch=False"):
+        OpenWAMTrainer(resolve_config(cfg), accelerator=None, dataset=None)
+    assert "names" not in frozen, "the check runs before any freeze"
 
 
 def test_diff_model_cfgs_buckets_keys():

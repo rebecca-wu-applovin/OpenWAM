@@ -28,6 +28,9 @@ normalize_mode: min-max
 normalization_stats_path: /root/projects/2610_policy_model/norm_stats/yam_sharpa_${.action_mode}.npy
 
 # ── Frame sampling ───────────────────────────────────────────────────────────
+# fps: the data rate (rows per second), checked against each source's meta/info.json. Row offsets and the action
+# chunk are in these rows; deploy serves actions at this rate.
+fps: 20
 # 33 raw rows → 32 actions. Video = the history rows t + history_offsets (the last one = the current frame t)
 # then the future rows t + future_offsets. The default is the first-frame layout: frame t + 8 future frames
 # every 4th row (rows t .. t+32). history_offsets alone sets H (the latent layout is derived from it).

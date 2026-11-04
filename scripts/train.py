@@ -112,6 +112,13 @@ def _train(cfg: DictConfig) -> None:
     from openwam.config import resolve_config
 
     _inject_project_seed(cfg)
+    resume_path = OmegaConf.select(cfg, "training.resume_ckpt_path", default=None)
+    if resume_path:
+        from openwam.train.utils.ckpt_model_loader import load_resume_cfg
+
+        # A resume runs the run's own config.yaml (raises if this launch's config differs), so the
+        # dataset, trainer and wandb below are all built from what the run started with.
+        cfg = load_resume_cfg(cfg, resume_path)
     # The one place the run config's derived values (cfg.common.layout) are computed and checked.
     resolve_config(cfg)
     _train_openwam(cfg)

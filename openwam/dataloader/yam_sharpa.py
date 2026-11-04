@@ -141,6 +141,7 @@ class YamSharpaDataset(LeRobotV3Reader):
         k for k in LeRobotV3Reader.CONFIG_KEYS if k not in ("unify_action", "unify_action_map", "unify_state_map")
     ) + (
         "action_mode",
+        "fps",
         "normalization_stats_path",
         "history_offsets",
         "future_offsets",
@@ -153,6 +154,7 @@ class YamSharpaDataset(LeRobotV3Reader):
         dataset_dir: str,
         *,
         action_mode: str,
+        fps: int,
         normalization_stats_path: Optional[str] = None,
         camera_layout: Optional[Sequence[str]] = None,
         history_offsets: Sequence[int],
@@ -165,6 +167,8 @@ class YamSharpaDataset(LeRobotV3Reader):
         Args:
             dataset_dir: str, LeRobot v3 root (holds ``meta/info.json``).
             action_mode: str, one of ``ACTION_REPRS``.
+            fps: int, the data rate the config states (rows per second; history / future offsets and deploy's
+                action rate are in these rows); must equal the source's ``meta/info.json`` fps.
             normalization_stats_path: str, pooled stats file (required when normalization is on).
             camera_layout: list[str] of camera feature keys, top-to-bottom; default ego over chest.
             history_offsets: list[int] of H row offsets <= 0 ending at 0 (e.g. [-80,-60,-40,-20,0]; [0] = only
@@ -198,6 +202,9 @@ class YamSharpaDataset(LeRobotV3Reader):
             unify_action_map=unify_action_map(self.action_mode),
             **kwargs,
         )
+        # The config's data rate is what deploy serves at: it must be the recorded one.
+        if self._fps != float(fps):
+            raise ValueError(f"yam_sharpa: dataloader.fps={fps} but {dataset_dir}/meta/info.json records fps={self._fps}")
 
     def _select_augmentations(self, train: bool) -> None:
         """The base's train-only augmentations plus random history (the base's single split rule, extended).

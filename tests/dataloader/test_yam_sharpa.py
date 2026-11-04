@@ -157,6 +157,7 @@ def _cfg(sources: dict, **overrides):
         "type": "yam_sharpa",
         "sources": {n: {"dataset_dir": str(d), "weight": w} for n, (d, w) in sources.items()},
         "action_mode": "fingertips_abs",
+        "fps": 20,  # must equal the synthetic source's meta/info.json fps
         "normalize_mode": None,
         "num_frames": 5,
         "history_offsets": [0],  # the current frame + 2 future frames (rows t, t+2, t+4)
@@ -283,6 +284,19 @@ def test_unknown_mode_and_unify_keys_rejected(source):
         build_dataset(_cfg({"a": (root, 1.0)}, action_mode="joint"), "train")
     with pytest.raises(ValueError, match="derives unify_action"):
         build_dataset(_cfg({"a": (root, 1.0)}, unify_action=True), "train")
+
+
+def test_fps_must_match_info_json(source):
+    root, _ = source
+    build_dataset(_cfg({"a": (root, 1.0)}, fps=20), "train")
+    with pytest.raises(ValueError, match="meta/info.json records fps=20"):
+        build_dataset(_cfg({"a": (root, 1.0)}, fps=30), "train")
+
+
+def test_config_keys_accept_fps():
+    from openwam.dataloader.yam_sharpa import YamSharpaDataset
+
+    assert "fps" in YamSharpaDataset.CONFIG_KEYS
 
 
 def _all_samples(reader, seed: int = 0) -> list:
@@ -677,36 +691,37 @@ def test_repo_config_resolves_stats_path_per_mode():
 
 
 @pytest.mark.parametrize("mode", R.ACTION_REPRS)
-def test_deploy_normalizer_and_decoder(source, tmp_path, mode):
-    from openwam.deploy.model_loader import _build_action_decoder, _build_normalizer, _UnifyAwareNormalizer
+def test_deploy_normalization_inverts_the_training_sample(source, tmp_path, mode):
+    """Deploy's I/O functions against a training sample: the raw proprio normalizes to the sample's proprio, and the
+    sample's normalized action maps back (gather, invert, decode) to the absolute targets."""
+    from openwam.dataloader.utils.normalization import apply_normalization, invert_normalization
+    from openwam.dataloader.utils.unify_action import UNIFY_DIM, map_to_unify, parse_unify_spec, unmap_from_unify
+    from openwam.deploy.model_loader import load_norm_stats
 
     root, eps = source
-    save_stats(compute_yam_sharpa_stats([root], mode, num_frames=5, workers=1), tmp_path / "normalization_stats.npy")
-    cfg = OmegaConf.create({"dataloader": {"type": "yam_sharpa", "action_mode": mode, "normalize_mode": "min-max"}})
-    norm = _build_normalizer(cfg, str(tmp_path))
-    D = R.raw_dim(mode)
-    if R.is_unify(mode):
-        assert isinstance(norm, _UnifyAwareNormalizer)
-        out = norm.unnormalize(np.zeros((4, 80), np.float32))
-    else:
-        out = norm.unnormalize(np.zeros((4, 48), np.float32))
-    assert out.shape == (4, D)
-
-    # train-time normalized sample → deploy unnormalize (+ decode) == absolute target
     stats_path = tmp_path / "normalization_stats.npy"
-    train_cfg = _cfg(
-        {"a": (root, 1.0)}, action_mode=mode, normalize_mode="min-max", normalization_stats_path=str(tmp_path / "s.npy")
+    save_stats(compute_yam_sharpa_stats([root], mode, num_frames=5, workers=1), stats_path)
+    state_stats, action_stats = load_norm_stats(
+        OmegaConf.create({"action_mode": mode, "normalize_mode": "min-max"}), str(tmp_path)
     )
-    save_stats(np.load(stats_path, allow_pickle=True).item(), tmp_path / "s.npy")
+    train_cfg = _cfg({"a": (root, 1.0)}, action_mode=mode, normalize_mode="min-max", normalization_stats_path=str(stats_path))
     s = _first_window(build_dataset(train_cfg, "train"))
     ep = eps[0]
     raw_proprio = R.encode_proprio(mode, ep["state"][0], ep["joints"][0])[0]
-    np.testing.assert_allclose(norm.normalize(raw_proprio), s["proprio"][0].numpy(), atol=1e-5)
-    actions = norm.unnormalize(s["action"].numpy())
-    decoder = _build_action_decoder(cfg)
-    assert (decoder is None) == (not R.is_relative(mode))
-    if decoder is not None:
-        actions = decoder(actions, raw_proprio)
+
+    # proprio IN: normalize the raw width, then (unify) scatter to 80 — the reader's order.
+    prop = apply_normalization(raw_proprio.astype(np.float32), state_stats, "min-max")
+    actions = s["action"].numpy()
+    if R.is_unify(mode):
+        dst = parse_unify_spec(R.unify_action_map(mode), UNIFY_DIM)
+        prop, _ = map_to_unify(prop, dst, UNIFY_DIM)
+        actions = unmap_from_unify(actions, dst)
+    np.testing.assert_allclose(prop, s["proprio"][0].numpy(), atol=1e-5)
+
+    # action OUT: invert the normalization, then (relative modes) compose with the raw frame-t proprio.
+    actions = invert_normalization(actions, action_stats, "min-max")
+    if R.is_relative(mode):
+        actions = R.decode_action(mode, actions, raw_proprio)
     abs_mode = mode.replace("_rel", "_abs")
     want = R.encode_action_pairs(
         abs_mode,
@@ -720,44 +735,21 @@ def test_deploy_normalizer_and_decoder(source, tmp_path, mode):
     np.testing.assert_allclose(actions, want, atol=1e-4)
 
 
-def test_deploy_obs_preprocess_vstack():
-    from openwam.deploy.obs_preprocess import ObsPreprocessor, ObsValidationError
-
-    cfg = OmegaConf.create(
-        {
-            "dataloader": {
-                "multiview": True,
-                "multiview_layout": "vstack",
-                "camera_layout": [EGO, CHEST],
-                "height": 480,
-                "width": 320,
-            }
-        }
-    )
-    pre = ObsPreprocessor.from_cfg(cfg)
-    ego = Image.new("RGB", (640, 480), CAM_COLORS[EGO])
-    chest = Image.new("RGB", (640, 480), CAM_COLORS[CHEST])
-    for imgs in ({EGO: ego, CHEST: chest}, {"head_camera": ego, "left_wrist_camera": chest}):
-        out = np.asarray(pre.preprocess({"images": dict(imgs), "state": [0.0] * 48})["image"])
-        assert out.shape == (480, 320, 3)
-        assert (out[:240] == CAM_COLORS[EGO]).all() and (out[240:] == CAM_COLORS[CHEST]).all()
-    with pytest.raises(ObsValidationError, match="requires every camera"):
-        pre.preprocess({"images": {EGO: ego}})
-
-
-def test_deploy_obs_preprocess_vstack_matches_training_resize():
+def test_deploy_canvas_matches_training_resize():
     """Deploy canvas == training canvas: each camera LANCZOS-resized to its tile (as the decode does), then stacked."""
     from openwam.dataloader.transforms.multiview import assemble_vstack_layout
-    from openwam.deploy.obs_preprocess import ObsPreprocessor
+    from openwam.deploy.engine import EngineSpec, InferenceEngine
 
-    cfg = OmegaConf.create(
-        {"dataloader": {"multiview": True, "multiview_layout": "vstack", "camera_layout": [EGO, CHEST],
-                        "height": 384, "width": 224}}
-    )
+    spec = EngineSpec(ckpt="-", action_mode="fingertips_abs", action_dim=48, chunk=32,
+                      steps_per_plan=20, action_fps=20, history_offsets=(0,), camera_layout=(EGO, CHEST))
+    # observation() reads only the spec and the canvas size: no model, no stats.
+    engine = InferenceEngine(None, None, spec, state_stats={}, action_stats={}, normalize_mode="min-max",
+                             height=384, width=224, seed=42, decode_video=False)
     rng = np.random.default_rng(0)
-    native = {c: Image.fromarray(rng.integers(0, 256, (480, 640, 3), dtype=np.uint8)) for c in (EGO, CHEST)}
-    deploy = np.asarray(ObsPreprocessor.from_cfg(cfg).preprocess({"images": dict(native), "state": [0.0] * 48})["image"])
+    native = {c: rng.integers(0, 256, (480, 640, 3), dtype=np.uint8) for c in (EGO, CHEST)}
+    obs = {**native, "observation.state": np.zeros(48), "camera_pose.ego_view": np.eye(4).reshape(-1)}
+    deploy = np.asarray(engine.observation(obs)["canvas"])
     # Training: decode_video_frames resizes each camera to (192, 224) with LANCZOS, then assemble_vstack_layout.
-    tiles = {c: im.resize((224, 192), Image.LANCZOS) for c, im in native.items()}
+    tiles = {c: Image.fromarray(im).resize((224, 192), Image.LANCZOS) for c, im in native.items()}
     train = np.asarray(assemble_vstack_layout(tiles, [EGO, CHEST], out_h=384, out_w=224))
     assert np.array_equal(deploy, train)

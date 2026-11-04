@@ -65,14 +65,13 @@ def _finite_float(value, name: str) -> float:
 
 
 def normalize_denoise_config(cfg=None, *, reset_inactive: bool = False) -> DenoiseConfig:
-    """Normalize and validate deploy denoising settings.
+    """Normalize and validate denoising settings (``deploy.sampler`` / the training visualizer's sampler).
 
     ``reset_inactive`` drops the async-only controls back to their defaults
-    under ``denoise_mode="sync"`` instead of rejecting them. Callers handed an
-    already-resolved config — per-request ``conditions``, :func:`make_schedule`
-    — cannot tell a user-written value from one inherited from the yaml, so
-    they build what they are given; the config-shape check stays strict where
-    "explicitly supplied" is knowable (startup validation and the CLI layer).
+    under ``denoise_mode="sync"`` instead of rejecting them. :func:`make_schedule`
+    is handed an already-merged config and cannot tell a user-written value
+    from one inherited from the yaml, so it builds what it is given; the
+    strict config-shape check runs once, at deploy startup (``check_deploy``).
     """
     mode = str(_config_value(cfg, "denoise_mode", "sync")).strip().lower()
     if mode not in VALID_DENOISE_MODES:
@@ -285,9 +284,9 @@ def make_schedule(
             (``0`` = pure curve; ``>0`` = piecewise offset).
 
     ``mode="sync"`` ignores the three ``async`` arguments rather than
-    rejecting them: this is the one call on the per-request path, so a
-    config-shape rule here would surface as a per-request ``ValueError``.
-    The shape check lives at startup and in the CLI layer instead.
+    rejecting them: the yaml always carries them, so rejecting here would
+    fail every sync run. The strict shape check runs once at deploy startup
+    (``check_deploy`` -> :func:`normalize_denoise_config`).
     """
     options = normalize_denoise_config(
         {

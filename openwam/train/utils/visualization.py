@@ -1,10 +1,10 @@
 """Periodic world-model rollouts during training, logged to wandb.
 
 Every ``training.vis_steps`` steps each rank denoises one fixed training sample:
-:func:`rollout_from_sample` encodes its H history frames and prompt with the backbone's
-deploy condition path (``video_backbone.preprocess_condition``, the history half of
-``preprocess_train``), so it works for every video backbone, and denoises the future
-video latents + action chunk with ``architecture.sample`` on a ``make_schedule`` grid. Rank 0 gathers them and logs
+:func:`rollout_from_sample` runs ``architecture.rollout`` (the same call the deploy engine makes): the H history
+frames and prompt go through the backbone's condition path (``video_backbone.preprocess_condition``, the history
+half of ``preprocess_train``), so it works for every video backbone, and the future video latents + action chunk
+are denoised on a ``make_schedule`` grid. Rank 0 gathers them and logs
 ``vis/rollout_<i>`` videos (GT | prediction side by side) plus ``vis/video_mse`` /
 ``vis/action_mse``. Everything the rollout touches (schedulers, RNG, train/eval
 flags, compiled-loop handle) is restored, so training continues unchanged.
@@ -78,9 +78,9 @@ def write_mp4(video: np.ndarray, path: str, fps: int) -> str:
 def rollout_from_sample(arch, sample: dict, schedule, *, seed: int) -> dict:
     """Denoise one training sample's future from its history, as deployment does.
 
-    The H history frames (``arch.layout.num_hist_frames``) and the prompt go through
-    ``video_backbone.preprocess_condition`` (the same encode as the clean prefix of ``preprocess_train``); the future
-    latents and the action chunk start from seeded noise (``arch.sample``).
+    The H history frames (``arch.layout.num_hist_frames``) and the prompt go through ``arch.rollout``:
+    ``video_backbone.preprocess_condition`` (the same encode as the clean prefix of ``preprocess_train``), then the
+    future latents and the action chunk denoised from seeded noise (``arch.sample``).
 
     Args:
         arch: unwrapped architecture.
@@ -95,8 +95,8 @@ def rollout_from_sample(arch, sample: dict, schedule, *, seed: int) -> dict:
     arch.eval()
     batch = collate([sample]).to(arch.device, arch.dtype)
     history = [clip[: int(arch.layout.num_hist_frames)] for clip in batch.video]
-    hist_latents, text = arch.video_backbone.preprocess_condition(history, batch.prompt, arch.layout)
-    latents, actions = arch.sample(hist_latents, text, batch.proprio, schedule, seed=seed)
+    # Training samples carry no unify mask choice: every action dim is active (as before the explicit mask).
+    latents, actions = arch.rollout(history, batch.prompt, batch.proprio, schedule, seed=seed, active_action_mask=None)
     video = arch.video_backbone.decode_future(latents, arch.layout)
     return {"video": video, "actions": actions.squeeze(0).float().cpu().numpy()}
 
@@ -144,7 +144,7 @@ class TrainVisualizer:
             (pixels in [0, 1]),
             ``action_mse`` float and ``pred_actions`` (K, A) in normalized space, ``caption`` str.
         """
-        from openwam.deploy.denoise_schedule import make_schedule
+        from openwam.model.denoise_schedule import make_schedule
 
         s = self.sample
         schedule = make_schedule(

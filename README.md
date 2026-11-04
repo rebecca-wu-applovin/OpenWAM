@@ -28,11 +28,11 @@ OpenWAM/
 │   │   ├── action_backbone/  # ActionDiTBackbone ABC, separate ActionDiT, scheduler
 │   │   └── video_backbone/   # VideoBackbone ABC + one directory per family (wan / cosmos3 / ge / flux)
 │   ├── train/         # OpenWAMTrainer, flow-match loss, checkpointing, optimizer utils
-│   └── deploy/        # Policy server, model loader, inference engine, executors, optimizations
-├── scripts/           # Entrypoints: train.sh, deploy.sh, inference tooling, LAPA tooling
+│   └── deploy/        # InferenceEngine / Session (one episode each), deploy config, model loader
+├── scripts/           # Entrypoints: train.sh, train_debug.sh, asset download, Modal launchers
 ├── configs/           # Hydra configs for model, dataloader, training, deploy
 ├── benchmarks/
-│   └── simeval/       # sim-policy-eval server launcher
+│   └── simeval/       # sim-policy-eval server (sim_policy_v1 protocol, one session per connection)
 └── assets/            # Base-model checkpoints (created by the download script; git-ignored)
 ```
 
@@ -51,7 +51,7 @@ All architectures are selected via `configs/model/<framework>.yaml` with `archit
 
 | Benchmark | Status | Notes |
 |---|---|---|
-| sim-policy-eval | Supported | Server launcher in `benchmarks/simeval/serve.py` |
+| sim-policy-eval | Supported | `sim_policy_v1` server in `benchmarks/simeval/server/serve.py` |
 -->
 
 ## News
@@ -168,15 +168,18 @@ Wan2.2-TI2V-5B video backbone, and the Mutual attention mask.
    [`configs/train.yaml`](configs/train.yaml). Outputs use training.output_path,
    whose default is `outputs/openwam_checkpoints`.
 
-4. Deploy the debug checkpoint:
+4. Serve the debug checkpoint to sim-policy-eval (one server per GPU, K = actions executed per plan; the canvas
+   size and frame count come from the checkpoint's own config):
 
    ~~~bash
-   bash scripts/deploy.sh <debug_ckpt_dir_path>
+   .venv/bin/python -u benchmarks/simeval/server/serve.py \
+       --ckpt <debug_ckpt_dir_path>/checkpoint_step_20.safetensors \
+       deploy.policy.steps_per_plan=20 --port 8848
    ~~~
 
-   Deployment enables compile by default, so the first inference may take
-   longer while compilation warms up. For sim-policy-eval, launch the server
-   per checkpoint file with [`benchmarks/simeval/serve.py`](benchmarks/simeval/serve.py).
+   In-process use goes through the same engine (`openwam.deploy`: `build_deploy_cfg` ->
+   `InferenceEngine.from_config` -> `new_session().plan(obs)`); see
+   [`benchmarks/simeval/README.md`](benchmarks/simeval/README.md).
 
 ## OpenWAM Usage Guidance
 
@@ -189,7 +192,7 @@ entry points for using and extending the repository:
 |---|---|
 | [Training and deployment](assets/openwam_usage_docs/train-and-deploy.md) | choose a model/dataloader, prepare assets, train, fine-tune, resume, or deploy a policy |
 | [Architecture extension](assets/openwam_usage_docs/architecture-extension.md) | add a video backbone (implement the base class's 14 abstract members + write one yaml), an action backbone, or a WAM architecture |
-| [Benchmark integration](assets/openwam_usage_docs/benchmark-integration.md) | extend a dataloader and connect a benchmark client to the WebSocket protocol |
+| [Benchmark integration](assets/openwam_usage_docs/benchmark-integration.md) | extend a dataloader and serve the deploy engine to a benchmark |
 
 > 💡 **Agent tip:** Pick the guide that matches your task and feed it directly
 > to your agent — less explaining, more building.

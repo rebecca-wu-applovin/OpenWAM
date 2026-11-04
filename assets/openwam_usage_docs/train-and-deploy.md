@@ -154,61 +154,41 @@ Set `NPROC_PER_NODE`, `NNODES`, `NODE_RANK`, and `MASTER_ADDR` for multi-node la
 
 ## 3. Deploy a checkpoint
 
-Deployment defaults are defined in [configs/deploy.yaml](../../configs/deploy.yaml). A training output contains weights, `config.yaml`, normalization data, tokenizer/component assets, and the saved model specification. Start a WebSocket server with:
+A training output contains weights, `config.yaml`, normalization data and tokenizer/component assets. Deploy reads
+the run's own `config.yaml` (re-checked with `resolve_config`, as training does) plus one `deploy` block from
+[configs/deploy.yaml](../../configs/deploy.yaml); only `deploy.*` keys can be overridden, the model / data config is
+the one the checkpoint was trained with. Everything is checked once at startup (`check_deploy`) and frozen.
 
-~~~bash
-bash scripts/deploy.sh <ckpt_dir_path>
+~~~python
+from openwam.deploy import InferenceEngine, build_deploy_cfg
+
+cfg = build_deploy_cfg(["deploy.ckpt.dir=<run_dir>", "deploy.ckpt.name=checkpoint_step_N.safetensors",
+                        "deploy.policy.steps_per_plan=20"])
+engine = InferenceEngine.from_config(cfg)
+session = engine.new_session()   # one per episode: its own observation history and seed
+out = session.plan(obs)          # {"actions": (K, D), "hand_targets": {"wrist": (K, 2, 4, 4), "tips" | "fingers"}}
 ~~~
 
-The newest checkpoint is selected automatically. To pin a file or launch one server per GPU:
+`obs` uses the training data's LeRobot feature names (`observation.images.<camera>`, `observation.state`,
+`camera_pose.ego_view`, `joint_angles` for `unify_*`, `task`). For sim-policy-eval, serve a checkpoint file with
+[benchmarks/simeval/server/serve.py](../../benchmarks/simeval/server/serve.py) (see its README).
 
-~~~bash
-bash scripts/deploy.sh <ckpt_dir_path> --ckpt-name <ckpt_file_name>
-NUM_GPUS=4 PORT_BASE=8848 bash scripts/deploy.sh <ckpt_dir_path>
-~~~
-
-The server accepts `obs`, `reset`, and `ping` JSON messages. Payload details are in [Benchmark integration](benchmark-integration.md).
-
-### Execution and denoising modes
-
-All inference fields below belong to the `inference` section of [configs/deploy.yaml](../../configs/deploy.yaml). The two mode switches are independent:
+### The deploy block
 
 ~~~yaml
-inference:
-  # Denoising trajectory
-  denoise_steps: 10                    # denoising steps per generation
-  denoise_mode: sync                   # sync or async noise trajectory
-
-  # Async denoising alignment
-  lead_modality: video                 # lead stream: video or action
-  variance_shift_alpha: 1.0            # lead-curve shift; must be >= 1
-  linear_offset: 0.0                   # lag; 0 <= value < 1
-
-  # Request execution
-  inference_mode: sync                 # sync execution or async prefetch
-  inference_horizon: null              # actions consumed per chunk; null = full chunk
-  inference_delay_steps: null          # async latency in action steps; < horizon
+ckpt: {dir: null, name: null}         # required: run dir + checkpoint_step_N.safetensors (no "latest" guess)
+server: {host: 0.0.0.0, port: 8848, device: cuda:0}
+policy:
+  steps_per_plan: null                # required K: actions per plan; divides dataloader.fps and every history offset
+  seed: 42                            # sampling seed of every plan of an episode, unless the client names one
+sampler:
+  denoise_steps: 10
+  denoise_mode: sync                  # sync | async (denoising trajectory)
+  lead_modality: video                # async only: action | video
+  variance_shift_alpha: 1.0           # async only: >= 1
+  linear_offset: 0.0                  # async only: 0 <= value < 1
+  decode_video: false                 # also decode each plan's future video (debugging)
 ~~~
 
-With `num_frames: 33`, each generated action chunk contains 32 actions. `inference_horizon` only limits how many are consumed before the next generation.
-
-Optimization fields are in the same deploy YAML:
-
-~~~yaml
-optimization:
-  # Decode and cache
-  decode_video: false                  # skip VAE decode when only actions are needed
-  dit_cache:
-    enabled: true                      # reuse similar video velocity predictions
-    cosine_threshold: 0.99              # similarity threshold for a cache hit
-    max_skips: 3                        # maximum consecutive skipped video forwards
-
-  # Compile architecture-specific paths
-  compile:
-    enabled: true                      # compile fixed-shape paths
-    self_attn: {torch_mode: default, dynamic: false}
-    cross_attn: {torch_mode: default, dynamic: false}
-
-~~~
-
-Compilation can add first-request warm-up latency. Source code: `scripts/train.py`, `openwam/train/openwam_trainer.py`, `scripts/deploy.py`, and `openwam/deploy/`.
+With `num_frames: 33`, each plan generates 32 actions (`common.layout.action_horizon`) and returns the first K.
+Source code: `openwam/deploy/` (`config.py`, `engine.py`, `model_loader.py`, `history_buffer.py`).

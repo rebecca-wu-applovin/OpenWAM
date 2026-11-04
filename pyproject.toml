@@ -59,9 +59,6 @@ include-package-data = true
 where = ["./"]
 include = ["openwam", "openwam.*"]
 
-[project.scripts]
-openwam-serve = "openwam.deploy.server:main"
-
 [tool.ruff]
 line-length = 120
 target-version = "py312"

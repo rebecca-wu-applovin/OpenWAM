@@ -1,7 +1,7 @@
 """Multi-view image composition.
 
-The image utilities (``crop_and_resize`` / ``assemble_multiview_layout``) are dataset-neutral; the deployment
-observation preprocessing (``deploy/obs_preprocess.py``) and the yam_sharpa reader use them. Keeping them in a
+The image utilities (``crop_and_resize`` / ``assemble_multiview_layout``) are dataset-neutral; the deploy engine
+(``InferenceEngine.observation``) and the yam_sharpa reader use them. Keeping them in a
 transform module avoids deploy → dataset hard-coupling.
 """
 

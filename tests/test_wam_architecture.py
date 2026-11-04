@@ -1,6 +1,7 @@
 """Tests for WAM Architecture registry and implementations."""
 
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -1441,48 +1442,44 @@ def test_sample_pins_inactive_action_dims_on_noise_path(monkeypatch):
     np.testing.assert_array_equal(pinned[:, _PIN_ACTIVE_IDX], baseline[:, _PIN_ACTIVE_IDX])
 
 
-def test_sample_infers_inactive_dims_from_unify_normalizer(monkeypatch):
-    """The pin auto-enables from the attached unify normalizer's scatter map and
-    stays off for plain (non-unify) normalizers or width mismatches."""
+def test_sample_without_mask_pins_nothing(monkeypatch):
+    """No active_action_mask = every dim active: nothing is inferred from other attributes of the architecture
+    (the pin is the caller's explicit choice, decided from action_mode by the deploy engine)."""
     import numpy as np
 
     monkeypatch.setattr(torch.compiler, "cudagraph_mark_step_begin", lambda: None)
 
     schedule = [(1000.0, 1000.0), (500.0, 500.0), (0.0, 0.0)]
-
-    class _UnifyNormalizer:  # duck-types _UnifyAwareNormalizer's private surface
-        _dst_index = np.asarray(_PIN_ACTIVE_IDX, dtype=np.int64)
-        _unify_dim = _PIN_ACTION_DIM
-
-        @staticmethod
-        def unnormalize(x):
-            return x
-
     baseline = _probe_actions(_make_inactive_dim_probe_arch(), schedule)
+    arch = _make_inactive_dim_probe_arch()
+    # What the removed inference read: a unify scatter map hanging off the architecture.
+    arch.normalizer = SimpleNamespace(_dst_index=np.asarray(_PIN_ACTIVE_IDX), _unify_dim=_PIN_ACTION_DIM)
+    assert arch._resolve_inactive_action_dims(None, torch.device("cpu")) is None
+    np.testing.assert_array_equal(_probe_actions(arch, schedule), baseline)
 
+
+def test_rollout_is_the_condition_encode_then_sample(monkeypatch):
+    """rollout = video_backbone.preprocess_condition on the history + prompts, then sample with the given mask."""
+    import numpy as np
+
+    monkeypatch.setattr(torch.compiler, "cudagraph_mark_step_begin", lambda: None)
+
+    schedule = [(1000.0, 1000.0), (500.0, 500.0), (0.0, 0.0)]
     mask = torch.zeros(_PIN_ACTION_DIM, dtype=torch.bool)
     mask[_PIN_ACTIVE_IDX] = True
-    explicit = _probe_actions(_make_inactive_dim_probe_arch(), schedule, active_action_mask=mask)
+    want = _probe_actions(_make_inactive_dim_probe_arch(), schedule, active_action_mask=mask)
 
-    auto_arch = _make_inactive_dim_probe_arch()
-    auto_arch.attach_normalizer(_UnifyNormalizer())
-    np.testing.assert_array_equal(_probe_actions(auto_arch, schedule), explicit)
+    arch = _make_inactive_dim_probe_arch()
+    calls = []
 
-    class _PlainNormalizer:
-        @staticmethod
-        def unnormalize(x):
-            return x
+    def _preprocess_condition(history, prompts, layout):
+        calls.append((history, prompts, layout))
+        return torch.zeros(1, 1, 1, 1, 1), _text()
 
-    plain_arch = _make_inactive_dim_probe_arch()
-    plain_arch.attach_normalizer(_PlainNormalizer())
-    np.testing.assert_array_equal(_probe_actions(plain_arch, schedule), baseline)
-
-    class _MismatchNormalizer(_UnifyNormalizer):
-        _unify_dim = _PIN_ACTION_DIM + 1
-
-    mismatch_arch = _make_inactive_dim_probe_arch()
-    mismatch_arch.attach_normalizer(_MismatchNormalizer())
-    np.testing.assert_array_equal(_probe_actions(mismatch_arch, schedule), baseline)
+    arch.video_backbone.preprocess_condition = _preprocess_condition
+    _, actions = arch.rollout([["frame"]], ["p"], torch.zeros(1, 1, 3), schedule, seed=7, active_action_mask=mask)
+    assert calls == [([["frame"]], ["p"], arch.layout)]
+    np.testing.assert_array_equal(actions[0].numpy(), want)
 
 
 # ---------------------------------------------------------------------------

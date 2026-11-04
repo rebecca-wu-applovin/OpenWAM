@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from openwam.model.architectures.base import BaseWAMArchitecture
 from openwam.train.utils.visualization import TrainVisualizer
 from tests._layout import make_layout
 
@@ -39,7 +40,9 @@ class _StubBackbone(torch.nn.Module):
 
 
 class _StubArch(torch.nn.Module):
-    """sample stub (one latent per video frame: tc = 1); records sample() calls."""
+    """sample stub (one latent per video frame: tc = 1); records sample() calls. ``rollout`` is the real one."""
+
+    rollout = BaseWAMArchitecture.rollout  # preprocess_condition + sample, exactly as deploy calls it
 
     def __init__(self, layout=None):
         super().__init__()
@@ -53,9 +56,10 @@ class _StubArch(torch.nn.Module):
         self.video_scheduler, self.action_scheduler = _Sched(), _Sched()
         self.calls = []
 
-    def sample(self, hist_latents, text, proprio, schedule, *, seed):
+    def sample(self, hist_latents, text, proprio, schedule, *, seed, active_action_mask):
         assert hist_latents.shape[2] == self.layout.num_hist_latents and text == "text"
         assert proprio.shape == (1, self.layout.num_hist_frames, 4)
+        assert active_action_mask is None  # training vis: every action dim active
         self.calls.append({"prompt": self.video_backbone.prompts[0], "schedule": schedule, "seed": seed})
         latents = torch.zeros(1, 2, self.layout.num_latents, 1, 1)
         return latents, torch.zeros(1, self.layout.action_horizon, 4)

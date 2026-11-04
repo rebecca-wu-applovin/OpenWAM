@@ -70,9 +70,8 @@ def pin_rot6d_identity(stats: dict, dims: Sequence[int]) -> None:
             stats[key][i] = val
 
 
-# Shared division-by-zero floor for read-time normalization. Referenced by
-# both ``apply_normalization`` (in-reader path) and ``transforms.normalize``'s
-# ``Normalizer`` default ``eps`` so the two paths agree on near-zero-variance
+# Shared division-by-zero floor of ``apply_normalization`` and its inverse
+# ``invert_normalization`` (deploy), so the two directions agree on near-zero-range
 # dims. (The compute-time degenerate-dim handling in the *_compute_stats.py
 # scripts is a separate concern with its own threshold.)
 NORM_EPS = 1e-6
@@ -142,6 +141,34 @@ def apply_normalization(
         scaled = ((arr - q01) / scale) * 2.0 - 1.0
         return np.clip(scaled, -1.0, 1.0)
     return arr
+
+
+def invert_normalization(arr: np.ndarray, stats: dict, mode: str) -> np.ndarray:
+    """Map normalized values back to raw units: the inverse of :func:`apply_normalization` (deploy actions).
+
+    Inside the training range this is the exact inverse; the min-max / quantile clip is not invertible, so a
+    clipped input comes back at the range boundary.
+
+    Args:
+        arr: ``(..., D)`` float array in normalized space (model actions).
+        stats: dict of ``(D,)`` float32 arrays (``min`` / ``max``, ``q01`` / ``q99`` or ``mean`` / ``std``),
+            as :func:`load_stats_file` returns them.
+        mode: ``"min-max"``, ``"quantile"`` or ``"z-score"``.
+
+    Returns:
+        ``(..., D)`` array in raw units. Raises ValueError for any other ``mode`` (no silent passthrough).
+    """
+    # Written as x / scale + offset with the forward map's scale / offset, the arithmetic deploy has always used.
+    if mode in ("min-max", "quantile"):
+        lo, hi = (stats["min"], stats["max"]) if mode == "min-max" else (stats["q01"], stats["q99"])
+        range_ = np.maximum(hi - lo, NORM_EPS)
+        scale = 2.0 / range_
+        offset = lo + range_ / 2.0  # the range centre maps to 0
+        return arr / scale + offset
+    if mode == "z-score":
+        scale = 1.0 / np.maximum(stats["std"], NORM_EPS)
+        return arr / scale + stats["mean"]
+    raise ValueError(f"invert_normalization: no inverse for normalize_mode={mode!r}")
 
 
 def materialize_eef_stats(
@@ -274,6 +301,7 @@ def _load_raw_stats(path: str, action_mode: Optional[str]) -> Mapping:
 
 __all__ = [
     "apply_normalization",
+    "invert_normalization",
     "load_stats_file",
     "materialize_eef_stats",
     "pin_rot6d_identity",

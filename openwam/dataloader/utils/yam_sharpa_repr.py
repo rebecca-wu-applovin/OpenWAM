@@ -327,6 +327,36 @@ def decode_action(action_repr: str, action_raw: np.ndarray, proprio_raw: np.ndar
     return out.reshape(*lead, D).astype(np.float32)
 
 
+def split_hand_targets(action_repr: str, actions: np.ndarray) -> dict:
+    """Split absolute action targets into per-hand wrist poses and the hand part, the form a hand IK takes.
+
+    Args:
+        action_repr: str.
+        actions: (K, D) absolute targets (:func:`decode_action` output, or an ``*_abs`` chunk): per hand
+            ``[wrist pos 3, rot6d 6, hand]`` with the wrist in the frame-t ego camera and hand = 5 fingertips x 3
+            in that wrist's frame (``fingertips_*``) or the 22 finger joints (``unify_*``).
+
+    Returns:
+        dict ``wrist`` (K, 2, 4, 4) camera_from_wrist (left, right; rot6d Gram-Schmidt-orthonormalized) and
+        ``tips`` (K, 2, 5, 3) m for ``fingertips_*`` or ``fingers`` (K, 2, 22) rad for ``unify_*``; float64.
+    """
+    rep = validate_repr(action_repr)
+    a = np.asarray(actions, dtype=np.float64)
+    D = raw_dim(rep)
+    if a.ndim != 2 or a.shape[1] != D:
+        raise ValueError(f"{rep}: expected a (K, {D}) chunk, got {a.shape}")
+    hand_w = D // 2  # per-hand block: 24 (fingertips) or 31 (unify)
+    wrist = np.tile(np.eye(4), (len(a), 2, 1, 1))
+    for side, o in enumerate(_wrist_offsets(rep)):
+        wrist[:, side, :3, 3] = a[:, o : o + 3]
+        wrist[:, side, :3, :3] = rotation_6d_to_matrix(a[:, o + 3 : o + _WRIST_DIM])
+    # The hand part follows each wrist block: (K, 2, 15) fingertips or (K, 2, 22) finger joints.
+    hand = np.stack([a[:, o + _WRIST_DIM : o + hand_w] for o in _wrist_offsets(rep)], axis=1)
+    if is_unify(rep):
+        return {"wrist": wrist, "fingers": hand}
+    return {"wrist": wrist, "tips": hand.reshape(len(a), 2, 5, 3)}
+
+
 __all__ = [
     "ACTION_REPRS",
     "CAM_POSE_DIM",
@@ -341,6 +371,7 @@ __all__ = [
     "is_unify",
     "raw_dim",
     "rot6d_dims",
+    "split_hand_targets",
     "unify_action_map",
     "validate_repr",
 ]

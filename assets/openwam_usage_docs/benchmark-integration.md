@@ -3,7 +3,7 @@
 Benchmark integration has two adapters:
 
 1. A dataloader emits OpenWAM sample dictionaries for training.
-2. A client speaks the policy server WebSocket protocol and converts returned actions to the benchmark controller.
+2. A server adapter translates the benchmark's observation / action format to the deploy engine's.
 
 The benchmark owns action ordering, units, signs, ranges, and gripper meaning. Keep those definitions in the dataloader and client adapter.
 
@@ -105,7 +105,7 @@ multiview: false
 normalize_mode: min-max              # min-max, z-score, quantile, or null
 ~~~
 
-Use [openwam/dataloader/utils/normalization.py](../../openwam/dataloader/utils/normalization.py) for normalization, [openwam/dataloader/utils/rotation.py](../../openwam/dataloader/utils/rotation.py) for the 6D rotation conversion and [openwam/dataloader/transforms/video.py](../../openwam/dataloader/transforms/video.py) for color jitter (train split, inside the dataset). Compute statistics from the training split; the reader exposes the stats file as `normalization_stats_path`, which the trainer copies into the checkpoint as `normalization_stats.npy`. Deployment gathers unified slots back to raw dimensions before unnormalizing. Keep the same statistics artifact with the checkpoint.
+Use [openwam/dataloader/utils/normalization.py](../../openwam/dataloader/utils/normalization.py) for normalization, [openwam/dataloader/utils/rotation.py](../../openwam/dataloader/utils/rotation.py) for the 6D rotation conversion and [openwam/dataloader/transforms/video.py](../../openwam/dataloader/transforms/video.py) for color jitter (train split, inside the dataset). Compute statistics from the training split; the reader exposes the stats file as `normalization_stats_path`, which the trainer copies into the checkpoint as `normalization_stats.npy`. Deployment gathers unified slots back to raw dimensions before inverting the normalization (`invert_normalization`). Keep the same statistics artifact with the checkpoint.
 
 Inspect one sample through the registry:
 
@@ -119,56 +119,17 @@ sample = dataset[0]
 print(len(dataset), sample['action'].shape, sample['video'])
 ~~~
 
-## 2. Adapt the benchmark client
+## 2. Serve the engine to the benchmark
 
-The wire protocol is implemented by `PolicyServer` in [openwam/deploy/server.py](../../openwam/deploy/server.py); clients (e.g. sim-policy-eval, launched through [benchmarks/simeval/serve.py](../../benchmarks/simeval/serve.py)) mirror it. The server decodes and composes images, forwards the prompt, normalizes state, and denormalizes actions.
+The deploy engine ([openwam/deploy/](../../openwam/deploy/)) owns the model and all of its I/O and knows no benchmark
+or transport: `InferenceEngine.new_session()` is one episode (its own observation history), `Session.plan(obs)` takes
+one observation under the training data's feature names and returns the next K actions in physical units (plus the
+hand-target split). A benchmark integration is a thin adapter around it, in `benchmarks/<name>/`:
 
-### Messages and lifecycle
+- a translation module (numpy only): the benchmark's observation names -> the engine's features, and the engine's
+  plan -> the benchmark's action format;
+- a server: one session per client connection (never shared, so episodes cannot mix), one lock serializing the GPU.
 
-Keep one persistent WebSocket connection. Send one JSON observation per control step:
-
-~~~json
-{
-  "type": "obs",
-  "images": {
-    "head_camera": "<base64_png>",
-    "left_wrist_camera": null,
-    "right_wrist_camera": null
-  },
-  "prompt": "<model_prompt>",
-  "state": [0.0, 0.0]
-}
-~~~
-
-`head_camera` is required. Wrist fields may be omitted or null; multiview servers black-fill missing slots and single-view servers ignore them. Encode RGB as base64 PNG. Do not resize unless the training reader pre-resized a tile.
-
-The response is a flat action array in physical units:
-
-~~~json
-{
-  "type": "action",
-  "action": [0.1, -0.2],
-  "step": 4,
-  "latency_ms": 12.3
-}
-~~~
-
-Reset at the start of every episode and after a hard control failure:
-
-~~~json
-{"type": "reset"}
-~~~
-
-~~~json
-{"type": "reset_ack"}
-~~~
-
-Reset clears buffered chunks and in-flight asynchronous inference; it does not reload weights. `ping` returns a `pong` response. Malformed messages return an error object.
-
-Synchronous and asynchronous execution use the same wire messages. The server may serve buffered action chunks without rerunning denoising on every step.
-
-### Convert actions at the boundary
-
-Read the returned list in the exact order documented by the reader. Apply only benchmark-specific conversion, such as rot6d-to-quaternion or EEF-to-OSC delta; the server response is already in physical units. Preserve the training action conventions.
-
-Add an adapter under `benchmarks/<name>/`, document its payload and lifecycle, and keep action conversion next to the client boundary so training and deployment conventions remain visible together.
+[benchmarks/simeval/](../../benchmarks/simeval/) is the reference: `sim_policy.py` (translation) and
+`server/serve.py` (sim-policy-eval's `sim_policy_v1` protocol over `multiprocessing.connection`). Keep benchmark
+conventions (action order, units, frames) in the translation module, next to the protocol they belong to.

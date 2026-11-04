@@ -165,12 +165,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
         self._device = torch.device("cuda")
         self._dtype = torch.bfloat16
 
-        # Optional action normalizer for deployment: the deploy engine uses it to
-        # return real-scale actions and to normalize raw robot state into the model's training space.
-        self.normalizer = None
-        # Optional deploy post-unnormalize hook (relative action modes), set by the deploy model loader.
-        self.deploy_action_decoder = None
-
         self.video_backbone: "VideoBackbone" = self._build_video_backbone(cfg["video_backbone"], mode, ckpt_dir)
 
     @staticmethod
@@ -347,33 +341,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
             self.proprio_slot_emb.to(dtype=dtype, device=device)
         for bb in self.backbones.values():
             bb.set_dtype_device(dtype, device)
-
-    # --- Normalizer (deployment) ---
-
-    def attach_normalizer(self, normalizer) -> None:
-        """Attach (or clear) the deploy action normalizer.
-
-        Deployment paths build the same normalizer used by training from
-        ``normalization_stats.npy``. The deploy engine uses it to return real-scale actions
-        and to normalize raw robot state into the model's training space. Pass ``None`` to clear.
-        """
-        self.normalizer = normalizer
-
-    def normalize_deploy_proprio(self, proprio):
-        """Normalize raw deploy proprio (array-like) into a float32 tensor; ``None`` passes through.
-
-        The denoising loop re-casts to the model device/dtype, so a CPU tensor is fine.
-        """
-        if proprio is None:
-            return None
-
-        import numpy as np
-        import torch
-
-        arr = np.asarray(proprio, dtype=np.float32)
-        if self.normalizer is not None:
-            arr = self.normalizer.normalize(arr)
-        return torch.from_numpy(arr)
 
     # --- Checkpoint save / load ---
 
@@ -668,34 +635,15 @@ class BaseWAMArchitecture(ABC, nn.Module):
     def _resolve_inactive_action_dims(
         self, active_action_mask: Optional[Tensor], device: torch.device
     ) -> Optional[Tensor]:
-        """Resolve which unified-action dims must ride the analytic noise path.
+        """Which unified-action dims ride the analytic noise path, from the caller's explicit mask.
 
-        An explicit ``active_action_mask`` wins; otherwise the active indices
-        are inferred from the attached unify normalizer's scatter map (its
-        absence, or a width mismatch with ``action_dim``, disables pinning).
-        Returns a bool ``(action_dim,)`` mask of INACTIVE dims, or ``None``
-        when every dim is active.
+        Args:
+            active_action_mask: (action_dim,) bool of the active dims, or None (every dim active). The deploy engine
+                builds it from ``action_mode`` (the unify scatter map); nothing is inferred here.
+            device: device of the returned mask.
+
+        Returns: (action_dim,) bool mask of the INACTIVE dims, or None when every dim is active.
         """
-        if active_action_mask is None:
-            normalizer = self.normalizer
-            active_action_indices = getattr(normalizer, "_dst_index", None)
-            unified_action_dim = getattr(normalizer, "_unify_dim", None)
-            if (
-                active_action_indices is not None
-                and unified_action_dim is not None
-                and int(unified_action_dim) == self.action_dim
-            ):
-                active_action_indices = torch.as_tensor(active_action_indices, device=device, dtype=torch.long)
-                if active_action_indices.numel() and (
-                    int(active_action_indices.min()) < 0 or int(active_action_indices.max()) >= self.action_dim
-                ):
-                    raise ValueError(
-                        f"Unified action indices must be within [0, {self.action_dim}); "
-                        f"got {active_action_indices.tolist()}."
-                    )
-                active_action_mask = torch.zeros(self.action_dim, device=device, dtype=torch.bool)
-                active_action_mask[active_action_indices] = True
-
         if active_action_mask is None:
             return None
         active_action_mask = torch.as_tensor(active_action_mask, device=device, dtype=torch.bool)
@@ -719,7 +667,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
         proprio: Tensor,
         proprio_mask: Tensor,
         inactive_action_dims: Optional[Tensor] = None,
-        dit_cache=None,
         cfg_scale: float = 1.0,
         cfg_merge: bool = False,
     ) -> Tuple[Tensor, Tensor]:
@@ -732,7 +679,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
             hist_latents: (B, C, num_hist_latents, h, w) clean prefix, re-imposed after every video step.
             text: TextCondition. proprio: (B, H, D) normalized proprio. proprio_mask: (B, H, D) bool.
             inactive_action_dims: (A,) index of unified-action dims kept on the analytic noise path, or None.
-            dit_cache: optional DiT velocity cache. cfg_scale / cfg_merge: classifier-free guidance (scale 1 = off).
+            cfg_scale / cfg_merge: classifier-free guidance (scale 1 = off).
 
         Returns: (latents (B, C, T, h, w) denoised video latents, actions (B, K, A) in normalized space).
         """
@@ -767,44 +714,31 @@ class BaseWAMArchitecture(ABC, nn.Module):
             v_timestep = torch.tensor([t_v], dtype=dtype, device=device)
             a_timestep = torch.tensor([t_a], dtype=dtype, device=device)
 
-            if (
-                dit_cache is not None
-                and video_stepping
-                and not dit_cache.should_recompute(sigma_v, require_action=action_stepping)
-            ):
-                # Reuse cached predictions from the previous joint forward.
-                # Joint denoising can only skip the whole DiT call when the
-                # action prediction was cached together with video prediction.
-                noise_pred = dit_cache.get_cached()
-                action_noise_pred = dit_cache.get_cached_action() if action_stepping else None
+            if cfg_scale_f > 1.0:
+                # _forward_with_cfg runs its own cudagraph_mark_step_begin()
+                # before each inner forward (1 for cfg_merge, 2 for sequential).
+                noise_pred, action_noise_pred = self._forward_with_cfg(
+                    action_latents=action_latents,
+                    a_timestep=a_timestep,
+                    inputs_shared={"latents": latents, "text": text, "proprio": proprio},
+                    v_timestep=v_timestep,
+                    cfg_scale=cfg_scale_f,
+                    cfg_merge=bool(cfg_merge),
+                )
             else:
-                if cfg_scale_f > 1.0:
-                    # _forward_with_cfg runs its own cudagraph_mark_step_begin()
-                    # before each inner forward (1 for cfg_merge, 2 for sequential).
-                    noise_pred, action_noise_pred = self._forward_with_cfg(
-                        action_latents=action_latents,
-                        a_timestep=a_timestep,
-                        inputs_shared={"latents": latents, "text": text, "proprio": proprio},
-                        v_timestep=v_timestep,
-                        cfg_scale=cfg_scale_f,
-                        cfg_merge=bool(cfg_merge),
-                    )
-                else:
-                    torch.compiler.cudagraph_mark_step_begin()
-                    # Inference never checkpoints (it would also bypass the compiled loops).
-                    noise_pred, action_noise_pred = self.forward(
-                        action_latents,
-                        a_timestep,
-                        latents=latents,
-                        timestep=v_timestep,
-                        text=text,
-                        proprio=proprio,
-                        proprio_mask=proprio_mask,
-                        use_gradient_checkpointing=False,
-                        use_gradient_checkpointing_offload=False,
-                    )
-                if dit_cache is not None and video_stepping:
-                    dit_cache.update(noise_pred, sigma_v, action_noise_pred)
+                torch.compiler.cudagraph_mark_step_begin()
+                # Inference never checkpoints (it would also bypass the compiled loops).
+                noise_pred, action_noise_pred = self.forward(
+                    action_latents,
+                    a_timestep,
+                    latents=latents,
+                    timestep=v_timestep,
+                    text=text,
+                    proprio=proprio,
+                    proprio_mask=proprio_mask,
+                    use_gradient_checkpointing=False,
+                    use_gradient_checkpointing_offload=False,
+                )
 
             if video_stepping:
                 new_latents = latents + noise_pred * (sigma_v_next - sigma_v)
@@ -846,7 +780,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
             proprio: (B, H, D) normalized proprio on the model device / dtype, one row per history frame (all real).
             schedule: (t_video, t_action) list from ``make_schedule``.
             seed: int, seeds one generator that draws the video noise, then the action noise.
-            active_action_mask: optional (A,) bool of the active unified-action dims (None: from the normalizer).
+            active_action_mask: optional (A,) bool of the active unified-action dims; None = every dim active.
 
         Returns: (latents (B, z, layout.num_latents, h, w), actions (B, layout.action_horizon, A) in normalized
             space). The shapes come from the layout; h, w are the history latents' grid.
@@ -868,6 +802,34 @@ class BaseWAMArchitecture(ABC, nn.Module):
             proprio_mask=torch.ones(proprio.shape, dtype=torch.bool, device=proprio.device),
             inactive_action_dims=self._resolve_inactive_action_dims(active_action_mask, device),
         )
+
+    @torch.no_grad()
+    def rollout(
+        self,
+        history: list,
+        prompts: list,
+        proprio: Tensor,
+        schedule,
+        *,
+        seed: int,
+        active_action_mask: Optional[Tensor],
+    ) -> Tuple[Tensor, Tensor]:
+        """Encode the history + prompts and denoise the future from seeded noise: deploy's and training vis's rollout.
+
+        Args:
+            history: B lists of H PIL frames each (the history canvases, oldest first).
+            prompts: B prompt strings.
+            proprio: (B, H, D) normalized proprio on the model device / dtype.
+            schedule: (t_video, t_action) list from ``make_schedule``.
+            seed: int, seeds the video and action noise.
+            active_action_mask: (A,) bool of the active unified-action dims, or None (every dim active); required so
+                each caller states its choice.
+
+        Returns: (latents (B, z, layout.num_latents, h, w), actions (B, layout.action_horizon, A) normalized), as
+            :meth:`sample`. Callers that want pixels decode with ``video_backbone.decode_future(latents, layout)``.
+        """
+        hist_latents, text = self.video_backbone.preprocess_condition(history, prompts, self.layout)
+        return self.sample(hist_latents, text, proprio, schedule, seed=seed, active_action_mask=active_action_mask)
 
     # --- §15: Classifier-Free Guidance helpers (inference-time) ---
 
