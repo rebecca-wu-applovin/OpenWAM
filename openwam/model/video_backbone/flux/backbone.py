@@ -21,20 +21,29 @@ Attention (``build_joint_attention_masks``; A = OpenWAM action tokens appended b
   H rows never read F or A; F, T, P and A rows read everything.
 Per sample, text keys beyond that caption's own bucket length are masked (native packs captions of
 different lengths without padding them to each other).
+
+Construction (everything from ``cfg = cfg.model.video_backbone``):
+* :meth:`FluxActionVideoBackbone.from_pretrained`: the trunk built from the yaml ``dit`` geometry + the
+  ``action_cond_dim`` P input, loaded from ``flux-3-action-base.safetensors``; VAE and Qwen3-VL from the bundle;
+* :meth:`FluxActionVideoBackbone.from_checkpoint_dir`: the same modules as meta shells, Qwen3-VL from the
+  ``config.json`` / processor files :meth:`save_deploy_assets` copied into ``<ckpt>/text_encoder/``.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Optional, Tuple
+import shutil
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from einops import rearrange
+from omegaconf import DictConfig, OmegaConf
 from torch import Tensor, nn
 
-from openwam.model.video_backbone.base import BlockLoopState, VideoBackbone
+from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
+from openwam.model.video_backbone.common.text_cache import PromptCache
 from openwam.model.video_backbone.flux.dit import (
     JointSingleSeq,
     JointSingleSeqParams,
@@ -61,6 +70,9 @@ _ENCODER_MIN_FRAMES = 9
 _VEC_DIM = 768  # pooled-vector width; flux feeds zeros
 _SHARED_ACTION_COND = "action_prediction_cond"  # co-trained action branch routed to our P stream
 _N_MODE = 5  # JointSingleSeqParams.depth
+# Qwen3-VL dir: ``text_encoder/`` in the bundle and, copied by save_deploy_assets (weights excluded), in a ckpt dir.
+_TEXT_ENCODER_SUBDIR = "text_encoder"
+_WEIGHT_PATTERNS = ("*.safetensors", "*.safetensors.index.json")
 
 
 def _rational_time_shift(t: Tensor, shift: float) -> Tensor:
@@ -79,8 +91,9 @@ class FluxActionVideoBackbone(VideoBackbone):
         *,
         dit: JointSingleSeq,
         vae: nn.Module,
-        text_encoder: Optional[nn.Module],
-        state_dim: int,
+        text_encoder: nn.Module,
+        text_encoder_dir: str,
+        action_cond_dim: int,
         shift_video: float = 5.0,
         text_dropout_p: float = 0.1,
         train_timestep_width: float = 0.75,
@@ -90,8 +103,9 @@ class FluxActionVideoBackbone(VideoBackbone):
         Args:
             dit: JointSingleSeq with streams video / video_cond / action_cond.
             vae: ViTNormInference (frozen).
-            text_encoder: Qwen3VLEmbedder (frozen) or None (deploy rebuild).
-            state_dim: int, proprio width fed to the P stream.
+            text_encoder: Qwen3VLEmbedder (frozen).
+            text_encoder_dir: str, the dir its config / processor files were read from (save_deploy_assets copies it).
+            action_cond_dim: int, proprio width fed to the P stream (must equal the architecture's state_dim).
             shift_video: float, inference shift of the OpenWAM scheduler (flux DROID inference: 5).
             text_dropout_p: float, training caption dropout to "" (flux PolicyConfig.caption_dropout).
             train_timestep_width / train_timestep_shift: native training timestep law (logit-logistic + rational shift).
@@ -101,9 +115,9 @@ class FluxActionVideoBackbone(VideoBackbone):
 
         self.dit = dit
         self.vae = vae
-        if text_encoder is not None:
-            self.text_encoder = text_encoder
-        self.state_dim = int(state_dim)
+        self.text_encoder = text_encoder
+        self._text_encoder_dir = text_encoder_dir
+        self.state_dim = int(action_cond_dim)
         self._shift_video = float(shift_video)
         self._scheduler = FlowScheduler(shift_video=self._shift_video)
         self._text_dropout_p = float(text_dropout_p)
@@ -113,7 +127,8 @@ class FluxActionVideoBackbone(VideoBackbone):
         self._temporal_compression = _TEMPORAL_COMPRESSION
         self._causal_temporal = True
         self._video_attention_mask_mode = "first_frame_causal"
-        self._text_cache: Optional[dict] = None
+        # Text slot read by encode_text: the online Qwen3-VL here, a PromptCache after build_text_cache.
+        self.text_lookup = self._qwen_entries
         # Test-only switch of build_flux_layer_masks (see verify_layout.py); never set in training.
         self.strict_clean_rows = False
 
@@ -139,8 +154,13 @@ class FluxActionVideoBackbone(VideoBackbone):
         return self._scheduler
 
     @property
-    def text_dim(self) -> Optional[int]:
+    def text_dim(self) -> int:
         return self.dit.params.context_in_dim
+
+    @property
+    def action_cond_dim(self) -> int:
+        """Input width of the P (proprio) stream; the architecture checks it equals its ``state_dim``."""
+        return self.state_dim
 
     @property
     def video_attention_mask_mode(self) -> str:
@@ -152,46 +172,91 @@ class FluxActionVideoBackbone(VideoBackbone):
 
     # ---------------------------------------------------------------- construction
     @classmethod
-    def from_pretrained(cls, source: Any, *, ckpt_dir: Optional[str] = None, **kw) -> "FluxActionVideoBackbone":
-        """Build from the pretrained flux weights.
+    def from_pretrained(cls, cfg: DictConfig) -> "FluxActionVideoBackbone":
+        """Build from the pretrained flux bundle at ``cfg.model_path``.
 
         Args:
-            source: training: dict / DictConfig of architecture params holding ``video_backbone``
-                (model_path, ...) and ``state_dim``; run-dir rebuild: that ``video_backbone`` cfg itself.
-            ckpt_dir: run dir being rebuilt from (resume / finetune); None for a fresh training build.
-            kw: ignored (``text_dim`` etc.).
+            cfg: ``cfg.model.video_backbone``: ``dit`` geometry, ``action_cond_dim``, ``model_path`` and the
+                scalar knobs.
 
         Returns:
-            FluxActionVideoBackbone with trunk, VAE and text encoder loaded.
+            FluxActionVideoBackbone with trunk, VAE and text encoder loaded (CPU). Raises ValueError when the
+            trunk weights do not match the yaml geometry.
         """
-        if ckpt_dir is not None:
-            # Rebuild from a run dir (resume / finetune, ckpt_model_loader): `source` is that run's own
-            # video_backbone cfg. Build the same pretrained model from it; the caller then overwrites
-            # every weight (accelerate load_state / the safetensors load). state_dim sits on the
-            # architecture, so read it from the run's saved config.
-            from omegaconf import OmegaConf
-
-            vb_cfg = source
-            state_dim = int(OmegaConf.load(os.path.join(ckpt_dir, "config.yaml")).model.architecture.state_dim)
-        else:
-            vb_cfg = source.get("video_backbone")
-            state_dim = int(source.get("state_dim", 48))
-        root = str(vb_cfg.get("model_path"))
-        dit = build_flux_dit(f"{root}/flux-3-action-base.safetensors", state_dim=state_dim, head_seed=0)
-        vae = build_flux_vae(f"{root}/video_vae.safetensors")
         from openwam.model.video_backbone.flux.text_encoder import Qwen3VLEmbedder
 
-        text_encoder = Qwen3VLEmbedder(f"{root}/text_encoder")
+        root = str(cfg.model_path)
+        # Built in this order (trunk, VAE): their random inits are part of the training seed stream.
+        dit = build_flux_dit(f"{root}/flux-3-action-base.safetensors", cfg.dit, action_cond_dim=int(cfg.action_cond_dim), head_seed=0)
+        vae = build_flux_vae(f"{root}/video_vae.safetensors")
+        text_dir = os.path.join(root, _TEXT_ENCODER_SUBDIR)
+        return cls._assemble(cfg, dit, vae, Qwen3VLEmbedder.from_pretrained(text_dir), text_dir)
+
+    @classmethod
+    def from_checkpoint_dir(cls, cfg: DictConfig, ckpt_dir: str) -> "FluxActionVideoBackbone":
+        """Build the empty skeleton of a saved checkpoint; the caller loads its weights.
+
+        Args:
+            cfg: the checkpoint's ``cfg.model.video_backbone``.
+            ckpt_dir: str, checkpoint dir holding ``text_encoder/`` (Qwen3-VL config + processor files).
+
+        Returns:
+            FluxActionVideoBackbone whose parameters are all on ``meta`` (bf16); non-persistent buffers are real.
+        """
+        from accelerate import init_empty_weights
+
+        from openwam.model.video_backbone.flux.text_encoder import Qwen3VLEmbedder
+        from openwam.model.video_backbone.flux.vae import ViTNormInference
+
+        text_dir = os.path.join(ckpt_dir, _TEXT_ENCODER_SUBDIR)
+        if not os.path.isdir(text_dir):
+            raise FileNotFoundError(f"flux text encoder assets not found at {text_dir} (written by save_deploy_assets)")
+        with init_empty_weights(include_buffers=False):
+            dit = _flux_dit(cfg.dit, int(cfg.action_cond_dim), torch.bfloat16)
+            vae = ViTNormInference(_flux_vae_params())
+        # Same dtypes as the pretrained path: the trunk is built in bf16, the VAE casts itself (params.dtype).
+        dit.eval()
+        vae.eval()
+        for p in vae.parameters():
+            p.requires_grad_(False)
+        return cls._assemble(cfg, dit, vae, Qwen3VLEmbedder.from_config_dir(text_dir), text_dir)
+
+    @classmethod
+    def _assemble(cls, cfg: DictConfig, dit, vae, text_encoder, text_encoder_dir: str) -> "FluxActionVideoBackbone":
+        """Shared tail of both constructors: wrap the modules with the yaml's scalar knobs.
+
+        Args:
+            cfg: ``cfg.model.video_backbone``. dit / vae / text_encoder: built modules (real or meta).
+            text_encoder_dir: str, where the text encoder's config / processor files were read from.
+
+        Returns:
+            FluxActionVideoBackbone.
+        """
         return cls(
             dit=dit,
             vae=vae,
             text_encoder=text_encoder,
-            state_dim=state_dim,
-            shift_video=float(vb_cfg.get("shift_video", 5.0)),
-            text_dropout_p=float(vb_cfg.get("text_dropout_p", 0.1)),
-            train_timestep_width=float(vb_cfg.get("train_timestep_width", 0.75)),
-            train_timestep_shift=float(vb_cfg.get("train_timestep_shift", 42.0)),
+            text_encoder_dir=text_encoder_dir,
+            action_cond_dim=int(cfg.action_cond_dim),
+            shift_video=float(cfg.shift_video),
+            text_dropout_p=float(cfg.text_dropout_p),
+            train_timestep_width=float(cfg.train_timestep_width),
+            train_timestep_shift=float(cfg.train_timestep_shift),
         )
+
+    def save_deploy_assets(self, output_dir: str) -> None:
+        """Copy the Qwen3-VL config / processor / tokenizer files (no weights) into ``<output_dir>/text_encoder/``.
+
+        Args:
+            output_dir: str, checkpoint dir. Files come from wherever this backbone read them (bundle or ckpt).
+
+        Returns:
+            None. An existing ``text_encoder/`` is left as it is.
+        """
+        dst = os.path.join(output_dir, _TEXT_ENCODER_SUBDIR)
+        if os.path.isdir(dst):
+            return
+        shutil.copytree(self._text_encoder_dir, dst, ignore=shutil.ignore_patterns(*_WEIGHT_PATTERNS))
 
     # ---------------------------------------------------------------- training noise (native)
     def sample_training_noise(self, batch: int, *, device, dtype) -> Tuple[Tensor, Tensor, Tensor]:
@@ -215,9 +280,9 @@ class FluxActionVideoBackbone(VideoBackbone):
         # Native flow_loss weighs every video token equally (video_loss_weight = 1).
         return t.float() * 1000.0, t, torch.ones(batch, device=device)
 
-    # ---------------------------------------------------------------- encoders
+    # ---------------------------------------------------------------- video IO
     @torch.no_grad()
-    def _vae_encode(self, video: Tensor) -> Tensor:
+    def encode_pixels(self, video: Tensor) -> Tensor:
         """``(N, 3, T, H, W)`` in [-1, 1] -> normalized latents ``(N, 96, 1 + (T-1)//4, H/32, W/32)``.
 
         A single frame is encoded alone (native ``encode_task`` / ``encode_frame``: the 2-D kernel path).
@@ -249,184 +314,116 @@ class FluxActionVideoBackbone(VideoBackbone):
         return lat[:, :, : 1 + (t - 1) // _TEMPORAL_COMPRESSION].clone()
 
     @torch.no_grad()
-    def decode_video(self, latents: Tensor, *, tiled: bool = True) -> list:
-        """Normalized latents ``(1, 96, T_lat, h, w)`` -> ``4 * T_lat - 3`` PIL frames (training vis).
+    def decode_latents(self, latents: Tensor) -> Tensor:
+        """Normalized latents ``(N, 96, T_lat, h, w)`` -> ``(N, 3, 4 * T_lat - 3, 32h, 32w)`` pixels in [-1, 1].
 
         The decoder's temporal NATTEN kernel spans 5 latents, so a shorter clip (our 1+4 future = 2 latents)
         is padded by repeating its last latent and the extra frames are cropped. The kernel is not causal,
         so the last decoded frames are approximate; fine for visualization, not a reconstruction metric.
-        ``tiled`` is unused: the VAE's own looped decode (``decoder_max_t``) bounds the memory.
         """
-        from openwam.model.video_backbone.common.pixels import tensor_to_pil_frames
-
-        _ = tiled
         t = latents.shape[2]
         if t < _DECODER_TEMPORAL_KERNEL:
             pad = latents[:, :, -1:].expand(-1, -1, _DECODER_TEMPORAL_KERNEL - t, -1, -1)
             latents = torch.cat([latents, pad], dim=2)
         dtype = next(self.vae.parameters()).dtype
-        # Same autocast as _vae_encode; ViTNormInference.decode denormalizes and clamps to [-1, 1].
+        # Same autocast as encode_pixels; ViTNormInference.decode denormalizes and clamps to [-1, 1].
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=latents.device.type == "cuda"):
             video = self.vae.decode(latents.to(dtype))
-        video = video[:, :, : _TEMPORAL_COMPRESSION * (t - 1) + 1]
-        return tensor_to_pil_frames(video.float().clamp(-1, 1))
+        return video[:, :, : _TEMPORAL_COMPRESSION * (t - 1) + 1]
 
-    def _pixels(self, frames) -> Tensor:
-        """list of B clips of PIL frames -> (B, 3, T, H, W) float32 in [-1, 1], built on self.device."""
-        from openwam.model.video_backbone.common.pixels import pil_clips_to_tensor
-
-        return pil_clips_to_tensor(frames, device=self.device)
-
-    def encode_history(self, frames) -> Tensor:
-        """Each history frame encoded alone (flux history.encode_windows).
-
-        Args:
-            frames: list of B clips (H PIL frames), or (B, 3, H, Hp, Wp) in [-1, 1].
-
-        Returns:
-            (B, 96, H, h, w) latents.
-        """
-        x = frames if torch.is_tensor(frames) else self._pixels(frames)
-        b, h = x.shape[0], x.shape[2]
-        hist = x.transpose(1, 2).flatten(0, 1).unsqueeze(2)  # (B*H, 3, 1, Hp, Wp)
-        return self._vae_encode(hist).unflatten(0, (b, h)).squeeze(3).transpose(1, 2)
-
-    def encode_sparse_future(self, future_frames) -> Tensor:
-        """future_frames: list of B clips of F PIL frames, or (B, 3, F, Hp, Wp). Returns: (B, 96, 1 + (F-1)//4, h, w)."""
-        x = future_frames if torch.is_tensor(future_frames) else self._pixels(future_frames)
-        with torch.no_grad():
-            return self._vae_encode(x).to(device=self.device, dtype=self.dtype)
-
+    # ---------------------------------------------------------------- text
     @torch.no_grad()
-    def build_text_cache(self, prompts: list, *, offload_device: str = "cpu") -> None:
-        """Encode every training prompt (and the "" dropout caption) once, then park Qwen on the CPU.
-
-        Args:
-            prompts: list[str] of every training prompt.
-            offload_device: where the frozen encoder lives afterwards.
-        """
-        texts = sorted(set(prompts) | {""})
-        cache = {}
-        for i in range(0, len(texts), 16):
-            chunk = texts[i : i + 16]
-            for p, ctx in zip(chunk, self.text_encoder.encode(chunk)):
-                cache[p] = ctx.to(self.device)
-        self._text_cache = cache
-        self.text_encoder.to(offload_device)
-        torch.cuda.empty_cache()
-
-    def encode_text(self, prompts: list) -> Tuple[Tensor, Tensor]:
-        """Captions -> ``(context (B, L_max, 20480), seq_lens (B,))``; each caption keeps its own bucket.
+    def _qwen_entries(self, prompts: list) -> list:
+        """Online Qwen3-VL encode (the default ``text_lookup``).
 
         Args:
             prompts: list[str] of B captions.
 
         Returns:
-            context zero-padded to the longest bucket, seq_lens = each caption's bucket length.
+            list of B contexts ``(1, L_i, 20480)`` on ``self.device``, ``L_i`` each caption's own bucket length.
         """
-        if self._text_cache is not None:
-            missing = [p for p in prompts if p not in self._text_cache]
-            if missing:
-                raise KeyError(f"flux text cache has no entry for {missing[:3]}")
-            ctxs = [self._text_cache[p] for p in prompts]
-        else:
-            ctxs = self.text_encoder.encode(list(prompts))
-        lens = torch.tensor([c.shape[1] for c in ctxs], device=self.device)
-        ctx = torch.zeros(len(ctxs), int(lens.max()), ctxs[0].shape[-1], device=self.device, dtype=self.dtype)
-        for i, c in enumerate(ctxs):
-            ctx[i, : c.shape[1]] = c[0].to(device=self.device, dtype=self.dtype)
-        return ctx, lens
+        return [ctx.to(self.device) for ctx in self.text_encoder.encode(list(prompts))]
 
-    # ---------------------------------------------------------------- sparse-history condition
-    def _prompts(self, text, batch_size: int) -> list:
-        """text: one str or B prompts; batch_size: B. Returns: B prompts, "" for caption-dropped ones (training mode)."""
-        prompts = [text] * batch_size if isinstance(text, str) else list(text)
+    @torch.no_grad()
+    def build_text_cache(self, prompts: list) -> None:
+        """Encode every training prompt (and the "" dropout caption) once, then park Qwen on the CPU.
+
+        Args:
+            prompts: list[str] of every training prompt.
+
+        Returns:
+            None. ``text_lookup`` becomes a PromptCache (sorted unique prompts + "", 16 per forward).
+        """
+        self.text_lookup = PromptCache(self.text_lookup, sorted(set(prompts) | {""}), batch_size=16)
+        self.text_encoder.to("cpu")
+        torch.cuda.empty_cache()
+
+    def _caption_dropout(self, prompts: list) -> list:
+        """prompts: B str. Returns: B prompts, "" for caption-dropped ones (p = text_dropout_p, training mode).
+
+        Native caption dropout: the empty caption through the same chat template. Transitional: Task 12 moves
+        caption dropout into the dataset.
+        """
         if self.training and self._text_dropout_p > 0:
-            # Native caption dropout: the empty caption through the same chat template.
             keep = torch.rand(len(prompts)) >= self._text_dropout_p
             prompts = [p if k else "" for p, k in zip(prompts, keep.tolist())]
         return prompts
 
-    def preprocess_sparse_condition(self, history_frames, text, *, num_future_frames: int) -> dict:
-        """Sparse-history conditioning: H history frames encoded one by one + the Qwen3-VL context.
+    def encode_text(self, prompts: list, *, grid, num_frames: int) -> TextCondition:
+        """Captions -> zero-padded Qwen3-VL context; each caption keeps its own bucket.
 
         Args:
-            history_frames: list of B clips (H PIL frames, oldest first).
-            text: list of B prompts (or one str).
-            num_future_frames: int F (1 + 4k).
+            prompts: list[str] of B captions. grid / num_frames: unused.
 
         Returns:
-            dict ``first_frame_latents`` (B, 96, H, h, w), ``num_clean_prefix_frames`` = H, ``context``
-            (B, L, 20480), ``seq_lens`` (B,), ``text_len`` (int L), ``height`` / ``width`` / ``num_frames`` (H + F).
+            TextCondition: context (B, L_max, 20480) zero-padded to the longest bucket, context_mask (B, L_max)
+            = position < the caption's bucket length, extra ``text_len`` = L_max (int; ``prepare`` slices the
+            text tokens off the context the architecture extended with proprio).
         """
-        h = len(history_frames[0])
-        self.num_future_latents(num_future_frames)  # validates F = 1 + 4k
-        prompts = self._prompts(text, len(history_frames))
-        with torch.no_grad():
-            latents = self.encode_history(history_frames)
-            context, seq_lens = self.encode_text(prompts)
-        w0, h0 = history_frames[0][0].size
-        return {
-            "first_frame_latents": latents.to(device=self.device, dtype=self.dtype),
-            "num_clean_prefix_frames": h,
-            "context": context,
-            "seq_lens": seq_lens,
-            "text_len": int(context.shape[1]),
-            "height": h0,
-            "width": w0,
-            "num_frames": h + int(num_future_frames),
-        }
-
-    # ---------------------------------------------------------------- train preprocessing
-    def preprocess_input_for_train(self, *, frames=None, text=None, **kw) -> dict:
-        """Frames + prompts -> latents (sparse history when ``num_history_frames`` > 0) + text context.
-
-        Returns:
-            dict ``input_latents`` (B, 96, T, h, w), ``first_frame_latents`` (clean prefix), ``num_clean_prefix_frames``,
-            ``context`` (B, L, 20480), ``seq_lens`` (B,), ``text_len`` (int L), ``height`` / ``width`` / ``num_frames``.
-        """
-        n_hist = int(kw.get("num_history_frames", 0) or 0)
-        if n_hist > 0:
-            # Sparse history = the shared condition (also built by deploy) + the future clip as target.
-            cond = self.preprocess_sparse_condition(
-                [c[:n_hist] for c in frames], text, num_future_frames=len(frames[0]) - n_hist
-            )
-            fut = self.encode_sparse_future([c[n_hist:] for c in frames])
-            return {**cond, "input_latents": torch.cat([cond["first_frame_latents"], fut], dim=2)}
-        prompts = self._prompts(text, len(frames))
-        with torch.no_grad():
-            latents = self._vae_encode(self._pixels(frames))
-            context, seq_lens = self.encode_text(prompts)
-        latents = latents.to(device=self.device, dtype=self.dtype)
-        w0, h0 = frames[0][0].size
-        return {
-            "input_latents": latents,
-            "first_frame_latents": latents[:, :, :1].clone(),
-            "num_clean_prefix_frames": 1,
-            "context": context,
-            "seq_lens": seq_lens,
-            "text_len": int(context.shape[1]),
-            "height": h0,
-            "width": w0,
-            "num_frames": len(frames[0]),
-        }
+        ctxs = self.text_lookup(self._caption_dropout(list(prompts)))
+        lens = torch.tensor([c.shape[1] for c in ctxs], device=self.device)
+        ctx = torch.zeros(len(ctxs), int(lens.max()), ctxs[0].shape[-1], device=self.device, dtype=self.dtype)
+        for i, c in enumerate(ctxs):
+            ctx[i, : c.shape[1]] = c[0].to(device=self.device, dtype=self.dtype)
+        positions = torch.arange(ctx.shape[1], device=ctx.device).unsqueeze(0)
+        return TextCondition(
+            context=ctx, context_mask=positions < lens.unsqueeze(1), extra={"text_len": int(ctx.shape[1])}
+        )
 
     # ---------------------------------------------------------------- block loop
-    def prepare(self, **kw) -> BlockLoopState:
+    def prepare(
+        self,
+        *,
+        latents: Tensor,
+        timestep: Tensor,
+        text: TextCondition,
+        num_clean_latents: int,
+        raw_proprio: Optional[Tensor] = None,
+        use_gradient_checkpointing: bool = False,
+        use_gradient_checkpointing_offload: bool = False,
+    ) -> BlockLoopState:
         """Embed T / F / H / P, build per-token modulations and RoPE, stash per-segment metadata.
 
-        Expects ``latents`` (B, 96, T, h, w), ``timestep`` (B,) = 1000 t, ``context`` (B, L(+N_p), 20480)
-        whose first ``text_len`` tokens are text, ``seq_lens`` (B,), ``num_clean_prefix_frames`` H and
-        ``raw_proprio`` (B, N_p, state_dim) (zeros when absent).
+        Args:
+            latents: (B, 96, T, h, w); the first ``num_clean_latents`` = H are the history (H stream).
+            timestep: (B,) = 1000 t.
+            text: TextCondition; the first ``extra["text_len"]`` context tokens are text (the architecture may
+                have appended proprio tokens after them), context_mask gives each caption's bucket length.
+            num_clean_latents: int H.
+            raw_proprio: (B, N_p, state_dim) proprio frames for the P stream (zeros when None).
+            use_gradient_checkpointing(_offload): bool loop flags.
+
+        Returns:
+            BlockLoopState.
         """
         dit = self.dit
-        latents = kw["latents"]
         b, _, t_lat, h, w = latents.shape
-        n_hist = int(kw.get("num_clean_prefix_frames", 1) or 1)
-        text_len = int(kw.get("text_len", kw["context"].shape[1]))
-        ctx = kw["context"][:, :text_len]
-        seq_lens = kw.get("seq_lens")
-        prop = kw.get("raw_proprio")
+        n_hist = int(num_clean_latents)
+        text_len = int(text.extra["text_len"])
+        ctx = text.context[:, :text_len]
+        # Each caption's own bucket length (the text part of the mask is a prefix of True).
+        seq_lens = text.context_mask[:, :text_len].sum(dim=1)
+        prop = raw_proprio
         if prop is None:
             prop = torch.zeros(b, n_hist, self.state_dim, device=latents.device, dtype=latents.dtype)
         prop = prop.reshape(b, -1, self.state_dim)
@@ -446,7 +443,7 @@ class FluxActionVideoBackbone(VideoBackbone):
         seg_lens = {k: int(v.shape[1]) for k, v in x.items()}
 
         # Per-token timesteps: future noisy (t in [0, 1]), every conditioning stream clean.
-        t = (kw["timestep"].float() / 1000.0).to(dev)
+        t = (timestep.float() / 1000.0).to(dev)
         ts = {k: torch.zeros(b, n, device=dev) for k, n in seg_lens.items()}
         ts["video"] = t[:, None].expand(b, seg_lens["video"])
         vector_emb = dit.vector_in(torch.zeros(b, _VEC_DIM, device=dev, dtype=dtype))
@@ -473,7 +470,7 @@ class FluxActionVideoBackbone(VideoBackbone):
             "pe": pe,
             "vec": vec,
             "n_hist": n_hist,
-            "text_valid": seq_lens.to(dev) if seq_lens is not None else None,
+            "text_valid": seq_lens.to(dev),
         }
         return BlockLoopState(
             hidden_states=hidden,
@@ -483,8 +480,8 @@ class FluxActionVideoBackbone(VideoBackbone):
             grid_frames=t_lat,
             grid_height=h,
             grid_width=w,
-            use_gradient_checkpointing=bool(kw.get("use_gradient_checkpointing", False)),
-            use_gradient_checkpointing_offload=bool(kw.get("use_gradient_checkpointing_offload", False)),
+            use_gradient_checkpointing=bool(use_gradient_checkpointing),
+            use_gradient_checkpointing_offload=bool(use_gradient_checkpointing_offload),
             extras=extras,
         )
 
@@ -598,7 +595,33 @@ class FluxActionVideoBackbone(VideoBackbone):
 
 
 # -------------------------------------------------------------------- builders
-def build_flux_dit(path: str, *, state_dim: int, head_seed: int = 0, dtype: torch.dtype = torch.bfloat16) -> JointSingleSeq:
+def _flux_dit(geometry: DictConfig, action_cond_dim: int, dtype: torch.dtype) -> JointSingleSeq:
+    """The trunk module with streams video / video_cond / action_cond (random init; caller loads weights).
+
+    Args:
+        geometry: the yaml ``dit`` block (JointSingleSeqParams fields other than the stream wiring).
+        action_cond_dim: int, P input width.
+        dtype: parameter dtype (set as the default dtype while building).
+
+    Returns:
+        JointSingleSeq.
+    """
+    params = JointSingleSeqParams(
+        in_channels={"video": _LATENT_CHANNELS, "video_cond": _LATENT_CHANNELS, _P_STREAM: int(action_cond_dim)},
+        sequence={"x_video": "video", "x_video_cond": "video_cond", f"x_{_P_STREAM}": _P_STREAM},
+        **OmegaConf.to_container(geometry),
+    )
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        return JointSingleSeq(params)
+    finally:
+        torch.set_default_dtype(prev)
+
+
+def build_flux_dit(
+    path: str, geometry: DictConfig, *, action_cond_dim: int, head_seed: int = 0, dtype: torch.dtype = torch.bfloat16
+) -> JointSingleSeq:
     """JointSingleSeq with streams video / video_cond / action_cond, loaded from the action-base trunk.
 
     ``action_prediction_cond`` mode blocks + modulations are routed to ``action_cond`` (flux wiring); the
@@ -607,25 +630,17 @@ def build_flux_dit(path: str, *, state_dim: int, head_seed: int = 0, dtype: torc
 
     Args:
         path: flux-3-action-base.safetensors.
-        state_dim: int, P input width.
+        geometry: the yaml ``dit`` block the trunk is built from.
+        action_cond_dim: int, P input width.
         head_seed: int, seed of the fresh input Linear.
         dtype: parameter dtype.
 
     Returns:
-        JointSingleSeq in eval mode on CPU.
+        JointSingleSeq in eval mode on CPU. Raises ValueError when the file does not match ``geometry``.
     """
     from safetensors import safe_open
 
-    params = JointSingleSeqParams(
-        in_channels={"video": _LATENT_CHANNELS, "video_cond": _LATENT_CHANNELS, _P_STREAM: int(state_dim)},
-        sequence={"x_video": "video", "x_video_cond": "video_cond", f"x_{_P_STREAM}": _P_STREAM},
-    )
-    prev = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        model = JointSingleSeq(params)
-    finally:
-        torch.set_default_dtype(prev)
+    model = _flux_dit(geometry, action_cond_dim, dtype)
     sd = {}
     with safe_open(path, framework="pt", device="cpu") as f:
         for key in f.keys():
@@ -637,15 +652,20 @@ def build_flux_dit(path: str, *, state_dim: int, head_seed: int = 0, dtype: torc
             elif len(parts) >= 3 and parts[1] == "action_prediction":
                 continue  # the trunk's action-prediction stream is replaced by OpenWAM's ActionDiT
             sd[".".join(parts)] = f.get_tensor(key)
+    # A geometry the file does not have shows up as missing / unexpected keys or a shape mismatch.
+    expected = model.state_dict()
+    bad_shapes = [k for k, v in sd.items() if k in expected and tuple(v.shape) != tuple(expected[k].shape)]
+    if bad_shapes:
+        raise ValueError(f"flux trunk does not match the yaml dit={dict(geometry)}: shape mismatch on {bad_shapes[:6]}")
     res = model.load_state_dict({k: v.to(dtype) for k, v in sd.items()}, strict=False)
     fresh = {f"emb_in.{_P_STREAM}.weight", f"final_layer.{_P_STREAM}.linear.weight",
              f"final_layer.{_P_STREAM}.adaLN_modulation.1.weight"}
     if set(res.missing_keys) - fresh or res.unexpected_keys:
-        raise ValueError(f"flux trunk load mismatch: missing {sorted(set(res.missing_keys) - fresh)[:6]}, "
-                         f"unexpected {res.unexpected_keys[:6]}")
+        raise ValueError(f"flux trunk does not match the yaml dit={dict(geometry)}: missing "
+                         f"{sorted(set(res.missing_keys) - fresh)[:6]}, unexpected {res.unexpected_keys[:6]}")
     # Reference init of a fresh embodiment head (wiring.fresh_head_state_dict): xavier input, zero output.
     gen = torch.Generator().manual_seed(head_seed)
-    weight = torch.empty(model.hidden_size, int(state_dim))
+    weight = torch.empty(model.hidden_size, int(action_cond_dim))
     nn.init.xavier_uniform_(weight, generator=gen)
     with torch.no_grad():
         model.emb_in[_P_STREAM].weight.copy_(weight.to(dtype))
@@ -655,13 +675,27 @@ def build_flux_dit(path: str, *, state_dim: int, head_seed: int = 0, dtype: torc
     return model
 
 
+def _flux_vae_params():
+    """Returns: the ViTNormInferenceParams OpenWAM runs the flux VAE with (no compile, looped 8-frame decode)."""
+    from openwam.model.video_backbone.flux.vae import ViTNormInferenceParams
+
+    return ViTNormInferenceParams(use_compile=False, chunked_encode=False, decoder_max_t=8)
+
+
 def build_flux_vae(path: str) -> nn.Module:
-    """Frozen ViTNorm video VAE (``ViTNormInference``, bf16) from ``video_vae.safetensors``."""
+    """Frozen ViTNorm video VAE (``ViTNormInference``, bf16) from ``video_vae.safetensors``.
+
+    Args:
+        path: str, video_vae.safetensors.
+
+    Returns:
+        ViTNormInference in eval mode, every parameter frozen.
+    """
     from safetensors.torch import load_file
 
-    from openwam.model.video_backbone.flux.vae import ViTNormInference, ViTNormInferenceParams
+    from openwam.model.video_backbone.flux.vae import ViTNormInference
 
-    vae = ViTNormInference(ViTNormInferenceParams(use_compile=False, chunked_encode=False, decoder_max_t=8))
+    vae = ViTNormInference(_flux_vae_params())
     vae.load_state_dict(load_file(path, device="cpu"))
     vae.eval()
     for p in vae.parameters():

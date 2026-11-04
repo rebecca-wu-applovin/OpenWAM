@@ -24,6 +24,8 @@ from openwam.model.compile_options import (
     section_enabled,
     torch_compile_kwargs,
 )
+from openwam.model.video_backbone.base import TextCondition
+from openwam.model.video_backbone.registry import LoadMode
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +50,10 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
     layers. The video DiT is not aware of the action stream.
     """
 
-    def __init__(self, cfg=None):
-        super().__init__(cfg)
+    def __init__(self, cfg=None, *, mode: LoadMode = LoadMode.PRETRAINED, ckpt_dir: Optional[str] = None):
+        """cfg: architecture params (see BaseWAMArchitecture). mode / ckpt_dir: how the video backbone is built
+        (LoadMode chosen by the entry point; ckpt_dir for CHECKPOINT, else None)."""
+        super().__init__(cfg, mode=mode, ckpt_dir=ckpt_dir)
         self._detach_bridge: bool = False
         self._compiled_action_forward: Optional[Callable[..., Tensor]] = None
         if cfg is None:
@@ -185,11 +189,16 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
         noisy_actions: Optional[Tensor],
         action_timestep: Optional[Tensor],
         *,
+        latents: Tensor,
+        timestep: Tensor,
+        text: TextCondition,
+        clean_latents: Tensor,
         proprio: Optional[Tensor] = None,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
         **pipeline_inputs,
     ) -> Tuple[Tensor, Optional[Tensor]]:
+        """Joint forward; arguments as in :meth:`BaseWAMArchitecture.forward`. Returns (video pred, action pred)."""
         vb = self.video_backbone
         ab = self.action_backbone
         if vb is None:
@@ -198,23 +207,17 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
                 "architecture.__init__ to enable forward()."
             )
 
-        pipeline_inputs = self._append_proprio_context_token(dict(pipeline_inputs), proprio)
-        action_context = pipeline_inputs.get("context")
-        action_context_mask = pipeline_inputs.get("context_mask")
-        if action_context is not None and action_context_mask is None and pipeline_inputs.get("seq_lens") is not None:
-            seq_lens = pipeline_inputs["seq_lens"].to(device=action_context.device)
-            positions = torch.arange(action_context.shape[1], device=action_context.device)
-            action_context_mask = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
-        # Same 4D + clean-prefix-aligned t_mod opt-in as the joint_self_attn
-        # forward. TI2V fires its own branch first so
-        # these kwargs are inert there; kept on for symmetry with joint_self_attn
-        # so the MoT driver gets a 4D ``t_mod``.
-        pipeline_inputs.setdefault("force_per_token_t_mod", True)
-        pipeline_inputs.setdefault("zero_clean_prefix_t_mod", True)
+        # Text (+ proprio tokens) is the context of both streams.
+        text = self._append_proprio_context_token(text, proprio, pipeline_inputs.get("_proprio_sample_mask"))
+        raw_proprio = None
         vstate = vb.prepare(
+            latents=latents,
+            timestep=timestep,
+            text=text,
+            num_clean_latents=int(clean_latents.shape[2]),
+            raw_proprio=raw_proprio,
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-            **pipeline_inputs,
         )
 
         if noisy_actions is None or ab is None:
@@ -240,8 +243,8 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
             noisy_actions,
             bridges,
             action_timestep,
-            context=action_context,
-            context_mask=action_context_mask,
+            context=text.context,
+            context_mask=text.context_mask,
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         )

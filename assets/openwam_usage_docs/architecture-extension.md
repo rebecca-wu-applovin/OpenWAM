@@ -52,15 +52,19 @@ class MyVideoBackbone(VideoBackbone):
     @property
     def scheduler(self): ...
 
-    # Training and block loop
-    def preprocess_input_for_train(self, *, frames=None, text=None, **kwargs) -> dict: ...
-    def prepare(self, **pipeline_inputs) -> BlockLoopState: ...
+    # Video and text IO (the base class runs the shared preprocessing flow on top of these)
+    def encode_pixels(self, pixels): ...        # (N, 3, T, H, W) in [-1, 1] -> (N, z, 1 + (T-1)/tc, h, w)
+    def decode_latents(self, latents): ...      # (N, z, T_lat, h, w) -> (N, 3, T, H, W) in [-1, 1]
+    def encode_text(self, prompts, *, grid, num_frames) -> TextCondition: ...
+
+    # Block loop
+    def prepare(self, *, latents, timestep, text, num_clean_latents, **kwargs) -> BlockLoopState: ...
     def run_block(self, block_id, state): ...
     def finalize(self, state): ...
-
-    # Deployment input path
-    def preprocess_input_for_inference(self, **kwargs) -> dict: ...
 ~~~
+
+The base class implements `to_pixels`, `encode_frames` / `encode_clip`, `preprocess_condition` (deploy),
+`preprocess_train` (training) and `decode_video` once on top of `encode_pixels` / `decode_latents` / `encode_text`.
 
 The execution order is `prepare → run_block → finalize`. `prepare` returns a `BlockLoopState` containing hidden tokens, timestep data, RoPE, context, and grid metadata. `finalize` returns video noise with shape `(B, C, T, H, W)`. Preserve gradient-checkpointing data in the state.
 
@@ -82,7 +86,7 @@ pre_attn_at_layer / post_attn_at_layer
 
 # Masks and deployment
 build_video_to_video_mask
-decode_video / save_deploy_assets
+build_text_cache / save_deploy_assets
 ~~~
 
 Add a matching Hydra group under [configs/model/video_backbone/](../../configs/model/video_backbone/):

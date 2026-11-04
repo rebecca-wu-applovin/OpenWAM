@@ -4,6 +4,14 @@ import pytest
 import torch
 
 from openwam.model.architectures.dual_system.joint_self_attn import DualSystemSelfAttnArchitecture
+from openwam.model.video_backbone.base import TextCondition
+
+
+def _text(context, seq_lens=None):
+    """context: (B, L, D); seq_lens: (B,) valid text tokens (default all). Returns: TextCondition."""
+    b, l = context.shape[:2]
+    lens = torch.full((b,), l) if seq_lens is None else seq_lens
+    return TextCondition(context=context, context_mask=torch.arange(l)[None] < lens[:, None])
 
 
 class _ContextProprioArch(DualSystemSelfAttnArchitecture):
@@ -25,31 +33,27 @@ class _ContextProprioArch(DualSystemSelfAttnArchitecture):
 
 def test_proprio_context_token_extends_context_and_mask():
     arch = _ContextProprioArch(state_dim=7, text_dim=16)
-    inputs = {
-        "context": torch.randn(2, 4, 16),
-        "seq_lens": torch.tensor([2, 4]),
-    }
+    text = _text(torch.randn(2, 4, 16), torch.tensor([2, 4]))
     proprio = torch.randn(2, 7)
 
-    out = arch._append_proprio_context_token(inputs, proprio)
+    out = arch._append_proprio_context_token(text, proprio, None)
 
-    assert out["context"].shape == (2, 5, 16)
-    assert out["context_mask"].shape == (2, 5)
-    assert out["context_mask"][:, -1].all()
-    assert out["context_mask"][0].tolist() == [True, True, False, False, True]
-    assert out["seq_lens"].tolist() == [2, 4]
+    assert out.context.shape == (2, 5, 16)
+    assert out.context_mask.shape == (2, 5)
+    assert out.context_mask[:, -1].all()
+    assert out.context_mask[0].tolist() == [True, True, False, False, True]
 
 
 def test_proprio_context_requires_dataset_field():
     arch = _ContextProprioArch(state_dim=7, text_dim=16)
     with pytest.raises(ValueError, match="requires `proprio`"):
-        arch._append_proprio_context_token({"context": torch.randn(1, 4, 16)}, None)
+        arch._append_proprio_context_token(_text(torch.randn(1, 4, 16)), None, None)
 
 
 def test_proprio_context_validates_dim():
     arch = _ContextProprioArch(state_dim=7, text_dim=16)
     with pytest.raises(ValueError, match="last dim must be 7"):
-        arch._append_proprio_context_token({"context": torch.randn(1, 4, 16)}, torch.randn(1, 6))
+        arch._append_proprio_context_token(_text(torch.randn(1, 4, 16)), torch.randn(1, 6), None)
 
 
 def test_action_dit_rejects_per_token_timestep():

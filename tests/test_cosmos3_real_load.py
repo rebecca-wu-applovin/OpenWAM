@@ -2,7 +2,7 @@
 
 Gated on CUDA + the bundle + diffusers; parametrized over Edge and Nano (each
 skips on its own when its bundle is absent). Asserts the released geometry,
-runs preprocess_input_for_train end-to-end on synthetic PIL frames, drives the
+runs preprocess_train end-to-end on synthetic PIL frames, drives the
 full block loop shape-conservingly, and round-trips the VAE.
 """
 
@@ -33,10 +33,17 @@ def variant(request):
     if not asset.exists():
         pytest.skip(f"{name} bundle missing at {asset}.")
     pytest.importorskip("diffusers")
-    from openwam.model.video_backbone import build_video_backbone
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
 
-    cfg = {"model": {"video_backbone": {"name": name, "model_path": str(asset)}}}
-    backbone = build_video_backbone(name, cfg)
+    from openwam.model.video_backbone import LoadMode, build_video_backbone
+
+    repo = str(Path(__file__).resolve().parent.parent)
+    with initialize_config_dir(config_dir=f"{repo}/configs", version_base=None):
+        cfg = compose("train", overrides=[f"model/video_backbone={name}", f"model.video_backbone.model_path={asset}"])
+    vb_cfg = cfg.model.video_backbone
+    OmegaConf.set_readonly(vb_cfg, True)
+    backbone = build_video_backbone(vb_cfg, LoadMode.PRETRAINED, None)
     backbone.set_dtype_device(torch.bfloat16, torch.device("cuda"))
     yield name, backbone, geometry
     del backbone  # free the GPU before the next variant builds
@@ -63,25 +70,21 @@ def test_preprocess_and_block_loop_shapes(variant):
     rng = np.random.default_rng(0)
     clip = [Image.fromarray(rng.integers(0, 255, (96, 160, 3), dtype=np.uint8)) for _ in range(9)]
     with torch.no_grad():
-        inputs = vb.preprocess_input_for_train(frames=[clip], text=["pick up the bottle"])
-        lat = inputs["input_latents"]
+        clean, lat, text = vb.preprocess_train([clip], ["pick up the bottle"], num_hist_frames=0)
         assert lat.shape[0] == 1 and lat.shape[1] == 48
         assert lat.shape[2] == 1 + (9 - 1) // 4  # 3 latent frames
         assert lat.shape[3] == 96 // 16 and lat.shape[4] == 160 // 16
-        assert inputs["context"].shape[-1] == text_dim
-        assert len(inputs["und_kv"]) == layers
-        assert inputs["num_clean_prefix_frames"] == 1
+        assert clean.shape[2] == 1
+        assert text.context.shape[-1] == text_dim
+        assert len(text.extra["und_kv"]) == layers
 
         state = vb.prepare(
             latents=lat.to(vb.dtype),
             timestep=torch.tensor([500.0], device=lat.device),
-            context=inputs["context"],
-            und_mask=inputs["und_mask"],
-            und_kv=inputs["und_kv"],
-            vision_positions=inputs["vision_positions"],
-            num_clean_prefix_frames=1,
+            text=text,
+            num_clean_latents=1,
         )
-        assert state.prefix_kv_len == inputs["context"].shape[1]
+        assert state.prefix_kv_len == text.context.shape[1]
         for i in range(vb.num_layers):
             state = vb.run_block(i, state)
         out = vb.finalize(state)
@@ -97,7 +100,7 @@ def test_vae_roundtrip(variant):
     rng = np.random.default_rng(1)
     clip = [Image.fromarray(rng.integers(0, 255, (96, 160, 3), dtype=np.uint8)) for _ in range(5)]
     with torch.no_grad():
-        inputs = vb.preprocess_input_for_train(frames=[clip], text=["x"])
-        frames = vb.decode_video(inputs["input_latents"].to(vb.dtype))
+        _, lat, _ = vb.preprocess_train([clip], ["x"], num_hist_frames=0)
+        frames = vb.decode_video(lat.to(vb.dtype))
     assert len(frames) == 5
     assert frames[0].size == (160, 96)

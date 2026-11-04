@@ -181,7 +181,11 @@ def test_video_backbone_shift_video_property_default_none():
             return 1
 
         @classmethod
-        def from_pretrained(cls, source, **kw):
+        def from_pretrained(cls, cfg):
+            return cls()
+
+        @classmethod
+        def from_checkpoint_dir(cls, cfg, ckpt_dir):
             return cls()
 
         def prepare(self, **kw):
@@ -199,7 +203,13 @@ def test_video_backbone_shift_video_property_default_none():
         def extract_action_tokens(self, *a, **k):
             raise NotImplementedError
 
-        def preprocess_input_for_train(self, **kw):
+        def encode_pixels(self, pixels):
+            raise NotImplementedError
+
+        def decode_latents(self, latents):
+            raise NotImplementedError
+
+        def encode_text(self, prompts, *, grid, num_frames):
             raise NotImplementedError
 
         def get_submodule(self, name):
@@ -207,9 +217,6 @@ def test_video_backbone_shift_video_property_default_none():
 
         def set_submodule(self, name, module):
             pass
-
-        def decode_video(self, latents, **kw):
-            raise NotImplementedError
 
         def set_dtype_device(self, dtype, device):
             pass
@@ -248,7 +255,11 @@ def test_video_backbone_shift_video_property_returns_stored_value():
             return 1
 
         @classmethod
-        def from_pretrained(cls, source, **kw):
+        def from_pretrained(cls, cfg):
+            return cls()
+
+        @classmethod
+        def from_checkpoint_dir(cls, cfg, ckpt_dir):
             return cls()
 
         def prepare(self, **kw):
@@ -266,7 +277,13 @@ def test_video_backbone_shift_video_property_returns_stored_value():
         def extract_action_tokens(self, *a, **k):
             raise NotImplementedError
 
-        def preprocess_input_for_train(self, **kw):
+        def encode_pixels(self, pixels):
+            raise NotImplementedError
+
+        def decode_latents(self, latents):
+            raise NotImplementedError
+
+        def encode_text(self, prompts, *, grid, num_frames):
             raise NotImplementedError
 
         def get_submodule(self, name):
@@ -274,9 +291,6 @@ def test_video_backbone_shift_video_property_returns_stored_value():
 
         def set_submodule(self, name, module):
             pass
-
-        def decode_video(self, latents, **kw):
-            raise NotImplementedError
 
         def set_dtype_device(self, dtype, device):
             pass

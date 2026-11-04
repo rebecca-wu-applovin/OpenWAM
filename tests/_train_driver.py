@@ -1,0 +1,64 @@
+"""Test-only driver: one single-process training run of ``configs/train_debug.yaml``, then dump the text cache.
+
+Same path as ``scripts/train_debug.sh`` -> ``scripts/train.py`` (its accelerator, seed and dataset helpers), run
+in a subprocess by ``tests/test_text_cache_after_resume.py`` so each run gets a fresh DeepSpeed process group.
+
+Usage (env RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT set, as train_debug.sh does):
+  python tests/_train_driver.py <cache_out.pt> [--keep-resume-state] <hydra overrides...>
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import sys
+
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _load_train_script():
+    """Returns: the ``scripts/train.py`` module (loaded by path; ``scripts`` is not a package)."""
+    spec = importlib.util.spec_from_file_location("openwam_train_script", os.path.join(REPO, "scripts", "train.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def main() -> None:
+    """Parse argv, run the trainer, write ``{prompt: cached text tensors}`` (CPU) to the cache path. Returns: None."""
+    import logging
+
+    import torch
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    sys.path.insert(0, REPO)
+    # INFO on stdout: the test reads the trainer's "[resume] resumed at global_step=N" line.
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+    out, args = sys.argv[1], sys.argv[2:]
+    keep_state = "--keep-resume-state" in args
+    overrides = [a for a in args if a != "--keep-resume-state"]
+    train = _load_train_script()
+    with initialize_config_dir(config_dir=os.path.join(REPO, "configs"), version_base=None):
+        cfg = compose("train_debug", overrides=overrides)
+
+    from openwam.dataloader.registry import build_dataset
+    from openwam.train import openwam_trainer
+    from openwam.train.utils.seeding import seed_everything
+
+    if keep_state:
+        # A finished run drops its accel_state dirs; keep them so a second run can resume from step N.
+        openwam_trainer.finalize_keep_weights_only = lambda *a, **k: None
+    train._inject_project_seed(cfg)
+    seed_everything(int(OmegaConf.select(cfg, "project.seed")), rank=0)
+    trainer = openwam_trainer.OpenWAMTrainer(
+        cfg, accelerator=train._build_accelerator(cfg), dataset=build_dataset(cfg.dataloader, split="train")
+    )
+    trainer.train()
+    # The cache the training steps used: prompt -> tuple of tensors (Wan: context (1, L, D), seq_lens (1,)).
+    cache = trainer.accelerator.unwrap_model(trainer.architecture).video_backbone.text_lookup.entries
+    torch.save({p: tuple(t.detach().cpu() for t in v) for p, v in cache.items()}, out)
+
+
+if __name__ == "__main__":
+    main()

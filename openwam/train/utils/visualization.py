@@ -110,7 +110,7 @@ def rollout_from_sample(arch, sample: dict, schedule, *, seed: int) -> dict:
     if proprio_mask is not None:
         inputs["_proprio_sample_mask"] = proprio_mask
     latents, actions = arch.sample(inputs, schedule, latent_shape=latent_shape, action_shape=action_shape, seed=seed)
-    video = arch.video_backbone.decode_video(latents[:, :, n_hist:], tiled=True)
+    video = arch.video_backbone.decode_video(latents[:, :, n_hist:])
     return {"video": video, "actions": actions.squeeze(0).float().cpu().numpy()}
 
 

@@ -16,7 +16,9 @@ def test_registry_keys_present():
 
 
 def test_unknown_key_raises():
-    from openwam.model.video_backbone import build_video_backbone
+    from omegaconf import OmegaConf
+
+    from openwam.model.video_backbone import LoadMode, build_video_backbone
 
     with pytest.raises(KeyError, match="Unknown video backbone"):
-        build_video_backbone("nonexistent_backbone", {})
+        build_video_backbone(OmegaConf.create({"name": "nonexistent_backbone"}), LoadMode.PRETRAINED, None)

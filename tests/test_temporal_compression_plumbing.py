@@ -83,7 +83,10 @@ def test_C9_prepare_inputs_passes_backbone_temporal_factor(monkeypatch):
 
     class _FakeBackbone:
         temporal_compression = 2
-        needs_first_frame_skip = False
+
+        # Bypass the real video preprocess — we only need the mask path.
+        def preprocess_train(self, clips, prompts, *, num_hist_frames):
+            return torch.zeros(1, 4, 1, 8, 8), torch.zeros(1, 4, 1, 8, 8), None
 
     class _ConcreteArch(base_mod.BaseWAMArchitecture):
         def forward(self, *args, **kwargs):  # pragma: no cover
@@ -94,9 +97,6 @@ def test_C9_prepare_inputs_passes_backbone_temporal_factor(monkeypatch):
     arch._device = torch.device("cpu")
     arch._dtype = torch.float32
     arch._use_proprioception_context = False
-
-    # Bypass preprocess by stubbing it out — we only need the mask path.
-    arch.preprocess = lambda **kw: {"input_latents": torch.zeros(1, 4, 1, 8, 8)}
 
     sample = {
         "video": [],

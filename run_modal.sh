@@ -39,7 +39,7 @@ case "${BACKBONE}" in
     # 07 sparse-history arms (weights uploaded by scripts/modal/sparse_history/upload_weights.sh).
     # LongLive = the Wan2.2 bundle + Robot-S DiT weights; GE reads VAE / T5 / tokenizer from an LTX-Video dir.
     longlive2_robot_s) BACKBONE_DIR=Wan2.2-TI2V-5B
-                       BACKBONE_EXTRA="model.video_backbone.dit_weights_path=/assets/video_backbone_ckpt/LongLive2.0-Robot-S/model.pt" ;;
+                       BACKBONE_EXTRA="model.video_backbone.dit_weights=/assets/video_backbone_ckpt/LongLive2.0-Robot-S/model.pt" ;;
     ge_base_fast)      BACKBONE_DIR=Genie-Envisioner-Base-fast
                        BACKBONE_EXTRA="model.video_backbone.ltx_path=/assets/video_backbone_ckpt/LTX-Video" ;;
     flux3_action_base) BACKBONE_DIR=flux-3-action-base ;;

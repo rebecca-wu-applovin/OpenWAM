@@ -107,8 +107,11 @@ def _proprio_holder(n_tokens, state_dim=3, ctx=8):
 
 
 def _append(holder, proprio, b=2, ctx=8, text_len=4):
-    inputs = {"context": torch.zeros(b, text_len, ctx), "seq_lens": torch.tensor([2, 4])}
-    return BaseWAMArchitecture._append_proprio_context_token(holder, inputs, proprio)
+    from openwam.model.video_backbone.base import TextCondition
+
+    mask = torch.arange(text_len)[None] < torch.tensor([2, 4])[:, None]
+    text = TextCondition(context=torch.zeros(b, text_len, ctx), context_mask=mask)
+    return BaseWAMArchitecture._append_proprio_context_token(holder, text, proprio, None)
 
 
 def test_n_proprio_tokens_with_slot_embedding():
@@ -117,10 +120,10 @@ def test_n_proprio_tokens_with_slot_embedding():
     nn.init.normal_(holder.proprio_slot_emb.weight)
     proprio = torch.randn(1, 3).expand(2, 5, 3).clone()  # same state in all 5 slots
     out = _append(holder, proprio)
-    assert out["context"].shape == (2, 4 + 5, 8)
-    assert out["context_mask"].shape == (2, 9)
-    assert out["context_mask"][:, 4:].all()
-    tok = out["context"][:, 4:]
+    assert out.context.shape == (2, 4 + 5, 8)
+    assert out.context_mask.shape == (2, 9)
+    assert out.context_mask[:, 4:].all()
+    tok = out.context[:, 4:]
     # Identical states differ only by the slot embedding → order is recoverable.
     expected = holder.proprio_encoder(proprio) + holder.proprio_slot_emb.weight
     torch.testing.assert_close(tok, expected)
@@ -132,8 +135,8 @@ def test_single_proprio_token_unchanged():
     holder = _proprio_holder(1)
     proprio = torch.randn(2, 3)
     out = _append(holder, proprio)
-    assert out["context"].shape == (2, 5, 8)
-    torch.testing.assert_close(out["context"][:, 4], holder.proprio_encoder(proprio))
+    assert out.context.shape == (2, 5, 8)
+    torch.testing.assert_close(out.context[:, 4], holder.proprio_encoder(proprio))
 
 
 def test_wrong_token_count_raises():

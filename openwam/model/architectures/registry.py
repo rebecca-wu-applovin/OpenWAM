@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Type
 
 from openwam.model.architectures.base import BaseWAMArchitecture
+from openwam.model.video_backbone.registry import LoadMode
 
 ARCHITECTURE_REGISTRY: Dict[str, Type[BaseWAMArchitecture]] = {}
 ARCHITECTURE_SUPPORT: Dict[str, "ArchitectureSupport"] = {}
@@ -219,7 +220,9 @@ def list_supported_architectures() -> tuple[str, ...]:
     return tuple(name for name in sorted(ARCHITECTURE_REGISTRY.keys()) if ARCHITECTURE_SUPPORT[name].supported)
 
 
-def build_architecture(name: str, cfg=None, *, allow_experimental: bool = False) -> BaseWAMArchitecture:
+def build_architecture(
+    name: str, cfg=None, *, mode: LoadMode, ckpt_dir: Optional[str], allow_experimental: bool = False
+) -> BaseWAMArchitecture:
     """
     Instantiate a registered WAM architecture by registry key.
 
@@ -227,7 +230,10 @@ def build_architecture(name: str, cfg=None, *, allow_experimental: bool = False)
         name (str): Registry key of the architecture (e.g., "dual_system_cross_attn").
         cfg: Configuration object passed to the architecture constructor.
             The architecture creates its own ``video_backbone`` internally
-            from ``cfg.video_backbone.name`` via the video backbone registry.
+            from ``cfg.video_backbone`` via the video backbone registry.
+        mode (LoadMode): how that backbone is built (PRETRAINED: upstream weights; CHECKPOINT: an empty
+            shell of ``ckpt_dir`` the caller fills). Decided by the entry point, never inferred here.
+        ckpt_dir (str | None): checkpoint dir for CHECKPOINT, None for PRETRAINED.
         allow_experimental (bool): If False, prevent instantiation of architectures marked as experimental.
 
     Returns:
@@ -251,4 +257,20 @@ def build_architecture(name: str, cfg=None, *, allow_experimental: bool = False)
         cfg_out.setdefault("variant", normalized.variant)
         for key, value in normalized.options.items():
             cfg_out.setdefault(key, value)
-    return ARCHITECTURE_REGISTRY[canonical_name](cfg=cfg_out)
+    return ARCHITECTURE_REGISTRY[canonical_name](cfg=cfg_out, mode=mode, ckpt_dir=ckpt_dir)
+
+
+def build_architecture_from_ckpt_dir(ckpt_dir: str, model_cfg) -> BaseWAMArchitecture:
+    """Build the empty architecture of one of our checkpoints (deploy, finetune and resume share it).
+
+    Args:
+        ckpt_dir: str, the checkpoint (run) dir; the backbones read their non-weight assets from it.
+        model_cfg: the ``model`` config to build (the ckpt's ``config.yaml`` model section, or for finetune
+            that section with the live overrides merged in).
+
+    Returns:
+        BaseWAMArchitecture whose video backbone is a meta shell (LoadMode.CHECKPOINT). The caller fills it:
+        ``load_checkpoint`` (deploy / finetune) or ``materialize_meta`` + accelerate ``load_state`` (resume).
+    """
+    resolved = resolve_architecture_config(model_cfg)
+    return build_architecture(resolved.registry_name, resolved.params, mode=LoadMode.CHECKPOINT, ckpt_dir=ckpt_dir)

@@ -1,18 +1,33 @@
 """Video backbone registry + factory.
 
 Decorator-based registration, mirroring ``openwam/model/architectures/registry.py`` for
-architectures. A backbone class registers under one or more names (a Wan
-backbone class backs several checkpoint variants); ``build_video_backbone``
-is the factory used by ``BaseWAMArchitecture`` for both training and deploy.
+architectures. A backbone class registers under one or more names (the Wan class backs several
+yamls); ``build_video_backbone`` is the factory the architecture calls for training and deploy.
+
+Every backbone has exactly two constructors, picked by the explicit :class:`LoadMode` the entry point
+(trainer / deploy loader) decided once:
+  - ``PRETRAINED`` -> ``cls.from_pretrained(cfg)``: the upstream weights (fresh training);
+  - ``CHECKPOINT`` -> ``cls.from_checkpoint_dir(cfg, ckpt_dir)``: an empty shell of one of our checkpoints
+    (deploy, finetune and resume alike; the caller fills the weights).
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Type
+from enum import Enum
+from typing import Dict, Optional, Type
+
+from omegaconf import DictConfig
 
 from openwam.model.video_backbone.base import VideoBackbone
 
 _VIDEO_BACKBONE_REGISTRY: Dict[str, Type[VideoBackbone]] = {}
+
+
+class LoadMode(Enum):
+    """Where a backbone's weights come from: upstream pretrained files, or one of our checkpoint dirs."""
+
+    PRETRAINED = "pretrained"
+    CHECKPOINT = "checkpoint"
 
 
 def register_video_backbone(name: str):
@@ -27,61 +42,30 @@ def register_video_backbone(name: str):
     return _wrap
 
 
-def build_video_backbone(
-    name: Optional[str],
-    cfg: Any,
-    *,
-    source: Any = None,
-    device: Optional[str] = None,
-    ckpt_dir: Optional[str] = None,
-    materialize_weights: bool = False,
-    text_dim: Optional[int] = None,
-) -> VideoBackbone:
-    """Instantiate a VideoBackbone from the registry.
-
-    Two call modes:
-      - **Training (default)**: pass ``name`` and full ``cfg``; the backbone
-        reads what it needs from ``cfg`` via ``cls.from_pretrained(cfg)``.
-      - **Deployment**: pass ``source`` (a model directory or components dict)
-        plus optional ``device`` and ``ckpt_dir``; the call
-        becomes ``cls.from_pretrained(source, device=..., ckpt_dir=...)``. This
-        is used by :class:`BaseWAMArchitecture` when the saved config carries a
-        ``video_backbone._source`` field.
+def build_video_backbone(cfg: DictConfig, mode: LoadMode, ckpt_dir: Optional[str]) -> VideoBackbone:
+    """Build the backbone ``cfg.name`` names, with the constructor ``mode`` selects.
 
     Args:
-        name:     Registry key (e.g. ``"wan22_ti2v_5b"``). Required unless
-                  ``source`` is given.
-        cfg:      Full Hydra config (only consumed when ``source is None``).
-        source:   Optional explicit deploy-time source.
-        device:   Forwarded to ``from_pretrained`` when ``source`` is set.
-        ckpt_dir: Forwarded to ``from_pretrained`` when ``source`` is set.
-        materialize_weights: Forwarded when ``source`` is set. Tells a backbone
-                  that builds empty shells from ``ckpt_dir`` that nothing will
-                  load a state_dict into it, so it must allocate real storage
-                  rather than leaving parameters on ``meta``. Set by the
-                  training RESUME path, where accelerate's ``load_state``
-                  fills the weights only after ``prepare``.
-        text_dim: Optional architecture-level raw text/context dimension.
-                  Forwarded to the backbone so it can validate that its text
-                  embedding expects the same context width as the action stream.
+        cfg: ``cfg.model.video_backbone`` (DictConfig); ``cfg.name`` is the registry key.
+        mode: LoadMode, decided by the entry point (trainer: PRETRAINED without a ckpt, CHECKPOINT for
+            finetune / resume; deploy: always CHECKPOINT).
+        ckpt_dir: str checkpoint dir for CHECKPOINT, None for PRETRAINED.
+
+    Returns:
+        VideoBackbone: loaded (PRETRAINED) or a meta shell to be filled by the caller (CHECKPOINT).
+        Raises KeyError for an unknown name, ValueError when ``ckpt_dir`` does not fit ``mode``.
     """
-    if name and name in _VIDEO_BACKBONE_REGISTRY:
-        cls = _VIDEO_BACKBONE_REGISTRY[name]
-    else:
+    name = cfg.name
+    if name not in _VIDEO_BACKBONE_REGISTRY:
         available = ", ".join(sorted(_VIDEO_BACKBONE_REGISTRY)) or "(none)"
         raise KeyError(f"Unknown video backbone '{name}'. Available: {available}")
-
-    if source is not None:
-        kw: Dict[str, Any] = {}
-        if device is not None:
-            kw["device"] = device
+    cls = _VIDEO_BACKBONE_REGISTRY[name]
+    if mode is LoadMode.PRETRAINED:
         if ckpt_dir is not None:
-            kw["ckpt_dir"] = ckpt_dir
-        if materialize_weights:
-            kw["materialize_weights"] = True
-        if text_dim is not None:
-            kw["text_dim"] = int(text_dim)
-        return cls.from_pretrained(source, **kw)
-    if text_dim is not None:
-        return cls.from_pretrained(cfg, text_dim=int(text_dim))
-    return cls.from_pretrained(cfg)
+            raise ValueError(f"{name}: LoadMode.PRETRAINED reads the upstream weights; got ckpt_dir={ckpt_dir!r}")
+        return cls.from_pretrained(cfg)
+    if mode is LoadMode.CHECKPOINT:
+        if ckpt_dir is None:
+            raise ValueError(f"{name}: LoadMode.CHECKPOINT needs ckpt_dir (the checkpoint's assets live there)")
+        return cls.from_checkpoint_dir(cfg, ckpt_dir)
+    raise ValueError(f"unknown LoadMode {mode!r}")

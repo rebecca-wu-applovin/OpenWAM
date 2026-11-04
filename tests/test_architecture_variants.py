@@ -26,6 +26,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+from openwam.model.video_backbone import LoadMode
+from openwam.model.video_backbone.base import TextCondition
 from tests.test_openwam_trainer import (
     _make_fake_loss_inputs,
     _MockVideoBackbone,
@@ -54,7 +56,7 @@ def _build_arch(registry_name: str, cfg: dict, *, num_layers: int = WAN_NUM_LAYE
     cfg = dict(cfg)
     cfg.setdefault("video_dim", WAN_VIDEO_DIM)
     cfg.setdefault("num_dit_layers", num_layers)
-    arch = build_architecture(registry_name, cfg)
+    arch = build_architecture(registry_name, cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
     num_heads = int(cfg.get("num_heads", 4))
     arch.video_backbone = _MockVideoBackbone(dim=WAN_VIDEO_DIM, num_layers=num_layers, num_heads=num_heads)
     arch._device = torch.device("cpu")
@@ -76,11 +78,9 @@ def _run_compute_loss(arch):
     inputs = _make_fake_loss_inputs(B=1, action_dim=ACTION_DIM, T_action=T_ACTION, video_dim=WAN_VIDEO_DIM)
     if arch.uses_proprioception:
         inputs["proprio"] = torch.randn(1, int(arch.action_backbone.state_dim))
-    if getattr(getattr(arch, "action_backbone", None), "variant", None) == "joint_self_attn":
-        text_dim = arch.action_backbone.text_dim
-        inputs["context"] = torch.randn(1, 4, text_dim)
-        inputs["context_mask"] = torch.ones(1, 4, dtype=torch.bool)
-        inputs["seq_lens"] = torch.tensor([4])
+    # Text context at the action backbone's text width (both streams read it).
+    text_dim = arch.action_backbone.text_dim
+    inputs["text"] = TextCondition(context=torch.randn(1, 4, text_dim), context_mask=torch.ones(1, 4, dtype=torch.bool))
     out = arch.compute_loss(**inputs, actions=actions)
     return out
 
@@ -228,7 +228,7 @@ def test_dual_system_cross_attn_inherits_geometry_from_video_backbone():
     )
 
     class _CrossAttnWithMockBackbone(DualSystemCrossAttnArchitecture):
-        def _init_video_backbone(self, _cfg):
+        def _init_video_backbone(self, _cfg, _mode, _dir):
             # Attach mock BEFORE __init__'s vb-derived setdefault block runs.
             self.video_backbone = _MockVideoBackbone(dim=WAN_VIDEO_DIM, num_layers=WAN_NUM_LAYERS, num_heads=4)
 
@@ -265,7 +265,7 @@ def _build_self_attn_with_backbone(backbone_cls, cfg_extra=None):
     )
 
     class _SelfAttnWithBackbone(DualSystemSelfAttnArchitecture):
-        def _init_video_backbone(self, _cfg):
+        def _init_video_backbone(self, _cfg, _mode, _dir):
             # Attach BEFORE __init__'s vb-derived setdefault/derive block runs.
             self.video_backbone = backbone_cls(dim=WAN_VIDEO_DIM, num_layers=WAN_NUM_LAYERS, num_heads=4)
 
@@ -429,9 +429,7 @@ def test_all_variants_load_and_run(registry_name, cfg, expected_selected_count):
 _FRAMEWORKS = ("dual_system",)
 _BACKBONES = ("wan22_ti2v_5b",)
 # Backbone-specific dummy weights dir for the compose smoke test. Mirrors the
-# real on-disk directory names so the production cross-check in
-# build_training_pipeline (name vs model_path stem) does not flag the test
-# overrides as a mismatch. The directory is never actually read — compose
+# real on-disk directory names. The directory is never actually read — compose
 # does not touch model_path.
 _BACKBONE_DUMMY_MODEL_PATH = {
     "wan22_ti2v_5b": "/dummy/Wan2.2-TI2V-5B",
@@ -499,73 +497,3 @@ def test_framework_default_backbone_is_wan22_ti2v_5b(framework):
     assert cfg.model.video_backbone.name == "wan22_ti2v_5b", (
         f"{framework} default backbone is {cfg.model.video_backbone.name!r}, expected 'wan22_ti2v_5b'"
     )
-
-
-# ---------------------------------------------------------------------------
-# 7. video_backbone.name vs model_path cross-check warning
-# ---------------------------------------------------------------------------
-# The name only drives registry dispatch — actual weights are decided by ``model_path``. A half
-# override on the CLI (e.g. only ``name``) silently loads the wrong backbone.
-# ``build_training_pipeline._warn_on_name_path_mismatch`` is a soft cross-check
-# that WARNs but does not abort, so intentional name/path ablations are still
-# allowed. These tests pin the matcher behaviour so the cross-check survives
-# future renames.
-
-
-@pytest.mark.parametrize(
-    "name,model_path",
-    [
-        ("wan22_ti2v_5b", "/path/to/Wan2.2-TI2V-5B"),
-        # Trailing slashes / missing leading dir still normalize to the same stem.
-        ("wan22_ti2v_5b", "Wan2.2-TI2V-5B/"),
-    ],
-)
-def test_backbone_name_path_match_does_not_warn(name, model_path, caplog):
-    from openwam.model.video_backbone.wan.pipeline_builder import (
-        _warn_on_name_path_mismatch,
-    )
-
-    with caplog.at_level("WARNING", logger="openwam.model.video_backbone.wan.pipeline_builder"):
-        _warn_on_name_path_mismatch(name, model_path)
-    assert not any("looks inconsistent" in r.message for r in caplog.records), (
-        f"{name!r} ↔ {model_path!r} should be treated as matching, but a "
-        f"WARNING fired: {[r.message for r in caplog.records]!r}"
-    )
-
-
-@pytest.mark.parametrize(
-    "name,model_path",
-    [
-        # The classic silent-load failure mode: only `name` was overridden on
-        # the CLI; `model_path` is still pointing at the default wan22 entry.
-        ("cosmos3_edge", "/path/to/Wan2.2-TI2V-5B"),
-        # And the reverse: name still default, but model_path swapped.
-        ("wan22_ti2v_5b", "/path/to/weights/Cosmos-Predict2.5-2B"),
-    ],
-)
-def test_backbone_name_path_mismatch_warns(name, model_path, caplog):
-    from openwam.model.video_backbone.wan.pipeline_builder import (
-        _warn_on_name_path_mismatch,
-    )
-
-    with caplog.at_level("WARNING", logger="openwam.model.video_backbone.wan.pipeline_builder"):
-        _warn_on_name_path_mismatch(name, model_path)
-    mismatches = [r for r in caplog.records if "looks inconsistent" in r.message]
-    assert mismatches, (
-        f"{name!r} ↔ {model_path!r} is a real mismatch but the cross-check "
-        f"did not WARN; current log records: {[r.message for r in caplog.records]!r}"
-    )
-
-
-def test_backbone_name_path_check_silent_when_name_missing(caplog):
-    """Deploy-time paths sometimes supply only model_path with no name field;
-    the cross-check must stay silent rather than fire a false-positive WARN.
-    """
-    from openwam.model.video_backbone.wan.pipeline_builder import (
-        _warn_on_name_path_mismatch,
-    )
-
-    with caplog.at_level("WARNING", logger="openwam.model.video_backbone.wan.pipeline_builder"):
-        _warn_on_name_path_mismatch(None, "/path/to/Wan2.2-TI2V-5B")
-        _warn_on_name_path_mismatch("", "/path/to/Wan2.2-TI2V-5B")
-    assert not any("looks inconsistent" in r.message for r in caplog.records)

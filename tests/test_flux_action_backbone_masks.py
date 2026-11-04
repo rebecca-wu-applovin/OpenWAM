@@ -7,6 +7,7 @@ import pytest
 import torch
 from einops import rearrange
 
+from openwam.model.video_backbone.base import TextCondition
 from openwam.model.video_backbone.flux.backbone import _N_MODE, FluxActionVideoBackbone
 from openwam.model.video_backbone.flux.masks import build_flux_layer_masks, build_stream_ids, video_time_ids
 from openwam.model.video_backbone.flux.positional import batched_prc_action, batched_prc_txt, batched_prc_vid
@@ -72,7 +73,7 @@ def test_text_padding_masks():
 
 
 def test_native_noise_law():
-    vb = FluxActionVideoBackbone(dit=torch.nn.Identity(), vae=torch.nn.Identity(), text_encoder=None, state_dim=4)
+    vb = FluxActionVideoBackbone(dit=torch.nn.Identity(), vae=torch.nn.Identity(), text_encoder=torch.nn.Identity(), text_encoder_dir="", action_cond_dim=4)
     torch.manual_seed(0)
     ts, sig, w = vb.sample_training_noise(4096, device="cpu", dtype=torch.float32)
     assert ((sig > 0) & (sig <= 1)).all() and torch.allclose(ts, sig * 1000) and (w == 1).all()
@@ -96,7 +97,7 @@ def _tiny_trunk():
 
 def test_per_layer_path_matches_native_forward():
     dit = _tiny_trunk()
-    vb = FluxActionVideoBackbone(dit=dit, vae=torch.nn.Identity(), text_encoder=None, state_dim=4)
+    vb = FluxActionVideoBackbone(dit=dit, vae=torch.nn.Identity(), text_encoder=torch.nn.Identity(), text_encoder_dir="", action_cond_dim=4)
     vb._device, vb._dtype = torch.device("cpu"), torch.float32
     b, n_hist, h, w, t = 1, 2, 2, 3, 0.3
     lat = torch.randn(b, 8, n_hist + 2, h, w)
@@ -113,8 +114,8 @@ def test_per_layer_path_matches_native_forward():
         x_action_cond=xp, x_action_cond_ids=ids["action_cond"][None],
         x_action_cond_timesteps=torch.zeros(xp.shape[:2]),
     )
-    st = vb.prepare(latents=lat, timestep=torch.full((b,), t * 1000), context=ctx, text_len=5,
-                    num_clean_prefix_frames=n_hist, raw_proprio=prop)
+    text = TextCondition(context=ctx, context_mask=torch.ones(b, 5, dtype=torch.bool), extra={"text_len": 5})
+    st = vb.prepare(latents=lat, timestep=torch.full((b,), t * 1000), text=text, num_clean_latents=n_hist, raw_proprio=prop)
     # native masks: mode blocks per stream, single blocks fully joint
     s = st.hidden_states.shape[1]
     sl = _slices({k: st.extras["seg_lens"][k] for k in SEG}, 0)
@@ -135,7 +136,7 @@ def test_per_layer_path_matches_native_forward():
 
 
 def test_mot_layer_count_and_geometry():
-    vb = FluxActionVideoBackbone(dit=_tiny_trunk(), vae=torch.nn.Identity(), text_encoder=None, state_dim=4)
+    vb = FluxActionVideoBackbone(dit=_tiny_trunk(), vae=torch.nn.Identity(), text_encoder=torch.nn.Identity(), text_encoder_dir="", action_cond_dim=4)
     assert vb.num_layers == _N_MODE + 2 and vb.head_dim * vb.num_heads == vb.dim
     with pytest.raises(NotImplementedError):
         st = type("S", (), {"extras": {"seg_lens": SEG, "text_valid": None}, "hidden_states": torch.zeros(1)})()

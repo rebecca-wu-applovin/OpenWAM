@@ -12,6 +12,7 @@ Each architecture composes the backbones it owns and implements its own
 ``forward()``.
 """
 
+import dataclasses
 import functools
 import logging
 import os
@@ -24,6 +25,7 @@ import torch
 from torch import Tensor, nn
 
 from openwam.model.compile_options import compile_enabled
+from openwam.model.video_backbone.registry import LoadMode
 
 
 def _wrap_single_forward(module: nn.Module) -> None:
@@ -76,7 +78,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from openwam.model.action_backbone.base import ActionDiTBackbone
-    from openwam.model.video_backbone.base import VideoBackbone
+    from openwam.model.video_backbone.base import TextCondition, VideoBackbone
 
 
 @dataclass
@@ -110,11 +112,15 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
     Args:
         cfg: Architecture-specific configuration (OmegaConf DictConfig or dict).
+        mode: LoadMode the entry point chose for the video backbone (PRETRAINED: upstream weights;
+            CHECKPOINT: an empty shell of ``ckpt_dir`` the caller fills). The entry points (trainer, deploy
+            loader, via ``build_architecture``) always pass it; the default only serves direct test builds.
+        ckpt_dir: str checkpoint dir for CHECKPOINT, None for PRETRAINED.
     """
 
     # --- Construction & config resolution ---
 
-    def __init__(self, cfg=None):
+    def __init__(self, cfg=None, *, mode: LoadMode = LoadMode.PRETRAINED, ckpt_dir: Optional[str] = None):
         super().__init__()
         self.cfg = cfg
         self.video_backbone: Optional["VideoBackbone"] = None
@@ -136,7 +142,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         self.normalizer = None
 
         if cfg is not None:
-            self._init_video_backbone(cfg)
+            self._init_video_backbone(cfg, mode, ckpt_dir)
 
     @staticmethod
     def _cfg_get(cfg, key, default=None):
@@ -146,63 +152,48 @@ class BaseWAMArchitecture(ABC, nn.Module):
             return cfg.get(key, default)
         return getattr(cfg, key, default)
 
-    def _init_video_backbone(self, cfg):
-        """Build video backbone from config.
+    def _init_video_backbone(self, cfg, mode: LoadMode, ckpt_dir: Optional[str]) -> None:
+        """Build ``self.video_backbone`` from ``cfg.video_backbone`` with the constructor ``mode`` selects.
 
-        Supports two source types in ``cfg.video_backbone``:
-        - ``_source``: direct model directory or dict with components → deploy-time path
-        - ``name``: registry key → training-time path
+        Args:
+            cfg: architecture params; ``cfg["video_backbone"]`` is the backbone's DictConfig slice (absent: no
+                backbone, e.g. tests that attach a mock).
+            mode: LoadMode decided by the entry point. ckpt_dir: str for CHECKPOINT, None for PRETRAINED.
 
-        Both paths flow through the public :func:`build_video_backbone`.
+        Returns:
+            None. Raises ValueError when the yaml's temporal contract or required mask mode disagrees.
         """
         from openwam.model.video_backbone import build_video_backbone
 
-        vb_cfg = cfg.get("video_backbone", {}) if isinstance(cfg, dict) else getattr(cfg, "video_backbone", None)
+        vb_cfg = cfg.get("video_backbone") if isinstance(cfg, dict) else getattr(cfg, "video_backbone", None)
         if vb_cfg is None:
             return
 
-        source = vb_cfg.get("_source") if isinstance(vb_cfg, dict) else getattr(vb_cfg, "_source", None)
-        vb_name = vb_cfg.get("name") if isinstance(vb_cfg, dict) else getattr(vb_cfg, "name", None)
-
-        text_dim = self._cfg_get(cfg, "text_dim", None)
-        text_dim = None if text_dim in (None, 0) else int(text_dim)
-        if source is not None:
-            ckpt_dir = vb_cfg.get("_ckpt_dir") if isinstance(vb_cfg, dict) else getattr(vb_cfg, "_ckpt_dir", None)
-            # Resume builds from ckpt_dir but never loads a state_dict here (see
-            # train/utils/ckpt_model_loader), so a backbone that would otherwise
-            # leave a meta shell has to allocate real storage instead.
-            materialize = bool(
-                vb_cfg.get("_materialize_weights")
-                if isinstance(vb_cfg, dict)
-                else getattr(vb_cfg, "_materialize_weights", False)
+        # A backbone yaml may pin the architecture's video mask (LongLive: the Long-WAM history mask).
+        # Checked before the build so a wrong launch fails before the weight load.
+        required_mask = self._cfg_get(vb_cfg, "required_video_attention_mask_mode", None)
+        actual_mask = self._cfg_get(cfg, "video_attention_mask_mode", None)
+        if required_mask is not None and actual_mask != required_mask:
+            raise ValueError(
+                f"video_backbone {vb_cfg.name!r} requires model.architecture.video_attention_mask_mode="
+                f"{required_mask!r}, got {actual_mask!r}"
             )
-            self.video_backbone = build_video_backbone(
-                vb_name,
-                cfg,
-                source=source,
-                device="cpu",
-                ckpt_dir=ckpt_dir,
-                materialize_weights=materialize,
-                text_dim=text_dim,
-            )
-        elif vb_name is not None:
-            self.video_backbone = build_video_backbone(vb_name, cfg, text_dim=text_dim)
+        self.video_backbone = build_video_backbone(vb_cfg, mode, ckpt_dir)
 
         # Cross-check: yaml-declared temporal contract must match what the
         # backbone actually exposes. Drift here would let the dataloader
         # enforce the wrong divisibility rule and let the mask-downsampler
         # produce a wrong-length tail, so we fail-fast at backbone init.
-        if self.video_backbone is not None:
-            declared_tc = self._cfg_get(vb_cfg, "temporal_compression", 4)
-            declared_causal = self._cfg_get(vb_cfg, "causal_temporal", True)
-            actual_tc = self.video_backbone.temporal_compression
-            actual_causal = self.video_backbone.causal_temporal
-            if (declared_tc, declared_causal) != (actual_tc, actual_causal):
-                raise ValueError(
-                    f"video_backbone.temporal_compression / causal_temporal yaml "
-                    f"({declared_tc}, {declared_causal}) does not match native VAE "
-                    f"({actual_tc}, {actual_causal}). Update the yaml fields to match."
-                )
+        declared_tc = self._cfg_get(vb_cfg, "temporal_compression", 4)
+        declared_causal = self._cfg_get(vb_cfg, "causal_temporal", True)
+        actual_tc = self.video_backbone.temporal_compression
+        actual_causal = self.video_backbone.causal_temporal
+        if (declared_tc, declared_causal) != (actual_tc, actual_causal):
+            raise ValueError(
+                f"video_backbone.temporal_compression / causal_temporal yaml "
+                f"({declared_tc}, {declared_causal}) does not match native VAE "
+                f"({actual_tc}, {actual_causal}). Update the yaml fields to match."
+            )
 
     def _resolve_video_dim(self, cfg) -> int:
         """Resolve video_dim from config or video_backbone; raise if neither provides it."""
@@ -289,21 +280,25 @@ class BaseWAMArchitecture(ABC, nn.Module):
             self.proprio_slot_emb = nn.Embedding(self.num_proprio_tokens, self.context_dim)
             nn.init.zeros_(self.proprio_slot_emb.weight)
 
-    def _append_proprio_context_token(self, pipeline_inputs: dict, proprio: Optional[Tensor]) -> dict:
-        """Append one proprio token to raw text context and extend context_mask.
+    def _append_proprio_context_token(
+        self, text: "TextCondition", proprio: Optional[Tensor], sample_mask: Optional[Tensor]
+    ) -> "TextCondition":
+        """Append the proprio token(s) to the text context and extend its mask.
 
-        If the caller passed a per-sample mask via ``pipeline_inputs['_proprio_sample_mask']``
-        (shape (B,) or (B, 1) bool), masked samples get a zero token and a False
-        attention mask entry. This isolates proprio_encoder gradients on those
-        samples (input * 0 -> weight grad = 0; attention mask cuts the forward path).
+        Args:
+            text: TextCondition, context (B, L, D_text) and context_mask (B, L).
+            proprio: (B, D), (B, 1, D) or (B, N, D) normalized proprio (N = num_proprio_tokens); unused when
+                proprio-as-context is off.
+            sample_mask: optional per-sample proprio mask, (B,), (B, 1) or (B, 1, D) bool (any dim True =
+                the sample has proprio). Masked samples get a zero token and a False mask entry, which also
+                isolates the proprio_encoder gradient on them (input * 0 -> weight grad = 0).
+
+        Returns:
+            TextCondition with context (B, L + N, D_text) and context_mask (B, L + N) (``extra`` shared);
+            ``text`` itself when proprio-as-context is off.
         """
-        # Always strip the internal routing key so it doesn't leak into downstream forwards,
-        # even when proprio context is globally disabled.
-        pipeline_inputs = dict(pipeline_inputs)
-        sample_mask = pipeline_inputs.pop("_proprio_sample_mask", None)
-
         if not bool(getattr(self, "_use_proprioception_context", False)):
-            return pipeline_inputs
+            return text
         if self.proprio_encoder is None:
             raise RuntimeError("proprio context is enabled but proprio_encoder is not initialized.")
         if proprio is None:
@@ -323,7 +318,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         if proprio.shape[-1] != self.proprio_dim:
             raise ValueError(f"proprio last dim must be {self.proprio_dim}, got {proprio.shape[-1]}")
 
-        context = pipeline_inputs["context"]
+        context = text.context
         if context.shape[0] != proprio.shape[0]:
             if proprio.shape[0] == 1 and context.shape[0] > 1:
                 proprio = proprio.expand(context.shape[0], -1, -1)
@@ -332,14 +327,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
                     f"Batch mismatch between context and proprio: {context.shape[0]} vs {proprio.shape[0]}"
                 )
 
-        # Normalize sample_mask to (B, 1) bool on context's device.
-        # Accepted incoming shapes (after stacking in _collect_inputs):
-        #   * (B,)         — legacy 1D enable-per-sample
-        #   * (B, 1)       — legacy "rank-2 enable"
-        #   * (B, 1, D)    — 2D per-dim mask emitted by the post-migration
-        #                    RoboCOIN/EgoDex/RoboTwin/OXE readers; the
-        #                    sample-level enable is ``mask.any(dim=-1)`` so any
-        #                    real dim still gates the token in.
+        # Normalize sample_mask to (B, 1) bool on context's device. Accepted shapes (after stacking in
+        # prepare_inputs): (B,) enable-per-sample, (B, 1), or (B, 1, D) per-dim mask whose sample-level
+        # enable is ``mask.any(dim=-1)``.
         if sample_mask is None:
             sample_mask = torch.ones(
                 (proprio.shape[0], 1),
@@ -371,25 +361,14 @@ class BaseWAMArchitecture(ABC, nn.Module):
         proprio_token = proprio_token * sample_mask_f
         sample_mask = sample_mask.expand(-1, proprio_token.shape[1])  # (B, N)
 
-        context_mask = pipeline_inputs.get("context_mask")
-        if context_mask is None:
-            seq_lens = pipeline_inputs.get("seq_lens")
-            if seq_lens is not None:
-                seq_lens = seq_lens.to(device=context.device)
-                positions = torch.arange(context.shape[1], device=context.device).unsqueeze(0)
-                context_mask = positions < seq_lens.unsqueeze(1)
-            else:
-                context_mask = torch.ones((context.shape[0], context.shape[1]), dtype=torch.bool, device=context.device)
-        else:
-            context_mask = context_mask.to(device=context.device, dtype=torch.bool)
-
-        updated = dict(pipeline_inputs)
-        updated["context"] = torch.cat([context, proprio_token], dim=1)
-        updated["context_mask"] = torch.cat([context_mask, sample_mask], dim=1)
-        # The appended proprio token can sit after padded text tokens, so the
-        # resulting valid tokens are not necessarily a contiguous prefix.
-        # Keep the original text seq_lens and make context_mask authoritative.
-        return updated
+        # The proprio tokens sit after the (possibly padded) text, so the valid tokens are not a contiguous
+        # prefix any more: the mask is authoritative.
+        context_mask = text.context_mask.to(device=context.device, dtype=torch.bool)
+        return dataclasses.replace(
+            text,
+            context=torch.cat([context, proprio_token], dim=1),
+            context_mask=torch.cat([context_mask, sample_mask], dim=1),
+        )
 
     # --- Device / dtype (top-level authority) ---
 
@@ -474,11 +453,16 @@ class BaseWAMArchitecture(ABC, nn.Module):
         """
         from safetensors.torch import load_file
 
+        from openwam.model.video_backbone.common.weights import retie, tied_groups
+
         state_dict = load_file(path)
         has_meta = any(p.device.type == "meta" for p in self.parameters())
+        # assign=True would untie tied weights (frozen text encoders' embeddings); re-tie them after.
+        groups = tied_groups(self)
         missing, unexpected = self.load_state_dict(state_dict, strict=False, assign=has_meta)
         if strict and (missing or unexpected):
             raise RuntimeError(f"Strict load failed: missing={missing}, unexpected={unexpected}")
+        retie(self, groups)
 
     # --- Training: module management ---
 
@@ -590,30 +574,24 @@ class BaseWAMArchitecture(ABC, nn.Module):
             if mod is not None:
                 mod.to(device=device)
 
-    def save_assets_for_deployment(self, output_dir: str, cfg) -> None:
+    def save_assets_for_deployment(self, output_dir: str) -> None:
         """Make the checkpoint directory self-contained for deploy.
 
-        One entry the trainer calls once per checkpoint save, BEFORE
-        ``save_config`` writes ``config.yaml``. Each backbone's
-        :meth:`VideoBackbone.save_deploy_assets` merges its component/tokenizer
-        reconstruction specs into ``cfg`` (so deploy rebuilds the module
-        skeletons from ``config.yaml`` without the training-time ``model_path``)
-        and copies its artifact files (tokenizer / processor) into ``output_dir``.
+        The trainer calls it once when it creates the run dir. Each backbone's
+        :meth:`VideoBackbone.save_deploy_assets` copies its non-weight files (tokenizer / processor /
+        third-party ``config.json``) into ``output_dir``; the module geometry is already in ``config.yaml``.
         Every backbone base declares the hook (default no-op), so no probing here.
+
+        Args:
+            output_dir: str, the run dir.
+
+        Returns:
+            None.
         """
         for bb in self.backbones.values():
-            bb.save_deploy_assets(output_dir, cfg)
+            bb.save_deploy_assets(output_dir)
 
     # --- Training: preprocessing ---
-
-    @torch.no_grad()
-    def preprocess(self, **kwargs) -> dict:
-        """Encode raw frames/text into latents + context for training.
-
-        Delegates to ``video_backbone.preprocess_input_for_train()``. External code
-        (trainer) should call this instead of touching video_backbone directly.
-        """
-        return self.video_backbone.preprocess_input_for_train(**kwargs)
 
     def set_training_runtime(
         self,
@@ -646,8 +624,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 accepted as well and treated as a one-sample batch.
 
         Returns:
-            Dict with all preprocessed video latents, text embeddings, action
-            tensors, masks, and forward-time flags ready for ``compute_loss``.
+            Dict ready for ``compute_loss``: ``clean_latents`` (B, z, N_clean, h, w) the clean prefix,
+            ``input_latents`` (B, z, T_lat, h, w) the full clean clip, ``text`` (TextCondition), the action /
+            proprio tensors and masks, and the forward-time flags.
         """
         from openwam.dataloader.transforms.pipeline import FirstFrameConditioningTransform
         from openwam.model.architectures.utils.common import downsample_video_mask_to_latent
@@ -664,7 +643,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         all_frames: list = []
         all_prompts: list = []
-        all_ref_images: list = []
         all_actions: list = []
         all_proprios: list = []
         all_proprio_masks: list = []
@@ -674,7 +652,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
         for sample in samples:
             all_frames.append(sample["video"])
             all_prompts.append(sample["prompt"])
-            all_ref_images.append(sample.get("first_frame_image"))
 
             action = sample.get("action")
             if action is not None:
@@ -731,32 +708,21 @@ class BaseWAMArchitecture(ABC, nn.Module):
             all_action_masks.append(amask)
             all_video_masks.append(vmask)
 
-        ref_flags = [r is not None for r in all_ref_images]
-        if any(ref_flags) and not all(ref_flags):
-            raise ValueError("Mixed reference images in batch: all samples must be consistent.")
-
-        # Sparse history: the first H frames of every clip are single-frame history.
+        # Sparse history: the first H frames of every clip are single-frame history (0 = first-frame layout).
+        # Transitional: read from the samples until Task 8 puts the layout in cfg.
         n_hist = {int(s.get("num_history_frames", 0) or 0) for s in samples}
         if len(n_hist) != 1:
             raise ValueError(f"Mixed num_history_frames in batch: {sorted(n_hist)}")
-        n_hist = n_hist.pop()
-        extra = {"num_history_frames": n_hist} if n_hist > 0 else {}
-
-        preprocessed = self.preprocess(
-            frames=all_frames,
-            text=all_prompts,
-            ref_images=all_ref_images if ref_flags[0] else None,
-            **extra,
+        clean_latents, input_latents, text = self.video_backbone.preprocess_train(
+            all_frames, all_prompts, num_hist_frames=n_hist.pop()
         )
 
         action_data = torch.cat(all_actions, dim=0) if all_actions[0] is not None else None
 
         inputs = {
-            **preprocessed,
-            "latents": None,
-            "cfg_scale": 1,
-            "cfg_merge": False,
-            "tiled": False,
+            "clean_latents": clean_latents,
+            "input_latents": input_latents,
+            "text": text,
             "use_gradient_checkpointing": self._use_gradient_checkpointing,
             "use_gradient_checkpointing_offload": self._use_gradient_checkpointing_offload,
             "max_timestep_boundary": self._max_timestep_boundary,
@@ -784,17 +750,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         if all_action_masks[0] is not None:
             inputs["action_is_pad"] = torch.stack([~m for m in all_action_masks], dim=0).to(device=_device)
         if all_video_masks[0] is not None:
-            # ``latent[0]`` is a clean conditioning frame (and must be excluded
-            # from the loss mask) when either:
-            #   (a) the input batch carries ``first_frame_latents`` (Wan TI2V
-            #       — per-batch signal), in which case
-            #       ``base.compute_loss`` will clean-replace ``latents[:, :, 0:1]``
-            #       on every step; or
-            #   (b) the backbone's *configuration* always reserves ``latent[0]``
-            #       for conditioning (only TI2V via the
-            #       ``fuse_vae_embedding_in_latents`` / per-token-t=0 path
-            #       today).
-            skip_first = inputs.get("first_frame_latents") is not None or self.video_backbone.needs_first_frame_skip
+            # ``latent[0]`` is always clean conditioning (every layout has clean_latents), so the mask skips it.
+            skip_first = True
             # Pass the backbone's temporal_compression so the tail-grouping
             # divisor matches the actual latent-T produced by the encoder.
             # The default 4 in ``downsample_video_mask_to_latent`` is the Wan
@@ -827,8 +784,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         loss calculation internally.
 
         Callers should produce ``inputs`` via ``self.prepare_inputs(batch)``
-        (preferred) or assemble it manually with the same keys: the output of
-        ``self.preprocess()`` plus any of ``actions / proprio /
+        (preferred) or assemble it manually with the same keys: ``clean_latents`` /
+        ``input_latents`` / ``text`` plus any of ``actions / proprio /
         action_is_pad / video_is_pad / use_gradient_checkpointing[_offload] /
         max_timestep_boundary / min_timestep_boundary``.
 
@@ -875,10 +832,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
         inputs["latents"] = (1 - sigma_bc) * inputs["input_latents"] + sigma_bc * video_noise
         video_target = video_noise - inputs["input_latents"]
 
-        if inputs.get("first_frame_latents") is not None:
-            # 1 clean first frame (TI2V) or H clean history frames (sparse history).
-            n_clean = inputs["first_frame_latents"].shape[2]
-            inputs["latents"][:, :, :n_clean] = inputs["first_frame_latents"]
+        # The clean prefix (1 first-frame latent or H history latents) stays clean.
+        n_clean = inputs["clean_latents"].shape[2]
+        inputs["latents"][:, :, :n_clean] = inputs["clean_latents"]
 
         # --- Prepare action noise ---
         noisy_actions, action_target, action_timesteps, action_timestep_ids, action_sigmas, a_sigma_bc = (
@@ -984,31 +940,13 @@ class BaseWAMArchitecture(ABC, nn.Module):
         """
         import torch.nn.functional as F
 
-        num_clean_prefix = int(inputs.get("num_clean_prefix_frames", 0) or 0)
         video_is_pad = inputs.get("video_is_pad")
 
-        n_skip = 0
-        if inputs.get("first_frame_latents") is not None:
-            # TI2V: trim the leading clean conditioning latent(s) from the
-            # loss. Wan emits ``num_clean_prefix_frames=0`` (one implicit
-            # conditioning latent at index 0); an explicit count is also
-            # accepted. Both drop exactly the conditioning latent(s), so use
-            # ``max(prefix, 1)``.
-            n_skip = max(num_clean_prefix, 1)
-        elif num_clean_prefix > 0:
-            # Clean-prefix flagged without first_frame_latents: trim prefix
-            # plus the first VAE-conditioning latent that
-            # ``downsample_video_mask_to_latent`` also excludes from the mask.
-            n_skip = num_clean_prefix + 1
-        elif video_is_pad is not None and video_is_pad.shape[-1] < noise_pred.shape[2]:
-            # Production tail-mask convention (no ref-prefix backbone such as
-            # I2V): ``video_is_pad`` is sized to T_lat minus the leading
-            # conditioning latents. Trim noise_pred / target to match.
-            n_skip = noise_pred.shape[2] - video_is_pad.shape[-1]
-
-        if n_skip > 0:
-            noise_pred = noise_pred[:, :, n_skip:]
-            target = target[:, :, n_skip:]
+        # The clean prefix is not a denoising target. Transitional: its length is read off clean_latents
+        # until Task 8 puts it in cfg (layout.num_hist_latents).
+        n_skip = int(inputs["clean_latents"].shape[2])
+        noise_pred = noise_pred[:, :, n_skip:]
+        target = target[:, :, n_skip:]
 
         vb = self.video_backbone
         if timestep_weights is not None:
@@ -1175,10 +1113,15 @@ class BaseWAMArchitecture(ABC, nn.Module):
         This is the single entry point for inference. External code
         (engine) should call this instead of touching video_backbone directly.
 
+        The condition is the backbone's deploy encode (``preprocess_condition``) of the first frame alone, the
+        same encode the sparse layout uses for its history; the video noise is built here.
+
         Args:
-            num_frames: Video frame count passed to the video backbone. For
-                RoboTwin this is the post-``video_stride`` count seen during
-                training, not the raw action window length.
+            first_frame_image: the clean first frame, one PIL image (or a list holding exactly one).
+            num_frames: Video frame count T (1 + temporal_compression * k) of the denoised clip.
+            height / width / tiled / tile_size / tile_stride / prompt_embed_cache: ignored (the grid comes from
+                the encoded first frame; decode is the backbone's; the text goes through the backbone's
+                ``text_lookup``). Kept until Task 8 deletes ``generate``.
             action_num_frames: Raw state/action window length. Generated
                 action chunk length is ``action_num_frames - 1``. Defaults to
                 ``num_frames`` for datasets whose video/action rates match.
@@ -1220,31 +1163,26 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         action_num_frames = int(action_num_frames if action_num_frames is not None else num_frames)
 
-        # CFG knobs ARE forwarded so a CFG-capable backbone
-        # can materialise ``inputs_shared['uncond_context']`` from its own
-        # encoder; the denoising loop below then applies CFG via
-        # ``cfg_scale_f`` / ``cfg_merge``. Wan does no CFG at inference and
-        # swallows these via ``**kw``, so its behaviour is unchanged.
-        inputs_shared = vb.preprocess_input_for_inference(
-            prompt=prompt,
-            first_frame_image=first_frame_image,
-            num_frames=num_frames,
-            height=height,
-            width=width,
-            seed=seed,
-            num_inference_steps=num_inference_steps,
-            shift=shift,
-            tiled=tiled,
-            prompt_embed_cache=prompt_embed_cache,
-            cfg_scale=cfg_scale,
-            cfg_merge=cfg_merge,
+        # Condition: the first frame encoded alone + the text of the T-frame clip.
+        images = first_frame_image if isinstance(first_frame_image, list) else [first_frame_image]
+        if len(images) != 1 or images[0] is None:
+            raise ValueError("generate is first-frame conditioned: pass exactly one first_frame_image.")
+        num_latents = vb.num_future_latents(num_frames)  # 1 + (T-1)/tc, validates T
+        clean_latents, text = vb.preprocess_condition(
+            [images], [prompt], num_frames=int(num_frames), num_latents=num_latents
         )
+        vb.scheduler.set_timesteps(num_inference_steps, shift=shift)
 
         if profile:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             logger.info("[WAM_PROFILE] pipeline_prep: %.3fs", time.time() - t0)
 
+        # Video noise: seeded CPU generator, float32, then the model dtype / device.
+        _, z, _, h_lat, w_lat = clean_latents.shape
+        generator = torch.Generator("cpu").manual_seed(int(seed))
+        noise = torch.randn((1, z, num_latents, h_lat, w_lat), generator=generator, device="cpu", dtype=torch.float32)
+        inputs_shared = {"latents": noise.to(dtype=dtype, device=device), "clean_latents": clean_latents, "text": text}
         if input_video_latents is not None:
             inputs_shared["latents"] = input_video_latents
         # Architecture-specific pipeline inputs are forwarded as-is. Subclasses
@@ -1253,11 +1191,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
         for key, value in extra_pipeline_inputs.items():
             if value is not None:
                 inputs_shared[key] = value
-        ref_latents = inputs_shared.get("first_frame_latents")
-        if ref_latents is not None:
-            latents = inputs_shared["latents"].clone()
-            latents[:, :, : ref_latents.shape[2]] = ref_latents
-            inputs_shared["latents"] = latents
+        latents = inputs_shared["latents"].clone()
+        latents[:, :, : clean_latents.shape[2]] = clean_latents
+        inputs_shared["latents"] = latents
         if self.uses_proprioception:
             if proprio is None:
                 raise ValueError("use_proprioception=True requires `proprio` during generation.")
@@ -1297,7 +1233,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         # VAE decode (only when pixels were requested).
         if decode_video:
-            video_frames = vb.decode_video(inputs_shared["latents"], tiled=tiled)
+            video_frames = vb.decode_video(inputs_shared["latents"])
         else:
             video_frames = None
 
@@ -1324,7 +1260,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         Args:
             schedule: list of (t_video, t_action) pairs ending with the (0, 0) sentinel (``make_schedule``).
             inputs_shared: forward kwargs; ``latents`` (B, C, T, h, w) start noisy and are updated in place
-                in the dict, the ``first_frame_latents`` clean prefix (B, C, H, h, w) is re-imposed each step.
+                in the dict, the ``clean_latents`` prefix (B, C, H, h, w) is re-imposed each step.
             action_latents: (B, K, A) initial action noise.
             inactive_action_dims: (A,) index of unified-action dims kept on the analytic noise path, or None.
             dit_cache / cfg_scale / cfg_merge: as in :meth:`generate`.
@@ -1398,10 +1334,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
             if video_stepping:
                 new_latents = inputs_shared["latents"] + noise_pred * (sigma_v_next - sigma_v)
-                ref_latents = inputs_shared.get("first_frame_latents")
-                if ref_latents is not None:
-                    new_latents = new_latents.clone()
-                    new_latents[:, :, : ref_latents.shape[2]] = ref_latents
+                clean = inputs_shared["clean_latents"]
+                new_latents = new_latents.clone()
+                new_latents[:, :, : clean.shape[2]] = clean
                 inputs_shared["latents"] = new_latents
 
             if action_stepping and action_noise_pred is not None:
@@ -1423,7 +1358,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         """Forward conditioning of the sparse-history layout from raw observations (deploy).
 
         The video backbone encodes the history + text exactly as its training path does
-        (``preprocess_sparse_condition`` is also what ``prepare_inputs`` runs for the condition part).
+        (``preprocess_condition`` is the history half of ``preprocess_train``).
 
         Args:
             history_frames: list of B clips, each H PIL canvases (oldest first, frame t last), training layout.
@@ -1431,14 +1366,20 @@ class BaseWAMArchitecture(ABC, nn.Module):
             proprio: (B, H, D) normalized proprio, one row per history frame (oldest first).
             num_future_frames: int F, future frames the denoised latents cover.
 
-        Returns: forward kwargs: the backbone's condition dict (``first_frame_latents`` (B, z, H, h, w), text
-            context, geometry) plus ``proprio`` (B, H, D) on the model device / dtype.
+        Returns: forward kwargs ``clean_latents`` (B, z, H, h, w), ``text`` (TextCondition for the H + T_fut
+            latent grid) and ``proprio`` (B, H, D) on the model device / dtype.
         """
-        cond = self.video_backbone.preprocess_sparse_condition(
-            history_frames, list(prompts), num_future_frames=int(num_future_frames)
+        vb = self.video_backbone
+        num_latents = len(history_frames[0]) + vb.num_future_latents(num_future_frames)
+        clean_latents, text = vb.preprocess_condition(
+            history_frames,
+            list(prompts),
+            # The text describes the equivalent contiguous clip of these latents.
+            num_frames=1 + int(vb.temporal_compression) * (num_latents - 1),
+            num_latents=num_latents,
         )
-        cond["proprio"] = torch.as_tensor(proprio).to(device=self.device, dtype=self.dtype)
-        return cond
+        proprio = torch.as_tensor(proprio).to(device=self.device, dtype=self.dtype)
+        return {"clean_latents": clean_latents, "text": text, "proprio": proprio}
 
     @torch.no_grad()
     def sample(
@@ -1455,8 +1396,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         Args:
             cond_inputs: forward kwargs without ``latents`` (``prepare_sparse_condition``, or ``prepare_inputs``
-                with the GT / training-only entries removed); a ``first_frame_latents`` (B, z, N, h, w) clean prefix
-                is written over the first N latent frames and re-imposed every step.
+                with the GT / training-only entries removed); the ``clean_latents`` (B, z, N, h, w) prefix is
+                written over the first N latent frames and re-imposed every step.
             schedule: (t_video, t_action) list from ``make_schedule``.
             latent_shape: (B, z, T, h, w) of the full latent clip (clean prefix + denoised part).
             action_shape: (B, K, A) of the action chunk.
@@ -1469,9 +1410,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         inputs = dict(cond_inputs)
         gen = torch.Generator(device=device).manual_seed(int(seed))
         latents = torch.randn(tuple(latent_shape), generator=gen, device=device, dtype=dtype)
-        clean = inputs.get("first_frame_latents")
-        if clean is not None:
-            latents[:, :, : clean.shape[2]] = clean
+        clean = inputs["clean_latents"]
+        latents[:, :, : clean.shape[2]] = clean
         inputs["latents"] = latents
         action_latents = torch.randn(tuple(action_shape), generator=gen, device=device, dtype=dtype)
         action_latents = self._denoise_loop(
@@ -1515,8 +1455,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         if not isinstance(uncond_context, Tensor):
             raise RuntimeError(
                 "CFG combine requested but `inputs_shared['uncond_context']` is missing "
-                "or not a tensor. `preprocess_input_for_inference` should populate it when "
-                "cfg_scale > 1.0."
+                "or not a tensor; no video backbone produces an unconditional context (see followups)."
             )
 
         if cfg_merge:
@@ -1572,6 +1511,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
         noisy_actions: Optional[Tensor],
         action_timestep: Optional[Tensor],
         *,
+        latents: Tensor,
+        timestep: Tensor,
+        text: "TextCondition",
+        clean_latents: Tensor,
         proprio: Optional[Tensor] = None,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
@@ -1585,6 +1528,16 @@ class BaseWAMArchitecture(ABC, nn.Module):
         ``(video_noise_pred, action_noise_pred)``. When ``noisy_actions`` is
         None (CFG nega pass / video-only generation) the action term is
         None.
+
+        Args:
+            noisy_actions: (B, K, A) or None. action_timestep: (B,) or None.
+            latents: (B, z, T_lat, h, w) noisy video latents (clean prefix already written in).
+            timestep: (B,) video timestep. text: TextCondition from the video backbone.
+            clean_latents: (B, z, N_clean, h, w) clean prefix; only its length N_clean is read here.
+            proprio: normalized proprio for the proprio-as-context token(s).
+            use_gradient_checkpointing / use_gradient_checkpointing_offload: bool.
+            pipeline_inputs: ``_proprio_sample_mask`` (per-sample proprio mask) and training-only entries
+                (``input_latents``) that the forward ignores.
         """
         ...
 
@@ -1610,9 +1563,7 @@ _CFG_BATCH_AXIS_KEYS: tuple = (
     "latents",
     "input_latents",
     "proprio",
-    "first_frame_latents",
-    "seq_lens",
-    "context_mask",
+    "clean_latents",
 )
 
 

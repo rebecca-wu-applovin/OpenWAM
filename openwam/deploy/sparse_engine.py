@@ -105,7 +105,7 @@ class SparseHistoryInferenceEngine(BaseInferenceEngine):
             proprio,
             num_future_frames=self.num_future_frames,
         )
-        b, z, h, hl, wl = cond["first_frame_latents"].shape
+        b, z, h, hl, wl = cond["clean_latents"].shape
         t_lat = h + arch.video_backbone.num_future_latents(self.num_future_frames)
         latents, actions = arch.sample(
             cond,

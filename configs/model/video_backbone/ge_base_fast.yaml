@@ -11,8 +11,29 @@ ltx_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/LT
 
 temporal_compression: 8   # LTX VAE (yaml contract checked against the backbone at build)
 causal_temporal: true
-shift_video: 1.0
+shift_video: 1.0          # deploy-grid shift; GE trains on the shift-1 FlowMatchEuler grid
 n_view: 2                 # cameras stacked top-to-bottom in the dataloader canvas
 text_max_length: 128      # GE get_text_conditions max_sequence_length
 caption_dropout_p: 0.06   # GE configs/ltx_model/video_model.yaml
 vae_sample: true          # GE get_latents samples the VAE posterior (training mode only; eval / deploy take its mode)
+seed: null                # int seeds the caption-dropout RNG; null = unseeded
+text_cache: true          # trainer encodes the dataset's prompt set once after the weights are in place, T5 then on CPU
+
+dit:                      # LTXVideoTransformer3DModel (GE multi-view): checked by the strict weight load
+  in_channels: 128
+  out_channels: 128
+  patch_size: 1
+  patch_size_t: 1
+  num_attention_heads: 32
+  attention_head_dim: 64
+  cross_attention_dim: 2048
+  num_layers: 28
+  activation_fn: gelu-approximate
+  qk_norm: rms_norm_across_heads
+  norm_elementwise_affine: false
+  norm_eps: 1.0e-06
+  caption_channels: 4096  # T5-XXL width (= the text_dim the action stream reads)
+  attention_bias: true
+  attention_out_bias: true
+  use_view_embed: true
+  max_view: 3

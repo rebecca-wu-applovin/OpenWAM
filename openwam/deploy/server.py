@@ -457,15 +457,13 @@ _CUDA_ONLY = " (CUDA only; torch_sdpa otherwise)"
 
 # Backends that run their fused kernel only for some inputs and quietly fall back to SDPA for the
 # rest, keyed by the restriction to report. The two subsystems spell them differently -- the Wan
-# paths use the ATTENTION_IMPLEMENTATION spelling, the ActionDiT closures are named after their
-# _BACKEND_MAP key (see openwam/model/action_backbone/components.py) -- and the two namespaces are
-# kept apart deliberately: ATTENTION_IMPLEMENTATION is an open set, so one flat table would let
-# "_flash2" arrive through the env var and be annotated as though it were a real Wan backend.
+# DiT uses the fused_backend_name() spelling (openwam/model/video_backbone/wan/dit.py), the ActionDiT
+# closures are named after their _BACKEND_MAP key (see openwam/model/action_backbone/components.py)
+# -- and the two namespaces are kept apart so a name is only annotated where it means something.
 _WAN_BACKENDS = {
     "flash_attention_3": _HALF_PRECISION_CUDA_ONLY,
     "flash_attention_2": _HALF_PRECISION_CUDA_ONLY,
     "sage_attention": _HALF_PRECISION_CUDA_ONLY,
-    "xformers": _CUDA_ONLY,
 }
 _ACTION_BACKENDS = {
     "_flash3": _HALF_PRECISION_CUDA_ONLY,
@@ -480,9 +478,8 @@ def _qualify_backend(name: str, known: dict) -> str:
 
     ``known`` is the table for the calling subsystem's namespace, so a name is only
     annotated where it means something. Anything unlisted is reported as-is: that
-    covers plain SDPA, which has no restriction to report, and any unrecognized
-    DIFFSYNTH_ATTENTION_IMPLEMENTATION value, which attention_forward also runs as
-    plain SDPA — neither should be labelled with a restriction it does not have.
+    covers plain SDPA, which has no restriction to report and should not be
+    labelled with one.
     """
     return f"{name}{known[name]}" if name in known else name
 
@@ -512,14 +509,6 @@ def _log_attention_backends(logger):
         lines.append(f"  Video DiT          : {_qualify_backend(_vdit.fused_backend_name(), _WAN_BACKENDS)}")
     except Exception as e:
         lines.append(f"  Video DiT          : ERROR ({e})")
-
-    # --- Wan shared core backend (attention.py, env: DIFFSYNTH_ATTENTION_IMPLEMENTATION) ---
-    try:
-        from openwam.model.video_backbone.wan.shared.core.attention.attention import ATTENTION_IMPLEMENTATION
-
-        lines.append(f"  Wan shared core    : {_qualify_backend(ATTENTION_IMPLEMENTATION, _WAN_BACKENDS)}")
-    except Exception as e:
-        lines.append(f"  Wan shared core    : ERROR ({e})")
 
     logger.info("\n".join(lines))
 

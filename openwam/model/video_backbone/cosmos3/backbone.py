@@ -4,12 +4,17 @@ Implements the :class:`VideoBackbone` contract on NVIDIA's Cosmos3-Edge unified
 dual-stream transformer (vendored in ``cosmos3/_vendor/``) — flat named children
 (``self.dit`` / ``self.vae``) mirroring the other families. The heavy batched
 block-loop lives in ``cosmos3/dit.py``; prompt tokenization + mRoPE
-packing in ``cosmos3/text.py``; component construction in
-``cosmos3/pipeline_builder.py`` (imported lazily inside :meth:`from_pretrained`
-so this module stays CPU-CI safe).
+packing in ``cosmos3/text.py``.
+
+Construction (everything from ``cfg = cfg.model.video_backbone``; Edge and Nano differ only in the yaml):
+  - :meth:`Cosmos3EdgeVideoBackbone.from_pretrained`: the diffusers-style bundle at ``model_path``
+    (``transformer/`` + ``vae/`` + ``text_tokenizer/``), checked against the yaml ``dit`` / ``vae`` blocks;
+  - :meth:`Cosmos3EdgeVideoBackbone.from_checkpoint_dir`: meta shells built from those yaml blocks, tokenizer
+    from the checkpoint's ``text_tokenizer/`` (copied there by :meth:`save_deploy_assets`).
+``diffusers`` / ``transformers`` are imported inside the constructors, so this module stays CPU-CI safe.
 
 The und (text) stream is causal, frozen, and computationally independent of the gen (video)
-stream, so :meth:`preprocess_input_for_train` runs the whole und tower once
+stream, so :meth:`encode_text` runs the whole und tower once
 under ``no_grad`` and caches the per-layer gen-facing K/V; the und final hidden
 (2048-wide) doubles as the ``context`` tensor the action stream consumes
 (``text_dim == 2048``). There is no cross-attention and no external text
@@ -23,10 +28,13 @@ declaration + GQA KV-expand.
 from __future__ import annotations
 
 import logging
+import os
 import random
+import shutil
 from typing import Any, Callable, List, Optional, Tuple
 
 import torch
+from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 
 from openwam.model.compile_options import (
@@ -35,7 +43,7 @@ from openwam.model.compile_options import (
     section_enabled,
     torch_compile_kwargs,
 )
-from openwam.model.video_backbone.base import BlockLoopState, VideoBackbone
+from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
 from openwam.model.video_backbone.cosmos3 import dit as cosmos3_dit
 from openwam.model.video_backbone.cosmos3 import text as cosmos3_text
 from openwam.model.video_backbone.cosmos3.scheduler import Cosmos3FlowSchedulerAdapter
@@ -50,6 +58,152 @@ _COSMOS3_CAUSAL_TEMPORAL: bool = True
 _COSMOS3_LATENT_CHANNELS: int = 48
 _DEFAULT_FPS: float = 24.0
 
+_COSMOS3_INSTALL_HINT = (
+    "cosmos3 needs `diffusers>=0.38` (for AutoencoderKLWan and the vendored transformer's support imports) "
+    "and `transformers` for the tokenizer. Install with: pip install 'diffusers>=0.38,<1'."
+)
+# Tokenizer dir: ``text_tokenizer/`` in the bundle and, copied by save_deploy_assets, in a checkpoint dir.
+_TOKENIZER_SUBDIR = "text_tokenizer"
+# The tokenizer's structural files (the only non-weight assets a checkpoint needs; dit / vae come from the yaml).
+_TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "chat_template.jinja")
+# und (text) pathway children frozen at build: they run under no_grad in the backbone's preprocess.
+_UND_PATHWAY_LAYER_CHILDREN = ("input_layernorm", "post_attention_layernorm", "mlp")
+_UND_PATHWAY_ATTN_CHILDREN = ("to_q", "to_k", "to_v", "to_out", "norm_q", "norm_k", "k_norm_und_for_gen")
+
+
+def _vendor():
+    """Lazy-import the vendored transformer module (pulls diffusers). Returns: the module."""
+    try:
+        from openwam.model.video_backbone.cosmos3._vendor import transformer_cosmos3
+    except ImportError as exc:  # diffusers missing or too old
+        raise ImportError(_COSMOS3_INSTALL_HINT) from exc
+    return transformer_cosmos3
+
+
+def _check_cfg(cfg: DictConfig) -> None:
+    """Reject backbone yaml values the code cannot honour, before any heavy import.
+
+    Args:
+        cfg: ``cfg.model.video_backbone``.
+
+    Returns:
+        None. Raises ValueError / NotImplementedError naming the bad key.
+    """
+    if float(cfg.fps) <= 0.0:
+        raise ValueError(f"cosmos3 fps must be > 0, got {cfg.fps!r}.")
+    if not cfg.freeze_und:
+        raise NotImplementedError(
+            "cosmos3 freeze_und=false is not supported: the und tower always runs under no_grad "
+            "(dit.run_und_tower), so its parameters can never receive gradients — the flag would silently "
+            "allocate optimizer state for weights that never train."
+        )
+    if int(cfg.max_text_tokens) < 8:
+        raise ValueError(f"cosmos3 max_text_tokens must be >= 8, got {cfg.max_text_tokens}.")
+    if not 0.0 <= float(cfg.text_encoder_dropout) <= 1.0:
+        raise ValueError(f"cosmos3 text_encoder_dropout must be in [0, 1], got {cfg.text_encoder_dropout!r}.")
+
+
+def _norm_cfg_value(value):
+    """Comparable form of a config value: lists recursed, floats rounded to 12 digits (yaml vs json parsing)."""
+    if isinstance(value, (list, tuple)):
+        return [_norm_cfg_value(v) for v in value]
+    if isinstance(value, float):
+        return round(value, 12)
+    return value
+
+
+def _check_against_yaml(config, declared: DictConfig, name: str) -> None:
+    """Compare a module loaded from the bundle with the yaml block it must equal.
+
+    Args:
+        config: the loaded module's ``.config`` (diffusers FrozenDict).
+        declared: the yaml block (``cfg.dit`` / ``cfg.vae``) the checkpoint shell is built from.
+        name: that block's key, for the message.
+
+    Returns:
+        None. Raises ValueError listing every differing key: weightless fields (rope theta, timestep scale,
+        mRoPE margins, ...) change behavior without changing any tensor shape, so a strict load cannot catch them.
+    """
+    mismatches = {
+        key: (config.get(key), value)
+        for key, value in OmegaConf.to_container(declared).items()
+        if _norm_cfg_value(config.get(key)) != _norm_cfg_value(value)
+    }
+    if mismatches:
+        raise ValueError(
+            f"cosmos3 bundle {name} config differs from the yaml {name} block on {mismatches} (bundle, yaml)"
+        )
+
+
+def _freeze_und_pathway(net) -> int:
+    """requires_grad_(False) on the und half + shared text embedding.
+
+    Args:
+        net: Cosmos3OmniTransformer.
+
+    Returns:
+        int, number of frozen parameter elements.
+    """
+    frozen = 0
+    for module in [net.embed_tokens, net.norm]:
+        for p in module.parameters():
+            p.requires_grad_(False)
+            frozen += p.numel()
+    for layer in net.layers:
+        for name in _UND_PATHWAY_LAYER_CHILDREN:
+            for p in getattr(layer, name).parameters():
+                p.requires_grad_(False)
+                frozen += p.numel()
+        # Not every variant has every und attention child (e.g. k_norm_und_for_gen is Edge-only).
+        for name in _UND_PATHWAY_ATTN_CHILDREN:
+            child = getattr(layer.self_attn, name, None)
+            if child is not None:
+                for p in child.parameters():
+                    p.requires_grad_(False)
+                    frozen += p.numel()
+    return frozen
+
+
+def _drop_lm_head(net) -> None:
+    """Remove ``lm_head`` (268M params, unused by the diffusion forward) so it never enters checkpoints.
+
+    Args:
+        net: Cosmos3OmniTransformer (modified in place).
+
+    Returns:
+        None.
+    """
+    if hasattr(net, "lm_head") and net.lm_head is not None:
+        delattr(net, "lm_head")
+        object.__setattr__(net, "lm_head", None)
+
+
+def freeze_unused_native_heads(net) -> int:
+    """Freeze the Omni action/sound heads OpenWAM's video-backbone path never calls.
+
+    Its action stream is the external ActionDiT. They stay registered children (riding the checkpoint
+    unchanged keeps a future native-action variant loadable) but, frozen, they occupy no optimizer state.
+
+    Args:
+        net: Cosmos3OmniTransformer.
+
+    Returns:
+        int, number of frozen parameter elements.
+    """
+    frozen = 0
+    for name in ("action_proj_in", "action_proj_out", "audio_proj_in", "audio_proj_out"):
+        child = getattr(net, name, None)
+        if child is not None:
+            for p in child.parameters():
+                p.requires_grad_(False)
+                frozen += p.numel()
+    for name in ("action_modality_embed", "audio_modality_embed"):
+        param = getattr(net, name, None)
+        if param is not None:
+            param.requires_grad_(False)
+            frozen += param.numel()
+    return frozen
+
 
 class Cosmos3EdgeVideoBackbone(VideoBackbone):
     """Wrap the Cosmos3-Edge generator + Wan2.2 VAE + tokenizer behind the ABC."""
@@ -60,6 +214,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         net: Any,
         vae: Optional[Any] = None,
         tokenizer: Optional[Any] = None,
+        tokenizer_dir: Optional[str] = None,
         dim: int,
         num_layers: int,
         num_heads: int,
@@ -83,6 +238,8 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         if vae is not None:
             self.vae = vae
         self._tokenizer = tokenizer
+        # Where the tokenizer was read from (bundle or checkpoint); save_deploy_assets copies from here.
+        self._tokenizer_dir = tokenizer_dir
 
         mean = latents_mean if latents_mean is not None else torch.zeros(_COSMOS3_LATENT_CHANNELS)
         std = latents_std if latents_std is not None else torch.ones(_COSMOS3_LATENT_CHANNELS)
@@ -106,9 +263,8 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         self._prompt_templates = bool(prompt_templates)
         self._duration_template = bool(duration_template)
         # Clip frame rate. Nothing in the dataloader stack reports one, so this
-        # is a configured assumption rather than a measurement — see
-        # ``_DEFAULT_CLIP_FPS`` in pipeline_builder. Callers may still override
-        # per call via the ``fps`` kwarg.
+        # is a configured assumption rather than a measurement (yaml ``fps``).
+        # Callers may still override per call via the ``fps`` kwarg.
         self._clip_fps = float(clip_fps)
         self._max_text_tokens = int(max_text_tokens)
         if not 0.0 <= float(text_dropout_p) <= 1.0:
@@ -226,33 +382,137 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
     # ================================================================
 
     @classmethod
-    def from_pretrained(cls, source: Any, *, device=None, ckpt_dir=None, **kw) -> "Cosmos3EdgeVideoBackbone":
-        from openwam.model.video_backbone.cosmos3.pipeline_builder import build_cosmos3_pipeline
+    def from_pretrained(cls, cfg: DictConfig) -> "Cosmos3EdgeVideoBackbone":
+        """Build from the diffusers-style bundle at ``cfg.model_path``.
 
-        holder = build_cosmos3_pipeline(source, device=device, ckpt_dir=ckpt_dir, **kw)
-        shift = float(getattr(holder, "shift_video", 5.0))
-        backbone = cls(
-            net=holder.net,
-            vae=getattr(holder, "vae", None),
-            tokenizer=getattr(holder, "tokenizer", None),
-            dim=holder.dim,
-            num_layers=holder.num_layers,
-            num_heads=holder.num_heads,
-            head_dim=holder.head_dim,
-            context_dim=holder.context_dim,
-            latents_mean=getattr(holder, "latents_mean", None),
-            latents_std=getattr(holder, "latents_std", None),
+        Args:
+            cfg: ``cfg.model.video_backbone``: ``model_path``, the ``dit`` / ``vae`` blocks the bundle must
+                match, prompt knobs, ``shift_video``.
+
+        Returns:
+            Cosmos3EdgeVideoBackbone on CPU (bf16; the bundle keeps ``time_embedder`` fp32). Raises ValueError
+            when the bundle's transformer / VAE config differs from the yaml.
+        """
+        _check_cfg(cfg)
+        vendor = _vendor()
+        try:
+            from diffusers import AutoencoderKLWan
+        except ImportError as exc:
+            raise ImportError(_COSMOS3_INSTALL_HINT) from exc
+        model_path = str(cfg.model_path)
+        if not os.path.isdir(os.path.join(model_path, "transformer")):
+            raise FileNotFoundError(
+                f"cosmos3 model_path has no transformer/ subfolder: {model_path} (expected a diffusers-style bundle)."
+            )
+        net = vendor.Cosmos3OmniTransformer.from_pretrained(
+            model_path, subfolder="transformer", torch_dtype=torch.bfloat16
+        )
+        _check_against_yaml(net.config, cfg.dit, "dit")
+        vae = AutoencoderKLWan.from_pretrained(model_path, subfolder="vae", torch_dtype=torch.bfloat16)
+        _check_against_yaml(vae.config, cfg.vae, "vae")
+        return cls._assemble(cfg, net, vae, os.path.join(model_path, _TOKENIZER_SUBDIR))
+
+    @classmethod
+    def from_checkpoint_dir(cls, cfg: DictConfig, ckpt_dir: str) -> "Cosmos3EdgeVideoBackbone":
+        """Build the empty skeleton of a saved checkpoint from the yaml ``dit`` / ``vae`` blocks.
+
+        Args:
+            cfg: the checkpoint's ``cfg.model.video_backbone``.
+            ckpt_dir: str, checkpoint dir holding ``text_tokenizer/`` (save_deploy_assets).
+
+        Returns:
+            Cosmos3EdgeVideoBackbone whose parameters are on ``meta`` (bf16). The rotary ``inv_freq`` buffer
+            is real (non-persistent, so no checkpoint carries it).
+        """
+        _check_cfg(cfg)
+        from accelerate import init_empty_weights
+
+        vendor = _vendor()
+        try:
+            from diffusers import AutoencoderKLWan
+        except ImportError as exc:
+            raise ImportError(_COSMOS3_INSTALL_HINT) from exc
+        tokenizer_dir = os.path.join(ckpt_dir, _TOKENIZER_SUBDIR)
+        if not os.path.isdir(tokenizer_dir):
+            raise FileNotFoundError(f"cosmos3 tokenizer not found at {tokenizer_dir} (written by save_deploy_assets)")
+        with init_empty_weights():
+            net = vendor.Cosmos3OmniTransformer(**OmegaConf.to_container(cfg.dit))
+        # Cast while on meta (free), so a resume shell materializes bf16 like a finetune load.
+        net = net.to(dtype=torch.bfloat16)
+        # The only non-persistent buffer: fully determined by config, recomputed in fp32.
+        inv_freq = cosmos3_dit.rotary_inv_freq(int(cfg.dit.head_dim), float(cfg.dit.rope_theta))
+        net.rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
+        leftover = [n for n, b in net.named_buffers() if b.is_meta]
+        if leftover:
+            raise RuntimeError(f"cosmos3 checkpoint shell has unmaterialized meta buffers: {leftover}")
+        with init_empty_weights():
+            vae = AutoencoderKLWan(**OmegaConf.to_container(cfg.vae)).to(dtype=torch.bfloat16)
+        leftover = [n for n, b in vae.named_buffers() if b.is_meta]
+        if leftover:
+            raise RuntimeError(f"cosmos3 VAE checkpoint shell has unmaterialized meta buffers: {leftover}")
+        return cls._assemble(cfg, net, vae, tokenizer_dir)
+
+    @classmethod
+    def _assemble(cls, cfg: DictConfig, net, vae, tokenizer_dir: str) -> "Cosmos3EdgeVideoBackbone":
+        """Shared tail of both constructors: drop / freeze the unused parts, read the tokenizer, wrap.
+
+        Args:
+            cfg: ``cfg.model.video_backbone``. net: Cosmos3OmniTransformer. vae: AutoencoderKLWan (real or meta).
+            tokenizer_dir: str, ``text_tokenizer/`` dir to read.
+
+        Returns:
+            Cosmos3EdgeVideoBackbone.
+        """
+        from transformers import PreTrainedTokenizerFast
+
+        _drop_lm_head(net)
+        # Frozen in every mode: finetune / resume build from a ckpt dir too and must not train the und tower.
+        n_heads_frozen = freeze_unused_native_heads(net)
+        if n_heads_frozen:
+            logger.info("cosmos3: froze unused native action/sound heads (%.1fM params)", n_heads_frozen / 1e6)
+        n_frozen = _freeze_und_pathway(net)
+        logger.info("cosmos3: froze und pathway + embeddings (%.1fM params)", n_frozen / 1e6)
+        vae.eval()
+        for p in vae.parameters():
+            p.requires_grad_(False)
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_dir)
+        shift = float(cfg.shift_video)
+        return cls(
+            net=net,
+            vae=vae,
+            tokenizer=tokenizer,
+            tokenizer_dir=tokenizer_dir,
+            dim=int(cfg.dit.hidden_size),
+            num_layers=int(cfg.dit.num_hidden_layers),
+            num_heads=int(cfg.dit.num_attention_heads),
+            head_dim=int(cfg.dit.head_dim),
+            # The action stream's context is the und final hidden, so its width is the hidden size.
+            context_dim=int(cfg.dit.hidden_size),
+            latents_mean=torch.tensor(list(cfg.vae.latents_mean), dtype=torch.float32),
+            latents_std=torch.tensor(list(cfg.vae.latents_std), dtype=torch.float32),
             scheduler=Cosmos3FlowSchedulerAdapter(shift_video=shift),
             shift_video=shift,
-            use_system_prompt=holder.use_system_prompt,
-            prompt_templates=holder.prompt_templates,
-            duration_template=getattr(holder, "duration_template", True),
-            clip_fps=getattr(holder, "clip_fps", _DEFAULT_FPS),
-            max_text_tokens=holder.max_text_tokens,
-            text_dropout_p=holder.text_dropout_p,
-            text_dropout_seed=holder.text_dropout_seed,
+            use_system_prompt=bool(cfg.use_system_prompt),
+            prompt_templates=bool(cfg.prompt_templates),
+            duration_template=bool(cfg.prompt_duration_template),
+            clip_fps=float(cfg.fps),
+            max_text_tokens=int(cfg.max_text_tokens),
+            text_dropout_p=float(cfg.text_encoder_dropout),
+            text_dropout_seed=None if cfg.text_encoder_dropout_seed is None else int(cfg.text_encoder_dropout_seed),
         )
-        return backbone
+
+    def build_text_cache(self, prompts: list) -> None:
+        """Not possible: the prompt templates and vision positions need the clip's latent grid.
+
+        Args:
+            prompts: list[str] (unused).
+
+        Returns:
+            Never; raises ValueError (cosmos3 yamls set ``text_cache: false``).
+        """
+        raise ValueError(
+            "cosmos3 encodes text per clip geometry and cannot cache it; set model.video_backbone.text_cache=false"
+        )
 
     # ================================================================
     # Internal helpers
@@ -263,45 +523,33 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             raise ValueError("cosmos3_edge backbone has no tokenizer attached (bad build).")
         return self._tokenizer
 
-    def _frames_to_tensor(self, frames: Any) -> Tensor:
-        """Accept (B,3,T,H,W) in [-1,1], the dataloader's ``list[list[PIL]]``
-        batch form, or a single flat ``list[PIL]`` clip."""
-        if torch.is_tensor(frames):
-            if frames.ndim != 5:
-                raise ValueError(f"cosmos3_edge expects (B, 3, T, H, W) frames; got {tuple(frames.shape)}.")
-            return frames
-        from openwam.model.video_backbone.common.pixels import pil_clips_to_tensor
+    def encode_pixels(self, pixels: Tensor) -> Tensor:
+        """Pixel clips -> normalized latents (Wan2.2 VAE posterior mode, upstream ``sample_mode="argmax"``).
 
-        if isinstance(frames, (list, tuple)) and frames and not isinstance(frames[0], (list, tuple)):
-            frames = [frames]  # single clip → batch of one
-        return pil_clips_to_tensor(frames, device=self.device)
+        Args:
+            pixels: (N, 3, T, H, W) in [-1, 1], T = 1 + 4k.
 
-    def _encode_frames(self, frames: Tensor) -> Tensor:
-        """Pixel video ``(B, 3, T, H, W)`` in [-1, 1] → normalized latents
-        ``(B, 48, T_lat, H/16, W/16)``. Mode of the posterior (upstream
-        ``sample_mode="argmax"``), then ``(μ − mean) / std`` in fp32, cast back."""
+        Returns:
+            (N, 48, 1 + (T-1)//4, H/16, W/16) latents ``(mu - mean) / std`` (fp32 math, cast back to the VAE dtype).
+        """
         vae = getattr(self, "vae", None)
         if vae is None:
             raise ValueError("cosmos3_edge backbone has no VAE attached.")
         vae_dtype = next(vae.parameters()).dtype
-        posterior = vae.encode(frames.to(device=self.device, dtype=vae_dtype)).latent_dist
+        posterior = vae.encode(pixels.to(device=self.device, dtype=vae_dtype)).latent_dist
         raw = posterior.mode()
         mean = self._latents_mean.to(raw.device)
         std = self._latents_std.to(raw.device)
         return ((raw.float() - mean) / std).to(raw.dtype)
 
-    def _encode_history(self, frames: Tensor) -> Tensor:
-        """Sparse-history encode: each history frame alone (a 1-frame clip).
-
-        Args:
-            frames: (B, 3, H, H_px, W_px) pixels in [-1, 1].
-
-        Returns:
-            (B, 48, H, h, w) normalized latents.
-        """
-        b, h = frames.shape[0], frames.shape[2]
-        hist = frames.transpose(1, 2).flatten(0, 1).unsqueeze(2)  # (B*H, 3, 1, H_px, W_px)
-        return self._encode_frames(hist).unflatten(0, (b, h)).squeeze(3).transpose(1, 2)
+    def decode_latents(self, latents: Tensor) -> Tensor:
+        """latents: (N, 48, T_lat, h, w) normalized. Returns: (N, 3, 1 + 4 (T_lat-1), 16h, 16w) VAE pixels."""
+        vae = getattr(self, "vae", None)
+        if vae is None:
+            raise ValueError("cosmos3_edge backbone has no VAE attached.")
+        vae_dtype = next(vae.parameters()).dtype
+        z = self._unnormalize_latents(latents).to(dtype=vae_dtype)
+        return vae.decode(z).sample
 
     def _unnormalize_latents(self, latents: Tensor) -> Tensor:
         mean = self._latents_mean.to(latents.device)
@@ -374,107 +622,91 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         return vision_pos.unsqueeze(1)  # [3, 1, N] — broadcast over batch
 
     # ================================================================
-    # Training preprocessing
+    # Text
     # ================================================================
 
-    def _prompts(self, text, batch_size: int) -> List[str]:
-        """text: one str or B prompts; batch_size: B. Returns: B prompts, caption-dropped in training mode."""
-        prompts = [text] * batch_size if isinstance(text, str) else list(text)
-        if len(prompts) != batch_size:
-            raise ValueError(f"cosmos3_edge got {len(prompts)} prompts for batch of {batch_size}.")
+    def _caption_dropout(self, prompts: List[str]) -> List[str]:
+        """prompts: B str. Returns: B prompts, each replaced by "" with p = text_dropout_p in training mode.
+
+        Transitional: Task 12 moves caption dropout into the dataset.
+        """
         if self.training and self._text_dropout_p > 0.0:
             prompts = [p if self._text_dropout_rng.random() >= self._text_dropout_p else "" for p in prompts]
         return prompts
 
-    def preprocess_sparse_condition(self, history_frames, text, *, num_future_frames: int, fps=None) -> dict:
-        """Sparse-history conditioning: H history frames encoded one by one + the und-tower text bundle.
+    @torch.no_grad()
+    def encode_text(self, prompts: list, *, grid, num_frames: int) -> TextCondition:
+        """Templated prompts through the frozen und tower (online; cosmos3 text depends on the clip, no cache).
 
         Args:
-            history_frames: list of B clips (H PIL frames, oldest first), or (B, 3, H, H_px, W_px) in [-1, 1].
-            text: list of B prompts (or one str).
-            num_future_frames: int F (1 + 4k); the prompt metadata and vision positions cover H + T_fut latents.
-            fps: float clip fps for the prompt template / fps modulation; None = the configured clip fps.
+            prompts: list[str] of B prompts.
+            grid: (T_lat, h, w) latent grid; the template's resolution is (16h, 16w) and the vision mRoPE
+                positions cover this grid.
+            num_frames: int, pixel frames of the equivalent contiguous clip (template duration; 1 = image).
 
         Returns:
-            dict with ``first_frame_latents`` (B, 48, H, h, w), ``num_clean_prefix_frames`` = H, ``context``,
-            ``und_mask``, ``seq_lens``, ``und_kv``, ``vision_positions`` [3, 1, N], ``num_frames`` (pixel frames of
-            the equivalent contiguous clip), ``height``, ``width``.
+            TextCondition: context (B, L, 2048) und final hidden, context_mask (B, L) = position < the prompt's
+            token count; extra ``und_kv`` (per-layer gen-facing K/V), ``und_mask`` ((B, L) bool, or None when no
+            prompt is padded) and ``vision_positions`` [3, 1, N].
         """
-        frames_t = self._frames_to_tensor(history_frames)
-        b, _, h, h_pix, w_pix = frames_t.shape
-        prompts = self._prompts(text, b)
-        fps = float(fps if fps is not None else self._clip_fps)
-        with torch.no_grad():
-            hist = self._encode_history(frames_t)
-            t_lat = h + self.num_future_latents(num_future_frames)
-            # Prompt metadata describes the equivalent contiguous clip of these latents (scheme (a)).
-            t_pix = 1 + self._temporal_compression * (t_lat - 1)
-            enc = self._encode_prompts(prompts, num_frames=t_pix, height=h_pix, width=w_pix, fps=fps)
-        vision_pos = self._vision_positions(enc["und_len_padded"], (t_lat,) + tuple(hist.shape[3:]), fps)
-        # NOTE: no `context_mask` key — the architecture appends a proprio token
-        # to `context` and derives the action-side mask from `seq_lens`; a
-        # provided mask would be one column short. The und padding mask rides
-        # the private `und_mask` key for the gen-attention prefix instead.
-        return {
-            "context": enc["context"],
+        t_lat, h, w = (int(v) for v in grid)
+        prompts = self._caption_dropout(list(prompts))
+        enc = self._encode_prompts(
+            prompts,
+            num_frames=int(num_frames),
+            height=h * _COSMOS3_SPATIAL_COMPRESSION,
+            width=w * _COSMOS3_SPATIAL_COMPRESSION,
+            fps=self._clip_fps,
+        )
+        context, seq_lens = enc["context"], enc["seq_lens"]
+        positions = torch.arange(context.shape[1], device=context.device).unsqueeze(0)
+        extra = {
             "und_mask": enc["context_mask"],
-            "seq_lens": enc["seq_lens"],
             "und_kv": enc["und_kv"],
-            "vision_positions": vision_pos,
-            "first_frame_latents": hist,
-            "num_clean_prefix_frames": h,
-            "num_frames": t_pix,
-            "height": h_pix,
-            "width": w_pix,
+            "vision_positions": self._vision_positions(enc["und_len_padded"], (t_lat, h, w), self._clip_fps),
         }
-
-    def encode_sparse_future(self, future_frames) -> Tensor:
-        """future_frames: list of B clips of F PIL frames (or the tensor form). Returns: (B, 48, 1 + (F-1)//4, h, w)."""
-        with torch.no_grad():
-            return self._encode_frames(self._frames_to_tensor(future_frames))
-
-    def preprocess_input_for_train(self, *, frames=None, text=None, **kw) -> dict:
-        if frames is None or text is None:
-            raise ValueError("cosmos3_edge preprocess_input_for_train needs `frames` and `text`.")
-        frames_t = self._frames_to_tensor(frames)
-        n_hist = int(kw.get("num_history_frames", 0) or 0)
-        if n_hist > 0:
-            # Sparse history = the shared condition (also built by deploy) + the future clip as target.
-            cond = self.preprocess_sparse_condition(
-                frames_t[:, :, :n_hist], text, num_future_frames=frames_t.shape[2] - n_hist, fps=kw.get("fps")
-            )
-            fut = self.encode_sparse_future(frames_t[:, :, n_hist:])
-            return {**cond, "input_latents": torch.cat([cond["first_frame_latents"], fut], dim=2)}
-
-        b, _, t_pix, h_pix, w_pix = frames_t.shape
-        prompts = self._prompts(text, b)
-        fps = float(kw.get("fps", self._clip_fps))
-        with torch.no_grad():
-            latents = self._encode_frames(frames_t)
-            enc = self._encode_prompts(prompts, num_frames=t_pix, height=h_pix, width=w_pix, fps=fps)
-
-        vision_pos = self._vision_positions(enc["und_len_padded"], tuple(latents.shape[2:]), fps)
-        # NOTE: no `context_mask` key (see preprocess_sparse_condition).
-        return {
-            "input_latents": latents,
-            "context": enc["context"],
-            "und_mask": enc["context_mask"],
-            "seq_lens": enc["seq_lens"],
-            "und_kv": enc["und_kv"],
-            "vision_positions": vision_pos,
-            "first_frame_latents": latents[:, :, :1].clone(),
-            "num_clean_prefix_frames": 1,
-            "num_frames": t_pix,
-            "height": h_pix,
-            "width": w_pix,
-        }
+        return TextCondition(
+            context=context, context_mask=positions < seq_lens.to(context.device).unsqueeze(1), extra=extra
+        )
 
     # ================================================================
     # Three-step execution
     # ================================================================
 
-    def prepare(self, **pipeline_inputs) -> BlockLoopState:
-        return cosmos3_dit.prepare_block_loop(self.dit, **pipeline_inputs)
+    def prepare(
+        self,
+        *,
+        latents: Tensor,
+        timestep: Tensor,
+        text: TextCondition,
+        num_clean_latents: int,
+        raw_proprio: Optional[Tensor] = None,
+        use_gradient_checkpointing: bool = False,
+        use_gradient_checkpointing_offload: bool = False,
+    ) -> BlockLoopState:
+        """Pack the gen stream (``cosmos3_dit.prepare_block_loop``) with the und bundle from ``text.extra``.
+
+        Args:
+            latents: (B, 48, T_lat, h, w); the first ``num_clean_latents`` get no timestep embedding.
+            timestep: (B,). text: TextCondition from :meth:`encode_text` (context may carry proprio tokens).
+            num_clean_latents: int. raw_proprio: unused. use_gradient_checkpointing(_offload): bool loop flags.
+
+        Returns:
+            BlockLoopState.
+        """
+        return cosmos3_dit.prepare_block_loop(
+            self.dit,
+            latents=latents,
+            timestep=timestep,
+            context=text.context,
+            context_mask=text.context_mask,
+            und_mask=text.extra["und_mask"],
+            und_kv=text.extra["und_kv"],
+            vision_positions=text.extra["vision_positions"],
+            num_clean_prefix_frames=int(num_clean_latents),
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+        )
 
     def apply_compile_optimizations(self, compile_cfg) -> None:
         """Keep layers as arguments so compilation does not change checkpoint keys."""
@@ -529,128 +761,25 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         return cosmos3_dit.state_post_attn(state, attn_out, post_state)
 
     # ================================================================
-    # Deploy
+    # Deploy assets
     # ================================================================
 
-    def preprocess_input_for_inference(self, **kw) -> dict:
-        prompt = kw.get("prompt")
-        if prompt is None:
-            raise ValueError("cosmos3_edge preprocess_input_for_inference needs `prompt`.")
-        first_frame_image = kw.get("first_frame_image")
-        if first_frame_image is None:
-            raise ValueError("cosmos3_edge deploy path is first-frame conditioned; pass `first_frame_image`.")
-        if isinstance(first_frame_image, list):
-            if len(first_frame_image) != 1:
-                raise ValueError(
-                    "cosmos3_edge deploy accepts exactly one conditioning image; got a list of "
-                    f"{len(first_frame_image)} — the B=1 prompt encoding (und K/V cache) cannot "
-                    "broadcast over an image batch."
-                )
-            first_frame_image = first_frame_image[0]
-        num_frames = int(kw.get("num_frames", 29))
-        if (num_frames - 1) % self._temporal_compression != 0:
-            raise ValueError(
-                f"cosmos3_edge num_frames must be 4k+1 (causal Wan2.2 VAE grid); got {num_frames}. "
-                f"Nearest valid: {((num_frames - 1) // self._temporal_compression) * self._temporal_compression + 1}."
-            )
-        height = int(kw.get("height", 480))
-        width = int(kw.get("width", 832))
-        seed = kw.get("seed")
-        cfg_scale = float(kw.get("cfg_scale", 1.0))
-        if cfg_scale > 1.0:
-            raise NotImplementedError(
-                "cosmos3_edge deploy CFG (cfg_scale > 1.0) is not wired yet: the shared CFG pass "
-                "swaps only `context`, which the cosmos3 gen blocks never read (text conditioning "
-                "rides the cached und K/V), so guidance would silently be a no-op at 2x cost. Run "
-                "cfg_scale=1.0, or implement an und-bundle-swapping CFG pass first."
-            )
-        shift = kw.get("shift")
-        prompt_embed_cache = kw.get("prompt_embed_cache")
-        # Read after the argument gates: every check above is pure-argument, so
-        # a caller passing a bad request gets the specific error rather than an
-        # AttributeError from touching instance state first.
-        fps = float(kw.get("fps", self._clip_fps))
+    def save_deploy_assets(self, output_dir: str) -> None:
+        """Copy the tokenizer's structural files into ``<output_dir>/text_tokenizer/`` (from_checkpoint_dir reads them).
 
-        from openwam.model.video_backbone.common.pixels import pil_clips_to_tensor
+        Args:
+            output_dir: str, checkpoint dir. Files come from wherever this backbone read its tokenizer.
 
-        frame_t = pil_clips_to_tensor([[first_frame_image]], device=self.device)
-        with torch.no_grad():
-            first_frame_latents = self._encode_frames(frame_t)  # (1, 48, 1, h, w)
-
-            # The templated text (and the und rope offsets) bake in geometry, so
-            # the cache key must carry it — a bare-prompt key would silently
-            # reuse stale conditioning across resolutions/durations.
-            cache_key = (str(prompt), num_frames, height, width, fps)
-            if prompt_embed_cache is not None and cache_key in prompt_embed_cache:
-                enc = prompt_embed_cache[cache_key]
-            else:
-                enc = self._encode_prompts([str(prompt)], num_frames=num_frames, height=height, width=width, fps=fps)
-                if prompt_embed_cache is not None:
-                    prompt_embed_cache[cache_key] = enc
-
-        t_lat = 1 + (num_frames - 1) // self._temporal_compression
-        h_lat = first_frame_latents.shape[3]
-        w_lat = first_frame_latents.shape[4]
-        generator = None
-        if seed is not None:
-            generator = torch.Generator(device="cpu").manual_seed(int(seed))
-        latents = torch.randn(
-            (1, _COSMOS3_LATENT_CHANNELS, t_lat, h_lat, w_lat),
-            generator=generator,
-            dtype=torch.float32,
-        ).to(device=self.device, dtype=self.dtype)
-        latents[:, :, :1] = first_frame_latents.to(latents.dtype)
-
-        return {
-            "latents": latents,
-            "context": enc["context"],
-            "und_mask": enc["context_mask"],
-            "seq_lens": enc["seq_lens"],
-            "und_kv": enc["und_kv"],
-            "vision_positions": self._vision_positions(enc["und_len_padded"], (t_lat, h_lat, w_lat), fps),
-            "first_frame_latents": first_frame_latents,
-            "num_clean_prefix_frames": 1,
-            "num_frames": num_frames,
-            "height": height,
-            "width": width,
-            "sigma_shift": float(shift) if shift is not None else self._shift_video,
-            "num_inference_steps": int(kw.get("num_inference_steps", 10)),
-            "cfg_scale": cfg_scale,
-            "cfg_merge": False,
-            "seed": int(seed) if seed is not None else 42,
-            "tiled": bool(kw.get("tiled", True)),
-            "uncond_context": None,
-        }
-
-    def decode_video(self, latents: Tensor, *, tiled: bool = True) -> list:
-        _ = tiled  # AutoencoderKLWan.decode has no tiling arg on this path
-        vae = getattr(self, "vae", None)
-        if vae is None:
-            raise ValueError("cosmos3_edge backbone has no VAE attached.")
-        vae_dtype = next(vae.parameters()).dtype
-        z = self._unnormalize_latents(latents).to(dtype=vae_dtype)
-        video = vae.decode(z).sample
-        from openwam.model.video_backbone.common.pixels import tensor_to_pil_frames
-
-        return tensor_to_pil_frames(video.float().clamp(-1, 1))
-
-    def save_deploy_assets(self, output_dir: str, cfg) -> None:
-        from omegaconf import OmegaConf
-
-        from openwam.model.video_backbone.cosmos3.component_specs import (
-            copy_cosmos3_artifacts,
-            generate_cosmos3_component_specs,
-        )
-
-        oc = cfg if OmegaConf.is_config(cfg) else OmegaConf.create(cfg)
-        model_path = OmegaConf.select(oc, "model.video_backbone.model_path")
-        specs = generate_cosmos3_component_specs(model_path, has_vae=getattr(self, "vae", None) is not None)
-        if specs is None:
-            logger.info("cosmos3_edge: model_path unreadable; skipping deploy-asset embedding.")
-            return
-        if OmegaConf.select(oc, "model.video_backbone.components") is None:
-            OmegaConf.update(oc, "model.video_backbone.components", specs["components"], force_add=True)
-        copy_cosmos3_artifacts(output_dir, str(model_path))
+        Returns:
+            None. Only missing files are copied: repeated saves are idempotent and a partial copy left by an
+            interrupted save is completed on the next one.
+        """
+        dst = os.path.join(output_dir, _TOKENIZER_SUBDIR)
+        os.makedirs(dst, exist_ok=True)
+        for name in _TOKENIZER_FILES:
+            src = os.path.join(self._tokenizer_dir, name)
+            if os.path.isfile(src) and not os.path.exists(os.path.join(dst, name)):
+                shutil.copy2(src, os.path.join(dst, name))
 
     # ================================================================
     # Lifecycle

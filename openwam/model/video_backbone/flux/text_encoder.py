@@ -1,5 +1,6 @@
 # Vendored into OpenWAM from black-forest-labs/flux-action @ 830f1ce (src/flux_action/models/text_encoder.py),
-# Apache-2.0. Changes: only the Qwen3-VL embedder is kept (no Hub spec parsing, mock encoder or compile hook).
+# Apache-2.0. Changes: only the Qwen3-VL embedder is kept (no Hub spec parsing, mock encoder or compile hook);
+# it wraps an already-built model, made by ``from_pretrained`` (weights) or ``from_config_dir`` (meta shell).
 """Qwen3-VL-4B text context for the flux-3-action trunk.
 
 Every caption goes through the chat template, is right-padded to its own bucket (the next multiple
@@ -30,20 +31,56 @@ def padded_text_token_count(real_len: int, pad_multiple: int = TEXT_PAD_MULTIPLE
 class Qwen3VLEmbedder(nn.Module):
     """Frozen Qwen3-VL-4B; ``self.model`` is the HF ``Qwen3VLForConditionalGeneration``."""
 
-    def __init__(self, model_dir: str, dtype: torch.dtype = torch.bfloat16):
-        """
+    def __init__(self, model: nn.Module, processor):
+        """Wrap a built Qwen3-VL; use :meth:`from_pretrained` / :meth:`from_config_dir`.
+
         Args:
-            model_dir: str, local Qwen3-VL-4B-Instruct directory (flux-3-action-base/text_encoder).
-            dtype: torch.dtype of the weights and of the returned context.
+            model: ``Qwen3VLForConditionalGeneration`` (real or meta).
+            processor: its ``AutoProcessor`` (chat template + right-padding tokenizer).
         """
         super().__init__()
-        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-
-        self.model = Qwen3VLForConditionalGeneration.from_pretrained(model_dir, torch_dtype=dtype)
-        self.processor = AutoProcessor.from_pretrained(model_dir)
+        self.model = model
+        self.processor = processor
         if self.processor.tokenizer.padding_side != "right":
             raise ValueError("the text encoder requires a right-padding tokenizer")
         self.output_layer = list(OUTPUT_LAYERS)
+
+    @classmethod
+    def from_pretrained(cls, model_dir: str, dtype: torch.dtype = torch.bfloat16) -> "Qwen3VLEmbedder":
+        """Load the weights and processor of a local Qwen3-VL-4B-Instruct dir.
+
+        Args:
+            model_dir: str, e.g. flux-3-action-base/text_encoder.
+            dtype: torch.dtype of the weights and of the returned context.
+
+        Returns:
+            Qwen3VLEmbedder on CPU.
+        """
+        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
+        model = Qwen3VLForConditionalGeneration.from_pretrained(model_dir, torch_dtype=dtype)
+        return cls(model, AutoProcessor.from_pretrained(model_dir))
+
+    @classmethod
+    def from_config_dir(cls, model_dir: str, dtype: torch.dtype = torch.bfloat16) -> "Qwen3VLEmbedder":
+        """Build the model from ``model_dir/config.json`` with parameters on ``meta``; the processor is real.
+
+        Args:
+            model_dir: str, a dir with Qwen3-VL's config.json + processor / tokenizer files (no weights needed).
+            dtype: torch.dtype of the (meta) parameters.
+
+        Returns:
+            Qwen3VLEmbedder whose parameters are on ``meta``; non-persistent rotary buffers are real.
+        """
+        from accelerate import init_empty_weights
+        from transformers import AutoConfig, AutoProcessor, Qwen3VLForConditionalGeneration
+
+        config = AutoConfig.from_pretrained(model_dir)
+        with init_empty_weights(include_buffers=False):
+            model = Qwen3VLForConditionalGeneration._from_config(config, dtype=dtype)
+        # Tie lm_head to embed_tokens as from_pretrained does (one tensor; the strict load keeps the tie).
+        model.tie_weights()
+        return cls(model, AutoProcessor.from_pretrained(model_dir))
 
     @torch.no_grad()
     def encode(self, texts: list[str], *, fixed_length: int | None = None) -> list[Tensor]:

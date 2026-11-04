@@ -1,6 +1,5 @@
 # Cosmos3-Nano (16B) video backbone — same dual-stream unified transformer and
-# code path as cosmos3_edge (shared class; geometry picked by `name` in
-# openwam/model/video_backbone/cosmos3/pipeline_builder._COSMOS3_VARIANTS).
+# code path as cosmos3_edge (shared class; the variant is the dit / vae blocks below).
 # Qwen3-VL-text MoT: 36 layers x 4096, 32 heads (8 KV), SiLU. VAE = Wan2.2-TI2V
 # (same config as Edge). Trainable gen pathway ~7.0B; the und pathway (~7.6B,
 # acts as the text encoder) is frozen at build. Action-side context width
@@ -25,6 +24,59 @@ max_text_tokens: 512
 fps: 24.0
 prompt_duration_template: true
 
-text_encoder_dropout: 0.0  # CFG dropout: prob of substituting "" for prompts (training only); seed via +model.video_backbone.text_encoder_dropout_seed=<int>
+text_encoder_dropout: 0.0  # CFG dropout: prob of substituting "" for prompts (training only)
+text_encoder_dropout_seed: null  # int seeds that dropout's RNG; null = unseeded
 
 freeze_und: true   # freeze the und (text) pathway + token embedding at build
+text_cache: false  # the text encode needs the clip's latent grid (prompt templates, vision positions): no prompt cache
+
+# Cosmos3OmniTransformer kwargs (the bundle's transformer/config.json minus fields the class does not take).
+dit:
+  attention_bias: false
+  attention_dropout: 0.0
+  head_dim: 128
+  hidden_size: 4096
+  intermediate_size: 12288
+  base_fps: 24
+  enable_fps_modulation: true
+  latent_channel: 48
+  unified_3d_mrope_reset_spatial_ids: true
+  unified_3d_mrope_temporal_modality_margin: 15000
+  latent_patch_size: 2
+  num_attention_heads: 32
+  num_hidden_layers: 36
+  num_key_value_heads: 8
+  patch_latent_dim: 192
+  rms_norm_eps: 1.0e-06
+  rope_theta: 5000000.0
+  action_dim: 64
+  action_gen: true
+  num_embodiment_domains: 32
+  sound_dim: 64
+  sound_gen: true
+  sound_latent_fps: 25
+  timestep_scale: 0.001
+  vocab_size: 151936
+  hidden_act: silu
+  qk_norm_for_text: true
+  use_und_k_norm_for_gen: false
+  rope_axes_dim: [24, 20, 20]
+# AutoencoderKLWan kwargs = the bundle's vae/config.json (Wan2.2-TI2V VAE); latents_mean / latents_std
+# also normalize the latents in encode / decode.
+vae:
+  base_dim: 160
+  decoder_base_dim: 256
+  dim_mult: [1, 2, 4, 4]
+  dropout: 0.0
+  in_channels: 12
+  is_residual: true
+  num_res_blocks: 2
+  out_channels: 12
+  patch_size: 2
+  scale_factor_spatial: 16
+  scale_factor_temporal: 4
+  temperal_downsample: [false, true, true]
+  attn_scales: []
+  z_dim: 48
+  latents_mean: [-0.2289, -0.0052, -0.1323, -0.2339, -0.2799, 0.0174, 0.1838, 0.1557, -0.1382, 0.0542, 0.2813, 0.0891, 0.157, -0.0098, 0.0375, -0.1825, -0.2246, -0.1207, -0.0698, 0.5109, 0.2665, -0.2108, -0.2158, 0.2502, -0.2055, -0.0322, 0.1109, 0.1567, -0.0729, 0.0899, -0.2799, -0.123, -0.0313, -0.1649, 0.0117, 0.0723, -0.2839, -0.2083, -0.052, 0.3748, 0.0152, 0.1957, 0.1433, -0.2944, 0.3573, -0.0548, -0.1681, -0.0667]
+  latents_std: [0.4765, 1.0364, 0.4514, 1.1677, 0.5313, 0.499, 0.4818, 0.5013, 0.8158, 1.0344, 0.5894, 1.0901, 0.6885, 0.6165, 0.8454, 0.4978, 0.5759, 0.3523, 0.7135, 0.6804, 0.5833, 1.4146, 0.8986, 0.5659, 0.7069, 0.5338, 0.4889, 0.4917, 0.4069, 0.4999, 0.6866, 0.4093, 0.5709, 0.6065, 0.6415, 0.4944, 0.5726, 1.2042, 0.5458, 1.6887, 0.3971, 1.06, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744]

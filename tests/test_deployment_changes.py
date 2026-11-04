@@ -765,7 +765,7 @@ class TestLogAttentionBackends:
         assert "install flash-attn" not in caplog.text
         assert "pip install" not in caplog.text
 
-    def test_three_subsystems_reported(self, caplog):
+    def test_both_subsystems_reported(self, caplog):
         import logging
 
         deploy = self._import_deploy()
@@ -773,7 +773,7 @@ class TestLogAttentionBackends:
             deploy._log_attention_backends(logging.getLogger("test_attn"))
         assert "ActionDiT" in caplog.text
         assert "Video DiT" in caplog.text
-        assert "Wan shared core" in caplog.text
+        assert "Wan shared core" not in caplog.text  # the diffsynth attention module is gone
 
     def test_check_mark_absent_without_flash_attn(self, caplog):
         """Without flash-attn, torch_sdpa is the backend — no ✓ expected either."""

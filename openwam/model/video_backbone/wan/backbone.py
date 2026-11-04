@@ -1,24 +1,32 @@
-"""Shared Wan :class:`VideoBackbone` base plus the concrete Wan subclass.
+"""Wan :class:`VideoBackbone`: Wan2.2-TI2V-5B and the backbones that are only another yaml of it.
 
-:class:`WanBase` holds every piece of behavior common to the Wan family (DiT
-forward, TI2V first-frame conditioning, deploy). The concrete backbone adds only
-its construction:
-  - :class:`Wan22Ti2v` — Wan2.2-TI2V-5B.
+:class:`WanBackbone` is the one Wan class; ``wan22_ti2v_5b``, ``wan22_ti2v_tiny`` (debug) and
+``longlive2_robot_s`` (LongLive2.0-Robot-S DiT weights, 128-token prompts) all build it.
 
-Lives in ``wan/backbone.py``. Owns the Wan
-modules (DiT/VAE/text encoder/tokenizer) — modules as named
-children, scheduler/tokenizer/division factors as plain attributes; external
-code reaches them only through the ABC methods.
+Construction (both classmethods, everything decided by ``cfg = cfg.model.video_backbone``):
+  - :meth:`WanBackbone.from_pretrained`: the DiT / VAE / umT5 skeletons are built from the yaml
+    geometry with parameters on ``meta``, then filled from the upstream files with
+    :func:`load_strict` (``init: pretrained``), or randomly initialized (``init: random``).
+  - :meth:`WanBackbone.from_checkpoint_dir`: the same skeletons left on ``meta`` (the caller loads the
+    checkpoint), tokenizer from the checkpoint dir's copy written by :meth:`save_deploy_assets`.
+
+Modules are named children (clean ``dit.*`` / ``vae.*`` / ``text_encoder.*`` keys); scheduler,
+tokenizer and division factors are plain attributes. External code reaches them only through the
+ABC methods.
 """
 
 from __future__ import annotations
 
+import glob
 import logging
+import os
+import shutil
 from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from einops import rearrange
+from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 
 from openwam.model.compile_options import (
@@ -27,64 +35,135 @@ from openwam.model.compile_options import (
     torch_compile_kwargs,
     wan_blocks_compile_cfg,
 )
-from openwam.model.video_backbone.base import BlockLoopState, VideoBackbone
-from openwam.model.video_backbone.wan import conditioning as wan_conditioning
-from openwam.model.video_backbone.wan import dit_forward as wan_dit_forward
-from openwam.model.video_backbone.wan import encode as wan_encode
-from openwam.model.video_backbone.wan import loader
-from openwam.model.video_backbone.wan.dit import modulate, rope_apply
-from openwam.model.video_backbone.wan.preprocess import (
-    check_resize_height_width,
-)
+from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
 from openwam.model.video_backbone.common.checkpoint import gradient_checkpoint_forward
+from openwam.model.video_backbone.common.text_cache import PromptCache
+from openwam.model.video_backbone.common.weights import load_strict, read_weights
+from openwam.model.video_backbone.wan import dit_forward as wan_dit_forward
+from openwam.model.video_backbone.wan.dit import WanModel, modulate, rope_apply
+from openwam.model.video_backbone.wan.preprocess import preprocess_video, vae_output_to_video
+from openwam.model.video_backbone.wan.scheduler import FlowMatchScheduler
+from openwam.model.video_backbone.wan.text_encoder import HuggingfaceTokenizer, WanTextEncoder
+from openwam.model.video_backbone.wan.vae import WanVideoVAE38
 
 logger = logging.getLogger(__name__)
 
+# Where save_deploy_assets puts the umT5 tokenizer inside a checkpoint dir (from_checkpoint_dir reads it back).
+CKPT_TOKENIZER_SUBDIR = os.path.join("tokenizer", "google", "umt5-xxl")
+# Tokenizer padding length; every encode call passes its own max_length (text_max_length).
+_TOKENIZER_SEQ_LEN = 512
 
-class WanBase(VideoBackbone):
+
+def _build_modules(cfg: DictConfig) -> Tuple[WanModel, WanVideoVAE38, WanTextEncoder]:
+    """Instantiate the three Wan modules from the yaml geometry (on whatever device context the caller set).
+
+    Args:
+        cfg: ``cfg.model.video_backbone`` with the ``dit`` / ``vae`` / ``text_encoder`` geometry blocks.
+
+    Returns:
+        (dit, vae, text_encoder). Built in this order, which fixes the RNG draws of a random init.
+    """
+    # TI2V constants: separate per-token timesteps + clean first-frame latents fused into the input.
+    dit = WanModel(**OmegaConf.to_container(cfg.dit), seperated_timestep=True, fuse_vae_embedding_in_latents=True)
+    vae = WanVideoVAE38(z_dim=int(cfg.vae.z_dim), dim=int(cfg.vae.dim))
+    text_encoder = WanTextEncoder(**OmegaConf.to_container(cfg.text_encoder))
+    return dit, vae, text_encoder
+
+
+def _build_meta_modules(cfg: DictConfig) -> Tuple[WanModel, WanVideoVAE38, WanTextEncoder]:
+    """Same as :func:`_build_modules` but every parameter is on ``meta`` (no storage, no init).
+
+    Args:
+        cfg: ``cfg.model.video_backbone``.
+
+    Returns:
+        (dit, vae, text_encoder) skeletons. Buffers and plain tensor attributes (DiT RoPE ``freqs``,
+        VAE ``mean`` / ``std``) are real: they are not in the state dict, so no load would fill them.
+    """
+    from accelerate import init_empty_weights
+
+    with init_empty_weights(include_buffers=False):
+        return _build_modules(cfg)
+
+
+def _strip_prefix(state: dict, prefix: str, path: str) -> dict:
+    """Remove ``prefix`` from every key of ``state``.
+
+    Args:
+        state: dict[str, Tensor] read from ``path``.
+        prefix: the yaml ``dit_weights_prefix`` ("" leaves keys unchanged).
+        path: the file the state came from (error message only).
+
+    Returns:
+        dict[str, Tensor] with stripped keys. Raises ValueError if any key lacks the prefix.
+    """
+    bad = [k for k in state if not k.startswith(prefix)]
+    if bad:
+        raise ValueError(f"{path}: {len(bad)} keys without the dit_weights_prefix {prefix!r}, e.g. {bad[:3]}")
+    return {k[len(prefix) :]: v for k, v in state.items()}
+
+
+def _load_component(module: nn.Module, state: dict, geometry: DictConfig, name: str) -> None:
+    """Strictly fill one meta skeleton, naming the yaml geometry block when the weights disagree with it.
+
+    Args:
+        module: the skeleton built from ``geometry``.
+        state: dict[str, Tensor] of its weights.
+        geometry: the yaml block the skeleton was built from (``cfg.dit`` / ``cfg.vae`` / ``cfg.text_encoder``).
+        name: that block's key, for the message.
+
+    Returns:
+        None. Raises ValueError (with the declared geometry) on any key / shape mismatch.
+    """
+    try:
+        load_strict(module, state, assign=True)
+    except ValueError as err:
+        raise ValueError(f"{name} weights do not match the yaml geometry {name}={dict(geometry)}: {err}") from err
+
+
+class WanBackbone(VideoBackbone):
     """Exposes the Wan modules through the VideoBackbone interface.
 
     Modules registered as named children (clean ``dit.*`` / ``vae.*`` keys);
-    scheduler / tokenizer / division factors are plain attributes. Concrete
-    subclasses construct via their own ``from_pretrained(source)``.
+    scheduler / tokenizer / division factors are plain attributes. Build it with
+    :meth:`from_pretrained` or :meth:`from_checkpoint_dir`.
     """
 
     # ================================================================
     # Construction
     # ================================================================
 
-    def __init__(self, holder, *, shift_video=None, text_dim: Optional[int] = None):
-        """Internal constructor. Use a subclass ``from_pretrained()`` instead.
+    def __init__(
+        self,
+        *,
+        dit: nn.Module,
+        vae: nn.Module,
+        text_encoder: nn.Module,
+        tokenizer,
+        tokenizer_dir: str,
+        shift_video: float,
+        text_max_length: int,
+    ):
+        """Wrap already-built modules. Use :meth:`from_pretrained` / :meth:`from_checkpoint_dir` instead.
 
-        ``shift_video`` is the optional Esser α-shift on the video scheduler,
-        stored as the single source of truth behind the ABC property. ``None``
-        keeps the scheduler template default (Wan = 5.0).
+        Args:
+            dit: WanModel. vae: WanVideoVAE38. text_encoder: WanTextEncoder.
+            tokenizer: callable umT5 tokenizer (HuggingfaceTokenizer).
+            tokenizer_dir: str, the dir ``tokenizer`` was read from (save_deploy_assets copies it).
+            shift_video: float, α-shift of the video scheduler (single source of truth behind the property).
+            text_max_length: int, umT5 tokens per prompt (512 Wan, 128 LongLive).
         """
         super().__init__()
-        # ``holder`` is a transient carrier: drain its sub-modules + non-Module
-        # state into self, then let it go out of scope. Nothing reads it after.
-        # Optional sub-modules declared up front so the attribute always exists
-        # (the loop below only setattr's the ones the holder actually carries).
-        self.vae = None
-        # Promote sub-modules to named children so state_dict uses clean prefixes.
-        for _name in ("dit", "vae", "text_encoder"):
-            _mod = getattr(holder, _name, None)
-            if _mod is not None:
-                # nn.Module → named child; non-Module (test mocks) → plain attr,
-                # same ``self.<name>`` access resolves on both.
-                setattr(self, _name, _mod)
-        # Backbone-owned non-Module state.
-        self._scheduler = getattr(holder, "scheduler", None)
-        self._tokenizer = getattr(holder, "tokenizer", None)
-        self._height_division_factor = getattr(holder, "height_division_factor", None)
-        self._width_division_factor = getattr(holder, "width_division_factor", None)
-        self._time_division_factor = getattr(holder, "time_division_factor", None)
-        self._time_division_remainder = getattr(holder, "time_division_remainder", None)
+        self.dit = dit
+        self.vae = vae
+        self.text_encoder = text_encoder
+        self._tokenizer = tokenizer
+        self._tokenizer_dir = tokenizer_dir
+        self._scheduler = FlowMatchScheduler("Wan")
         self._device = torch.device("cuda")
         self._dtype = torch.bfloat16
-        self._shift_video = None if shift_video is None else float(shift_video)
-        actual_text_dim = loader.infer_text_dim(getattr(holder, "dit", None))
-        self._text_dim = actual_text_dim if text_dim is None else int(text_dim)
+        self._shift_video = float(shift_video)
+        self.text_max_length = int(text_max_length)
         # Wan native contract: DiT patch (1,2,2); VAE 4× temporal compression +
         # causal first-frame token.
         self._dit_patch_size = (1, 2, 2)
@@ -92,8 +171,90 @@ class WanBase(VideoBackbone):
         self._wan_blocks_compile_enabled = False
         self._wan_blocks_compile_kwargs: dict | None = None
         self._compiled_wan_blocks: dict[int, Callable[..., Tensor]] = {}
-        # prompt -> (context (1, 512, D), seq_lens (1,)) once build_text_cache ran; None = encode online.
-        self._text_cache: Optional[dict] = None
+        # Text slot read by encode_text: the online umT5 here, a PromptCache after build_text_cache.
+        self.text_lookup = self._t5_entries
+
+    @classmethod
+    def from_pretrained(cls, cfg: DictConfig) -> "WanBackbone":
+        """Build from upstream weights (``init: pretrained``) or a random init (``init: random``).
+
+        Args:
+            cfg: ``cfg.model.video_backbone``. Reads the ``dit`` / ``vae`` / ``text_encoder`` geometry,
+                ``init``, ``model_path`` + ``weights`` (file names), ``dit_weights`` /
+                ``dit_weights_prefix`` (DiT file override, LongLive), ``tokenizer_path``,
+                ``shift_video``, ``text_max_length``.
+
+        Returns:
+            WanBackbone on CPU, every module in bf16 and eval mode. Raises ValueError when a weight file
+            does not match the yaml geometry.
+        """
+        if cfg.init == "random":
+            # Debug backbone: real tensors, default init, no file read.
+            dit, vae, text_encoder = _build_modules(cfg)
+        elif cfg.init == "pretrained":
+            dit, vae, text_encoder = _build_meta_modules(cfg)
+            # DiT: the model_path shards, or the dit_weights file (LongLive model.pt) instead of them.
+            if cfg.dit_weights is None:
+                dit_files = sorted(glob.glob(os.path.join(cfg.model_path, cfg.weights.dit)))
+            else:
+                dit_files = [str(cfg.dit_weights)]
+            if not dit_files:
+                raise FileNotFoundError(f"no DiT weights match {os.path.join(cfg.model_path, cfg.weights.dit)}")
+            logger.info("Wan DiT weights: %s", dit_files)
+            dit_state = _strip_prefix(read_weights(dit_files), str(cfg.dit_weights_prefix), str(dit_files))
+            _load_component(dit, dit_state, cfg.dit, "dit")
+            # Cast now so the fp32 shards (~20 GB) are freed before the next file is read.
+            del dit_state
+            dit.to(dtype=torch.bfloat16)
+            # Upstream VAE keys are the inner VideoVAE38_'s; the wrapper holds it as ``model``.
+            vae_state = read_weights([os.path.join(cfg.model_path, cfg.weights.vae)])
+            _load_component(vae, {f"model.{k}": v for k, v in vae_state.items()}, cfg.vae, "vae")
+            te_state = read_weights([os.path.join(cfg.model_path, cfg.weights.text_encoder)])
+            _load_component(text_encoder, te_state, cfg.text_encoder, "text_encoder")
+        else:
+            raise ValueError(f"video_backbone.init must be 'pretrained' or 'random', got {cfg.init!r}")
+        return cls._assemble(cfg, dit, vae, text_encoder, str(cfg.tokenizer_path))
+
+    @classmethod
+    def from_checkpoint_dir(cls, cfg: DictConfig, ckpt_dir: str) -> "WanBackbone":
+        """Build the empty skeleton of a saved OpenWAM checkpoint; the caller loads its weights.
+
+        Args:
+            cfg: the checkpoint's ``cfg.model.video_backbone`` (geometry, ``shift_video``, ``text_max_length``).
+            ckpt_dir: str, checkpoint dir holding ``tokenizer/google/umt5-xxl`` (save_deploy_assets).
+
+        Returns:
+            WanBackbone whose parameters are all on ``meta`` (bf16), with the checkpoint's tokenizer.
+            Fill it with a strict ``assign=True`` load (or ``to_empty`` + an accelerate state load).
+        """
+        tokenizer_dir = os.path.join(ckpt_dir, CKPT_TOKENIZER_SUBDIR)
+        if not os.path.isdir(tokenizer_dir):
+            raise FileNotFoundError(f"umT5 tokenizer not found at {tokenizer_dir} (written by save_deploy_assets)")
+        dit, vae, text_encoder = _build_meta_modules(cfg)
+        return cls._assemble(cfg, dit, vae, text_encoder, tokenizer_dir)
+
+    @classmethod
+    def _assemble(cls, cfg: DictConfig, dit, vae, text_encoder, tokenizer_dir: str) -> "WanBackbone":
+        """Shared tail of both constructors: bf16 + eval, tokenizer, scalar cfg values.
+
+        Args:
+            cfg: ``cfg.model.video_backbone``. dit / vae / text_encoder: built modules (real or meta).
+            tokenizer_dir: str, umT5 tokenizer dir to read.
+
+        Returns:
+            WanBackbone.
+        """
+        modules = [m.to(dtype=torch.bfloat16).eval() for m in (dit, vae, text_encoder)]
+        tokenizer = HuggingfaceTokenizer(name=tokenizer_dir, seq_len=_TOKENIZER_SEQ_LEN, clean="whitespace")
+        return cls(
+            dit=modules[0],
+            vae=modules[1],
+            text_encoder=modules[2],
+            tokenizer=tokenizer,
+            tokenizer_dir=tokenizer_dir,
+            shift_video=float(cfg.shift_video),
+            text_max_length=int(cfg.text_max_length),
+        )
 
     # ================================================================
     # Internal properties
@@ -102,13 +263,6 @@ class WanBase(VideoBackbone):
     @property
     def _dit(self):
         return self.dit
-
-    @property
-    def needs_first_frame_skip(self) -> bool:
-        """``True``: Wan is TI2V-only, so ``latent[0]`` is a clean conditioning
-        frame (per-token t=0 on frame-0 tokens) excluded from the diffusion loss.
-        """
-        return True
 
     # ================================================================
     # ABC: Properties (6) — device/dtype inherited from VideoBackbone
@@ -135,11 +289,9 @@ class WanBase(VideoBackbone):
         return int(self._dit.dim) // self.num_heads
 
     @property
-    def text_dim(self) -> Optional[int]:
-        return getattr(self, "_text_dim", None)
-
-    # umT5 token budget per prompt (Wan native 512; LongLive / Long-WAM uses 128).
-    text_max_length: int = 512
+    def text_dim(self) -> int:
+        """Raw text-context width the DiT's text embedding takes (= yaml ``dit.text_dim``)."""
+        return int(self._dit.text_embedding[0].in_features)
 
     @property
     def video_attention_mask_mode(self) -> str:
@@ -288,45 +440,50 @@ class WanBase(VideoBackbone):
     # ABC: Three-step execution (3)
     # ================================================================
 
-    def prepare(self, **kw) -> BlockLoopState:
-        dit = self.dit
-        latents = kw["latents"]
-        timestep = kw["timestep"]
-        context = kw["context"]
-        context_mask = kw.get("context_mask")
-        seq_lens = kw.get("seq_lens")
-        fuse_vae_embedding_in_latents = kw.get("fuse_vae_embedding_in_latents", False)
-        num_clean_prefix_frames = kw.get("num_clean_prefix_frames", 0)
-        use_gradient_checkpointing = kw.get("use_gradient_checkpointing", False)
-        use_gradient_checkpointing_offload = kw.get("use_gradient_checkpointing_offload", False)
-        force_per_token_t_mod = bool(kw.get("force_per_token_t_mod", False))
+    def prepare(
+        self,
+        *,
+        latents: Tensor,
+        timestep: Tensor,
+        text: TextCondition,
+        num_clean_latents: int,
+        raw_proprio: Optional[Tensor] = None,
+        use_gradient_checkpointing: bool = False,
+        use_gradient_checkpointing_offload: bool = False,
+    ) -> BlockLoopState:
+        """Pre-loop: per-token time modulation, text embedding, patchify, RoPE.
 
+        Args:
+            latents: (B, z, T_lat, h, w); the first ``num_clean_latents`` are clean (per-token t = 0).
+            timestep: (B,) video timestep. text: TextCondition (context (B, L, D_text), context_mask (B, L)).
+            num_clean_latents: int, clean prefix latents. raw_proprio: unused (Wan takes proprio as a context token).
+            use_gradient_checkpointing / use_gradient_checkpointing_offload: bool loop flags.
+
+        Returns:
+            BlockLoopState of the patchified sequence.
+        """
+        dit = self.dit
+        # TI2V per-token t = 0 on the clean prefix (Wan always has one; Task 11 drops the dead branches).
         time_embed, time_modulation = wan_dit_forward.build_time_modulation(
             dit,
             timestep,
             latents,
             patch_size=self._dit_patch_size,
-            fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
-            force_per_token_t_mod=force_per_token_t_mod,
-            num_clean_prefix_frames=num_clean_prefix_frames,
-            zero_clean_prefix_t_mod=bool(kw.get("zero_clean_prefix_t_mod", False)),
-            has_first_frame_latents=kw.get("first_frame_latents") is not None,
+            fuse_vae_embedding_in_latents=True,
+            force_per_token_t_mod=True,
+            num_clean_prefix_frames=int(num_clean_latents),
+            zero_clean_prefix_t_mod=True,
+            has_first_frame_latents=True,
         )
 
-        context = dit.text_embedding(context)
-        if context_mask is None:
-            if seq_lens is not None:
-                seq_lens = seq_lens.to(device=context.device)
-                positions = torch.arange(context.shape[1], device=context.device).unsqueeze(0)
-                context_mask = positions < seq_lens.unsqueeze(1)
-        else:
-            context_mask = context_mask.to(device=context.device, dtype=torch.bool)
-            if context_mask.ndim != 2:
-                raise ValueError(f"context_mask must be 2D [B, L], got shape {tuple(context_mask.shape)}")
-            if context_mask.shape[0] != context.shape[0] or context_mask.shape[1] != context.shape[1]:
-                raise ValueError(
-                    f"context_mask shape must match context [B, L], got {tuple(context_mask.shape)} vs {tuple(context.shape)}"
-                )
+        context = dit.text_embedding(text.context)
+        context_mask = text.context_mask.to(device=context.device, dtype=torch.bool)
+        if context_mask.ndim != 2:
+            raise ValueError(f"context_mask must be 2D [B, L], got shape {tuple(context_mask.shape)}")
+        if context_mask.shape[0] != context.shape[0] or context_mask.shape[1] != context.shape[1]:
+            raise ValueError(
+                f"context_mask shape must match context [B, L], got {tuple(context_mask.shape)} vs {tuple(context.shape)}"
+            )
 
         hidden_states = latents
         if hidden_states.shape[0] != context.shape[0]:
@@ -499,182 +656,102 @@ class WanBase(VideoBackbone):
         return hidden_states
 
     # ================================================================
-    # Text-embedding cache (training: fixed prompt set, frozen T5)
+    # Video and text IO
     # ================================================================
 
+    def to_pixels(self, clips: list) -> Tensor:
+        """PIL clips -> pixels with Wan's own bf16 formula (``uint8 * 2/255 - 1`` in ``self.dtype``).
+
+        Transitional override of the base LUT conversion, kept for bitwise-equal Wan latents (Task 12 drops it).
+
+        Args:
+            clips: list of B clips, each T same-size PIL frames.
+
+        Returns:
+            (B, 3, T, H, W) in [-1, 1], ``self.dtype`` on ``self.device``.
+        """
+        return torch.cat([preprocess_video(clip, dtype=self.dtype, device=self.device) for clip in clips], dim=0)
+
+    def encode_pixels(self, pixels: Tensor) -> Tensor:
+        """pixels: (N, 3, T, H, W) in [-1, 1]. Returns: (N, 48, 1 + (T-1)//4, H/16, W/16) normalized VAE38 latents."""
+        return self.vae.batch_encode(pixels, device=pixels.device)
+
+    def decode_latents(self, latents: Tensor) -> Tensor:
+        """latents: (N, 48, T_lat, h, w). Returns: (N, 3, 1 + 4 (T_lat-1), 16h, 16w) pixels (tiled VAE decode)."""
+        return self.vae.decode(latents.to(self.device), device=self.device, tiled=True)
+
     @torch.no_grad()
-    def build_text_cache(self, prompts: list, *, batch_size: int = 8, offload_device: str = "cpu") -> None:
-        """Encode every training prompt once, then park the text encoder off the GPU.
+    def decode_video(self, latents: Tensor) -> list:
+        """Decode one latent clip to PIL frames with Wan's own pixel -> uint8 conversion.
+
+        Transitional override of the base ``tensor_to_pil_frames`` path, kept for bitwise-equal Wan rollouts
+        (Task 12 drops it).
+
+        Args:
+            latents: (1, 48, T_lat, h, w).
+
+        Returns:
+            list of 1 + 4 (T_lat - 1) PIL frames. Raises ValueError for a batch B != 1.
+        """
+        if latents.shape[0] != 1:
+            raise ValueError(f"decode_video decodes one clip, got a batch of {latents.shape[0]}")
+        return vae_output_to_video(self.decode_latents(latents))
+
+    @torch.no_grad()
+    def _t5_entries(self, prompts: list) -> list:
+        """Online umT5 encode (the default ``text_lookup``).
+
+        Args:
+            prompts: list[str] of B prompts.
+
+        Returns:
+            list of B entries ``(context (1, L, D), seq_lens (1,) long)`` on ``self.device``, L = text_max_length;
+            context is zero past each prompt's length.
+        """
+        ids, mask = self._tokenizer(
+            prompts,
+            return_mask=True,
+            add_special_tokens=True,
+            max_length=self.text_max_length,
+            padding="max_length",
+            truncation=True,
+        )
+        ids, mask = ids.to(self.device), mask.to(self.device)
+        seq_lens = mask.gt(0).sum(dim=1).long()
+        context = self.text_encoder(ids, mask)
+        # Zero the padding positions so cached and online contexts agree.
+        for i, v in enumerate(seq_lens):
+            context[i, v:] = 0
+        return [(context[j : j + 1], seq_lens[j : j + 1]) for j in range(len(prompts))]
+
+    @torch.no_grad()
+    def build_text_cache(self, prompts: list) -> None:
+        """Encode every training prompt once, then park the text encoder on the CPU.
 
         Args:
             prompts: list[str], every prompt training can draw (dataset ``all_prompts()``).
-            batch_size: int, prompts per T5 forward while building.
-            offload_device: where the frozen T5 lives afterwards. It stays a registered
-                child, so ``state_dict`` / checkpoints keep the same ``text_encoder.*`` keys.
 
-        Returns: None. Sets ``self._text_cache`` = {prompt: (context (1, 512, D), seq_lens (1,))}
-            on the GPU; ``_encode_text`` then reads it and raises on unknown prompts.
+        Returns: None. ``text_lookup`` becomes a PromptCache (8 prompts per umT5 forward, in ``prompts`` order);
+            ``text_encoder`` stays a registered child, so ``state_dict`` keeps the same ``text_encoder.*`` keys.
         """
-        cache = {}
-        for i in range(0, len(prompts), batch_size):
-            chunk = list(prompts[i : i + batch_size])
-            context, seq_lens = wan_encode.encode_text(
-                chunk,
-                tokenizer=self._tokenizer,
-                text_encoder=self.text_encoder,
-                device=self.device,
-                max_length=self.text_max_length,
-            )
-            # Per-prompt (1, ...) slices; clone so each entry owns its storage.
-            for j, p in enumerate(chunk):
-                cache[p] = (context[j : j + 1].clone(), seq_lens[j : j + 1].clone())
-        self._text_cache = cache
-        self.text_encoder.to(offload_device)
+        self.text_lookup = PromptCache(self.text_lookup, prompts, batch_size=8)
+        self.text_encoder.to("cpu")
         torch.cuda.empty_cache()
 
-    def _encode_text(self, prompts: list) -> Tuple[Tensor, Tensor]:
-        """Text context for a batch: cache lookup if built, else online T5.
-
-        Args: prompts: list[str] of length B.
-        Returns: context (B, 512, D) on self.device, seq_lens (B,) long.
-        """
-        if self._text_cache is None:
-            return wan_encode.encode_text(
-                prompts,
-                tokenizer=self._tokenizer,
-                text_encoder=self.text_encoder,
-                device=self.device,
-                max_length=self.text_max_length,
-            )
-        missing = [p for p in prompts if p not in self._text_cache]
-        if missing:
-            # The encoder is on CPU now; a new prompt means all_prompts() missed a source.
-            raise KeyError(f"text cache has no entry for prompts {missing[:3]} (cache size {len(self._text_cache)})")
-        # torch.cat copies, so callers may modify the batch in place.
-        context = torch.cat([self._text_cache[p][0] for p in prompts], dim=0)
-        seq_lens = torch.cat([self._text_cache[p][1] for p in prompts], dim=0)
-        return context, seq_lens
-
-    # ================================================================
-    # ABC: Unified preprocessing (1)
-    # ================================================================
-
-    def _sparse_pixels(self, clip) -> Tensor:
-        """clip: list of T PIL frames. Returns: (1, 3, T, H_px, W_px) pixels in [-1, 1] on the device."""
-        return wan_encode.preprocess_video(clip, dtype=self.dtype, device=self.device)
-
-    def preprocess_sparse_condition(self, history_frames, text, *, num_future_frames: int) -> dict:
-        """Sparse-history conditioning: H history frames encoded one by one + the text context.
+    def encode_text(self, prompts: list, *, grid, num_frames: int) -> TextCondition:
+        """umT5 context of B prompts (through ``text_lookup``: online or cached).
 
         Args:
-            history_frames: list of B clips, each H PIL frames (oldest first).
-            text: list of B prompts.
-            num_future_frames: int F (1 + 4k), the future frames the clip covers.
+            prompts: list[str] of B prompts. grid / num_frames: unused (Wan's text does not depend on the clip).
 
         Returns:
-            preprocess dict without ``input_latents``; ``first_frame_latents`` (B, z, H, h, w) holds the H clean
-            history latents and ``num_clean_prefix_frames`` = H (per-token t=0 on them, loss skips them).
+            TextCondition: context (B, L, D), context_mask (B, L) = position < the prompt's token count, extra {}.
         """
-        h, f = len(history_frames[0]), int(num_future_frames)
-        height, width, _ = check_resize_height_width(
-            history_frames[0][0].size[1],
-            history_frames[0][0].size[0],
-            f,
-            height_division_factor=self._height_division_factor,
-            width_division_factor=self._width_division_factor,
-            time_division_factor=self._time_division_factor,
-            time_division_remainder=self._time_division_remainder,
-        )
-        if (f - 1) % self._time_division_factor:
-            raise ValueError(f"future frames must be 1 + {self._time_division_factor}k, got {f}")
-        context, seq_lens = self._encode_text(text)
-        # History: (B*H, 3, 1, H_px, W_px) → B*H single-frame latents → (B, z, H, h, w).
-        hist = torch.cat([self._sparse_pixels(clip).transpose(1, 2).flatten(0, 1).unsqueeze(2) for clip in history_frames])
-        hist_lat = wan_encode.encode_video(hist, vae=self.vae)
-        hist_lat = hist_lat.unflatten(0, (len(history_frames), h)).squeeze(3).transpose(1, 2)
-        return {
-            "context": context,
-            "seq_lens": seq_lens,
-            "height": height,
-            "width": width,
-            "num_frames": h + f,
-            "fuse_vae_embedding_in_latents": True,
-            "num_clean_prefix_frames": h,
-            "first_frame_latents": hist_lat.to(dtype=self.dtype, device=self.device),
-        }
-
-    def encode_sparse_future(self, future_frames) -> Tensor:
-        """future_frames: list of B clips of F PIL frames. Returns: (B, z, 1 + (F-1)//4, h, w), one causal clip each."""
-        fut = torch.cat([self._sparse_pixels(clip) for clip in future_frames], dim=0)
-        fut_lat = wan_encode.encode_video(fut, vae=self.vae)
-        return fut_lat.to(dtype=self.dtype, device=self.device)
-
-    def _preprocess_sparse_history(self, frames, text, num_history_frames: int) -> dict:
-        """Train inputs for the sparse-history layout: the shared condition + the future clip as target.
-
-        Args:
-            frames: list of B clips of H + F PIL frames (history first).
-            text: list of B prompts.
-            num_history_frames: int, H.
-
-        Returns:
-            :meth:`preprocess_sparse_condition` dict plus ``input_latents`` (B, z, H + T_fut, h, w).
-        """
-        h = int(num_history_frames)
-        cond = self.preprocess_sparse_condition(
-            [clip[:h] for clip in frames], text, num_future_frames=len(frames[0]) - h
-        )
-        fut_lat = self.encode_sparse_future([clip[h:] for clip in frames])
-        return {**cond, "input_latents": torch.cat([cond["first_frame_latents"], fut_lat], dim=2)}
-
-    def preprocess_input_for_train(self, *, frames=None, text=None, **kw) -> dict:
-        """Unified train preprocessing: raw data (``frames``/``text``, optional
-        ``ref_images`` in kw) → the denoising-loop input dict.
-        ``num_history_frames`` > 0 switches to the sparse-history layout.
-        """
-        if int(kw.get("num_history_frames", 0) or 0) > 0:
-            return self._preprocess_sparse_history(frames, text, kw["num_history_frames"])
-        device = self.device
-        dtype = self.dtype
-
-        height, width, num_frames = check_resize_height_width(
-            frames[0][0].size[1],
-            frames[0][0].size[0],
-            len(frames[0]),
-            height_division_factor=self._height_division_factor,
-            width_division_factor=self._width_division_factor,
-            time_division_factor=self._time_division_factor,
-            time_division_remainder=self._time_division_remainder,
-        )
-
-        context, seq_lens = self._encode_text(text)
-
-        all_input_videos = []
-        for clip_frames in frames:
-            all_input_videos.append(wan_encode.preprocess_video(clip_frames, dtype=self.dtype, device=self.device))
-        stacked_inputs = torch.cat(all_input_videos, dim=0)
-        input_latents = wan_encode.encode_video(stacked_inputs, vae=self.vae)
-        input_latents = input_latents.to(dtype=dtype, device=device)
-
-        # TI2V first-frame conditioning: ``latent[0]`` of the already-encoded video
-        # latents is the clean reference (no second VAE call, no prepend).
-        # ``base.compute_loss`` clean-replaces ``latents[:, :, 0:1]`` with it on every
-        # step and ``_compute_video_loss`` trims frame 0. Only when a reference
-        # frame is actually provided.
-        ref_images = kw.get("ref_images")
-        has_ref = ref_images is not None and ref_images[0] is not None
-
-        return {
-            "input_latents": input_latents,
-            "context": context,
-            "seq_lens": seq_lens,
-            "height": height,
-            "width": width,
-            "num_frames": num_frames,
-            "fuse_vae_embedding_in_latents": has_ref,
-            "num_clean_prefix_frames": 0,
-            "first_frame_latents": input_latents[:, :, 0:1].clone() if has_ref else None,
-        }
+        entries = self.text_lookup(prompts)
+        context = torch.cat([e[0] for e in entries], dim=0)
+        seq_lens = torch.cat([e[1] for e in entries], dim=0).to(device=context.device)
+        positions = torch.arange(context.shape[1], device=context.device).unsqueeze(0)
+        return TextCondition(context=context, context_mask=positions < seq_lens.unsqueeze(1), extra={})
 
     # ================================================================
     # ABC: Sub-module access (1)
@@ -686,153 +763,25 @@ class WanBase(VideoBackbone):
         return mod if isinstance(mod, nn.Module) else None
 
     # ================================================================
-    # ABC: Decoding (1)
+    # Self-contained checkpoint: non-weight assets into the run dir
     # ================================================================
 
-    def decode_video(self, latents: Tensor, *, tiled: bool = True) -> list:
-        video_tensor = wan_encode.decode_latents(
-            latents, vae=self.vae, device=self.device, tiled=tiled
-        )
-        return wan_encode.latents_to_frames(video_tensor)
+    def save_deploy_assets(self, output_dir: str) -> None:
+        """Copy the umT5 tokenizer into the checkpoint dir, where :meth:`from_checkpoint_dir` reads it.
 
-    # ================================================================
-    # Self-contained checkpoint: specs into config + artifacts into dir
-    # ================================================================
+        Args:
+            output_dir: str, checkpoint dir; the tokenizer lands in ``<output_dir>/tokenizer/google/umt5-xxl``.
+                It is copied from wherever this backbone read it (upstream dir, or the source checkpoint).
 
-    def save_deploy_assets(self, output_dir: str, cfg) -> None:
-        """Make this backbone's checkpoint slice self-contained in one pass:
-        merge the Wan component + tokenizer specs into ``cfg`` and copy the Wan
-        tokenizer into ``output_dir`` (single tokenizer-layout source, no
-        duplication).
+        Returns:
+            None. A tokenizer already present in ``output_dir`` is left as is.
         """
-        from openwam.model.video_backbone.wan.component_specs import save_video_backbone_deploy_assets
-
-        save_video_backbone_deploy_assets(output_dir, cfg)
-
-    # ================================================================
-    # ABC: Deploy-input preprocessing (override)
-    # ================================================================
-
-    def preprocess_input_for_inference(
-        self,
-        *,
-        prompt: str,
-        first_frame_image=None,
-        num_frames: int = 49,
-        height: int = 384,
-        width: int = 320,
-        seed: int = 42,
-        num_inference_steps: int = 50,
-        shift: float = 5.0,
-        tiled: bool = True,
-        prompt_embed_cache: Optional[dict] = None,
-        **kw,
-    ) -> dict:
-        """Build the inference denoising-loop input dict from explicit kwargs,
-        via explicit backbone helpers (no unit-runner).
-
-        Only the text embedding is cached (prompt-keyed, seed/dim-independent);
-        noise / first_frame_latents are rebuilt every call.
-        ``**kw`` swallows fields other backbones consume (CFG) that Wan
-        ignores — Wan does no CFG at inference.
-        """
-        # Wan native tiling grid (other backbones may differ).
-        tile_size = (30, 52)
-        tile_stride = (15, 26)
-
-        self.scheduler.set_timesteps(num_inference_steps=num_inference_steps, shift=shift)
-
-        # ShapeChecker: snap to a model-valid grid; noise uses these.
-        height, width, num_frames = check_resize_height_width(
-            height,
-            width,
-            num_frames,
-            height_division_factor=self._height_division_factor,
-            width_division_factor=self._width_division_factor,
-            time_division_factor=self._time_division_factor,
-            time_division_remainder=self._time_division_remainder,
-        )
-
-        if self._text_cache is not None:
-            # Training-time rollout (vis): the text encoder is parked on CPU, use the cache.
-            context, seq_lens = self._encode_text([prompt])
-        else:
-            context, seq_lens = wan_encode.encode_text_for_inference(
-                prompt,
-                prompt_embed_cache=prompt_embed_cache,
-                tokenizer=self._tokenizer,
-                text_encoder=self.text_encoder,
-                device=self.device,
-                max_length=self.text_max_length,
-            )
-
-        inputs_shared = {
-            "end_image": None,
-            "input_video": None,
-            "denoising_strength": 1.0,
-            "control_video": None,
-            "reference_image": None,
-            "seed": seed,
-            "rand_device": "cpu",
-            "height": height,
-            "width": width,
-            "num_frames": num_frames,
-            "cfg_scale": 1.0,
-            "cfg_merge": False,
-            "sigma_shift": shift,
-            "tiled": tiled,
-            "tile_size": tile_size,
-            "tile_stride": tile_stride,
-            "input_audio": None,
-        }
-        inputs_shared["context"] = context
-        inputs_shared["seq_lens"] = seq_lens
-        inputs_shared["prompt"] = prompt
-        inputs_shared["num_inference_steps"] = num_inference_steps
-
-        # Deploy ``input_video`` is always None, so ``latents`` == ``noise``
-        # (same tensor under both keys, as base.generate expects).
-        noise = wan_conditioning.build_deploy_noise(
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            seed=seed,
-            rand_device="cpu",
-            vae=self.vae,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        inputs_shared["noise"] = noise
-        inputs_shared["latents"] = noise
-
-        wan_conditioning.finalize_ti2v_first_frame_latents(
-            inputs_shared,
-            first_frame_image,
-            vae=self.vae,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        return inputs_shared
+        dst = os.path.join(output_dir, CKPT_TOKENIZER_SUBDIR)
+        if os.path.isdir(dst):
+            return
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copytree(self._tokenizer_dir, dst)
+        logger.info("Copied umT5 tokenizer %s -> %s", self._tokenizer_dir, dst)
 
 
-class Wan22Ti2v(WanBase):
-    """Wan2.2-TI2V-5B backbone (native VAE)."""
-
-    @classmethod
-    def from_pretrained(cls, source, *, text_dim: Optional[int] = None, **kw) -> "Wan22Ti2v":
-        """Build a Wan22Ti2v from a source.
-
-        Sources: ``DictConfig`` (full Hydra cfg → loader), ``str`` dir path /
-        ``dict`` with ``model_path`` (lightweight build), else an already-built
-        component holder. Construction returns a transient holder that
-        ``__init__`` drains into the backbone.
-        """
-        holder = loader.build_holder(source, **kw)
-        # Resolve optional cfg-side ``shift_video`` here (not in __init__)
-        # because the cfg shape depends on the ``source`` type.
-        shift_video_cfg = loader.resolve_cfg_shift_video(source)
-
-        return cls(holder, shift_video=shift_video_cfg, text_dim=text_dim)
-
-
-__all__ = ["WanBase", "Wan22Ti2v"]
+__all__ = ["WanBackbone"]

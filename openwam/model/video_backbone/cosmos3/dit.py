@@ -264,11 +264,10 @@ def prepare_block_loop(
     # None all the way to SDPA (see the note above _und_attention_mask); it is
     # NOT normalized into an all-True tensor here.
     #
-    # ``context_mask`` is deliberately NOT derived from ``und_mask``. The
-    # architecture appends a proprio token to ``context`` before the action
-    # stream reads it, so a mask built from the und length is one column short —
-    # the reason ``preprocess_input_for_train`` omits the key in the first
-    # place. Nothing in the cosmos3 gen path consumes ``state.context_mask``
+    # ``context_mask`` is deliberately NOT derived from ``und_mask``: it is the
+    # caller's mask of ``context`` (text + the proprio tokens the architecture
+    # appends for the action stream), while ``und_mask`` covers the und tokens
+    # only. Nothing in the cosmos3 gen path consumes ``state.context_mask``
     # (there is no cross-attention), so it stays whatever the caller passed.
 
     zero = torch.zeros((), dtype=target_dtype, device=tokens.device)

@@ -1,18 +1,17 @@
-"""``finetune_ckpt_path``: the ckpt's config.yaml is the reconstruction base, the
-live cfg.model is the authority.
+"""``finetune_ckpt_path`` / ``resume_ckpt_path``: which model config builds the checkpoint shell.
 
-Regression: the finetune path built the architecture from
-``ckpt_cfg.model`` alone, so every ``model.*`` value the operator set in
-``configs/`` (or on the CLI) was silently discarded — a run configured with
-``attention_mask_mode=isolated`` trained the checkpoint's ``mutual`` instead.
-Worse, ``save_config`` wrote the LIVE cfg into the new run dir, so the new
-checkpoint's config.yaml advertised values the model had never been built with
-and deploying it rebuilt a different model than the one that trained.
+Finetune: the ckpt's config.yaml is the reconstruction base, the live cfg.model is the authority.
+Regression: the finetune path built the architecture from ``ckpt_cfg.model`` alone, so every
+``model.*`` value the operator set in ``configs/`` (or on the CLI) was silently discarded — a run
+configured with ``attention_mask_mode=isolated`` trained the checkpoint's ``mutual`` instead. Worse,
+``save_config`` wrote the LIVE cfg into the new run dir, so the new checkpoint's config.yaml
+advertised values the model had never been built with.
 
-``build_architecture`` is stubbed out (the real one loads ~25 GB of weights), so
-these run on CPU with no checkpoint; everything up to it — config merge,
-``resolve_architecture_config``, the ``_source`` dict the backbone build reads —
-is the real code path.
+Resume: the ckpt config stays authoritative and the safetensors are never read (accelerate's
+``load_state`` fills the shell after prepare), so the shell gets storage instead.
+
+``build_architecture_from_ckpt_dir`` is stubbed out (the real one builds a multi-GB skeleton), so these
+run on CPU with no checkpoint; everything up to it — reading the ckpt config, the merge — is real.
 """
 
 import pytest
@@ -20,23 +19,16 @@ from omegaconf import OmegaConf, open_dict
 
 from openwam.train.utils import ckpt_model_loader as cml
 
-# Minimal stand-in for a saved run's config.yaml: the two ``components`` /
-# ``tokenizer`` keys only a saved config carries, plus one overridable value per
-# section (video_backbone / action_backbone / architecture).
+# Minimal stand-in for a saved run's config.yaml: the backbone geometry block plus one overridable
+# value per section (video_backbone / action_backbone / architecture).
 CKPT_CFG = {
     "model": {
         "video_backbone": {
             "name": "wan22_ti2v_5b",
             "model_path": "/ckpt-host/Wan2.2-TI2V-5B",
             "shift_video": 5.0,
-            "components": [
-                {
-                    "attr": "dit",
-                    "model_class": "openwam.model.video_backbone.wan.dit.WanModel",
-                    "extra_kwargs": {"dim": 3072, "num_layers": 30, "num_heads": 24},
-                }
-            ],
-            "tokenizer": {"class": "x.Tok", "attr": "tokenizer", "subdir": "tokenizer/google/umt5-xxl"},
+            "text_cache": True,
+            "dit": {"dim": 3072, "num_layers": 30, "num_heads": 24},
         },
         "action_backbone": {"dim": 1024, "ffn_dim": 4096, "shift_action": 5.0},
         "freeze": ["video_backbone.vae"],
@@ -58,7 +50,7 @@ CKPT_CFG = {
 
 
 def _write_ckpt_cfg(tmp_path, **model_patch):
-    """Write a ckpt config.yaml, optionally patching its model section."""
+    """Write a ckpt config.yaml, optionally patching its model section. Returns: the ckpt dir."""
     cfg = OmegaConf.create(CKPT_CFG)
     for dotted, val in model_patch.items():
         OmegaConf.update(cfg, f"model.{dotted.replace('__', '.')}", val)
@@ -67,11 +59,10 @@ def _write_ckpt_cfg(tmp_path, **model_patch):
 
 
 def _live_cfg(**model_patch):
-    """A live Hydra-shaped run config: same yaml family as the ckpt, minus the
-    saved-only reconstruction specs, plus struct mode as Hydra hands it over."""
+    """A live Hydra-shaped run config: same yaml family as the ckpt (minus its ``dit`` block, so a
+    ckpt-only key exists), plus struct mode as Hydra hands it over."""
     model = OmegaConf.to_container(OmegaConf.create(CKPT_CFG["model"]), resolve=True)
-    del model["video_backbone"]["components"]
-    del model["video_backbone"]["tokenizer"]
+    del model["video_backbone"]["dit"]
     model["video_backbone"]["model_path"] = "/live-host/Wan2.2-TI2V-5B"
     cfg = OmegaConf.create({"model": model, "training": {"batch_size": 4}, "project": {"seed": 42}})
     for dotted, val in model_patch.items():
@@ -82,20 +73,25 @@ def _live_cfg(**model_patch):
 
 @pytest.fixture
 def capture(monkeypatch):
-    """Stub ``build_architecture`` / weight discovery; capture the build params."""
+    """Stub the shell build / weight discovery / resume storage; capture what they were given."""
     captured: dict = {}
 
     class _Built:
         def load_checkpoint(self, weights):
             captured["loaded"] = weights
 
-    def _build(name, params, **kw):
-        captured["registry_name"] = name
-        captured["params"] = params
+    def _build(ckpt_dir, model_cfg):
+        captured["ckpt_dir"] = ckpt_dir
+        captured["model_cfg"] = model_cfg
         return _Built()
 
-    monkeypatch.setattr("openwam.model.build_architecture", _build, raising=True)
+    monkeypatch.setattr("openwam.model.build_architecture_from_ckpt_dir", _build, raising=True)
     monkeypatch.setattr(cml, "find_latest_weights", lambda d: "w.safetensors", raising=True)
+    monkeypatch.setattr(
+        "openwam.model.video_backbone.common.weights.materialize_meta",
+        lambda module, device: captured.setdefault("materialized", device),
+        raising=True,
+    )
     return captured
 
 
@@ -110,37 +106,42 @@ def test_live_model_cfg_overrides_the_ckpt_config(tmp_path, capture):
         video_backbone__shift_video=1.5,
     )
 
-    cml.build_architecture_from_ckpt_dir(ckpt_dir, weights_required=True, override_cfg=cfg)
+    cml.build_for_finetune(ckpt_dir, cfg)
 
-    params = capture["params"]
-    assert params["attention_mask_mode"] == "isolated"
-    assert params["mot_checkpoint_mixed_attn"] is False
-    assert params["video_attention_mask_mode"] == "bidirectional"
-    assert params["shift_action"] == 9.0
-    assert params["video_backbone"]["shift_video"] == 1.5
-    # The backbone build reads video_backbone values back off ``_source``, not
-    # off ``params`` — an override that reaches only one of the two would give
-    # the architecture and its backbone different schedules.
-    assert params["video_backbone"]["_source"]["shift_video"] == 1.5
+    model = capture["model_cfg"]
+    assert model.architecture.attention_mask_mode == "isolated"
+    assert model.architecture.mot_checkpoint_mixed_attn is False
+    assert model.architecture.video_attention_mask_mode == "bidirectional"
+    assert model.action_backbone.shift_action == 9.0
+    # One config builds both the architecture and its backbone, so an override cannot reach only one.
+    assert model.video_backbone.shift_video == 1.5
+    assert capture["ckpt_dir"] == ckpt_dir
     assert capture["loaded"] == "w.safetensors"
+    assert "materialized" not in capture, "finetune loads weights; the meta shell is fine"
 
 
-def test_ckpt_reconstruction_specs_survive_the_merge(tmp_path, capture):
-    """``components`` / ``tokenizer`` exist only in the ckpt config: the merge
-    must not drop them, or the skeletons can't be rebuilt without model_path."""
+def test_explicit_weights_file_is_loaded(tmp_path, capture):
+    """A ``checkpoint_step_*.safetensors`` source builds from its dir and loads exactly that file."""
+    ckpt_dir = _write_ckpt_cfg(tmp_path)
+    weights = tmp_path / "checkpoint_step_7.safetensors"
+    weights.write_bytes(b"")
+
+    cml.build_for_finetune(str(weights), _live_cfg())
+
+    assert capture["ckpt_dir"] == ckpt_dir
+    assert capture["loaded"] == str(weights)
+
+
+def test_ckpt_only_keys_survive_the_merge(tmp_path, capture):
+    """Keys only the ckpt config has (here the DiT geometry) survive the merge and land in cfg, which
+    is what save_config() writes — otherwise the NEW run's checkpoints could not be rebuilt."""
     ckpt_dir = _write_ckpt_cfg(tmp_path)
     cfg = _live_cfg(architecture__attention_mask_mode="isolated")
 
-    cml.build_architecture_from_ckpt_dir(ckpt_dir, weights_required=True, override_cfg=cfg)
+    cml.build_for_finetune(ckpt_dir, cfg)
 
-    source = capture["params"]["video_backbone"]["_source"]
-    assert source["components"][0]["extra_kwargs"]["num_layers"] == 30
-    assert source["tokenizer"]["subdir"] == "tokenizer/google/umt5-xxl"
-    assert capture["params"]["video_backbone"]["_ckpt_dir"] == ckpt_dir
-    # ...and they must also land in cfg, which is what save_config() writes —
-    # otherwise the NEW run's checkpoints stop being self-contained.
-    assert OmegaConf.select(cfg, "model.video_backbone.components") is not None
-    assert OmegaConf.select(cfg, "model.video_backbone.tokenizer") is not None
+    assert capture["model_cfg"].video_backbone.dit.num_layers == 30
+    assert cfg.model.video_backbone.dit.num_layers == 30
 
 
 def test_cfg_model_is_rewritten_to_exactly_what_was_built(tmp_path, capture):
@@ -152,14 +153,11 @@ def test_cfg_model_is_rewritten_to_exactly_what_was_built(tmp_path, capture):
     ckpt_dir = _write_ckpt_cfg(tmp_path)
     cfg = _live_cfg(architecture__attention_mask_mode="isolated", video_backbone__shift_video=1.5)
 
-    cml.build_architecture_from_ckpt_dir(ckpt_dir, weights_required=True, override_cfg=cfg)
+    cml.build_for_finetune(ckpt_dir, cfg)
 
-    params = capture["params"]
-    assert cfg.model.architecture.attention_mask_mode == params["attention_mask_mode"] == "isolated"
-    assert cfg.model.video_backbone.shift_video == params["video_backbone"]["shift_video"] == 1.5
-    # The ckpt-sourced DiT geometry is recorded too, so a later deploy sizes the
-    # skeleton the same way this run did.
-    assert cfg.model.video_backbone.components[0].extra_kwargs.num_layers == 30
+    assert capture["model_cfg"] is cfg.model
+    assert cfg.model.architecture.attention_mask_mode == "isolated"
+    assert cfg.model.video_backbone.shift_video == 1.5
     # Struct mode survives the node swap: a typo'd model key must still raise.
     with pytest.raises(Exception):
         cfg.model.not_a_real_key = 1
@@ -174,19 +172,19 @@ def test_explicit_null_in_live_cfg_clears_a_ckpt_value(tmp_path, capture):
     ckpt_dir = _write_ckpt_cfg(tmp_path)
     cfg = _live_cfg(architecture__bridge_layers=None, architecture__bridge_interval=2)
 
-    cml.build_architecture_from_ckpt_dir(ckpt_dir, weights_required=True, override_cfg=cfg)
+    cml.build_for_finetune(ckpt_dir, cfg)
 
-    assert capture["params"]["bridge_layers"] is None
-    assert capture["params"]["bridge_interval"] == 2
+    assert capture["model_cfg"].architecture.bridge_layers is None
+    assert capture["model_cfg"].architecture.bridge_interval == 2
 
 
 def test_video_backbone_name_mismatch_raises(tmp_path, capture):
-    """The ckpt's component specs are bound to its backbone family."""
+    """The ckpt's weights are bound to its backbone family."""
     ckpt_dir = _write_ckpt_cfg(tmp_path)
     cfg = _live_cfg(video_backbone__name="cosmos3_edge")
 
     with pytest.raises(ValueError, match="model.video_backbone.name"):
-        cml.build_architecture_from_ckpt_dir(ckpt_dir, weights_required=True, override_cfg=cfg)
+        cml.build_for_finetune(ckpt_dir, cfg)
 
 
 def test_architecture_framework_mismatch_raises(tmp_path, capture):
@@ -195,21 +193,24 @@ def test_architecture_framework_mismatch_raises(tmp_path, capture):
     cfg = _live_cfg(architecture__framework="other_system")
 
     with pytest.raises(ValueError, match="model.architecture.framework"):
-        cml.build_architecture_from_ckpt_dir(ckpt_dir, weights_required=True, override_cfg=cfg)
+        cml.build_for_finetune(ckpt_dir, cfg)
 
 
 def test_resume_keeps_the_ckpt_config(tmp_path, capture):
     """Resume continues ONE run whose config.yaml is reused untouched, so the
     ckpt config stays authoritative — a live override there would make that
-    file lie about the model being trained."""
+    file lie about the model being trained. Its shell gets storage instead of a
+    safetensors load (accelerate's load_state fills it after prepare)."""
     ckpt_dir = _write_ckpt_cfg(tmp_path)
+    cfg = _live_cfg(architecture__attention_mask_mode="isolated")
 
-    cml.build_architecture_from_ckpt_dir(ckpt_dir, weights_required=False, override_cfg=None)
+    cml.build_for_resume(ckpt_dir, cfg)
 
-    params = capture["params"]
-    assert params["attention_mask_mode"] == "mutual"
-    assert params["video_backbone"]["shift_video"] == 5.0
-    assert params["video_backbone"]["_materialize_weights"] is True
+    model = capture["model_cfg"]
+    assert model.architecture.attention_mask_mode == "mutual"
+    assert model.video_backbone.shift_video == 5.0
+    assert cfg.model.architecture.attention_mask_mode == "isolated", "resume must not rewrite the live cfg"
+    assert capture["materialized"] == "cpu"
     assert "loaded" not in capture, "resume must not load safetensors"
 
 
@@ -226,12 +227,24 @@ def test_resume_reports_the_live_keys_it_discards(tmp_path, caplog):
     assert "'mutual'" in caplog.text and "'isolated'" in caplog.text
 
 
-def test_ckpt_config_without_a_model_section_raises(tmp_path, capture):
+@pytest.mark.parametrize("build", [cml.build_for_finetune, cml.build_for_resume])
+def test_ckpt_config_without_a_model_section_raises(tmp_path, capture, build):
     """Not a run dir written by this trainer — say so instead of an AttributeError."""
     OmegaConf.save(OmegaConf.create({"training": {"batch_size": 4}}), tmp_path / "config.yaml")
 
     with pytest.raises(ValueError, match="no `model:` section"):
-        cml.build_architecture_from_ckpt_dir(str(tmp_path), weights_required=True, override_cfg=None)
+        build(str(tmp_path), _live_cfg())
+
+
+def test_build_architecture_from_ckpt_dir_uses_checkpoint_mode(tmp_path, monkeypatch):
+    """Deploy / finetune / resume all get the CHECKPOINT shell of the ckpt dir (never the upstream weights)."""
+    from openwam.model.architectures import registry
+    from openwam.model.video_backbone import LoadMode
+
+    seen = {}
+    monkeypatch.setattr(registry, "build_architecture", lambda name, params, **kw: seen.update(kw, name=name))
+    registry.build_architecture_from_ckpt_dir(str(tmp_path), OmegaConf.create(CKPT_CFG["model"]))
+    assert seen == {"name": "dual_system_self_attn", "mode": LoadMode.CHECKPOINT, "ckpt_dir": str(tmp_path)}
 
 
 def test_trainer_reads_freeze_from_the_merged_cfg(tmp_path, monkeypatch):
@@ -283,7 +296,7 @@ def test_trainer_reads_freeze_from_the_merged_cfg(tmp_path, monkeypatch):
         def load_checkpoint(self, weights):
             pass
 
-    monkeypatch.setattr("openwam.model.build_architecture", lambda name, params, **kw: _Arch(), raising=True)
+    monkeypatch.setattr("openwam.model.build_architecture_from_ckpt_dir", lambda d, m: _Arch(), raising=True)
     monkeypatch.setattr(cml, "find_latest_weights", lambda d: "w.safetensors", raising=True)
 
     from openwam.train.openwam_trainer import OpenWAMTrainer
@@ -295,7 +308,7 @@ def test_trainer_reads_freeze_from_the_merged_cfg(tmp_path, monkeypatch):
 
 
 def test_diff_model_cfgs_buckets_keys():
-    """Lists stay leaves so a components diff doesn't bury the real changes."""
+    """Lists stay leaves so a long-list diff doesn't bury the real changes."""
     ckpt = OmegaConf.create({"a": {"x": 1, "y": 2}, "specs": [{"k": 1}], "only_ckpt": 3})
     live = OmegaConf.create({"a": {"x": 1, "y": 9}, "specs": [{"k": 1}], "only_live": 4})
 

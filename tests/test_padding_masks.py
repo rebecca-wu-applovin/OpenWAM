@@ -158,16 +158,18 @@ class TestLatentMaskDownsample:
 class TestLossMasking:
     def test_video_loss_ignores_padded(self):
         arch = _make_arch()
-        target = torch.zeros(1, 2, 4, 2, 2)
-        pred = torch.zeros(1, 2, 4, 2, 2)
-        pred[:, :, :2] = 1.0
-        pred[:, :, 2:] = 1000.0
+        target = torch.zeros(1, 2, 5, 2, 2)
+        pred = torch.zeros(1, 2, 5, 2, 2)
+        pred[:, :, 0] = 999.0  # clean prefix latent: never in the loss
+        pred[:, :, 1:3] = 1.0
+        pred[:, :, 3:] = 1000.0
+        clean = torch.zeros(1, 2, 1, 2, 2)
 
         mask = torch.tensor([[False, False, True, True]])
-        inputs_m = {"video_is_pad": mask}
+        inputs_m = {"clean_latents": clean, "video_is_pad": mask}
 
         loss_m = arch._compute_video_loss(pred, target, torch.tensor([0]), inputs_m, device="cpu")
-        loss_u = arch._compute_video_loss(pred, target, torch.tensor([0]), {}, device="cpu")
+        loss_u = arch._compute_video_loss(pred, target, torch.tensor([0]), {"clean_latents": clean}, device="cpu")
 
         assert abs(loss_m.item() - 1.0) < 1e-5
         assert loss_u.item() > 100.0
@@ -181,26 +183,7 @@ class TestLossMasking:
         pred[0, 0, 2, 0, 0] = 888.0
 
         inputs = {
-            "first_frame_latents": torch.zeros(1, 1, 1, 1, 1),
-            "video_is_pad": torch.tensor([[False, True]]),
-        }
-
-        loss = arch._compute_video_loss(pred, target, torch.tensor([0]), inputs, device="cpu")
-        assert abs(loss.item() - 4.0) < 1e-5, f"got {loss.item()}"
-
-    def test_video_loss_conditioning_latent_without_prefix(self):
-        """No ref-prefix metadata and no ``first_frame_latents``, but the tail mask still
-        excludes the leading first-frame conditioning latent."""
-        arch = _make_arch()
-        target = torch.zeros(1, 1, 3, 1, 1)
-        pred = torch.zeros(1, 1, 3, 1, 1)
-        pred[0, 0, 0, 0, 0] = 999.0
-        pred[0, 0, 1, 0, 0] = 2.0
-        pred[0, 0, 2, 0, 0] = 888.0
-
-        inputs = {
-            "num_clean_prefix_frames": 0,
-            "first_frame_latents": None,
+            "clean_latents": torch.zeros(1, 1, 1, 1, 1),
             "video_is_pad": torch.tensor([[False, True]]),
         }
 
@@ -216,8 +199,8 @@ class TestLossMasking:
         arch = _make_arch()
         pred = torch.zeros(1, 1, 3, 1, 1)
         target = torch.zeros(1, 1, 3, 1, 1)
-        # mask length 4 > noise_pred T=3; no n_skip path fixes this case.
-        inputs = {"video_is_pad": torch.tensor([[False, False, False, True]])}
+        # mask length 3 > noise_pred T=3 minus the 1 clean latent.
+        inputs = {"clean_latents": torch.zeros(1, 1, 1, 1, 1), "video_is_pad": torch.tensor([[False, False, True]])}
         with pytest.raises(ValueError, match="video_is_pad length"):
             arch._compute_video_loss(pred, target, torch.tensor([0]), inputs, device="cpu")
 
@@ -238,11 +221,12 @@ class TestLossMasking:
         pred = torch.randn(2, 4, 8, 3, 3)
         target = torch.randn(2, 4, 8, 3, 3)
         ids = torch.tensor([10, 20])
-        all_valid = torch.zeros(2, 8, dtype=torch.bool)
+        all_valid = torch.zeros(2, 7, dtype=torch.bool)
+        clean = torch.zeros(2, 4, 1, 3, 3)
 
-        inputs_m = {"video_is_pad": all_valid}
+        inputs_m = {"clean_latents": clean, "video_is_pad": all_valid}
         loss_m = arch._compute_video_loss(pred, target, ids, inputs_m, device="cpu")
-        loss_u = arch._compute_video_loss(pred, target, ids, {}, device="cpu")
+        loss_u = arch._compute_video_loss(pred, target, ids, {"clean_latents": clean}, device="cpu")
         assert abs(loss_m.item() - loss_u.item()) < 1e-5
 
     def test_batch_mixed_padding(self):
@@ -273,7 +257,7 @@ class TestLossMasking:
         pred[:, :, 2] = 888.0
 
         inputs = {
-            "first_frame_latents": torch.zeros(1, 2, 1, 2, 2),
+            "clean_latents": torch.zeros(1, 2, 1, 2, 2),
             "video_is_pad": latent_mask.unsqueeze(0),
         }
 
@@ -282,17 +266,10 @@ class TestLossMasking:
 
 
 # ============================================================================
-# Part 5: prepare_inputs honors `video_backbone.needs_first_frame_skip` (Fix #4)
+# Part 5: prepare_inputs always drops the clean latent from the tail mask
 #
-# Reviewer @wayrise flagged that `prepare_inputs` previously decided
-# ``skip_first`` purely from ``inputs.get("first_frame_latents")``. That
-# matched Wan TI2V (it sets the field) and
-# T2V backbones (no FFL, no skip). But Wan I2V wires conditioning through
-# the ``y`` channel *without* setting ``first_frame_latents``, and a
-# future Wan T2V configuration would (silently) also lose its skip.
-#
-# Fix: ``skip_first = first_frame_latents is not None or
-# vb.needs_first_frame_skip``. The tests below pin both arms.
+# Every layout has a clean prefix (``clean_latents``, Task 7), so ``video_is_pad``
+# is always sized to T_lat minus the leading clean latent.
 # ============================================================================
 
 
@@ -308,9 +285,8 @@ def _build_one_sample(num_frames=33, video_stride=4, valid_len=33):
     import numpy as np
 
     _, video_mask, _ = _build_masks(num_frames, video_stride, valid_len)
-    # `video` content doesn't matter: the mock backbone's preprocess_input_for_train
-    # ignores raw frames and emits its own latents/context. We use a small
-    # list so ``FirstFrameConditioningTransform`` still picks frame 0.
+    # `video` content doesn't matter: the mock backbone's preprocess_train
+    # ignores raw frames and emits its own latents / text.
     return {
         "video": [np.zeros((1, 1, 3), dtype=np.uint8) for _ in range(num_frames)],
         "prompt": "ignored",
@@ -320,79 +296,14 @@ def _build_one_sample(num_frames=33, video_stride=4, valid_len=33):
     }
 
 
-class TestPrepareInputsSkipFirst:
-    """`prepare_inputs` uses (first_frame_latents OR needs_first_frame_skip)
-    to decide whether ``video_is_pad`` is sized to T_lat-1 or T_lat."""
+def test_prepare_inputs_skips_the_clean_latent():
+    """The mock emits 1 clean latent of 3: the tail mask covers the other 2."""
+    from tests.test_openwam_trainer import _MockVideoBackbone
 
-    def _make_backbone(self, *, emit_first_frame_latents, needs_skip):
-        """Build a tiny mock that controls both signals independently."""
-        from tests.test_openwam_trainer import _MockVideoBackbone
+    arch = _make_arch_with_backbone(_MockVideoBackbone(dim=64, num_layers=2))
+    arch.set_training_runtime()
 
-        class _ConfigurableBackbone(_MockVideoBackbone):
-            @property
-            def needs_first_frame_skip(self) -> bool:
-                return needs_skip
+    inputs = arch.prepare_inputs([_build_one_sample(num_frames=33, video_stride=4, valid_len=33)])
 
-            def preprocess_input_for_train(self, *, frames=None, text=None, **kw):
-                out = {
-                    "input_latents": torch.randn(1, 16, 3, 8, 8),
-                    "context": torch.randn(1, 4, self._dim),
-                    "context_mask": torch.ones(1, 4, dtype=torch.bool),
-                    "seq_lens": torch.ones(1, dtype=torch.long),
-                }
-                if emit_first_frame_latents:
-                    out["first_frame_latents"] = torch.zeros(1, 16, 1, 8, 8)
-                return out
-
-        return _ConfigurableBackbone(dim=64, num_layers=2)
-
-    def test_skip_via_property_when_no_first_frame_latents(self):
-        """Backbone signature: `needs_first_frame_skip=True` but no
-        ``first_frame_latents``. Mask must still be
-        sized to T_lat-1 so the loss-side shape-fallback trims latent[0]."""
-        vb = self._make_backbone(emit_first_frame_latents=False, needs_skip=True)
-        arch = _make_arch_with_backbone(vb)
-        arch.set_training_runtime()
-
-        inputs = arch.prepare_inputs([_build_one_sample(num_frames=33, video_stride=4, valid_len=33)])
-
-        # 33 frames @ stride 4 → 9 latent slots; skip_first=True → 8 tail latents.
-        assert "video_is_pad" in inputs
-        assert inputs["video_is_pad"].shape == (1, 2), (
-            f"expected (1, 2) tail mask after skip_first, got {tuple(inputs['video_is_pad'].shape)}"
-        )
-
-    def test_t2v_path_keeps_frame_zero_when_no_signal(self):
-        """T2V signature: no ``first_frame_latents`` AND
-        ``needs_first_frame_skip=False``. ``video_is_pad`` must cover the
-        full T_lat so latent[0] enters the loss as a predicted frame."""
-        vb = self._make_backbone(emit_first_frame_latents=False, needs_skip=False)
-        arch = _make_arch_with_backbone(vb)
-        arch.set_training_runtime()
-
-        inputs = arch.prepare_inputs([_build_one_sample(num_frames=33, video_stride=4, valid_len=33)])
-
-        assert "video_is_pad" in inputs
-        # 33 frames @ stride 4 → 9 latent slots; skip_first=False → full 9.
-        # ``downsample_video_mask_to_latent`` without skip_first returns a
-        # mask of length ``T_lat`` (3 here for the tiny mock_latent shape
-        # case)... but our mock emits 3 latents directly; the dataloader
-        # mask length is still derived from the raw video mask. Assert the
-        # resulting mask matches the raw downsample (skip_first=False).
-        from openwam.model.architectures.utils.common import downsample_video_mask_to_latent
-
-        _, video_mask, _ = _build_masks(33, 4, 33)
-        expected = downsample_video_mask_to_latent(~video_mask, skip_first=False)
-        assert inputs["video_is_pad"].shape == (1, expected.shape[0])
-        assert torch.equal(inputs["video_is_pad"][0].cpu(), expected)
-
-    def test_per_batch_signal_still_wins_when_property_is_false(self):
-        """Data-driven TI2V case: ``needs_first_frame_skip=False``, but the batch carries ``first_frame_latents``.
-        The OR clause must still trip skip_first."""
-        vb = self._make_backbone(emit_first_frame_latents=True, needs_skip=False)
-        arch = _make_arch_with_backbone(vb)
-        arch.set_training_runtime()
-
-        inputs = arch.prepare_inputs([_build_one_sample(num_frames=33, video_stride=4, valid_len=33)])
-
-        assert inputs["video_is_pad"].shape == (1, 2)
+    assert inputs["clean_latents"].shape[2] == 1
+    assert inputs["video_is_pad"].shape == (1, 2)

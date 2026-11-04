@@ -139,47 +139,6 @@ def test_action_sage_backend_falls_back_on_cpu(monkeypatch):
     assert fn(q, k, v).shape == q.shape
 
 
-# ----------------------------------------------------------- Wan shared core
-
-
-@pytest.mark.parametrize("impl", ["flash_attention_3", "flash_attention_2", "sage_attention"])
-def test_shared_core_downgrades_fused_backends_it_cannot_run(monkeypatch, impl):
-    from openwam.model.video_backbone.wan.shared.core.attention import attention as shared
-
-    monkeypatch.setattr(shared, "ATTENTION_IMPLEMENTATION", impl)
-
-    assert shared.resolve_implementation(_FakeQuery(True, torch.bfloat16)) == impl
-    assert shared.resolve_implementation(_FakeQuery(True, torch.float32)) == "torch"
-    assert shared.resolve_implementation(_FakeQuery(False, torch.float32)) == "torch"
-
-
-def test_shared_core_keeps_xformers_for_cuda_fp32(monkeypatch):
-    """xformers is CUDA-only but does support fp32, so it must not be downgraded for it."""
-    from openwam.model.video_backbone.wan.shared.core.attention import attention as shared
-
-    monkeypatch.setattr(shared, "ATTENTION_IMPLEMENTATION", "xformers")
-
-    assert shared.resolve_implementation(_FakeQuery(True, torch.float32)) == "xformers"
-    assert shared.resolve_implementation(_FakeQuery(False, torch.float32)) == "torch"
-
-
-def test_shared_core_attention_forward_runs_on_cpu(monkeypatch):
-    """End-to-end: a CPU call must produce the SDPA result, not raise."""
-    from openwam.model.video_backbone.wan.shared.core.attention import attention as shared
-
-    monkeypatch.setattr(shared, "ATTENTION_IMPLEMENTATION", "flash_attention_2")
-    monkeypatch.setattr(shared, "flash_attn_interface", None, raising=False)
-
-    q, k, v = (torch.randn(2, 4, 8, 16) for _ in range(3))
-
-    out = shared.attention_forward(q, k, v)
-
-    assert torch.allclose(out, F.scaled_dot_product_attention(q, k, v), atol=0, rtol=0)
-
-
-# ------------------------------------------------------- deploy diagnostics
-
-
 def test_fused_backend_name_follows_availability(monkeypatch):
     import openwam.model.video_backbone.wan.dit as vdit
 
@@ -215,16 +174,9 @@ def test_diagnostics_do_not_claim_a_backend_unconditionally(monkeypatch, caplog)
 
 
 def test_qualifier_is_not_attached_to_backends_that_have_no_restriction():
-    """ATTENTION_IMPLEMENTATION is an open set: an unknown value runs as plain SDPA.
-
-    initialize_attention_priority() lowercases DIFFSYNTH_ATTENTION_IMPLEMENTATION
-    but does not otherwise check it -- unlike WAM_ATTENTION_IMPL, which is validated
-    against _BACKEND_MAP -- and attention_forward's else-branch runs anything it does
-    not recognize through torch_sdpa. Such a run must not be reported as restricted.
-    """
+    """Plain SDPA (and any name the table does not list) must not be reported as restricted."""
     from openwam.deploy.server import _WAN_BACKENDS, _qualify_backend
 
-    # "" is reachable: the env lookup guards on `is not None`, not truthiness.
     for unrestricted in ("torch", "torch_sdpa", "sdpa", "", "some_future_backend"):
         assert _qualify_backend(unrestricted, _WAN_BACKENDS) == unrestricted
 
@@ -232,16 +184,10 @@ def test_qualifier_is_not_attached_to_backends_that_have_no_restriction():
         _qualify_backend("flash_attention_2", _WAN_BACKENDS)
         == "flash_attention_2 (CUDA fp16/bf16 only; torch_sdpa otherwise)"
     )
-    assert _qualify_backend("xformers", _WAN_BACKENDS) == "xformers (CUDA only; torch_sdpa otherwise)"
 
 
 def test_a_name_from_one_namespace_is_not_qualified_in_the_other():
-    """The two subsystems' spellings must not cross-annotate.
-
-    ATTENTION_IMPLEMENTATION is an open set, so an ActionDiT closure name reaches the
-    Wan path through the env var. attention_forward runs it as plain SDPA, so reporting
-    it as a fused backend would be the very defect this module exists to prevent.
-    """
+    """The two subsystems' spellings must not cross-annotate."""
     from openwam.deploy.server import _ACTION_BACKENDS, _WAN_BACKENDS, _qualify_backend
 
     for action_name in _ACTION_BACKENDS:
@@ -299,11 +245,10 @@ def test_action_dit_backend_names_match_components():
 
 
 def test_wan_backend_names_match_their_sources():
-    """The Wan table's counterpart pin, over both names that reach it.
+    """The Wan table's counterpart pin.
 
-    fused_backend_name() and initialize_attention_priority() are the two sources of the
-    Wan spellings; a backend added to either without a table entry silently loses its
-    qualifier, which is the bug this module exists to prevent.
+    fused_backend_name() is the source of the Wan spellings; a backend added there without
+    a table entry silently loses its qualifier, which is the bug this module exists to prevent.
     """
     from openwam.deploy import server
 
@@ -312,10 +257,9 @@ def test_wan_backend_names_match_their_sources():
 
     for name in fused:
         assert server._WAN_BACKENDS.get(name) == server._HALF_PRECISION_CUDA_ONLY
-    assert server._WAN_BACKENDS.get("xformers") == server._CUDA_ONLY
     for name in unrestricted:
         assert name not in server._WAN_BACKENDS
 
-    assert set(server._WAN_BACKENDS) == fused | {"xformers"}, (
+    assert set(server._WAN_BACKENDS) == fused, (
         "a Wan backend was added or removed; classify it in _WAN_BACKENDS"
     )

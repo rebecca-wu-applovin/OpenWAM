@@ -30,6 +30,8 @@ from openwam.model.compile_options import (
     self_attn_compile_cfg,
     torch_compile_kwargs,
 )
+from openwam.model.video_backbone.base import TextCondition
+from openwam.model.video_backbone.registry import LoadMode
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +46,21 @@ logger = logging.getLogger(__name__)
 class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
     """DualSystem with true joint self-attention (FastWAM MoT pattern)."""
 
-    def __init__(self, cfg=None):
-        super().__init__(cfg)
+    def __init__(self, cfg=None, *, mode: LoadMode = LoadMode.PRETRAINED, ckpt_dir: Optional[str] = None):
+        """cfg: architecture params (see BaseWAMArchitecture). mode / ckpt_dir: how the video backbone is built
+        (LoadMode chosen by the entry point; ckpt_dir for CHECKPOINT, else None)."""
+        super().__init__(cfg, mode=mode, ckpt_dir=ckpt_dir)
+        vb = self.video_backbone
+        if (
+            vb is not None
+            and getattr(vb, "consumes_raw_proprio", False)
+            and vb.action_cond_dim != int(cfg.get("state_dim"))
+        ):
+            # flux feeds the raw proprio into its own P stream, whose input width is fixed in its yaml.
+            raise ValueError(
+                f"video_backbone.action_cond_dim={vb.action_cond_dim} must equal "
+                f"model.architecture.state_dim={cfg.get('state_dim')}"
+            )
         self._mot_driver: DualSystemMoTDriver | None = None
         self._mot_driver_kwargs: dict = {}
         self._compiled_mot_run_joint_loop: Optional[Callable[..., Tuple[object, object]]] = None
@@ -172,11 +187,16 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         noisy_actions: Optional[Tensor],
         action_timestep: Optional[Tensor],
         *,
+        latents: Tensor,
+        timestep: Tensor,
+        text: TextCondition,
+        clean_latents: Tensor,
         proprio: Optional[Tensor] = None,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
         **pipeline_inputs,
     ) -> Tuple[Tensor, Optional[Tensor]]:
+        """Joint forward; arguments as in :meth:`BaseWAMArchitecture.forward`. Returns (video pred, action pred)."""
         vb = self.video_backbone
         ab = self.action_backbone
         if vb is None:
@@ -185,26 +205,18 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
                 "architecture.__init__ to enable forward()."
             )
 
-        pipeline_inputs = self._append_proprio_context_token(dict(pipeline_inputs), proprio)
-        if getattr(vb, "consumes_raw_proprio", False):
-            # Backbones that embed proprio in their own sequence (flux's x_action_cond stream).
-            pipeline_inputs["raw_proprio"] = proprio
-        action_context = pipeline_inputs.get("context")
-        action_context_mask = pipeline_inputs.get("context_mask")
-        if action_context is not None and action_context_mask is None and pipeline_inputs.get("seq_lens") is not None:
-            seq_lens = pipeline_inputs["seq_lens"].to(device=action_context.device)
-            positions = torch.arange(action_context.shape[1], device=action_context.device)
-            action_context_mask = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
-        # Opt every Wan backbone into 4D + clean-prefix-aligned t_mod (mirrors
-        # TI2V's native ``seperated_timestep + fuse_vae_embedding_in_latents``
-        # path; TI2V itself fires that path first so these kwargs are inert for
-        # it). ``setdefault`` so explicit callers can still pass False.
-        pipeline_inputs.setdefault("force_per_token_t_mod", True)
-        pipeline_inputs.setdefault("zero_clean_prefix_t_mod", True)
+        # Text (+ proprio tokens) is the context of both streams.
+        text = self._append_proprio_context_token(text, proprio, pipeline_inputs.get("_proprio_sample_mask"))
+        # Backbones that embed proprio in their own sequence (flux's x_action_cond stream).
+        raw_proprio = proprio if getattr(vb, "consumes_raw_proprio", False) else None
         vstate = vb.prepare(
+            latents=latents,
+            timestep=timestep,
+            text=text,
+            num_clean_latents=int(clean_latents.shape[2]),
+            raw_proprio=raw_proprio,
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-            **pipeline_inputs,
         )
 
         if noisy_actions is None or ab is None:
@@ -219,8 +231,8 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         astate = ab.prepare_state(
             noisy_actions,
             action_timestep,
-            context=action_context,
-            context_mask=action_context_mask,
+            context=text.context,
+            context_mask=text.context_mask,
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         )

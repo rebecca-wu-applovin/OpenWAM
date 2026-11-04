@@ -87,17 +87,14 @@ def test_import_action_scheduler():
     assert len(s.timesteps) == 20
 
 
-def test_import_model_config():
-    from openwam.model.video_backbone.wan.shared.core.loader import ModelConfig  # noqa: F401
-
-
 def test_import_video_backbone():
-    from openwam.model.video_backbone import Wan22Ti2v  # noqa: F401
-    from openwam.model.video_backbone.wan.loader import load_wan_components  # noqa: F401
+    from openwam.model.video_backbone import WanBackbone  # noqa: F401
+    from openwam.model.video_backbone.common.weights import load_strict, read_weights  # noqa: F401
 
 
 def test_import_architecture_registry():
     from openwam.model import build_architecture, list_supported_architectures
+    from openwam.model.video_backbone import LoadMode
 
     supported = list_supported_architectures()
     assert "dual_system_cross_attn" in supported
@@ -130,7 +127,7 @@ def test_import_architecture_registry():
     }
 
     for arch_name in configs:
-        arch = build_architecture(arch_name, configs[arch_name])
+        arch = build_architecture(arch_name, configs[arch_name], mode=LoadMode.PRETRAINED, ckpt_dir=None)
         assert arch is not None
 
 

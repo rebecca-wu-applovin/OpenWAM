@@ -12,6 +12,7 @@ import torch
 
 def _make_dual_system(variant="joint_cross_attn", detach_bridge=True, dim=64, video_dim=64):
     from openwam.model import build_architecture
+    from openwam.model.video_backbone import LoadMode
 
     cfg = {
         "framework": "dual_system",
@@ -25,7 +26,10 @@ def _make_dual_system(variant="joint_cross_attn", detach_bridge=True, dim=64, vi
         "bridge_layers": (0, 2),
     }
     return build_architecture(
-        "dual_system_cross_attn" if variant == "joint_cross_attn" else "dual_system_self_attn", cfg
+        "dual_system_cross_attn" if variant == "joint_cross_attn" else "dual_system_self_attn",
+        cfg,
+        mode=LoadMode.PRETRAINED,
+        ckpt_dir=None,
     )
 
 

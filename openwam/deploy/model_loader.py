@@ -92,65 +92,12 @@ def load_from_checkpoint_dir(
         ckpt_path = _find_latest_checkpoint(ckpt_dir)
     logger.info("Loading checkpoint: %s", ckpt_path)
 
-    # 3. Build architecture (creates video backbone internally from config).
-    from openwam.model import build_architecture, resolve_architecture_config
+    # 3. Build the empty architecture from the ckpt's own config + assets (LoadMode.CHECKPOINT, the same
+    # shell the trainer builds for finetune / resume).
+    from openwam.model import build_architecture_from_ckpt_dir
 
-    m = cfg.model
-    resolved_arch = resolve_architecture_config(m)
-    params = dict(resolved_arch.params)
-
-    # ``resolve_architecture_config`` may hand back ``params["video_backbone"]``
-    # as a ``DictConfig``. Subsequent ``vb_params["_source"] = <dict>``
-    # assignments would then be auto-promoted by OmegaConf to a ``DictConfig``,
-    # which causes ``WanVideoBackbone.from_pretrained`` to mis-dispatch the
-    # deploy source into the training path (``build_training_pipeline``
-    # requires ``cfg.training``, which is absent from a video_backbone-only
-    # subtree). Pinning to a plain ``dict`` here keeps the deploy dispatch
-    # honest.
-    vb_params = params.get("video_backbone")
-    if vb_params is None:
-        vb_params = {}
-    elif not isinstance(vb_params, dict) or isinstance(vb_params, DictConfig):
-        vb_params = OmegaConf.to_container(vb_params, resolve=True) or {}
-    params["video_backbone"] = vb_params
-
-    # Provide video backbone source from config components or model_path.
-    vb_components = OmegaConf.select(cfg, "model.video_backbone.components", default=None)
-    if vb_components is not None:
-        logger.info("Using config-embedded component specs for video-backbone construction")
-        vb_cfg_dict = OmegaConf.to_container(cfg.model.video_backbone, resolve=True)
-        vb_params["_source"] = vb_cfg_dict
-        vb_params["_ckpt_dir"] = ckpt_dir
-    else:
-        model_path = OmegaConf.select(cfg, "model.video_backbone.model_path", default=None)
-        if model_path is not None:
-            vb_name = str(OmegaConf.select(cfg, "model.video_backbone.name", default=""))
-            if vb_name.startswith("cosmos3_"):
-                # Cosmos3 carries fields the path-only string source would
-                # lose (`shift_video` / prompt knobs).
-                # `from_pretrained` accepts a dict natively (via
-                # `_video_backbone_cfg`). Wan never hits this branch.
-                vb_params["_source"] = {k: v for k, v in vb_params.items() if not str(k).startswith("_")}
-            elif vb_name in ("ge_base_fast", "flux3_action_base"):
-                # No self-contained components: rebuild the pretrained skeleton from model_path the way the
-                # trainer's resume does (ckpt_model_loader: the run's video_backbone cfg + its ckpt dir); the
-                # load_checkpoint below then overwrites every weight.
-                vb_params["_source"] = OmegaConf.to_container(cfg.model.video_backbone, resolve=True)
-                vb_params["_ckpt_dir"] = ckpt_dir
-            else:
-                vb_params["_source"] = str(model_path)
-        else:
-            logger.warning(
-                "No components or model_path in config; architecture __init__ will attempt to build from config."
-            )
-
-    architecture = build_architecture(resolved_arch.registry_name, params)
-    logger.info(
-        "Architecture: %s (framework=%s variant=%s)",
-        resolved_arch.registry_name,
-        resolved_arch.canonical.framework,
-        resolved_arch.canonical.variant,
-    )
+    architecture = build_architecture_from_ckpt_dir(ckpt_dir, cfg.model)
+    logger.info("Architecture: %s", type(architecture).__name__)
 
     # 4. Load all weights from checkpoint
     architecture.load_checkpoint(ckpt_path)

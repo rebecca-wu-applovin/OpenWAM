@@ -10,3 +10,19 @@ shift_video: 5.0             # inference sampler shift (flux DROID_INFERENCE_SET
 train_timestep_width: 0.75   # PolicyConfig.train_timestep_width: logit(t) ~ Logistic(0, 0.75)
 train_timestep_shift: 42.0   # PolicyConfig.train_timestep_shift: rational shift
 text_dropout_p: 0.1          # PolicyConfig.caption_dropout ("" through the chat template)
+text_cache: true             # trainer encodes the dataset's prompt set once after the weights are in place, Qwen then on CPU
+action_cond_dim: 48          # P (proprio) stream input width; the architecture requires it to equal model.architecture.state_dim
+
+dit:                         # JointSingleSeqParams (stream wiring video / video_cond / action_cond is fixed in code)
+  vec_in_dim: 768
+  context_in_dim: 20480      # 8 stacked Qwen3-VL-4B layers x 2560 (= the text_dim the action stream reads)
+  hidden_size: 3072
+  num_heads: 24
+  depth: 5                   # mode blocks
+  depth_single_blocks: 28
+  depth_late_blocks: 0
+  axes_dim: [32, 32, 32, 32]
+  theta: 10000
+  mlp_ratio: 3.0
+  qkv_bias: false
+  gate_type: null

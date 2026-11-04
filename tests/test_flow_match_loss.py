@@ -42,7 +42,9 @@ def test_video_loss_basic():
     target = torch.randn(2, 16, 5, 4, 4)
     timestep_ids = torch.tensor([10, 20])
 
-    loss = arch._compute_video_loss(noise_pred, target, timestep_ids, {}, device="cpu")
+    # One clean prefix latent, skipped by the loss.
+    inputs = {"clean_latents": torch.zeros(2, 16, 1, 4, 4)}
+    loss = arch._compute_video_loss(noise_pred, target, timestep_ids, inputs, device="cpu")
     assert loss.shape == ()
     assert loss.item() > 0
 

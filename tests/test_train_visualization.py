@@ -24,7 +24,7 @@ class _StubBackbone(torch.nn.Module):
         super().__init__()
         self.size = None  # (w, h) of the frames to return, set by the arch stub
 
-    def decode_video(self, latents, *, tiled=True):
+    def decode_video(self, latents):
         return [Image.new("RGB", self.size, (10, 10, 10)) for _ in range(latents.shape[2])]
 
 

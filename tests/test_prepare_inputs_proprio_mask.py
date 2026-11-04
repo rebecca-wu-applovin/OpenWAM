@@ -1,12 +1,14 @@
 """``prepare_inputs`` collects per-sample ``proprio_mask`` alongside ``proprio``.
 
-The full ``prepare_inputs`` flow runs through ``video_backbone.preprocess_input_for_train``
+The full ``prepare_inputs`` flow runs through ``video_backbone.preprocess_train``
 (real VAE / text encoder), which we don't want to spin up in a unit test.
-We test the proprio_mask collection by stubbing ``preprocess`` and the
+We test the proprio_mask collection by stubbing the video backbone's ``preprocess_train`` and the
 ``_pipeline_transform_instance``, keeping the rest of the path real.
 """
 
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import torch
 
@@ -40,10 +42,10 @@ class _StubArch(DualSystemSelfAttnArchitecture):
         self._max_timestep_boundary = 1.0
         self._min_timestep_boundary = 0.0
         self._pipeline_transform_instance = _IdentityTransform()
-
-    # Bypass the real video preprocess; tests only care about proprio_mask wiring.
-    def preprocess(self, **kwargs) -> dict:
-        return {}
+        # Bypass the real video preprocess; tests only care about proprio_mask wiring.
+        self.video_backbone = SimpleNamespace(
+            preprocess_train=lambda clips, prompts, *, num_hist_frames: (None, None, None)
+        )
 
 
 def _make_sample(*, proprio=None, proprio_mask=None, state_dim: int = 20):
@@ -54,7 +56,7 @@ def _make_sample(*, proprio=None, proprio_mask=None, state_dim: int = 20):
         "prompt": "",
         "action": torch.zeros(2, state_dim, dtype=torch.float32),
         # Omit action_mask / video_mask: those code paths reach into video_backbone
-        # (needs_first_frame_skip) which we don't stub here.
+        # (temporal_compression) which we don't stub here.
         "action_mask": None,
         "video_mask": None,
         "proprio": proprio,

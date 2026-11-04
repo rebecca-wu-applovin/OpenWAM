@@ -59,10 +59,17 @@ class ActionDiTBackbone(nn.Module, ABC):
         """Move action backbone params/buffers to (dtype, device)."""
         self.to(dtype=dtype, device=device)
 
-    def save_deploy_assets(self, output_dir: str, cfg) -> None:
+    def save_deploy_assets(self, output_dir: str) -> None:
         """Default no-op: action weights are fully captured by the safetensors
         checkpoint, no external artifacts to copy. Part of the architecture's
-        deploy-asset hook contract."""
+        deploy-asset hook contract.
+
+        Args:
+            output_dir: str, the checkpoint dir (unused).
+
+        Returns:
+            None.
+        """
 
     @property
     def uses_proprioception(self) -> bool:

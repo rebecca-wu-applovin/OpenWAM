@@ -1,9 +1,8 @@
 """Stateless pixel/latent preprocessing for the Wan backbone.
 
-Pure functions lifted verbatim from the former ``BasePipeline`` helpers so the
-backbone owns its deploy preprocessing without a pipeline object. ``dtype`` /
-``device`` (and the division factors for :func:`check_resize_height_width`) are
-passed explicitly instead of read off ``self`` — same numerics, no hidden state.
+Pure functions lifted verbatim from the former ``BasePipeline`` helpers: Wan's own
+PIL -> pixel and VAE output -> PIL conversions (kept until Task 12 unifies them with
+``common/pixels.py``). ``dtype`` / ``device`` are passed explicitly.
 """
 
 from __future__ import annotations
@@ -60,41 +59,3 @@ def vae_output_to_video(vae_output, pattern="B C T H W", min_value=-1, max_value
     return [
         _vae_output_to_image(image, pattern="H W C", min_value=min_value, max_value=max_value) for image in vae_output
     ]
-
-
-def check_resize_height_width(
-    height,
-    width,
-    num_frames=None,
-    *,
-    height_division_factor,
-    width_division_factor,
-    time_division_factor,
-    time_division_remainder,
-):
-    """Round ``height``/``width``/``num_frames`` up to the backbone's model grid.
-
-    ``time_division_factor == 1`` (per-frame encoders) skips the temporal check,
-    which would otherwise bump ``num_frames`` by 1 every call (any ``N % 1 == 0``).
-    """
-    if height % height_division_factor != 0:
-        height = (height + height_division_factor - 1) // height_division_factor * height_division_factor
-        print(f"height % {height_division_factor} != 0. We round it up to {height}.")
-    if width % width_division_factor != 0:
-        width = (width + width_division_factor - 1) // width_division_factor * width_division_factor
-        print(f"width % {width_division_factor} != 0. We round it up to {width}.")
-    if num_frames is None:
-        return height, width
-    if time_division_factor > 1 and (num_frames % time_division_factor != time_division_remainder):
-        num_frames = (
-            num_frames + time_division_factor - 1
-        ) // time_division_factor * time_division_factor + time_division_remainder
-        print(f"num_frames % {time_division_factor} != {time_division_remainder}. We round it up to {num_frames}.")
-    return height, width, num_frames
-
-
-def generate_noise(shape, *, dtype, device, seed=None, rand_device="cpu", rand_torch_dtype=torch.float32):
-    """Seeded Gaussian noise built on ``rand_device`` then moved to ``(dtype, device)``."""
-    generator = None if seed is None else torch.Generator(rand_device).manual_seed(seed)
-    noise = torch.randn(shape, generator=generator, device=rand_device, dtype=rand_torch_dtype)
-    return noise.to(dtype=dtype, device=device)

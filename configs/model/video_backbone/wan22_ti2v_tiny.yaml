@@ -1,49 +1,26 @@
-# DEBUG ONLY: Wan2.2-TI2V pipeline with tiny, randomly initialized modules. Config only, no code change.
-# How: a `components` list makes loader.build_holder take the existing build_holder_from_components
-# path (the one deploy uses), which instantiates each class from extra_kwargs and loads NO weights.
-# So DiT, T5 and VAE are all random; shapes / masks / data flow match real training, values don't.
-# Used by configs/train_debug.yaml.
+# DEBUG ONLY: Wan2.2-TI2V backbone with tiny, randomly initialized modules (init: random, no weight
+# files read). Shapes / masks / data flow match real training, values don't. The real umT5 tokenizer
+# (vocab 256384) is still read from tokenizer_path. Used by configs/train_debug.yaml.
 
-name: wan22_ti2v_5b   # keep: registry dispatch + adapter class
-model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Wan2.2-TI2V-5B  # only the tokenizer is read from here
-shift_video: 5.0
+defaults:
+  - wan22_ti2v_5b
+  - _self_
 
-components:
-  - attr: dit
-    model_class: openwam.model.video_backbone.wan.dit.WanModel
-    extra_kwargs:              # real TI2V-5B: dim 3072, ffn 14336, heads 24, layers 30, text_dim 4096
-      dim: 768
-      ffn_dim: 3072
-      num_heads: 6             # head_dim stays 128 like the real model
-      num_layers: 4
-      text_dim: 128            # must equal text_encoder.dim (context width)
-      # unchanged from TI2V-5B:
-      patch_size: [1, 2, 2]
-      in_dim: 48
-      out_dim: 48
-      freq_dim: 256
-      eps: 1.0e-06
-      seperated_timestep: true
-      fuse_vae_embedding_in_latents: true
-  - attr: vae
-    model_class: openwam.model.video_backbone.wan.vae.WanVideoVAE38
-    extra_kwargs:
-      z_dim: 48                # latent channels: must stay 48 (DiT in_dim)
-      dim: 32                  # real: 160. Barely shrinks it (561M vs 705M, meta-device count); VAE is frozen + random either way
-  - attr: text_encoder
-    model_class: openwam.model.video_backbone.wan.text_encoder.WanTextEncoder
-    extra_kwargs:              # real umT5-XXL: 4096 / 4096 / 10240 / 64 heads / 24 layers
-      dim: 128
-      dim_attn: 128
-      dim_ffn: 512
-      num_heads: 2
-      num_layers: 2
+name: wan22_ti2v_5b   # keep: registry dispatch
+init: random
 
-tokenizer:                     # real umT5 tokenizer (vocab 256384), read from model_path/google/umt5-xxl
-  class: openwam.model.video_backbone.wan.text_encoder.HuggingfaceTokenizer
-  attr: tokenizer
-  subdir: tokenizer/google/umt5-xxl
-  path_kwarg: name
-  kwargs:
-    seq_len: 512
-    clean: whitespace
+dit:                   # real TI2V-5B: dim 3072, ffn 14336, heads 24, layers 30, text_dim 4096
+  dim: 768
+  ffn_dim: 3072
+  num_heads: 6         # head_dim stays 128 like the real model
+  num_layers: 4
+  text_dim: 128        # must equal text_encoder.dim (context width)
+vae:
+  z_dim: 48            # latent channels: must stay 48 (DiT in_dim)
+  dim: 32              # real: 160. Barely shrinks it (561M vs 705M); VAE is frozen + random either way
+text_encoder:          # real umT5-XXL: 4096 / 4096 / 10240 / 64 heads / 24 layers
+  dim: 128
+  dim_attn: 128
+  dim_ffn: 512
+  num_heads: 2
+  num_layers: 2

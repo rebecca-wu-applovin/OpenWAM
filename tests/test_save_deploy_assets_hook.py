@@ -2,8 +2,9 @@
 to every backbone unconditionally — each backbone base declares the hook
 (default no-op), so there is no hasattr probing.
 
-Lets different backbones (Wan component specs + tokenizer, future ones) ship
-their own deploy assets without the trainer importing them directly.
+Lets different backbones (tokenizers / processors / third-party config.json)
+ship their own deploy assets without the trainer importing them directly. The
+hook only copies files; it never receives (or writes) the config.
 """
 
 from __future__ import annotations
@@ -16,10 +17,10 @@ from openwam.model.architectures.base import BaseWAMArchitecture
 class _RecordingBackbone(nn.Module):
     def __init__(self):
         super().__init__()
-        self.calls: list[tuple[str, object]] = []
+        self.calls: list[str] = []
 
-    def save_deploy_assets(self, output_dir, cfg):
-        self.calls.append((output_dir, cfg))
+    def save_deploy_assets(self, output_dir):
+        self.calls.append(output_dir)
 
 
 class _ConcreteArch(BaseWAMArchitecture):
@@ -36,11 +37,10 @@ def test_dispatch_to_all_backbones(tmp_path):
     arch.video_backbone = vb
     arch.action_backbone = ab
 
-    cfg = {"model": {"video_backbone": {"model_path": str(tmp_path)}}}
-    arch.save_assets_for_deployment(str(tmp_path), cfg)
+    arch.save_assets_for_deployment(str(tmp_path))
 
-    assert vb.calls == [(str(tmp_path), cfg)]
-    assert ab.calls == [(str(tmp_path), cfg)]
+    assert vb.calls == [str(tmp_path)]
+    assert ab.calls == [str(tmp_path)]
 
 
 def test_all_backbone_bases_declare_hook():

@@ -19,6 +19,12 @@ views, as in GE) plus GE's view embedding.
 Under the MoT (``dual_system / joint_self_attn``) the per-layer masks come from
 :meth:`build_joint_attention_masks`: GE's per-view / cross-view block pattern
 plus OpenWAM's "clean history never reads noisy frames or action" rule.
+
+Construction (everything from ``cfg = cfg.model.video_backbone``):
+  * :meth:`GEBaseFastVideoBackbone.from_pretrained`: the DiT from the yaml ``dit`` block + the GE weights file,
+    VAE / T5 / tokenizer with their libraries' ``from_pretrained`` from ``ltx_path``;
+  * :meth:`GEBaseFastVideoBackbone.from_checkpoint_dir`: meta shells (DiT from the yaml, VAE / T5 from the
+    ``config.json`` files :meth:`save_deploy_assets` copied into ``<ckpt>/ltx/``), tokenizer from the same copy.
 """
 
 from __future__ import annotations
@@ -26,15 +32,19 @@ from __future__ import annotations
 import logging
 import os
 import random
-from typing import Any, List, Optional, Tuple
+import shutil
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 
-from openwam.model.video_backbone.base import BlockLoopState, VideoBackbone
+from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
 from openwam.model.video_backbone.common.flow_scheduler import FlowScheduler
+from openwam.model.video_backbone.common.text_cache import PromptCache
+from openwam.model.video_backbone.common.weights import load_strict
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +55,10 @@ _GE_FRAME_RATE = 30.0  # GE's forward_pass hard-codes frame_rate=30 for the RoPE
 _GE_NUM_TRAIN_TIMESTEPS = 1000
 
 
-def _cfg(vb_cfg, key, default=None):
-    """Read ``key`` from a dict / DictConfig backbone cfg."""
-    if vb_cfg is None:
-        return default
-    val = vb_cfg.get(key, default) if hasattr(vb_cfg, "get") else getattr(vb_cfg, key, default)
-    return default if val is None else val
+# LTX-Video files a checkpoint needs to rebuild the frozen VAE / T5 / tokenizer without the weights
+# (copied into <ckpt>/ltx/ by save_deploy_assets, paths relative to ltx_path).
+_CKPT_ASSET_SUBDIR = "ltx"
+_LTX_ASSETS = (os.path.join("vae", "config.json"), os.path.join("text_encoder", "config.json"), "tokenizer")
 
 
 class GEBaseFastVideoBackbone(VideoBackbone):
@@ -63,12 +71,25 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         vae=None,
         tokenizer=None,
         text_encoder=None,
+        assets_dir: Optional[str] = None,
+        shift_video: float = 1.0,
         n_view: int = 2,
         text_max_length: int = 128,
         caption_dropout_p: float = 0.06,
         vae_sample: bool = True,
         seed: Optional[int] = None,
     ) -> None:
+        """Wrap built modules; use :meth:`from_pretrained` / :meth:`from_checkpoint_dir` instead.
+
+        Args:
+            dit: LTXVideoTransformer3DModel. vae: AutoencoderKLLTXVideo. tokenizer: T5Tokenizer. text_encoder: T5.
+            assets_dir: str, LTX-Video layout dir the VAE / T5 configs and tokenizer were read from
+                (``ltx_path`` or ``<ckpt>/ltx``); save_deploy_assets copies from it.
+            shift_video: float, deploy-grid α-shift (GE trains on the shift-1 grid).
+            n_view: int, camera tiles stacked in the canvas. text_max_length: int, T5 tokens.
+            caption_dropout_p: float, training caption dropout. vae_sample: bool, sample the VAE posterior.
+            seed: int | None, seed of the caption-dropout RNG.
+        """
         super().__init__()
         # Flat named children so the model yaml freeze list hits vae / text_encoder.
         self.dit = dit
@@ -77,6 +98,7 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         if text_encoder is not None:
             self.text_encoder = text_encoder
         self._tokenizer = tokenizer
+        self._assets_dir = assets_dir
         cfg = dit.config
         self._dim = int(cfg.num_attention_heads * cfg.attention_head_dim)
         self._num_layers = int(cfg.num_layers)
@@ -87,15 +109,16 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         self._caption_dropout_p = float(caption_dropout_p)
         self._vae_sample = bool(vae_sample)
         self._rng = random.Random(seed)
-        # GE trains with diffusers' default FlowMatchEulerDiscreteScheduler (shift 1): the
-        # adapter's 1000-step grid sigma_i = 1 - i/1000 is the same grid (used by deploy).
-        self._scheduler = FlowScheduler(shift_video=1.0, num_train_timesteps=_GE_NUM_TRAIN_TIMESTEPS)
-        self._shift_video = 1.0
+        # GE trains with diffusers' default FlowMatchEulerDiscreteScheduler (shift 1): with the yaml's
+        # shift_video 1.0 the adapter's 1000-step grid sigma_i = 1 - i/1000 is the same grid (used by deploy).
+        self._shift_video = float(shift_video)
+        self._scheduler = FlowScheduler(shift_video=self._shift_video, num_train_timesteps=_GE_NUM_TRAIN_TIMESTEPS)
         self._dit_patch_size = (1, 1, 1)
         self._temporal_compression = _GE_TEMPORAL_COMPRESSION
         self._causal_temporal = True
         self._video_attention_mask_mode = "bidirectional"
-        self._text_cache: Optional[dict] = None
+        # Text slot read by encode_text: the online T5 here, a PromptCache after build_text_cache.
+        self.text_lookup = self._t5_entries
         self._mask_cache: dict = {}
 
     # ================================================================
@@ -141,21 +164,16 @@ class GEBaseFastVideoBackbone(VideoBackbone):
     # ================================================================
 
     @classmethod
-    def from_pretrained(
-        cls, source: Any, *, text_dim: Optional[int] = None, ckpt_dir: Optional[str] = None, **kw
-    ):
+    def from_pretrained(cls, cfg: DictConfig) -> "GEBaseFastVideoBackbone":
         """Build from the pretrained GE / LTX weights.
 
         Args:
-            source: training: dict / DictConfig of architecture params holding ``video_backbone``;
-                run-dir rebuild: that ``video_backbone`` cfg itself. It has ``model_path`` (GE ckpt dir),
-                ``ltx_path`` (LTX-Video dir: vae/, text_encoder/, tokenizer/) and optional
-                ``n_view``, ``text_max_length``, ``caption_dropout_p``, ``vae_sample``.
-            ckpt_dir: run dir being rebuilt from (resume / finetune); None for a fresh training build.
-            text_dim: must be None / 4096 (native components only).
+            cfg: ``cfg.model.video_backbone``: ``dit`` geometry, ``model_path`` + ``weights_file`` (GE DiT),
+                ``ltx_path`` (LTX-Video dir: vae/, text_encoder/, tokenizer/) and the scalar knobs.
 
         Returns:
-            GEBaseFastVideoBackbone on CPU in bf16.
+            GEBaseFastVideoBackbone on CPU in bf16. Raises ValueError when the DiT weights do not match the
+            yaml ``dit`` block.
         """
         from diffusers import AutoencoderKLLTXVideo
         from safetensors.torch import load_file
@@ -163,35 +181,76 @@ class GEBaseFastVideoBackbone(VideoBackbone):
 
         from openwam.model.video_backbone.ge.dit import LTXVideoTransformer3DModel
 
-        if ckpt_dir is not None:
-            # Rebuild from a run dir (resume / finetune, ckpt_model_loader): `source` is that run's own
-            # video_backbone cfg. Build the same pretrained model from it; the caller then overwrites
-            # every weight (accelerate load_state / the safetensors load).
-            vb_cfg = source
-        else:
-            vb_cfg = source.get("video_backbone")
-        model_path = str(_cfg(vb_cfg, "model_path"))
-        ltx_path = str(_cfg(vb_cfg, "ltx_path"))
-
-        dit = LTXVideoTransformer3DModel()
-        state = load_file(os.path.join(model_path, str(_cfg(vb_cfg, "weights_file", "GE_base_fast_v0.1.safetensors"))))
-        dit.load_state_dict(state, strict=True)  # 718 tensors, no action expert
+        ltx_path = str(cfg.ltx_path)
+        # Real (random) init before the load: its RNG draws are part of the training seed stream.
+        dit = LTXVideoTransformer3DModel(**OmegaConf.to_container(cfg.dit))
+        state = load_file(os.path.join(str(cfg.model_path), str(cfg.weights_file)))
+        try:
+            load_strict(dit, state, assign=False)  # 718 tensors, no action expert
+        except ValueError as err:
+            raise ValueError(f"GE DiT weights do not match the yaml dit={dict(cfg.dit)}: {err}") from err
         dit.to(torch.bfloat16)
         vae = AutoencoderKLLTXVideo.from_pretrained(ltx_path, subfolder="vae", torch_dtype=torch.bfloat16)
         tokenizer = T5Tokenizer.from_pretrained(ltx_path, subfolder="tokenizer")
         text_encoder = T5EncoderModel.from_pretrained(ltx_path, subfolder="text_encoder", torch_dtype=torch.bfloat16)
-        if text_dim is not None and int(text_dim) != int(dit.config.caption_channels):
-            raise ValueError(f"ge_base_fast text_dim is {dit.config.caption_channels}, architecture asked {text_dim}")
+        return cls._assemble(cfg, dit, vae, tokenizer, text_encoder, ltx_path)
+
+    @classmethod
+    def from_checkpoint_dir(cls, cfg: DictConfig, ckpt_dir: str) -> "GEBaseFastVideoBackbone":
+        """Build the empty skeleton of a saved checkpoint; the caller loads its weights.
+
+        Args:
+            cfg: the checkpoint's ``cfg.model.video_backbone`` (DiT geometry + scalar knobs).
+            ckpt_dir: str, checkpoint dir holding ``ltx/{vae,text_encoder}/config.json`` and ``ltx/tokenizer/``.
+
+        Returns:
+            GEBaseFastVideoBackbone whose parameters are all on ``meta`` (bf16).
+        """
+        from accelerate import init_empty_weights
+        from diffusers import AutoencoderKLLTXVideo
+        from transformers import T5Config, T5EncoderModel, T5Tokenizer
+
+        from openwam.model.video_backbone.ge.dit import LTXVideoTransformer3DModel
+
+        assets = os.path.join(ckpt_dir, _CKPT_ASSET_SUBDIR)
+        if not os.path.isdir(assets):
+            raise FileNotFoundError(f"GE assets not found at {assets} (written by save_deploy_assets)")
+        vae_config = AutoencoderKLLTXVideo.load_config(assets, subfolder="vae")
+        t5_config = T5Config.from_pretrained(assets, subfolder="text_encoder")
+        # Buffers stay real (include_buffers=False): the persistent ones are overwritten by the load anyway.
+        with init_empty_weights(include_buffers=False):
+            dit = LTXVideoTransformer3DModel(**OmegaConf.to_container(cfg.dit))
+            vae = AutoencoderKLLTXVideo.from_config(vae_config)
+            text_encoder = T5EncoderModel(t5_config)
+        # Tie shared / encoder.embed_tokens as from_pretrained does (one tensor; the strict load keeps the tie).
+        text_encoder.tie_weights()
+        tokenizer = T5Tokenizer.from_pretrained(assets, subfolder="tokenizer")
+        modules = [m.to(dtype=torch.bfloat16) for m in (dit, vae, text_encoder)]
+        return cls._assemble(cfg, modules[0], modules[1], tokenizer, modules[2], assets)
+
+    @classmethod
+    def _assemble(cls, cfg: DictConfig, dit, vae, tokenizer, text_encoder, assets_dir: str) -> "GEBaseFastVideoBackbone":
+        """Shared tail of both constructors: wrap the modules with the yaml's scalar knobs.
+
+        Args:
+            cfg: ``cfg.model.video_backbone``. dit / vae / tokenizer / text_encoder: built components.
+            assets_dir: str, the LTX-Video layout dir they were read from.
+
+        Returns:
+            GEBaseFastVideoBackbone.
+        """
         return cls(
             dit=dit,
             vae=vae,
             tokenizer=tokenizer,
             text_encoder=text_encoder,
-            n_view=int(_cfg(vb_cfg, "n_view", 2)),
-            text_max_length=int(_cfg(vb_cfg, "text_max_length", 128)),
-            caption_dropout_p=float(_cfg(vb_cfg, "caption_dropout_p", 0.06)),
-            vae_sample=bool(_cfg(vb_cfg, "vae_sample", True)),
-            seed=_cfg(vb_cfg, "seed", None),
+            assets_dir=assets_dir,
+            shift_video=float(cfg.shift_video),
+            n_view=int(cfg.n_view),
+            text_max_length=int(cfg.text_max_length),
+            caption_dropout_p=float(cfg.caption_dropout_p),
+            vae_sample=bool(cfg.vae_sample),
+            seed=None if cfg.seed is None else int(cfg.seed),
         )
 
     # ================================================================
@@ -209,49 +268,57 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         emb = self.text_encoder(tok.input_ids.to(dev))[0]
         return emb.to(device=self.device, dtype=self.dtype), tok.attention_mask.bool().to(self.device)
 
+    def _t5_entries(self, prompts: List[str]) -> list:
+        """Online T5 encode (the default ``text_lookup``).
+
+        Args:
+            prompts: list[str] of B prompts.
+
+        Returns:
+            list of B entries ``(embedding (1, 128, 4096), mask (1, 128) bool)`` on ``self.device``.
+        """
+        emb, mask = self._t5(prompts)
+        return [(emb[j : j + 1], mask[j : j + 1]) for j in range(len(prompts))]
+
     @torch.no_grad()
-    def build_text_cache(self, prompts: list, *, batch_size: int = 8, offload_device: str = "cpu") -> None:
-        """Encode every training prompt (+ the empty dropout prompt) once, then park T5 off the GPU.
+    def build_text_cache(self, prompts: list) -> None:
+        """Encode every training prompt (+ the empty dropout prompt) once, then park T5 on the CPU.
 
         Args:
             prompts: list[str], the dataset's prompt set.
-            batch_size: int, prompts per T5 forward.
-            offload_device: where T5 lives afterwards (stays a registered child).
+
+        Returns:
+            None. ``text_lookup`` becomes a PromptCache (8 prompts per T5 forward, prompts + "" deduplicated in
+            order); T5 stays a registered child.
         """
-        cache = {}
-        allp = list(dict.fromkeys(list(prompts) + [""]))
-        for i in range(0, len(allp), batch_size):
-            chunk = allp[i : i + batch_size]
-            emb, mask = self._t5(chunk)
-            for j, p in enumerate(chunk):
-                cache[p] = (emb[j : j + 1].clone(), mask[j : j + 1].clone())
-        self._text_cache = cache
-        self.text_encoder.to(offload_device)
+        self.text_lookup = PromptCache(self.text_lookup, list(dict.fromkeys(list(prompts) + [""])), batch_size=8)
+        self.text_encoder.to("cpu")
         torch.cuda.empty_cache()
 
-    def _encode_text(self, prompts: List[str]) -> Tuple[Tensor, Tensor]:
-        """(B, 128, 4096) context + (B, 128) mask, with GE's training-time caption dropout.
+    def encode_text(self, prompts: list, *, grid, num_frames: int) -> TextCondition:
+        """T5 context of B prompts with GE's training-time caption dropout.
 
-        Dropped samples (p = caption_dropout_p, training only) take the empty prompt's
-        embedding but keep their own mask, exactly as ge_trainer.py does.
+        Dropped samples (p = caption_dropout_p, training only) take the empty prompt's embedding but keep their
+        own mask, exactly as ge_trainer.py does (transitional: Task 12 moves caption dropout into the dataset).
+
+        Args:
+            prompts: list[str] of B prompts. grid / num_frames: unused.
+
+        Returns:
+            TextCondition: context (B, 128, 4096), context_mask (B, 128) the tokenizer attention mask, extra {}.
         """
-        need = list(prompts) + [""]
-        if self._text_cache is not None:
-            missing = [p for p in need if p not in self._text_cache]
-            if missing:
-                raise KeyError(f"text cache has no entry for prompts {missing[:3]}")
-            emb = torch.cat([self._text_cache[p][0] for p in need], dim=0)
-            mask = torch.cat([self._text_cache[p][1] for p in need], dim=0)
-        else:
-            emb, mask = self._t5(need)
+        # The empty prompt rides in the same lookup: it is the dropout replacement.
+        entries = self.text_lookup(list(prompts) + [""])
+        emb = torch.cat([e[0] for e in entries], dim=0)
+        mask = torch.cat([e[1] for e in entries], dim=0)
         emb, mask, uncond = emb[:-1].clone(), mask[:-1].clone(), emb[-1:]
         if self.training and self._caption_dropout_p > 0:
             drop = torch.tensor([self._rng.random() < self._caption_dropout_p for _ in prompts], device=emb.device)
             emb = torch.where(drop[:, None, None], uncond.expand_as(emb), emb)
-        return emb, mask
+        return TextCondition(context=emb, context_mask=mask, extra={})
 
     # ================================================================
-    # Video IO
+    # Video IO (views: split the canvas, encode / decode each tile, stack back along height)
     # ================================================================
 
     def _split_views(self, frames: Tensor) -> Tensor:
@@ -272,106 +339,44 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         std = vae.latents_std.view(1, -1, 1, 1, 1).to(lat.device, lat.dtype)
         return (lat - mean) * float(vae.config.scaling_factor) / std
 
-    def _encode_history(self, frames: Tensor) -> Tensor:
-        """Every history frame encoded alone (GE memory frames), per view.
+    def encode_pixels(self, pixels: Tensor) -> Tensor:
+        """Each view tile of each canvas clip encoded as its own causal clip.
 
         Args:
-            frames: (B, 3, H, V*h_px, W) canvas pixels in [-1, 1].
+            pixels: (N, 3, T, V*h_px, W) canvas pixels in [-1, 1], T = 1 + 8k.
+
+        Returns: (N, 128, 1 + (T-1)//8, V*h, w) latents, views stacked along height.
+        """
+        lat = self._vae_encode(self._split_views(pixels))
+        return rearrange(lat, "(b v) c t h w -> b c t (v h) w", b=pixels.shape[0])
+
+    def encode_frames(self, pixels: Tensor) -> Tensor:
+        """Every frame encoded alone, per view, in GE's sample -> view -> frame batch order.
+
+        Transitional override of the base (sample -> frame order, views split inside :meth:`encode_pixels`): in
+        training the VAE posterior is sampled, and the draw order of the noise follows the batch order, so only
+        this order keeps GE's latents bitwise equal (Task 12 unifies it).
+
+        Args:
+            pixels: (B, 3, H, V*h_px, W) canvas pixels in [-1, 1].
 
         Returns: (B, 128, H, V*h, w) latents, views stacked along height.
         """
-        b, h = frames.shape[0], frames.shape[2]
-        views = self._split_views(frames)  # (B*V, 3, H, h_px, W)
+        b, h = pixels.shape[0], pixels.shape[2]
+        views = self._split_views(pixels)  # (B*V, 3, H, h_px, W)
         hist = views.transpose(1, 2).flatten(0, 1).unsqueeze(2)  # (B*V*H, 3, 1, h_px, W)
         lat = self._vae_encode(hist).unflatten(0, (views.shape[0], h)).squeeze(3).transpose(1, 2)
         return rearrange(lat, "(b v) c t h w -> b c t (v h) w", b=b)
 
-    def _encode_clip(self, frames: Tensor) -> Tensor:
-        """A clip encoded as one causal clip, per view.
-
-        Args:
-            frames: (B, 3, T, V*h_px, W) canvas pixels in [-1, 1], T = 1 + 8k.
-
-        Returns: (B, 128, 1 + (T-1)//8, V*h, w) latents, views stacked along height.
-        """
-        lat = self._vae_encode(self._split_views(frames))
-        return rearrange(lat, "(b v) c t h w -> b c t (v h) w", b=frames.shape[0])
-
-    def _to_pixels(self, frames) -> Tensor:
-        """frames: list of B clips of T PIL canvases, or (B, 3, T, H_px, W) in [-1, 1]. Returns: the tensor form."""
-        from openwam.model.video_backbone.common.pixels import pil_clips_to_tensor
-
-        return frames if torch.is_tensor(frames) else pil_clips_to_tensor(frames, device=self.device)
-
-    def preprocess_sparse_condition(self, history_frames, text, *, num_future_frames: int) -> dict:
-        """Sparse-history conditioning: H history canvases encoded one by one + the T5 context.
-
-        Args:
-            history_frames: list of B clips (H PIL canvases, ego over chest), or (B, 3, H, H_px, W) in [-1, 1].
-            text: list of B prompts (or one str for all).
-            num_future_frames: int F (1 + 8k).
-
-        Returns:
-            dict with ``first_frame_latents`` (B, 128, H, V*h, w), ``num_clean_prefix_frames`` = H, ``context``
-            (B, 128, 4096), ``context_mask``, ``seq_lens``, ``num_frames`` = H + F, ``height``, ``width``.
-        """
-        frames_t = self._to_pixels(history_frames)
-        self.num_future_latents(num_future_frames)  # validates F = 1 + 8k
-        latents = self._encode_history(frames_t).to(dtype=self.dtype)
-        prompts = [text] * len(frames_t) if isinstance(text, str) else list(text)
-        context, mask = self._encode_text(prompts)
-        return {
-            "first_frame_latents": latents,
-            "num_clean_prefix_frames": int(frames_t.shape[2]),
-            "context": context,
-            "context_mask": mask,
-            "seq_lens": mask.sum(dim=1).long(),
-            "num_frames": int(frames_t.shape[2]) + int(num_future_frames),
-            "height": int(frames_t.shape[3]),
-            "width": int(frames_t.shape[4]),
-        }
-
-    def encode_sparse_future(self, future_frames) -> Tensor:
-        """future_frames: list of B clips of F PIL canvases (or the tensor form). Returns: (B, 128, 1 + (F-1)//8, V*h, w)."""
-        return self._encode_clip(self._to_pixels(future_frames)).to(dtype=self.dtype)
-
-    def preprocess_input_for_train(self, *, frames=None, text=None, **kw) -> dict:
-        """Raw clips + prompts → denoising-loop inputs.
-
-        Args:
-            frames: list of B clips (H + F PIL canvases, ego over chest) or (B, 3, T, H_px, W) in [-1, 1].
-            text: list of B prompts.
-            num_history_frames (kw): H clean single-frame history latents (07: 5); 0 = first frame only.
-
-        Returns:
-            dict with ``input_latents`` (B, 128, T_lat, V*h, w), ``first_frame_latents`` (the clean
-            prefix), ``num_clean_prefix_frames``, ``context`` (B, 128, 4096), ``context_mask``,
-            ``seq_lens``.
-        """
-        frames_t = self._to_pixels(frames)
-        n_hist = int(kw.get("num_history_frames", 0) or 0)
-        n_fut = frames_t.shape[2] - n_hist
-        if (n_fut - 1) % self._temporal_compression:
-            raise ValueError(f"ge_base_fast: future frames must be 1 + 8k, got {n_fut}")
-        if n_hist > 0:
-            # Sparse history = the shared condition (also built by deploy) + the future clip as target.
-            cond = self.preprocess_sparse_condition(frames_t[:, :, :n_hist], text, num_future_frames=n_fut)
-            fut = self.encode_sparse_future(frames_t[:, :, n_hist:])
-            return {**cond, "input_latents": torch.cat([cond["first_frame_latents"], fut], dim=2)}
-        latents = self._encode_clip(frames_t).to(dtype=self.dtype)
-        prompts = [text] * len(frames_t) if isinstance(text, str) else list(text)
-        context, mask = self._encode_text(prompts)
-        return {
-            "input_latents": latents,
-            "first_frame_latents": latents[:, :, :1].clone(),
-            "num_clean_prefix_frames": 1,
-            "context": context,
-            "context_mask": mask,
-            "seq_lens": mask.sum(dim=1).long(),
-            "num_frames": int(frames_t.shape[2]),
-            "height": int(frames_t.shape[3]),
-            "width": int(frames_t.shape[4]),
-        }
+    def decode_latents(self, latents: Tensor) -> Tensor:
+        """(N, 128, T, V*h, w) normalized latents → (N, 3, 1 + 8 (T-1), V*h_px, W) canvas pixels, views stacked."""
+        vae = self.vae
+        lat = rearrange(latents, "b c t (v h) w -> (b v) c t h w", v=self._n_view)
+        mean = vae.latents_mean.view(1, -1, 1, 1, 1).to(lat.device, lat.dtype)
+        std = vae.latents_std.view(1, -1, 1, 1, 1).to(lat.device, lat.dtype)
+        lat = lat * std / float(vae.config.scaling_factor) + mean
+        video = vae.decode(lat.to(next(vae.parameters()).dtype)).sample  # (N*V, 3, T, h, w)
+        return rearrange(video, "(b v) c t h w -> b c t (v h) w", v=self._n_view)
 
     # ================================================================
     # Native training noise (ge_trainer.py:574-596, 646-648)
@@ -407,21 +412,34 @@ class GEBaseFastVideoBackbone(VideoBackbone):
             raise ValueError(f"latent height {vh} does not split into {self._n_view} views")
         return t, vh // self._n_view, w
 
-    def prepare(self, **kw) -> BlockLoopState:
+    def prepare(
+        self,
+        *,
+        latents: Tensor,
+        timestep: Tensor,
+        text: TextCondition,
+        num_clean_latents: int,
+        raw_proprio: Optional[Tensor] = None,
+        use_gradient_checkpointing: bool = False,
+        use_gradient_checkpointing_offload: bool = False,
+    ) -> BlockLoopState:
         """Patchify (patch 1: one token per latent pixel), per-token time / view modulation, RoPE, text.
 
-        Inputs (kw): ``latents`` (B, 128, T, V*h, w); ``timestep`` (B,) in [0, 1000];
-        ``num_clean_prefix_frames`` H (their tokens get t = 0, GE pixel_wise_timestep);
-        ``context`` (B, L, 4096) (text, + proprio appended by the framework); ``context_mask`` (B, L).
+        Args:
+            latents: (B, 128, T, V*h, w). timestep: (B,) in [0, 1000].
+            text: TextCondition, context (B, L, 4096) (text, + proprio appended by the framework), context_mask (B, L).
+            num_clean_latents: int H, clean prefix latents (their tokens get t = 0, GE pixel_wise_timestep).
+            raw_proprio: unused. use_gradient_checkpointing(_offload): bool loop flags.
+
+        Returns:
+            BlockLoopState.
         """
         dit = self.dit
-        latents = kw["latents"]
-        timestep = kw["timestep"]
         b = latents.shape[0]
         t_lat, vh, vw = self._grid(latents)
         n_view = self._n_view
         tpf = n_view * vh * vw
-        n_clean = int(kw.get("num_clean_prefix_frames", 0) or 0)
+        n_clean = int(num_clean_latents)
 
         # Tokens: frame-major, views inside a frame (= flatten the stacked latent grid).
         hidden = dit.proj_in(rearrange(latents, "b c t h w -> b (t h w) c").to(dit.proj_in.weight.dtype))
@@ -454,13 +472,8 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         sin = rearrange(sin[:, :, None].expand(-1, -1, n_view, -1, -1, -1), "o t v y x d -> o (t v y x) d")
 
         # Text (+ proprio) → caption projection; mask True = attend.
-        context = dit.caption_projection(kw["context"].to(hidden.dtype))
-        cmask = kw.get("context_mask")
-        if cmask is None:
-            seq_lens = kw.get("seq_lens")
-            pos = torch.arange(context.shape[1], device=context.device)[None]
-            cmask = pos < seq_lens.to(context.device)[:, None] if seq_lens is not None else torch.ones_like(pos, dtype=torch.bool).expand(b, -1)
-        cmask = cmask.to(device=context.device, dtype=torch.bool)
+        context = dit.caption_projection(text.context.to(hidden.dtype))
+        cmask = text.context_mask.to(device=context.device, dtype=torch.bool)
 
         return BlockLoopState(
             hidden_states=hidden,
@@ -471,8 +484,8 @@ class GEBaseFastVideoBackbone(VideoBackbone):
             grid_frames=t_lat,
             grid_height=n_view * vh,
             grid_width=vw,
-            use_gradient_checkpointing=bool(kw.get("use_gradient_checkpointing", False)),
-            use_gradient_checkpointing_offload=bool(kw.get("use_gradient_checkpointing_offload", False)),
+            use_gradient_checkpointing=bool(use_gradient_checkpointing),
+            use_gradient_checkpointing_offload=bool(use_gradient_checkpointing_offload),
             extras={"cos": cos, "sin": sin, "emb_t": emb_t, "view_h": vh, "n_clean": max(n_clean, 1)},
         )
 
@@ -572,31 +585,32 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         )
 
     # ================================================================
-    # Deploy (decode only; inference preprocessing is not wired yet)
+    # Deploy assets
     # ================================================================
 
     def build_video_to_video_mask(self, video_seq_len: int, video_tokens_per_frame: int, device) -> Tensor:
         raise NotImplementedError("ge_base_fast builds its masks per layer (build_joint_attention_masks)")
 
-    def preprocess_input_for_inference(self, **kw) -> dict:
-        raise NotImplementedError("ge_base_fast deploy preprocessing is not wired yet (07 trains only)")
+    def save_deploy_assets(self, output_dir: str) -> None:
+        """Copy the VAE / T5 ``config.json`` and the tokenizer into ``<output_dir>/ltx/`` (from_checkpoint_dir reads them).
 
-    def decode_video(self, latents: Tensor, *, tiled: bool = True) -> list:
-        """(1, 128, T, V*h, w) normalized latents → list of vstacked PIL canvases."""
-        from openwam.model.video_backbone.common.pixels import tensor_to_pil_frames
+        Args:
+            output_dir: str, checkpoint dir. Files come from wherever this backbone read them (ltx_path or a ckpt).
 
-        vae = self.vae
-        lat = rearrange(latents, "b c t (v h) w -> (b v) c t h w", v=self._n_view)
-        mean = vae.latents_mean.view(1, -1, 1, 1, 1).to(lat.device, lat.dtype)
-        std = vae.latents_std.view(1, -1, 1, 1, 1).to(lat.device, lat.dtype)
-        lat = lat * std / float(vae.config.scaling_factor) + mean
-        video = vae.decode(lat.to(next(vae.parameters()).dtype)).sample  # (V, 3, T, h, w)
-        video = rearrange(video, "(b v) c t h w -> b c t (v h) w", v=self._n_view)
-        return tensor_to_pil_frames(video.float().clamp(-1, 1))
-
-    def save_deploy_assets(self, output_dir: str, cfg) -> None:
-        """No self-contained deploy bundle yet; checkpoints reload via the training cfg paths."""
-        logger.info("ge_base_fast: deploy-asset embedding not implemented; skipping.")
+        Returns:
+            None. Files already present are left as they are.
+        """
+        for rel in _LTX_ASSETS:
+            src = os.path.join(self._assets_dir, rel)
+            dst = os.path.join(output_dir, _CKPT_ASSET_SUBDIR, rel)
+            if os.path.exists(dst):
+                continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            # The tokenizer is a directory of side files; the two configs are single files.
+            if os.path.isdir(src):
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
 
 
 __all__ = ["GEBaseFastVideoBackbone"]

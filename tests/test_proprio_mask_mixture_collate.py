@@ -2,9 +2,9 @@
 
 Asserts that a mixed [EgoDex-style mask=False, AgiBot-style mask=True] batch
 gets a per-row proprio_mask collected by ``prepare_inputs`` and consumed by
-``_append_proprio_context_token`` via ``pipeline_inputs['_proprio_sample_mask']``.
+``_append_proprio_context_token`` as its ``sample_mask`` argument.
 
-We avoid spinning up a real video backbone by stubbing ``preprocess`` and the
+We avoid spinning up a real video backbone by stubbing its ``preprocess_train`` and the
 sample-pipeline transform, and by driving the proprio path directly via
 ``_append_proprio_context_token``. Backbones aren't needed for the per-sample
 gating contract: prepare_inputs collects, compute_loss routes, the helper
@@ -13,11 +13,14 @@ consumes. Mid-pipeline behavior (video backbone forward) is out of scope.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from openwam.model.architectures.dual_system.joint_self_attn import (
     DualSystemSelfAttnArchitecture,
 )
+from openwam.model.video_backbone.base import TextCondition
 
 
 class _IdentityTransform:
@@ -45,9 +48,9 @@ class _StubArch(DualSystemSelfAttnArchitecture):
         self._max_timestep_boundary = 1.0
         self._min_timestep_boundary = 0.0
         self._pipeline_transform_instance = _IdentityTransform()
-
-    def preprocess(self, **kwargs) -> dict:
-        return {}
+        self.video_backbone = SimpleNamespace(
+            preprocess_train=lambda clips, prompts, *, num_hist_frames: (None, None, None)
+        )
 
 
 def _egodex_like_sample(state_dim: int = 20):
@@ -80,12 +83,13 @@ def _agibot_like_sample(state_dim: int = 20):
 def _run_through_proprio_helper(arch: _StubArch, inputs: dict, text_len: int = 4):
     """Helper: synthesize a context tensor + drive _append_proprio_context_token."""
     B = inputs["proprio"].shape[0]
-    pipeline_inputs = {
-        "context": torch.randn(B, text_len, arch.context_dim),
-        "seq_lens": torch.tensor([text_len] * B),
-        "_proprio_sample_mask": inputs["proprio_mask"],
-    }
-    return arch._append_proprio_context_token(pipeline_inputs, inputs["proprio"])
+    text = _text(torch.randn(B, text_len, arch.context_dim))
+    return arch._append_proprio_context_token(text, inputs["proprio"], inputs["proprio_mask"])
+
+
+def _text(context):
+    """context: (B, L, D). Returns: TextCondition with every text token valid."""
+    return TextCondition(context=context, context_mask=torch.ones(context.shape[:2], dtype=torch.bool))
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +109,8 @@ def test_egodex_agibot_mixed_batch_end_to_end():
     assert inputs["proprio_mask"].squeeze(-1).tolist() == [False, True]
 
     out = _run_through_proprio_helper(arch, inputs)
-    assert out["context"].shape == (2, 5, 16)
-    assert out["context_mask"].shape == (2, 5)
+    assert out.context.shape == (2, 5, 16)
+    assert out.context_mask.shape == (2, 5)
 
 
 def test_mixed_batch_context_mask_last_two_match():
@@ -116,11 +120,11 @@ def test_mixed_batch_context_mask_last_two_match():
     inputs = arch.prepare_inputs(batch)
     out = _run_through_proprio_helper(arch, inputs)
 
-    assert out["context_mask"][:, -1].tolist() == [False, True]
+    assert out.context_mask[:, -1].tolist() == [False, True]
     # EgoDex row: appended proprio token must be all-zero
-    assert out["context"][0, -1, :].abs().sum().item() == 0.0
+    assert out.context[0, -1, :].abs().sum().item() == 0.0
     # AgiBot row: appended proprio token must be non-zero
-    assert out["context"][1, -1, :].abs().sum().item() > 0
+    assert out.context[1, -1, :].abs().sum().item() > 0
 
 
 # ---------------------------------------------------------------------------
@@ -135,13 +139,11 @@ def test_mixed_batch_egodex_no_proprio_encoder_grad():
     arch_mixed.proprio_encoder.zero_grad(set_to_none=True)
     inputs_mixed = arch_mixed.prepare_inputs([_egodex_like_sample(), _agibot_like_sample()])
     torch.manual_seed(0)
-    pipeline_inputs_mixed = {
-        "context": torch.randn(2, 4, arch_mixed.context_dim),
-        "seq_lens": torch.tensor([4, 4]),
-        "_proprio_sample_mask": inputs_mixed["proprio_mask"],
-    }
-    out_mixed = arch_mixed._append_proprio_context_token(pipeline_inputs_mixed, inputs_mixed["proprio"])
-    out_mixed["context"].sum().backward()
+    text_mixed = _text(torch.randn(2, 4, arch_mixed.context_dim))
+    out_mixed = arch_mixed._append_proprio_context_token(
+        text_mixed, inputs_mixed["proprio"], inputs_mixed["proprio_mask"]
+    )
+    out_mixed.context.sum().backward()
     g_mixed = arch_mixed.proprio_encoder.weight.grad.clone()
 
     # AgiBot-only reference, identical encoder init
@@ -151,13 +153,9 @@ def test_mixed_batch_egodex_no_proprio_encoder_grad():
     inputs_solo = arch_solo.prepare_inputs([_agibot_like_sample()])
     torch.manual_seed(0)
     ctx_full = torch.randn(2, 4, arch_solo.context_dim)
-    pipeline_inputs_solo = {
-        "context": ctx_full[1:2].detach().clone(),
-        "seq_lens": torch.tensor([4]),
-        "_proprio_sample_mask": inputs_solo["proprio_mask"],
-    }
-    out_solo = arch_solo._append_proprio_context_token(pipeline_inputs_solo, inputs_solo["proprio"])
-    out_solo["context"].sum().backward()
+    text_solo = _text(ctx_full[1:2].detach().clone())
+    out_solo = arch_solo._append_proprio_context_token(text_solo, inputs_solo["proprio"], inputs_solo["proprio_mask"])
+    out_solo.context.sum().backward()
     g_solo = arch_solo.proprio_encoder.weight.grad.clone()
 
     assert torch.allclose(g_mixed, g_solo, atol=1e-6, rtol=1e-5)

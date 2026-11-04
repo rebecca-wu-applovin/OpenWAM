@@ -5,7 +5,8 @@ Call order — core skeleton only:
   __init__():  seed -> build_architecture -> freeze -> init_schedulers
                -> [latent setup] -> log param counts
   train():     build optimizer/dataloader/scheduler -> setup output dir
-               -> accelerate prepare -> loop{ compute_loss -> backward/clip/step
+               -> accelerate prepare -> (resume) load full state -> text cache
+               -> loop{ compute_loss -> backward/clip/step
                -> reduce metrics -> log step -> maybe save ckpt }
                -> finish_training (final ckpt, drop resume state, close wandb)
 
@@ -89,56 +90,38 @@ class OpenWAMTrainer:
         t = cfg.training
         m = cfg.model
 
-        # Build architecture (creates video_backbone internally from config).
+        # Build architecture (creates video_backbone internally from config). The load mode is decided
+        # here, once: no ckpt -> upstream pretrained weights; finetune / resume -> the checkpoint's shell
+        # (same shell for both; they differ only in how its weights are filled, see ckpt_model_loader).
         from openwam.model import build_architecture, resolve_architecture_config
+        from openwam.model.video_backbone import LoadMode
 
-        # Finetune/resume: build from the self-contained checkpoint dir
-        # (skeletons from its config.yaml component specs, weights from its
-        # safetensors) so model.video_backbone.model_path need not exist on
-        # this host. Weights land here, BEFORE the freeze below. The ckpt config
-        # is the reconstruction BASE only — on finetune this run's cfg.model is
-        # layered on top (see ckpt_model_loader.merge_ckpt_model_cfg).
         finetune_path = cfg_get(t, "finetune_ckpt_path", None) or None
         resume_path = cfg_get(t, "resume_ckpt_path", None) or None
         if finetune_path and resume_path:
             raise ValueError("finetune_ckpt_path and resume_ckpt_path are mutually exclusive; set at most one.")
-        self._ckpt_source_dir = finetune_path or resume_path
-        if self._ckpt_source_dir is not None:
-            from openwam.train.utils.ckpt_model_loader import (
-                build_architecture_from_ckpt_dir,
-                propagate_component_specs,
-                warn_live_model_cfg_ignored,
-            )
+        if finetune_path is not None:
+            from openwam.train.utils.ckpt_model_loader import build_for_finetune
 
-            # Finetune starts a NEW run: the ckpt config is only the
-            # reconstruction base (it alone carries the component/tokenizer
-            # specs), and this run's cfg.model overrides it — merged in place, so
-            # the architecture built here and the config save_config() writes to
-            # the new run dir are the same one. Resume continues ONE run whose
-            # config.yaml is already on disk and is reused untouched, so there the
-            # ckpt config stays authoritative and divergence is only reported.
-            resolved_arch, self.architecture, ckpt_cfg = build_architecture_from_ckpt_dir(
-                self._ckpt_source_dir,
-                weights_required=finetune_path is not None,
-                override_cfg=cfg if finetune_path is not None else None,
-            )
-            if finetune_path is not None:
-                # The merge replaced the cfg.model node, so `m` (bound above)
-                # still points at the pre-merge one — rebind it before `freeze`
-                # and the architecture logging below read from it.
-                m = cfg.model
-            else:
-                warn_live_model_cfg_ignored(ckpt_cfg, cfg, self._ckpt_source_dir)
-                propagate_component_specs(ckpt_cfg, cfg)
+            # Finetune starts a NEW run: this run's cfg.model is layered over the ckpt's and written back
+            # in place, so the architecture built here and the config save_config() writes are the same.
+            # Weights land here, BEFORE the freeze below.
+            self.architecture = build_for_finetune(finetune_path, cfg)
+            # The merge replaced the cfg.model node, so `m` (bound above) still points at the pre-merge
+            # one — rebind it before `freeze` and the architecture logging below read from it.
+            m = cfg.model
+        elif resume_path is not None:
+            from openwam.train.utils.ckpt_model_loader import build_for_resume
+
+            # Resume continues ONE run whose config.yaml is reused untouched (ckpt config authoritative);
+            # its weights are restored by load_full_state after prepare.
+            self.architecture = build_for_resume(resume_path, cfg)
         else:
-            resolved_arch = resolve_architecture_config(m)
-            self.architecture = build_architecture(resolved_arch.registry_name, resolved_arch.params)
-        logger.info(
-            "Architecture: %s (framework=%s variant=%s)",
-            resolved_arch.registry_name,
-            resolved_arch.canonical.framework,
-            resolved_arch.canonical.variant,
-        )
+            resolved = resolve_architecture_config(m)
+            self.architecture = build_architecture(
+                resolved.registry_name, resolved.params, mode=LoadMode.PRETRAINED, ckpt_dir=None
+            )
+        logger.info("Architecture: %s", type(self.architecture).__name__)
 
         # Device placement: skip .to(device) when initialize_model_on_cpu and a real
         # training Accelerator is present — DeepSpeed's prepare() then handles the move.
@@ -238,9 +221,6 @@ class OpenWAMTrainer:
 
         output_path, resume_state_dir = self.setup_output_dir(debug, resume_path)
         optimizer, dataloader, scheduler = self.prepare_accelerate(optimizer, dataloader, scheduler)
-        # After prepare (DeepSpeed moves the whole module to the GPU): encode prompts once, park T5 on CPU.
-        if bool(cfg_get(t, "cache_text_embeddings", False)):
-            self.cache_text_embeddings()
 
         if self._run_seed is not None:
             wire_sampler_seed(dataloader, int(self._run_seed), rank=self._rank)
@@ -300,6 +280,11 @@ class OpenWAMTrainer:
                     "for faithful mid-epoch resume.",
                     skip_first,
                 )
+
+        # Text cache only now that the weights are final (prepare -> resume load_full_state -> cache, the same
+        # order for every mode): on resume the text encoder holds real values only after load_full_state.
+        if bool(self.cfg.model.video_backbone.text_cache):
+            self.build_text_cache()
 
         _step_t0 = _time.monotonic()
         # Per-phase step timing (wandb timing/*); DeepSpeed's engine.step is hooked so
@@ -500,15 +485,9 @@ class OpenWAMTrainer:
                 run_dir_name += "_debug"
             output_path = os.path.join(base_output_path, run_dir_name)
             os.makedirs(output_path, exist_ok=True)
-            # Self-contained deploy: backbones save assets, then config + action stats.
-            # BEFORE save_config so config.yaml carries the merged reconstruction specs.
-            self.architecture.save_assets_for_deployment(output_path, self.cfg)
-            if self._ckpt_source_dir is not None:
-                # Self-contained finetune/resume: model_path may be unreachable,
-                # so relay the tokenizer files from the source ckpt dir instead.
-                from openwam.train.utils.ckpt_model_loader import copy_ckpt_artifacts
-
-                copy_ckpt_artifacts(self._ckpt_source_dir, output_path)
+            # Self-contained deploy: backbones copy their non-weight assets (from model_path, or from the
+            # source ckpt dir on finetune), then config + action stats.
+            self.architecture.save_assets_for_deployment(output_path)
             save_config(output_path, self.cfg)
             if self.dataset is not None:
                 save_normalization_stats(output_path, self.dataset)
@@ -551,25 +530,17 @@ class OpenWAMTrainer:
         )
         return optimizer, dataloader, scheduler
 
-    # (7b) Called by train() after prepare when training.cache_text_embeddings is on.
-    def cache_text_embeddings(self) -> None:
+    # (7b) Called by train() after prepare (and the resume load) when model.video_backbone.text_cache is on.
+    def build_text_cache(self) -> None:
         """Pre-encode the dataset's full prompt set; the frozen text encoder then sits on CPU.
 
         Input: none (uses self.dataset.all_prompts() and the unwrapped architecture's video backbone).
-        Returns: None. Logs and keeps online encoding when the backbone or dataset can't support it.
+        Returns: None. The backbone raises if it cannot cache (cosmos3: its yaml says text_cache: false).
         """
         arch = self.architecture if self.accelerator is None else self.accelerator.unwrap_model(self.architecture)
-        bb = arch.video_backbone
-        prompts = self.dataset.all_prompts() if hasattr(self.dataset, "all_prompts") else None
-        if not hasattr(bb, "build_text_cache") or not prompts:
-            logger.warning(
-                "cache_text_embeddings: unsupported here (backbone %s, dataset %s); encoding text online",
-                type(bb).__name__,
-                type(self.dataset).__name__,
-            )
-            return
-        bb.build_text_cache(prompts)
-        logger.info("cache_text_embeddings: cached %d prompts; text encoder moved to CPU", len(prompts))
+        prompts = self.dataset.all_prompts()
+        arch.video_backbone.build_text_cache(prompts)
+        logger.info("text cache: cached %d prompts; text encoder moved to CPU", len(prompts))
 
     # (8) Called by train() on the resume path — restore full state, map step -> (start_epoch, skip).
     def resume_if_configured(self, resume_state_dir: str, dataloader, grad_accum: int) -> tuple[int, int, int, int]:

@@ -1,6 +1,40 @@
 # Wan2.2-TI2V-5B video backbone (cfg.model.video_backbone.*). Any H,W % 32 == 0.
+# The module geometry below is declared here (not inferred from the weight files): the backbone is
+# built from it on the meta device and the weights are then loaded strictly, so a wrong number fails
+# at build time. longlive2_robot_s / wan22_ti2v_tiny start from this file and override a few keys.
 
 name: wan22_ti2v_5b
-model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Wan2.2-TI2V-5B  # [Required] weights dir
+model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Wan2.2-TI2V-5B  # [Required] upstream weights dir
+init: pretrained          # pretrained: load `weights` from model_path | random: random init (debug only, no weight files)
+weights:                  # upstream file names under model_path
+  dit: diffusion_pytorch_model*.safetensors   # glob over the shards
+  vae: Wan2.2_VAE.pth
+  text_encoder: models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: ${.model_path}/google/umt5-xxl   # umT5 tokenizer dir read by from_pretrained (deploy reads the ckpt's copy)
+dit_weights: null         # null: DiT from model_path/weights.dit; a file path: DiT from that file instead (LongLive)
+dit_weights_prefix: ""    # key prefix stripped from dit_weights
 
-shift_video: 5.0      # flow-matching α-shift for the video scheduler (train + deploy single source of truth)
+shift_video: 5.0          # flow-matching α-shift for the video scheduler (train + deploy single source of truth)
+text_max_length: 512      # umT5 tokens per prompt
+text_cache: true          # trainer encodes the dataset's prompt set once after the weights are in place, umT5 then on CPU
+
+dit:                      # WanModel (TI2V: seperated_timestep / fuse_vae_embedding_in_latents are fixed in code)
+  dim: 3072
+  ffn_dim: 14336
+  num_heads: 24
+  num_layers: 30
+  text_dim: 4096          # must equal text_encoder.dim (context width)
+  in_dim: 48              # = vae.z_dim
+  out_dim: 48
+  freq_dim: 256
+  eps: 1.0e-06
+  patch_size: [1, 2, 2]
+vae:                      # WanVideoVAE38
+  z_dim: 48
+  dim: 160
+text_encoder:             # WanTextEncoder (umT5-XXL encoder)
+  dim: 4096
+  dim_attn: 4096
+  dim_ffn: 10240
+  num_heads: 64
+  num_layers: 24

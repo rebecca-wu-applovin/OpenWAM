@@ -152,10 +152,9 @@ def main(cfg: DictConfig) -> None:
         print(OmegaConf.to_yaml(cfg))
         print("=" * 60)
     else:
-        # Silence stray ``print(...)`` calls in vendored loaders (e.g. diffsynth's
-        # ``model_loader.py``) on non-main ranks — they otherwise print "Loading
-        # models from: ..." / "Loaded model: { ... }" once per rank, doubling
-        # the startup log. Logging-based output is unaffected.
+        # Silence stray ``print(...)`` calls (third-party loaders, the ckpt loader's
+        # warm-start notice) on non-main ranks — they would otherwise print once
+        # per rank, multiplying the startup log. Logging-based output is unaffected.
         import builtins
 
         builtins.print = lambda *a, **kw: None

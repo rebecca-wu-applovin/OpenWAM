@@ -221,12 +221,18 @@ class _TinyVideoBackbone:
     def __init__(self):
         self.scheduler = _TinyScheduler()
 
-    def preprocess_input_for_inference(self, *args, **kwargs):
-        del args, kwargs
-        return {"latents": torch.zeros(1, 1, 1, 1, 1)}
+    @staticmethod
+    def num_future_latents(num_frames):
+        del num_frames
+        return 1
 
-    def decode_video(self, latents, tiled=True):
-        del latents, tiled
+    @staticmethod
+    def preprocess_condition(history, prompts, *, num_frames, num_latents):
+        del history, prompts, num_frames, num_latents
+        return torch.zeros(1, 1, 1, 1, 1), None
+
+    def decode_video(self, latents):
+        del latents
         return None
 
 
@@ -263,6 +269,7 @@ def test_base_generate_unnormalizes_deploy_actions():
     result = arch.generate(
         schedule=[(0.0, 1.0), (0.0, 0.0)],
         prompt="",
+        first_frame_image=object(),
         num_frames=2,
         decode_video=False,
         seed=123,

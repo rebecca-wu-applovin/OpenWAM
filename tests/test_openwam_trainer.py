@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 from openwam.model.architectures.dual_system import DualSystemCrossAttnArchitecture
-from openwam.model.video_backbone.base import BlockLoopState, VideoBackbone
+from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
 
 # ---------------------------------------------------------------------------
 # Mock pipeline: replaces WanVideoPipeline to avoid loading ~20GB of weights
@@ -138,7 +138,11 @@ class _MockVideoBackbone(VideoBackbone):
         self.last_extracted = None
 
     @classmethod
-    def from_pretrained(cls, source, **kw):
+    def from_pretrained(cls, cfg):
+        return cls()
+
+    @classmethod
+    def from_checkpoint_dir(cls, cfg, ckpt_dir):
         return cls()
 
     @property
@@ -247,16 +251,19 @@ class _MockVideoBackbone(VideoBackbone):
         state.hidden_states = state.hidden_states[:, :n_video, :]
         return state, action_tokens
 
-    def preprocess_input_for_train(self, *, frames=None, text=None, **kw):
-        # ``first_frame_latents`` puts the test on the Wan TI2V path
-        # (latent[0] = conditioning, loss + mask both skip it).
-        return {
-            "input_latents": torch.randn(1, 16, 3, 8, 8),
-            "context": torch.randn(1, 4, self._dim),
-            "context_mask": torch.ones(1, 4, dtype=torch.bool),
-            "seq_lens": torch.ones(1, dtype=torch.long),
-            "first_frame_latents": torch.zeros(1, 16, 1, 8, 8),
-        }
+    def encode_pixels(self, pixels):
+        raise NotImplementedError("mock: preprocess_train is stubbed")
+
+    def decode_latents(self, latents):
+        raise NotImplementedError("mock: decode_video is stubbed")
+
+    def encode_text(self, prompts, *, grid, num_frames):
+        raise NotImplementedError("mock: preprocess_train is stubbed")
+
+    def preprocess_train(self, clips, prompts, *, num_hist_frames):
+        # One clean first-frame latent (latent[0] = conditioning, loss + mask both skip it).
+        text = TextCondition(context=torch.randn(1, 4, self._dim), context_mask=torch.ones(1, 4, dtype=torch.bool))
+        return torch.zeros(1, 16, 1, 8, 8), torch.randn(1, 16, 3, 8, 8), text
 
     def get_submodule(self, name):
         return getattr(self, f"_{name}", None)
@@ -264,7 +271,7 @@ class _MockVideoBackbone(VideoBackbone):
     def set_submodule(self, name, module):
         setattr(self, f"_{name}", module)
 
-    def decode_video(self, latents, *, tiled=True):
+    def decode_video(self, latents):
         return []
 
     def set_dtype_device(self, dtype, device):
@@ -331,11 +338,8 @@ def _make_fake_loss_inputs(B=1, action_dim=7, T_action=5, video_dim=64):
     C, T, H, W = 16, 3, 8, 8
     return {
         "input_latents": torch.randn(B, C, T, H, W),
-        "latents": None,
-        "height": H * 8,
-        "width": W * 8,
-        "num_frames": 9,
-        "tiled": False,
+        "clean_latents": torch.zeros(B, C, 1, H, W),
+        "text": TextCondition(context=torch.randn(B, 4, video_dim), context_mask=torch.ones(B, 4, dtype=torch.bool)),
         "use_gradient_checkpointing": False,
         "use_gradient_checkpointing_offload": False,
         "max_timestep_boundary": 1.0,

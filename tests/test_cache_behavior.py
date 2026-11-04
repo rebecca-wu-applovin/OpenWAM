@@ -1,178 +1,93 @@
-"""Unit tests for prompt_embed_cache in WanBase.preprocess_input_for_inference.
+"""Wan's text slot: ``encode_text`` reads ``text_lookup``, the online umT5 or (after ``build_text_cache``) a PromptCache.
 
-The deploy method builds every conditioning signal with explicit helpers (no
-WanVideoPipeline unit-runner). The only cached quantity is the text embedding
-``(context, seq_lens)``, reused via ``prompt_embed_cache``. These tests spy on
-the text encoder to verify:
+A mock tokenizer / text encoder (no weights) records each encoder call, so the tests can check:
 
-1. Cold start: no cache → text is encoded.
-2. Seen prompt: text encode skipped.
-3. Unseen prompt: cache miss → text encoded.
-4. prompt_A -> prompt_B -> prompt_A: prompt_A embed still cached.
-5. No cache: runs cleanly every call.
+1. Online: every ``encode_text`` runs the encoder.
+2. After ``build_text_cache``: no encoder call, same context / mask as online, encoder parked on CPU.
+3. A prompt outside the cached set raises KeyError.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import torch
+from torch import nn
 
-from openwam.model.video_backbone.wan.backbone import WanBase
-
-# ---------------------------------------------------------------------------
-# Minimal mock infrastructure
-# ---------------------------------------------------------------------------
-
-
-class _MockScheduler:
-    def set_timesteps(self, num_inference_steps, shift):
-        pass
-
-
-class _MockPipe:
-    def __init__(self):
-        self.scheduler = _MockScheduler()
+from openwam.model.video_backbone.wan.backbone import WanBackbone
 
 
 class _MockTokenizer:
+    """Token count = len(prompt) (capped at 4), so seq_lens differ per prompt."""
+
     def __call__(self, prompts, **kw):
         n = len(prompts)
-        return torch.zeros(n, 4, dtype=torch.long), torch.ones(n, 4, dtype=torch.long)
+        mask = torch.zeros(n, 4, dtype=torch.long)
+        for i, p in enumerate(prompts):
+            mask[i, : min(len(p), 4)] = 1
+        return torch.arange(4).repeat(n, 1), mask
 
 
-class _MockTextEncoder:
-    """Records each call so a test can count how often text was encoded."""
+class _MockTextEncoder(nn.Module):
+    """Records each call; the context depends on the token ids and mask."""
 
-    def __init__(self, calls):
-        self._calls = calls
+    def __init__(self):
+        super().__init__()
+        self.calls: list[int] = []
+        self.weight = nn.Parameter(torch.ones(1))
 
-    def __call__(self, ids, mask):
-        self._calls.append(list(range(ids.shape[0])))
-        return torch.zeros(ids.shape[0], 4, 8)
-
-
-class _MockWanVB:
-    """WanVideoBackbone-like object exercising the deploy cache seam.
-
-    The encode seams (text / noise) are stubbed so the test needs
-    no real weights or GPU; ``_encode_text`` records its calls so a test can
-    assert whether the text path was hit or served from a cache.
-    """
-
-    def __init__(self, pipe=None):
-        self._pipe = pipe if pipe is not None else _MockPipe()
-        self._device = "cpu"
-        self._dtype = torch.float32
-        self._encode_text_calls: list[list] = []
-        # Encode + conditioning seams now live in wan.encode / wan.conditioning
-        # free functions; provide the state they read explicitly.
-        self._tokenizer = _MockTokenizer()
-        self.text_encoder = _MockTextEncoder(self._encode_text_calls)
-        self._text_cache = None  # training text cache off (WanVideoBackbone.__init__ default): encode online
-        self.text_max_length = 512  # WanVideoBackbone class default (umT5 token budget)
-        self._height_division_factor = 16
-        self._width_division_factor = 16
-        self._time_division_factor = 4
-        self._time_division_remainder = 1
-        # build_deploy_noise reads z_dim / upsampling_factor off the native VAE.
-        self.vae = SimpleNamespace(model=SimpleNamespace(z_dim=4), upsampling_factor=8)
-
-    @property
-    def device(self):
-        return self._device
-
-    @property
-    def dtype(self):
-        return self._dtype
-
-    @property
-    def scheduler(self):
-        return self._pipe.scheduler
-
-    # --- real method under test (conditioning seams now in wan.conditioning) ---
-    def preprocess_input_for_inference(self, **kw):
-        return WanBase.preprocess_input_for_inference(self, **kw)
+    def forward(self, ids, mask):
+        self.calls.append(ids.shape[0])
+        return (ids.float() + mask.float()).unsqueeze(-1).expand(-1, -1, 8).clone()
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _prep(vb, prompt, prompt_embed_cache=None, seed=0):
-    return vb.preprocess_input_for_inference(
-        prompt=prompt,
-        first_frame_image=None,
-        num_frames=17,
-        height=32,
-        width=32,
-        seed=seed,
-        tiled=False,
-        num_inference_steps=2,
-        shift=5.0,
-        prompt_embed_cache=prompt_embed_cache,
+def _wan(text_encoder):
+    """A WanBackbone around the mock text side only (no DiT / VAE), on CPU."""
+    vb = WanBackbone(
+        dit=None,
+        vae=None,
+        text_encoder=text_encoder,
+        tokenizer=_MockTokenizer(),
+        tokenizer_dir="",
+        shift_video=5.0,
+        text_max_length=4,
     )
+    vb._device = torch.device("cpu")
+    return vb
 
 
-def _text_calls(vb) -> int:
-    return len(vb._encode_text_calls)
+def _encode(vb, prompts):
+    return vb.encode_text(prompts, grid=(1, 1, 1), num_frames=1)
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+def test_online_encodes_every_call():
+    enc = _MockTextEncoder()
+    vb = _wan(enc)
+    text = _encode(vb, ["ab", "abcdef"])
+    _encode(vb, ["ab"])
+    assert enc.calls == [2, 1]
+    # Mask = position < token count; context zeroed past it.
+    assert text.context_mask.tolist() == [[True, True, False, False], [True, True, True, True]]
+    assert text.context[0, 2:].abs().sum() == 0 and text.extra == {}
 
 
-def test_cold_start_encodes_text():
-    """No cache provided — text is encoded."""
-    vb = _MockWanVB()
-    _prep(vb, "prompt_A")
-    assert _text_calls(vb) == 1
+def test_cache_matches_online_and_skips_the_encoder():
+    prompts = ["ab", "abcdef", "abc"]
+    online = _encode(_wan(_MockTextEncoder()), prompts)
+    enc = _MockTextEncoder()
+    vb = _wan(enc)
+    vb.build_text_cache(prompts)
+    n_build = len(enc.calls)
+    cached = _encode(vb, prompts[::-1])
+    assert len(enc.calls) == n_build, "cached encode_text must not run the encoder"
+    assert torch.equal(cached.context, online.context.flip(0))
+    assert torch.equal(cached.context_mask, online.context_mask.flip(0))
+    assert enc.weight.device.type == "cpu" and "text_encoder.weight" in vb.state_dict()
 
 
-def test_prompt_embed_cache_hit_skips_text_encode():
-    """After first call with prompt_A, a second call skips text encode via prompt_embed_cache."""
-    vb = _MockWanVB()
-    prompt_embed_cache: dict = {}
-
-    _prep(vb, "prompt_A", prompt_embed_cache=prompt_embed_cache)
-    assert "prompt_A" in prompt_embed_cache
-    assert _text_calls(vb) == 1
-
-    _prep(vb, "prompt_A", prompt_embed_cache=prompt_embed_cache)
-    assert _text_calls(vb) == 1, "text should be served from prompt_embed_cache"
-
-
-def test_prompt_embed_cache_miss_on_new_prompt():
-    """First time seeing prompt_B: cache miss → text encoded."""
-    vb = _MockWanVB()
-    prompt_embed_cache: dict = {}
-
-    _prep(vb, "prompt_A", prompt_embed_cache=prompt_embed_cache)
-    assert "prompt_A" in prompt_embed_cache
-
-    _prep(vb, "prompt_B", prompt_embed_cache=prompt_embed_cache)
-    assert _text_calls(vb) == 2, "expected text encode for an unseen prompt"
-    assert "prompt_B" in prompt_embed_cache
-
-
-def test_prompt_embed_cache_survives_prompt_change():
-    """After prompt_A -> prompt_B -> prompt_A: prompt_A embed is still cached."""
-    vb = _MockWanVB()
-    prompt_embed_cache: dict = {}
-
-    _prep(vb, "prompt_A", prompt_embed_cache=prompt_embed_cache)
-    _prep(vb, "prompt_B", prompt_embed_cache=prompt_embed_cache)
-    calls_before = _text_calls(vb)
-
-    _prep(vb, "prompt_A", prompt_embed_cache=prompt_embed_cache)
-    assert _text_calls(vb) == calls_before, "prompt_A embed should still be cached"
-
-
-def test_both_caches_none_does_not_crash():
-    """With no caches, the function encodes text every call."""
-    vb = _MockWanVB()
-    for i in range(3):
-        _prep(vb, f"prompt_{i}")
-    assert _text_calls(vb) == 3
+def test_cache_miss_raises():
+    vb = _wan(_MockTextEncoder())
+    vb.build_text_cache(["ab"])
+    try:
+        _encode(vb, ["never seen"])
+    except KeyError:
+        return
+    raise AssertionError("an uncached prompt must raise KeyError")
