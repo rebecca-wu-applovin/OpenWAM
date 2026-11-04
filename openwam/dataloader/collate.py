@@ -40,8 +40,10 @@ class Batch:
 
         Args:
             device: torch.device (or str) to move to.
-            dtype: torch.dtype of ``action`` / ``proprio`` (default float32 = what ``collate`` builds, so
-                accelerate's dataloader, which calls ``.to(device, non_blocking=...)``, leaves values unchanged).
+            dtype: torch.dtype of ``action`` / ``proprio``. The float32 default exists for accelerate: its prepared
+                DataLoader moves every batch with ``accelerate.utils.send_to_device``, which duck-types any object
+                with ``.to`` and calls ``batch.to(device, non_blocking=...)`` without a dtype; float32 is what
+                ``collate`` builds, so that move leaves values unchanged. The trainer then passes the model dtype.
             non_blocking: bool, forwarded to ``Tensor.to``.
 
         Returns:

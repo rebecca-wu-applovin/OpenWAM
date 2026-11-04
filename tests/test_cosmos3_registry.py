@@ -81,7 +81,6 @@ def test_double_registration_raises():
 @pytest.mark.parametrize(
     "change, error, match",
     [
-        ({"text_encoder_dropout": 1.5}, ValueError, "text_encoder_dropout"),
         ({"max_text_tokens": 2}, ValueError, "max_text_tokens"),
         ({"fps": 0}, ValueError, "fps"),
         ({"freeze_und": False}, NotImplementedError, "freeze_und"),

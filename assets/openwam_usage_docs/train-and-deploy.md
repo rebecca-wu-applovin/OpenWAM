@@ -98,7 +98,7 @@ bash scripts/train.sh \
   dataloader.action_mode=fingertips_rel
 ~~~
 
-Each registered class implements from_config(config, split) and returns window samples. The trainer keeps samples as a list of dictionaries. num_frames is the raw state/action window length; the action horizon is num_frames - 1. Video is the history rows t + history_offsets followed by the future rows t + future_offsets; the standard first-frame setting (history_offsets [0], future_offsets [4, 8, ..., 32]) yields 9 video frames. Camera layout, transforms, normalization, action maps, and masks belong to the dataloader.
+Each registered class implements from_config(config, split) and returns window samples. The trainer's DataLoader stacks each list of sample dictionaries into one `Batch` dataclass with `openwam.dataloader.collate.collate`; `compute_loss(batch)` takes that `Batch`. num_frames is the raw state/action window length; the action horizon is num_frames - 1. Video is the history rows t + history_offsets followed by the future rows t + future_offsets; the standard first-frame setting (history_offsets [0], future_offsets [4, 8, ..., 32]) yields 9 video frames. Camera layout, transforms, normalization, action maps, and masks belong to the dataloader.
 
 ## 2. Start training
 

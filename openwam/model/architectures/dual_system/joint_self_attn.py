@@ -59,10 +59,8 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         bl = resolve_bridge_layers(cfg)
         video_dim = int(cfg["video_dim"])
         # Default the action-side raw context width to the loaded backbone's
-        # text_dim (Wan T5-XXL=4096); explicit cfg/CLI
-        # still wins. Falls back to 4096 when the backbone doesn't expose it.
-        _vb_text_dim = getattr(self.video_backbone, "text_dim", None)
-        text_dim = int(self._cfg_get(cfg, "text_dim", _vb_text_dim or 4096))
+        # text_dim (Wan T5-XXL=4096); explicit cfg/CLI still wins.
+        text_dim = int(cfg.get("text_dim", self.video_backbone.text_dim))
         self._init_proprio_context(cfg, text_dim=text_dim)
 
         # FastWAM-Joint compat: action residual hidden_dim may differ from
@@ -73,7 +71,7 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         attn_head_dim = int(cfg.get("attn_head_dim", video_dim // num_heads))
 
         self.action_backbone = ActionDiT(
-            action_dim=int(cfg.get("action_dim", 20)),
+            action_dim=int(cfg["action_dim"]),
             dim=action_dim_hidden,
             ffn_dim=int(cfg.get("ffn_dim", 4 * action_dim_hidden)),
             num_heads=num_heads,
@@ -83,7 +81,7 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
             variant="joint_self_attn",
             attn_head_dim=attn_head_dim,
             text_dim=text_dim,
-            shift_action=cfg.get("shift_action"),
+            shift_action=float(cfg["shift_action"]),
         )
 
         # The MoT driver pairs the two backbones (both built by now).
@@ -132,18 +130,14 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
             )
 
         kwargs = torch_compile_kwargs(section, default_mode="reduce-overhead")
-        try:
-            self._compiled_mot_run_joint_loop = torch.compile(_run_joint_loop, **kwargs)
-        except Exception as exc:  # pragma: no cover - defensive setup fallback
-            self._compiled_mot_run_joint_loop = None
-            logger.warning("dual self-attn MoT torch.compile setup failed; running eager: %s", exc)
-            return
+        # A compile setup failure propagates: no silent eager fallback.
+        self._compiled_mot_run_joint_loop = torch.compile(_run_joint_loop, **kwargs)
         logger.info("Enabled dual self-attn MoT compile with torch.compile kwargs=%s", kwargs)
 
     def forward(
         self,
-        noisy_actions: Optional[Tensor],
-        action_timestep: Optional[Tensor],
+        noisy_actions: Tensor,
+        action_timestep: Tensor,
         *,
         latents: Tensor,
         timestep: Tensor,
@@ -152,7 +146,7 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         proprio_mask: Tensor,
         use_gradient_checkpointing: bool,
         use_gradient_checkpointing_offload: bool,
-    ) -> Tuple[Tensor, Optional[Tensor]]:
+    ) -> Tuple[Tensor, Tensor]:
         """Joint forward; arguments as in :meth:`BaseWAMArchitecture.forward`. Returns (video pred, action pred)."""
         video_backbone = self.video_backbone
         action_backbone = self.action_backbone
@@ -169,13 +163,6 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         )
 
-        if noisy_actions is None:
-            # Video only: the same frame mask, expanded without action tokens.
-            masks = video_backbone.build_joint_attention_masks(self.frame_mask, vstate, 0)
-            for block_id in range(video_backbone.num_layers):
-                vstate = video_backbone.run_block(block_id, vstate, masks[block_id])
-            return video_backbone.finalize(vstate), None
-
         driver = self._mot_driver
         astate = action_backbone.prepare_state(
             noisy_actions,
@@ -187,17 +174,8 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         )
         compiled_loop = self._compiled_mot_run_joint_loop
         if compiled_loop is not None and not use_gradient_checkpointing and not use_gradient_checkpointing_offload:
-            try:
-                vstate, astate = compiled_loop(vstate, astate)
-            except Exception as exc:
-                self._compiled_mot_run_joint_loop = None
-                logger.warning("dual self-attn compiled MoT loop failed; falling back to eager: %s", exc)
-                vstate, astate = driver.run_joint_loop(
-                    vstate,
-                    astate,
-                    use_gradient_checkpointing=use_gradient_checkpointing,
-                    use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-                )
+            # A failure of the compiled loop propagates: no silent eager fallback.
+            vstate, astate = compiled_loop(vstate, astate)
         else:
             vstate, astate = driver.run_joint_loop(
                 vstate,

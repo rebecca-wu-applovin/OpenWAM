@@ -6,8 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from openwam.model.video_backbone.common.checkpoint import gradient_checkpoint_forward
-
 try:
     import flash_attn_interface
 
@@ -222,38 +220,60 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(
-        self,
-        x,
-        context,
-        t_mod,
-        freqs,
-        context_mask: Optional[torch.Tensor] = None,
-        self_attn_mask: Optional[torch.Tensor] = None,
-    ):
-        if context_mask is not None and context_mask.dim() == 3:
-            context_mask = context_mask.unsqueeze(1)
-        has_seq = len(t_mod.shape) == 4
-        chunk_dim = 2 if has_seq else 1
+    def pre_attn(self, x, t_mod, freqs):
+        """First half of the block: AdaLN-modulated norm1 -> self-attention Q/K/V with RoPE (no attention).
+
+        Args:
+            x: (B, S, dim) hidden states.
+            t_mod: (B, S, 6, dim) per-token time modulation (``build_time_modulation``).
+            freqs: (S, 1, head_dim / 2) complex RoPE table.
+
+        Returns:
+            q, k, v: (B, S, dim) each. post: tuple ``(x, gate_msa, shift_mlp, scale_mlp, gate_mlp)`` for
+            :meth:`post_attn` (x (B, S, dim), the rest (B, S, dim)).
+        """
         # msa: multi-head self-attention  mlp: multi-layer perceptron
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
-        ).chunk(6, dim=chunk_dim)
-        if has_seq:
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                shift_msa.squeeze(2),
-                scale_msa.squeeze(2),
-                gate_msa.squeeze(2),
-                shift_mlp.squeeze(2),
-                scale_mlp.squeeze(2),
-                gate_mlp.squeeze(2),
-            )
+            c.squeeze(2) for c in (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=2)
+        )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, attn_mask=self_attn_mask))
+        sa = self.self_attn
+        q = rope_apply(sa.norm_q(sa.q(input_x)), freqs, sa.num_heads)
+        k = rope_apply(sa.norm_k(sa.k(input_x)), freqs, sa.num_heads)
+        v = sa.v(input_x)
+        return q, k, v, (x, gate_msa, shift_mlp, scale_mlp, gate_mlp)
+
+    def post_attn(self, attn_out, post, context, context_mask):
+        """Second half of the block: self-attention output projection + gate -> text cross-attention -> FFN.
+
+        Args:
+            attn_out: (B, S, dim) attention output before ``self_attn.o``.
+            post: the tuple :meth:`pre_attn` returned.
+            context: (B, L, dim) embedded text context.
+            context_mask: (B, 1, S, L) bool cross-attention mask (True = attend).
+
+        Returns:
+            (B, S, dim) new hidden states.
+        """
+        x, gate_msa, shift_mlp, scale_mlp, gate_mlp = post
+        x = self.gate(x, gate_msa, self.self_attn.o(attn_out))
         x = x + self.cross_attn(self.norm3(x), context, ctx_mask=context_mask)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = self.gate(x, gate_mlp, self.ffn(input_x))
-        return x
+        return self.gate(x, gate_mlp, self.ffn(input_x))
+
+    def forward(self, x, context, t_mod, freqs, context_mask, self_attn_mask):
+        """Whole block = :meth:`pre_attn` -> self-attention -> :meth:`post_attn`.
+
+        Args:
+            x: (B, S, dim). context: (B, L, dim). t_mod: (B, S, 6, dim). freqs: (S, 1, head_dim / 2) complex.
+            context_mask: (B, 1, S, L) bool. self_attn_mask: (S, S) bool self-attention mask.
+
+        Returns:
+            (B, S, dim) new hidden states.
+        """
+        q, k, v, post = self.pre_attn(x, t_mod, freqs)
+        attn_out = self.self_attn.attn(q, k, v, attn_mask=self_attn_mask)
+        return self.post_attn(attn_out, post, context, context_mask)
 
 
 class Head(nn.Module):
@@ -266,14 +286,11 @@ class Head(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
     def forward(self, x, t_mod):
-        if len(t_mod.shape) == 3:
-            shift, scale = (
-                self.modulation.unsqueeze(0).to(dtype=t_mod.dtype, device=t_mod.device) + t_mod.unsqueeze(2)
-            ).chunk(2, dim=2)
-            x = self.head(self.norm(x) * (1 + scale.squeeze(2)) + shift.squeeze(2))
-        else:
-            shift, scale = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(2, dim=1)
-            x = self.head(self.norm(x) * (1 + scale) + shift)
+        """x: (B, S, dim). t_mod: (B, S, dim) per-token time embedding. Returns: (B, S, out_dim * prod(patch))."""
+        shift, scale = (
+            self.modulation.unsqueeze(0).to(dtype=t_mod.dtype, device=t_mod.device) + t_mod.unsqueeze(2)
+        ).chunk(2, dim=2)
+        x = self.head(self.norm(x) * (1 + scale.squeeze(2)) + shift.squeeze(2))
         return x
 
 
@@ -290,17 +307,12 @@ class WanModel(torch.nn.Module):
         patch_size: Tuple[int, int, int],
         num_heads: int,
         num_layers: int,
-        has_ref_conv: bool = False,
-        seperated_timestep: bool = False,
-        fuse_vae_embedding_in_latents: bool = False,
     ):
         super().__init__()
         self.dim = dim
         self.in_dim = in_dim
         self.freq_dim = freq_dim
         self.patch_size = patch_size
-        self.seperated_timestep = seperated_timestep
-        self.fuse_vae_embedding_in_latents = fuse_vae_embedding_in_latents
 
         self.patch_embedding = nn.Conv3d(in_dim, dim, kernel_size=patch_size, stride=patch_size)
         self.text_embedding = nn.Sequential(nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim))
@@ -312,10 +324,6 @@ class WanModel(torch.nn.Module):
         self.head = Head(dim, out_dim, patch_size, eps)
         head_dim = dim // num_heads
         self.freqs = precompute_freqs_cis_3d(head_dim)
-
-        if has_ref_conv:
-            self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
-        self.has_ref_conv = has_ref_conv
 
     def patchify(self, x: torch.Tensor):
         return self.patch_embedding(x)
@@ -331,62 +339,3 @@ class WanModel(torch.nn.Module):
             y=self.patch_size[1],
             z=self.patch_size[2],
         )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        timestep: torch.Tensor,
-        context: torch.Tensor,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
-        **kwargs,
-    ):
-        context = self.text_embedding(context)
-
-        x, (f, h, w) = self.patchify(x)
-        batch_size = x.shape[0]
-        tokens_per_frame = h * w
-
-        # Per-token timestep: frame 0 = t=0 (conditioning), others = sampled t.
-        # Following FastWAM: build (B, f*h*w) timestep tensor.
-        if self.fuse_vae_embedding_in_latents and f > 1:
-            token_timesteps = torch.ones(
-                batch_size, f, tokens_per_frame, dtype=timestep.dtype, device=timestep.device
-            ) * timestep.view(batch_size, 1, 1)
-            token_timesteps[:, 0, :] = 0  # frame 0 = clean conditioning
-            token_timesteps = token_timesteps.reshape(batch_size, -1)  # (B, f*h*w)
-            t_emb = sinusoidal_embedding_1d(self.freq_dim, token_timesteps.reshape(-1))
-            t = self.time_embedding(t_emb.to(x.dtype)).reshape(batch_size, -1, self.dim)
-            # t: (B, f*h*w, dim) — per-token
-            t_mod = self.time_projection(t).unflatten(2, (6, self.dim))
-            # t_mod: (B, f*h*w, 6, dim) — per-token, DiTBlock handles has_seq=True
-        else:
-            t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
-            # t: (B, dim) — global
-            t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
-            # t_mod: (B, 6, dim) — global
-
-        freqs = (
-            torch.cat(
-                [
-                    self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-                    self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                    self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
-                ],
-                dim=-1,
-            )
-            .reshape(f * h * w, 1, -1)
-            .to(x.device)
-        )
-
-        for block in self.blocks:
-            if self.training:
-                x = gradient_checkpoint_forward(
-                    block, use_gradient_checkpointing, use_gradient_checkpointing_offload, x, context, t_mod, freqs
-                )
-            else:
-                x = block(x, context, t_mod, freqs)
-
-        x = self.head(x, t)
-        x = self.unpatchify(x, (f, h, w))
-        return x

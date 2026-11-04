@@ -55,12 +55,10 @@ def _resolve_requires_proprio(cfg, engine) -> bool:
     if cfg_value is not None:
         return _parse_bool(cfg_value)
 
+    # No cfg key: ask the loaded architecture (every architecture declares uses_proprioception).
     arch = getattr(engine, "architecture", None)
     if arch is not None:
-        try:
-            return bool(arch.uses_proprioception)
-        except Exception:
-            return bool(getattr(arch, "uses_proprioception", False))
+        return bool(arch.uses_proprioception)
     return False
 
 

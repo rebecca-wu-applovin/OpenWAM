@@ -1,7 +1,7 @@
 # GE-Base-fast video backbone (Genie Envisioner, AgiBot; cfg.model.video_backbone.*).
 # GE multi-view LTX DiT + LTX-Video VAE (8x temporal, 32x spatial) + LTX-Video T5.
 # Views: the vstacked canvas is split into n_view tiles (ego = GE "head" slot 0, chest = slot 1).
-# Video noise schedule is GE-native (ge_base_fast.sample_training_noise); shift_video only
+# Video noise schedule is GE-native (ge/scheduler.py GEFlowScheduler.sample_train); shift_video only
 # shapes the deploy grid (GE trains on the shift-1 FlowMatchEuler grid).
 
 name: ge_base_fast
@@ -10,13 +10,11 @@ weights_file: GE_base_fast_v0.1.safetensors
 ltx_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/LTX-Video        # [Required] vae/ text_encoder/ tokenizer/
 
 temporal_compression: 8   # LTX VAE (yaml contract checked against the backbone at build; the latent layout reads it)
-causal_temporal: true
+causal_temporal: true     # the VAE encodes frame 0 alone (yaml contract checked against the backbone at build)
 shift_video: 1.0          # deploy-grid shift; GE trains on the shift-1 FlowMatchEuler grid
 n_view: 2                 # cameras stacked top-to-bottom in the dataloader canvas
 text_max_length: 128      # GE get_text_conditions max_sequence_length
-caption_dropout_p: 0.06   # GE configs/ltx_model/video_model.yaml
 vae_sample: true          # GE get_latents samples the VAE posterior (training mode only; eval / deploy take its mode)
-seed: null                # int seeds the caption-dropout RNG; null = unseeded
 text_cache: true          # trainer encodes the dataset's prompt set once after the weights are in place, T5 then on CPU
 
 dit:                      # LTXVideoTransformer3DModel (GE multi-view): checked by the strict weight load

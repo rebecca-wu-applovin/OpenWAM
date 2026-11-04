@@ -1,4 +1,4 @@
-"""PIL <-> tensor video helpers shared by the cosmos3 / ge / flux backbones.
+"""PIL <-> tensor video helpers of the base-class flow (``VideoBackbone.to_pixels``), shared by every family.
 
 Moved from the deleted ``cosmos_predict25/_vae_utils.py`` (renamed, logic unchanged).
 """

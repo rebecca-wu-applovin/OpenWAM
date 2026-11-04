@@ -9,11 +9,14 @@ This file re-exports them and registers the built-in backbones at the bottom::
     from openwam.model.video_backbone import LoadMode, build_video_backbone
     backbone = build_video_backbone(cfg.model.video_backbone, LoadMode.PRETRAINED, None)
 
-Adding a new backbone:
-1. Subclass :class:`VideoBackbone` (implement ``from_pretrained`` / ``from_checkpoint_dir``,
-   ``encode_pixels`` / ``decode_latents`` / ``encode_text`` and prepare/run_block/finalize).
+Adding a new backbone = implement the 14 abstract members of :class:`VideoBackbone` + write one yaml:
+1. ``<family>/backbone.py``: subclass :class:`VideoBackbone` and implement its 14 abstract members (construction
+   ``from_pretrained`` / ``from_checkpoint_dir``; geometry ``dim`` / ``num_layers`` / ``num_heads`` / ``head_dim`` /
+   ``text_dim`` / ``scheduler``; IO ``encode_pixels`` / ``decode_latents`` / ``encode_text``; block loop
+   ``prepare`` / ``run_block`` / ``finalize``). The shared preprocessing flow and masks come from the base.
 2. Register it at the bottom of this file via ``register_video_backbone("name")(YourClass)``.
-3. Set ``video_backbone.name: your_name`` in the model config yaml.
+3. Write ``configs/model/video_backbone/<name>.yaml`` (``name: <name>`` + the module geometry).
+See ``assets/openwam_usage_docs/architecture-extension.md`` ("Add a video DiT backbone").
 """
 
 from __future__ import annotations

@@ -32,9 +32,6 @@ SYSTEM_PROMPT_VIDEO = "You are a helpful assistant who will generate videos from
 DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
 IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
 VIDEO_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
-INVERSE_DURATION_TEMPLATE = "The video is not {duration:.1f} seconds long and is not of {fps:.0f} FPS."
-INVERSE_IMAGE_RESOLUTION_TEMPLATE = "This image is not of {height}x{width} resolution."
-INVERSE_VIDEO_RESOLUTION_TEMPLATE = "This video is not of {height}x{width} resolution."
 
 START_OF_GENERATION_TOKEN = "<|vision_start|>"
 
@@ -46,7 +43,6 @@ def apply_prompt_templates(
     height: int,
     width: int,
     fps: float,
-    negative: bool = False,
     add_duration_template: bool = True,
     add_resolution_template: bool = True,
 ) -> str:
@@ -58,13 +54,9 @@ def apply_prompt_templates(
         return f"{base}. {addition}" if base else addition
 
     if not is_image and add_duration_template:
-        template = INVERSE_DURATION_TEMPLATE if negative else DURATION_TEMPLATE
-        text = _append(text, template.format(duration=num_frames / fps, fps=fps))
+        text = _append(text, DURATION_TEMPLATE.format(duration=num_frames / fps, fps=fps))
     if add_resolution_template:
-        if is_image:
-            template = INVERSE_IMAGE_RESOLUTION_TEMPLATE if negative else IMAGE_RESOLUTION_TEMPLATE
-        else:
-            template = INVERSE_VIDEO_RESOLUTION_TEMPLATE if negative else VIDEO_RESOLUTION_TEMPLATE
+        template = IMAGE_RESOLUTION_TEMPLATE if is_image else VIDEO_RESOLUTION_TEMPLATE
         text = _append(text, template.format(height=height, width=width))
     return text
 

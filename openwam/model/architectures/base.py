@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple
 import torch
 from torch import Tensor, nn
 
-from openwam.config.resolve import PROPRIO_INPUTS
 from openwam.model.compile_options import compile_enabled
 from openwam.model.video_backbone.registry import LoadMode, build_video_backbone
 
@@ -89,8 +88,8 @@ class TrainOptions:
     Fields:
         use_gradient_checkpointing: bool, recompute block activations in the training backward.
         use_gradient_checkpointing_offload: bool, also offload the checkpointed activations to CPU.
-        lambda_video: float, weight of the video flow-matching loss.
-        lambda_action: float, weight of the action flow-matching loss.
+        lambda_video: float, weight of the video flow-matching loss (0 = the term is left out of the loss).
+        lambda_action: float, weight of the action flow-matching loss (0 = the term is left out of the loss).
     """
 
     use_gradient_checkpointing: bool
@@ -147,6 +146,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
             ``INFERENCE_ONLY``.
     """
 
+    # Built by the subclass ``__init__`` (every architecture has an action stream).
+    action_backbone: "ActionDiTBackbone"
+
     # --- Construction & config resolution ---
 
     def __init__(self, cfg: dict, *, layout, mode: LoadMode, ckpt_dir: Optional[str], train_options: TrainOptions):
@@ -160,25 +162,16 @@ class BaseWAMArchitecture(ABC, nn.Module):
         self.frame_mask = build_frame_mask(layout, str(cfg["clean_attention"]), str(cfg["attention_mask_mode"]))
         # How the video backbone gets the proprio (validated by resolve_config); build_contexts applies it.
         self.proprio_input = str(cfg["proprio_input"])
-        if self.proprio_input not in PROPRIO_INPUTS:
-            raise ValueError(f"proprio_input must be one of {PROPRIO_INPUTS}, got {self.proprio_input!r}")
-        self.action_backbone: Optional["ActionDiTBackbone"] = None
         self._device = torch.device("cuda")
         self._dtype = torch.bfloat16
 
         # Optional action normalizer for deployment: the deploy engine uses it to
         # return real-scale actions and to normalize raw robot state into the model's training space.
         self.normalizer = None
+        # Optional deploy post-unnormalize hook (relative action modes), set by the deploy model loader.
+        self.deploy_action_decoder = None
 
         self.video_backbone: "VideoBackbone" = self._build_video_backbone(cfg["video_backbone"], mode, ckpt_dir)
-
-    @staticmethod
-    def _cfg_get(cfg, key, default=None):
-        if cfg is None:
-            return default
-        if isinstance(cfg, dict):
-            return cfg.get(key, default)
-        return getattr(cfg, key, default)
 
     @staticmethod
     def _build_video_backbone(vb_cfg, mode: LoadMode, ckpt_dir: Optional[str]) -> "VideoBackbone":
@@ -193,7 +186,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         """
         video_backbone = build_video_backbone(vb_cfg, mode, ckpt_dir)
         # The layout and the dataloader read the yaml's temporal_compression: it must be the VAE's.
-        declared = (int(vb_cfg["temporal_compression"]), bool(vb_cfg.get("causal_temporal", True)))
+        declared = (int(vb_cfg["temporal_compression"]), bool(vb_cfg["causal_temporal"]))
         actual = (video_backbone.temporal_compression, video_backbone.causal_temporal)
         if declared != actual:
             raise ValueError(
@@ -214,18 +207,13 @@ class BaseWAMArchitecture(ABC, nn.Module):
         ``move_frozen_to_device``, and ``save_assets_for_deployment`` to iterate
         over all backbones generically.
         """
-        result = {"video_backbone": self.video_backbone}
-        if self.action_backbone is not None:
-            result["action_backbone"] = self.action_backbone
-        return result
+        return {"video_backbone": self.video_backbone, "action_backbone": self.action_backbone}
 
     # --- Action-side properties (delegate to action_backbone) ---
 
     @property
     def action_scheduler(self):
         """Flow-matching scheduler for the action stream (owned by action_backbone)."""
-        if self.action_backbone is None:
-            raise RuntimeError("action_backbone is not initialized")
         return self.action_backbone.scheduler
 
     @property
@@ -235,23 +223,29 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
     @property
     def action_dim(self) -> int:
-        return self.action_backbone.action_dim if self.action_backbone is not None else 0
+        return self.action_backbone.action_dim
 
     @property
     def bridge_layers(self) -> tuple:
-        return self.action_backbone.bridge_layers if self.action_backbone is not None else ()
+        return self.action_backbone.bridge_layers
 
     @property
     def uses_proprioception(self) -> bool:
-        return self._use_proprioception_context or (
-            self.action_backbone is not None and self.action_backbone.uses_proprioception
-        )
+        return self._use_proprioception_context or self.action_backbone.uses_proprioception
 
     # --- Proprio-as-context conditioning ---
 
-    def _init_proprio_context(self, cfg, *, text_dim: int = 4096) -> None:
-        """Initialize FastWAM-style proprio-as-context conditioning."""
-        enabled = bool(self._cfg_get(cfg, "use_proprioception", False))
+    def _init_proprio_context(self, cfg: dict, *, text_dim: int) -> None:
+        """Initialize FastWAM-style proprio-as-context conditioning.
+
+        Args:
+            cfg: dict of architecture params (``use_proprioception``, ``state_dim``).
+            text_dim: int, width of the text context the proprio tokens are appended to.
+
+        Returns:
+            None. Declares ``proprio_encoder`` / ``proprio_slot_emb`` (None when unused).
+        """
+        enabled = bool(cfg["use_proprioception"])
         self._use_proprioception_context = enabled
         self.proprio_encoder: Optional[nn.Module] = None
         self.proprio_slot_emb: Optional[nn.Embedding] = None
@@ -261,7 +255,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         self.num_proprio_tokens = int(self.layout.num_proprio_tokens)
         if not enabled:
             return
-        state_dim = int(self._cfg_get(cfg, "state_dim", 0) or 0)
+        # Required by the yaml; only read when the proprio tokens exist.
+        state_dim = int(cfg["state_dim"])
         if state_dim <= 0:
             raise ValueError("use_proprioception=True requires explicit state_dim for context-token proprio.")
         self.proprio_dim = state_dim
@@ -345,12 +340,11 @@ class BaseWAMArchitecture(ABC, nn.Module):
         """Dispatch to each backbone — they own their own dtype/device handling."""
         self._dtype = dtype
         self._device = device
-        proprio_encoder = getattr(self, "proprio_encoder", None)
-        if proprio_encoder is not None:
-            proprio_encoder.to(dtype=dtype, device=device)
-        slot_emb = getattr(self, "proprio_slot_emb", None)
-        if slot_emb is not None:
-            slot_emb.to(dtype=dtype, device=device)
+        # The proprio modules exist only under use_proprioception (declared None otherwise).
+        if self.proprio_encoder is not None:
+            self.proprio_encoder.to(dtype=dtype, device=device)
+        if self.proprio_slot_emb is not None:
+            self.proprio_slot_emb.to(dtype=dtype, device=device)
         for bb in self.backbones.values():
             bb.set_dtype_device(dtype, device)
 
@@ -377,9 +371,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         import torch
 
         arr = np.asarray(proprio, dtype=np.float32)
-        normalizer = getattr(self, "normalizer", None)
-        if normalizer is not None:
-            arr = normalizer.normalize(arr)
+        if self.normalizer is not None:
+            arr = self.normalizer.normalize(arr)
         return torch.from_numpy(arr)
 
     # --- Checkpoint save / load ---
@@ -397,32 +390,27 @@ class BaseWAMArchitecture(ABC, nn.Module):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         save_file(state_dict, path)
 
-    def load_checkpoint(self, path: str, strict: bool = True) -> None:
-        """Load architecture state from a safetensors checkpoint.
+    def load_checkpoint(self, path: str) -> None:
+        """Fill the architecture from one of our safetensors checkpoints (deploy / finetune), strictly.
 
-        Missing or unexpected keys raise under ``strict=True``.
+        The one strict rule (``load_strict``): missing / unexpected keys, a shape mismatch, or a tensor still on
+        meta after the load raise. A CHECKPOINT shell holds meta tensors, which only ``assign=True`` can fill (an
+        in-place copy into meta is a silent no-op); an architecture with real storage everywhere is copied into
+        in place. Tied weights stay tied either way.
 
-        Meta-device sub-modules (self-contained deploy empty shells built
-        via ``from_empty`` / ``init_empty_weights``) need
-        ``load_state_dict(..., assign=True)`` — the default in-place copy is
-        a silent no-op against meta tensors and leaves the shells
-        unpopulated. ``assign=True`` rebinds the parameter slot to the
-        safetensors tensor instead. We only flip the flag when meta params
-        actually exist so the training-resume path (real-device params,
-        in-place copy preserves identity) is unchanged.
+        Args:
+            path: str, a ``checkpoint_step_*.safetensors`` file holding exactly ``self.state_dict()``'s keys.
+
+        Returns:
+            None. Raises ValueError on any mismatch (see ``load_strict``).
         """
         from safetensors.torch import load_file
 
-        from openwam.model.video_backbone.common.weights import retie, tied_groups
+        from openwam.model.video_backbone.common.weights import load_strict
 
-        state_dict = load_file(path)
-        has_meta = any(p.device.type == "meta" for p in self.parameters())
-        # assign=True would untie tied weights (frozen text encoders' embeddings); re-tie them after.
-        groups = tied_groups(self)
-        missing, unexpected = self.load_state_dict(state_dict, strict=False, assign=has_meta)
-        if strict and (missing or unexpected):
-            raise RuntimeError(f"Strict load failed: missing={missing}, unexpected={unexpected}")
-        retie(self, groups)
+        # Whether this is a meta shell is a property of the module itself, not of the caller's mode.
+        has_meta = any(t.is_meta for t in [*self.parameters(), *self.buffers()])
+        load_strict(self, load_file(path), assign=has_meta)
 
     # --- Training: module management ---
 
@@ -437,22 +425,15 @@ class BaseWAMArchitecture(ABC, nn.Module):
         cannot drift, and the shift is owned by the checkpoint config (not a
         separate deploy-time knob).
 
-        ``shift is None`` (the default for configs without an explicit override)
-        falls back to each scheduler's template default (Wan/action = 5.0),
-        i.e. bit-identical pre-shift behavior.
+        Args:
+            num_timesteps: int, size of the discrete training grid.
+
+        Returns:
+            None.
         """
-        # ``getattr`` (rather than direct attribute access) so test doubles
-        # / mocks that don't carry the shift property still work — they fall
-        # back to the scheduler's template default, matching the production
-        # no-override path.
-        for name, bb in self.backbones.items():
-            if not hasattr(bb, "scheduler"):
-                continue
-            kwargs = {"training": True}
-            shift = getattr(bb, "shift_video" if name == "video_backbone" else "shift_action", None)
-            if shift is not None:
-                kwargs["shift"] = float(shift)
-            bb.scheduler.set_timesteps(num_timesteps, **kwargs)
+        video_backbone, action_backbone = self.video_backbone, self.action_backbone
+        video_backbone.scheduler.set_timesteps(num_timesteps, training=True, shift=video_backbone.shift_video)
+        action_backbone.scheduler.set_timesteps(num_timesteps, training=True, shift=action_backbone.shift_action)
 
     def freeze_modules(self, names: list[str]) -> list[str]:
         """Freeze named sub-modules by dotted path. Returns actually frozen names.
@@ -565,8 +546,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 action_is_pad (B, K, A), proprio (B, H, D), proprio_mask (B, H, D).
 
         Returns:
-            dict of 0-dim tensors: loss (weighted sum, carries the graph), loss_video, loss_action (weighted,
-            detached).
+            dict of 0-dim tensors: loss (weighted sum of the terms with a nonzero lambda, carries the graph),
+            loss_video, loss_action (weighted, detached).
         """
         video_backbone = self.video_backbone
         action_scheduler = self.action_backbone.scheduler
@@ -579,17 +560,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
         B = clean_latents.shape[0]
 
         # --- Sample video timesteps ---
-        # Backbones with a native training noise distribution (07: GE / flux)
-        # expose ``sample_training_noise``; the rest use the shared scheduler grid.
-        native_sampler = getattr(video_backbone, "sample_training_noise", None)
-        video_loss_weights = None
-        if native_sampler is not None:
-            video_timesteps, video_sigmas, video_loss_weights = native_sampler(B, device=_device, dtype=_dtype)
-            video_timestep_ids = None
-        else:
-            video_timestep_ids = torch.randint(0, len(video_backbone.scheduler.timesteps), (B,))
-            video_timesteps = video_backbone.scheduler.timesteps[video_timestep_ids].to(dtype=_dtype, device=_device)
-            video_sigmas = video_backbone.scheduler.sigmas[video_timestep_ids].to(dtype=_dtype, device=_device)
+        # The scheduler owns the training noise law: the grid draw (Wan / cosmos3) or a native one (GE / flux).
+        video_timesteps, video_sigmas, video_loss_weights = video_backbone.scheduler.sample_train(
+            B, device=_device, dtype=_dtype
+        )
 
         # --- Add video noise (flow-matching: linear interp + velocity target) ---
         video_noise = torch.randn_like(clean_latents)
@@ -602,14 +576,14 @@ class BaseWAMArchitecture(ABC, nn.Module):
         noisy_latents[:, :, :n_clean] = clean_latents[:, :, :n_clean]
 
         # --- Prepare action noise ---
-        noisy_actions, action_target, action_timesteps, action_timestep_ids = None, None, None, None
-        if lambda_action > 0:
-            action_timestep_ids = torch.randint(0, len(action_scheduler.timesteps), (B,))
-            action_timesteps = action_scheduler.timesteps[action_timestep_ids].to(dtype=_dtype, device=_device)
-            action_sigmas = action_scheduler.sigmas[action_timestep_ids].to(dtype=_dtype, device=_device)
-            action_noise = torch.randn_like(batch.action)
-            noisy_actions = action_scheduler.add_noise(batch.action, action_noise, action_sigmas.view(B, 1, 1))
-            action_target = action_scheduler.training_target(batch.action, action_noise)
+        # Drawn after the video noise, so the global RNG sequence is video timesteps, video noise, action ones.
+        # The action stream always runs (one forward path); lambda_action only weights its loss.
+        action_timesteps, action_sigmas, action_loss_weights = action_scheduler.sample_train(
+            B, device=_device, dtype=_dtype
+        )
+        action_noise = torch.randn_like(batch.action)
+        noisy_actions = action_scheduler.add_noise(batch.action, action_noise, action_sigmas.view(B, 1, 1))
+        action_target = action_scheduler.training_target(batch.action, action_noise)
 
         # --- Joint forward pass ---
         # ``self(...)`` (not ``self.forward``) so nn.Module.__call__ fires architecture-level hooks.
@@ -626,24 +600,16 @@ class BaseWAMArchitecture(ABC, nn.Module):
         )
 
         # --- Video loss ---
-        loss_video = self._compute_video_loss(
-            video_noise_pred, video_target, video_timestep_ids, _device, timestep_weights=video_loss_weights
-        )
-
-        if lambda_action == 0 or action_noise_pred is None:
-            return {
-                "loss": lambda_video * loss_video,
-                "loss_video": lambda_video * loss_video.detach(),
-                "loss_action": torch.tensor(0.0, device=loss_video.device),
-            }
+        loss_video = self._compute_video_loss(video_noise_pred, video_target, video_loss_weights)
 
         # --- Action loss ---
-        loss_action = self._compute_action_loss(
-            action_noise_pred, action_target, action_timestep_ids, action_scheduler, batch.action_is_pad, _device
-        )
+        loss_action = self._compute_action_loss(action_noise_pred, action_target, action_loss_weights, batch.action_is_pad)
 
+        # Same rule for both terms: a 0 weight leaves that term out of ``loss`` (the trainer rejects both 0).
         if lambda_video == 0:
             loss = lambda_action * loss_action
+        elif lambda_action == 0:
+            loss = lambda_video * loss_video
         else:
             loss = lambda_video * loss_video + lambda_action * loss_action
 
@@ -653,14 +619,12 @@ class BaseWAMArchitecture(ABC, nn.Module):
             "loss_action": lambda_action * loss_action.detach(),
         }
 
-    def _compute_video_loss(self, noise_pred, target, timestep_ids, device, timestep_weights=None):
+    def _compute_video_loss(self, noise_pred: Tensor, target: Tensor, loss_weights: Tensor) -> Tensor:
         """Per-sample weighted video MSE loss over the denoised (future) latents.
 
         Args:
             noise_pred / target: (B, z, num_latents, h, w); the first ``layout.num_hist_latents`` are skipped.
-            timestep_ids: (B,) indices into the scheduler grid (None with ``timestep_weights``).
-            device: torch.device of the loss.
-            timestep_weights: (B,) weights of a backbone's native noise sampler, overriding the scheduler's.
+            loss_weights: (B,) float32 per-sample weights from ``scheduler.sample_train``, on the loss device.
 
         Returns:
             0-dim float32 loss.
@@ -672,41 +636,32 @@ class BaseWAMArchitecture(ABC, nn.Module):
         noise_pred = noise_pred[:, :, n_skip:]
         target = target[:, :, n_skip:]
 
-        if timestep_weights is not None:
-            tw = timestep_weights.to(dtype=torch.float32, device=device)
-        else:
-            tw = self.video_backbone.scheduler.linear_timesteps_weights[timestep_ids].to(
-                dtype=torch.float32, device=device
-            )
-
         per_element = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
         # Every frame is real (the dataset never pads): plain mean over frames.
         per_sample = per_element.mean(dim=(1, 3, 4)).mean(dim=1)
-        return (per_sample * tw).mean()
+        return (per_sample * loss_weights).mean()
 
-    def _compute_action_loss(self, noise_pred, target, timestep_ids, scheduler, action_is_pad, device):
+    def _compute_action_loss(
+        self, noise_pred: Tensor, target: Tensor, loss_weights: Tensor, action_is_pad: Tensor
+    ) -> Tensor:
         """Per-sample weighted action MSE loss over the supervised (step, dim) cells.
 
         Args:
             noise_pred / target: (B, K, A) predicted / target velocity.
-            timestep_ids: (B,) indices into the action scheduler grid. scheduler: the action scheduler.
+            loss_weights: (B,) float32 per-sample weights from ``scheduler.sample_train``, on the loss device.
             action_is_pad: (B, K, A) bool, True = no supervision for that cell.
-            device: torch.device of the loss.
 
         Returns:
             0-dim float32 loss: per sample sum over valid cells / number of valid cells, weighted, batch mean.
         """
         import torch.nn.functional as F
 
-        tw = scheduler.training_weight(timestep_ids).to(dtype=torch.float32, device=device)
-        if tw.ndim != 1:
-            raise ValueError(f"action loss weights must be per-sample [B], got shape {tuple(tw.shape)}")
         per_element = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
         if action_is_pad.shape != per_element.shape:
             raise ValueError(f"action_is_pad {tuple(action_is_pad.shape)} must match the action {tuple(per_element.shape)}")
         valid_mask_f = (~action_is_pad.to(device=per_element.device, dtype=torch.bool)).float()
         per_sample = (per_element * valid_mask_f).sum(dim=(1, 2)) / valid_mask_f.sum(dim=(1, 2)).clamp(min=1)
-        return (per_sample * tw).mean()
+        return (per_sample * loss_weights).mean()
 
     # --- Inference: generation ---
 
@@ -722,7 +677,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         when every dim is active.
         """
         if active_action_mask is None:
-            normalizer = getattr(self, "normalizer", None)
+            normalizer = self.normalizer
             active_action_indices = getattr(normalizer, "_dst_index", None)
             unified_action_dim = getattr(normalizer, "_unify_dim", None)
             if (
@@ -993,15 +948,13 @@ class BaseWAMArchitecture(ABC, nn.Module):
     def apply_compile_optimizations(self, compile_cfg) -> None:
         """Apply architecture-specific deploy-time compile optimizations."""
         _ = compile_enabled(compile_cfg, default=False, strict=True)
-        vb_compile = getattr(getattr(self, "video_backbone", None), "apply_compile_optimizations", None)
-        if callable(vb_compile):
-            vb_compile(compile_cfg)
+        self.video_backbone.apply_compile_optimizations(compile_cfg)
 
     @abstractmethod
     def forward(
         self,
-        noisy_actions: Optional[Tensor],
-        action_timestep: Optional[Tensor],
+        noisy_actions: Tensor,
+        action_timestep: Tensor,
         *,
         latents: Tensor,
         timestep: Tensor,
@@ -1010,17 +963,17 @@ class BaseWAMArchitecture(ABC, nn.Module):
         proprio_mask: Tensor,
         use_gradient_checkpointing: bool,
         use_gradient_checkpointing_offload: bool,
-    ) -> Tuple[Tensor, Optional[Tensor]]:
+    ) -> Tuple[Tensor, Tensor]:
         """Run the joint video + action forward.
 
         Each concrete architecture implements its own forward end-to-end —
         runs the video DiT block loop, captures or interleaves with the
         action stream as appropriate, and returns
-        ``(video_noise_pred, action_noise_pred)``. When ``noisy_actions`` is
-        None (video-only training, ``lambda_action = 0``) the action term is None.
+        ``(video_noise_pred, action_noise_pred)``. Both streams always run (training weights the action loss
+        with ``lambda_action``, possibly 0).
 
         Args:
-            noisy_actions: (B, K, A) or None. action_timestep: (B,) or None.
+            noisy_actions: (B, K, A) noisy actions. action_timestep: (B,) action timestep.
             latents: (B, z, num_latents, h, w) noisy video latents (clean prefix already written in; its length is
                 ``layout.num_hist_latents``).
             timestep: (B,) video timestep. text: TextCondition from the video backbone.

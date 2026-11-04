@@ -1,7 +1,6 @@
 """Video color jitter: one set of random factors applied to every frame of a clip (temporal consistency)."""
 
-import random
-
+import numpy as np
 from PIL import ImageEnhance
 
 
@@ -21,7 +20,8 @@ def color_jitter_enabled(color_jitter) -> bool:
 class VideoColorJitter:
     """Random brightness / contrast / saturation jitter, the same factors for all frames of a clip.
 
-    The readers build it for the train split only. Factors come from python's ``random`` (seeded per worker).
+    The readers build it for the train split only. Factors come from the sample's own RNG (the mixture's
+    ``(seed, epoch, idx)`` generator), so a sample does not depend on the worker or the global RNG state.
 
     Args:
         brightness: Max brightness change factor.
@@ -42,19 +42,20 @@ class VideoColorJitter:
         self.saturation = saturation
         self.hue = hue
 
-    def apply(self, frames: list) -> list:
+    def apply(self, frames: list, rng: np.random.Generator) -> list:
         """Jitter one clip.
 
         Args:
             frames: list of T PIL images (RGB).
+            rng: numpy Generator of the sample; three draws (brightness, contrast, saturation factor).
 
         Returns:
             list of T jittered PIL images.
         """
-        # Sample random factors (same for all frames)
-        b_factor = 1.0 + random.uniform(-self.brightness, self.brightness)
-        c_factor = 1.0 + random.uniform(-self.contrast, self.contrast)
-        s_factor = 1.0 + random.uniform(-self.saturation, self.saturation)
+        # One factor per enhancement, the same for all frames (temporal consistency).
+        b_factor = 1.0 + rng.uniform(-self.brightness, self.brightness)
+        c_factor = 1.0 + rng.uniform(-self.contrast, self.contrast)
+        s_factor = 1.0 + rng.uniform(-self.saturation, self.saturation)
 
         augmented = []
         for frame in frames:

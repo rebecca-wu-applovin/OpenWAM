@@ -105,7 +105,8 @@ class TrainVisualizer:
     """Fixed-sample world-model rollouts for wandb.
 
     Args:
-        dataset: training dataset; ``dataset[i]`` returns an OpenWAM sample dict
+        dataset: the training dataset's eval view (``dataset.eval_view()``: no caption dropout, fixed history, no
+            jitter); ``dataset[i]`` returns an OpenWAM sample dict
             (``video`` list of H + F PIL frames, ``prompt`` str, ``proprio`` (H, D), ``action`` (K, A), ``source``).
         rank: int, this process's global rank (picks which fixed sample it renders).
         num_samples: int, how many rollouts rank 0 logs (ranks >= this still render, unlogged).
@@ -146,15 +147,13 @@ class TrainVisualizer:
         from openwam.deploy.denoise_schedule import make_schedule
 
         s = self.sample
-        ab, vb = getattr(arch, "action_backbone", None), getattr(arch, "video_backbone", None)
-        shift = getattr(ab, "shift_action", None) or 5.0
         schedule = make_schedule(
             "sync",
             video_scheduler=arch.video_scheduler,
             action_scheduler=arch.action_scheduler,
             num_steps=self.denoise_steps,
-            shift=shift,
-            shift_video=getattr(vb, "shift_video", None),
+            shift=arch.action_backbone.shift_action,
+            shift_video=arch.video_backbone.shift_video,
         )
         # Seed the global RNG too, in case an encoder draws from it; run() restores the training RNG afterwards.
         torch.manual_seed(self.seed)
@@ -192,7 +191,7 @@ class TrainVisualizer:
 
         Returns:
             None. Restored afterwards: every submodule's train/eval flag, the training schedulers, the
-            torch / CUDA / numpy / python RNG states, and the architecture's compiled-MoT-loop handle.
+            torch / CUDA / numpy / python RNG states.
         """
         arch = accelerator.unwrap_model(architecture)
         # The rollout flips the whole model to eval; remember each module's own flag
@@ -201,22 +200,12 @@ class TrainVisualizer:
         # The rollout's set_timesteps(denoise_steps) overwrites the live training schedulers in place
         # (1000 -> 10 timesteps; Cosmos also drops its loss weights). Snapshot and restore them, or every
         # later step trains on only those 10 noise levels. Shallow copy is enough: set_timesteps rebinds.
-        sched_states = []
-        for name in ("video_scheduler", "action_scheduler"):
-            try:  # the properties raise RuntimeError (not AttributeError) when a backbone is missing
-                s = getattr(arch, name)
-            except (AttributeError, RuntimeError):
-                continue
-            if all(s is not t for t, _ in sched_states):
-                sched_states.append((s, dict(vars(s))))
+        sched_states = [(s, dict(vars(s))) for s in (arch.video_scheduler, arch.action_scheduler)]
         # RNG: the rollout seeds its own generators, but the backbones' encoders may draw from the global
         # streams; restoring them keeps the training noise / timestep draws identical to a vis-off run.
         import random
 
         rng_state = (torch.get_rng_state(), torch.cuda.get_rng_state_all(), np.random.get_state(), random.getstate())
-        # A compiled-loop failure on the rollout's batch-1 shapes sets this handle to None (eager fallback);
-        # put it back so training keeps its compiled loop.
-        compiled_loop = getattr(arch, "_compiled_mot_run_joint_loop", None)
         torch.cuda.empty_cache()
         try:
             result = self._rollout(arch)
@@ -232,8 +221,6 @@ class TrainVisualizer:
             torch.cuda.set_rng_state_all(rng_state[1])
             np.random.set_state(rng_state[2])
             random.setstate(rng_state[3])
-            if compiled_loop is not None:
-                arch._compiled_mot_run_joint_loop = compiled_loop
             torch.cuda.empty_cache()
 
         from accelerate.utils import gather_object

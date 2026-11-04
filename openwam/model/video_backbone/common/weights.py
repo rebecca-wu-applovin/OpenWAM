@@ -77,7 +77,7 @@ def retie(module: nn.Module, groups: list[list[str]]) -> None:
     """
 
     def _owner(name: str):
-        # Plain attribute walk: some modules override get_submodule.
+        # The module owning a dotted parameter name, and the leaf attribute name on it.
         *path, leaf = name.split(".")
         owner = module
         for part in path:

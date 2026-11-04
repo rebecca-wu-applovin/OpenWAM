@@ -12,10 +12,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from openwam.dataloader.transforms.multiview import (
-    DEFAULT_MULTIVIEW_CAMERA_LAYOUT,
-    format_prompt_for_inference,
-)
+from openwam.dataloader.transforms.multiview import DEFAULT_MULTIVIEW_CAMERA_LAYOUT
 from openwam.deploy.obs_preprocess import ObsPreprocessor, ObsValidationError
 
 
@@ -180,24 +177,6 @@ def test_multiview_black_fill_one_wrist_missing():
 
 
 # --- Prompt template contract (migrated from test_policy_server_obs.py) ---
-
-
-def test_prompt_wrap_plain_instruction():
-    assert format_prompt_for_inference("pick up the bottle") == (
-        "A video recorded from a robot's point of view executing the following instruction: pick up the bottle"
-    )
-
-
-def test_prompt_wrap_keeps_trailing_period():
-    assert format_prompt_for_inference("pick up the bottle.") == (
-        "A video recorded from a robot's point of view executing the following instruction: pick up the bottle."
-    )
-
-
-def test_prompt_wrap_empty_instruction():
-    assert format_prompt_for_inference("") == (
-        "A video recorded from a robot's point of view executing the following instruction: "
-    )
 
 
 def test_decode_passes_prompt_through():

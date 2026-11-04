@@ -166,6 +166,7 @@ def _cfg(sources: dict, **overrides):
         "camera_layout": [EGO, CHEST],
         "history_sampling": "fixed",
         "history_window": 100,
+        "caption_dropout_p": 0.0,
         "seed": 0,
     }
     cfg.update(overrides)
@@ -412,10 +413,121 @@ def test_val_split_uses_fixed_offsets(tmp_path):
     assert draw.call_count == len(rand_train)
 
 
-def test_unknown_history_sampling_rejected(source):
-    root, _ = source
-    with pytest.raises(ValueError, match="history_sampling"):
-        build_dataset(_cfg({"a": (root, 1.0)}, history_sampling="uniform"), "train")
+# ── caption dropout (dataloader.caption_dropout_p) ──────────────────────────
+
+
+def _prompts_by_index(ds, epoch: int, num_workers: int) -> list:
+    """(prompt, proprio bytes) of every mixture index, read through a DataLoader.
+
+    Args:
+        ds: MultiYamSharpaDataset. epoch: int, ``set_epoch`` value. num_workers: int, forked DataLoader workers.
+
+    Returns:
+        list of (str prompt, bytes of the (H, D) proprio), one per index in order.
+    """
+    import torch
+
+    ds.set_epoch(epoch)
+    with _mock_decoder():
+        loader = torch.utils.data.DataLoader(
+            ds, batch_size=None, num_workers=num_workers, multiprocessing_context="fork" if num_workers else None
+        )
+        return [(s["prompt"], s["proprio"].numpy().tobytes()) for s in loader]
+
+
+def test_caption_dropout_deterministic(tmp_path):
+    # The dropout draw comes from the per-sample (seed, epoch, idx) RNG, after the random history offsets.
+    _write_source(tmp_path / "a", [60, 60])
+    dropped = build_dataset(_random_cfg(tmp_path / "a", caption_dropout_p=0.5), "train")
+    serial = _prompts_by_index(dropped, epoch=0, num_workers=0)
+    assert serial == _prompts_by_index(dropped, epoch=0, num_workers=4)  # worker count does not matter
+    n_empty = sum(p == "" for p, _ in serial)
+    assert 0 < n_empty < len(serial)
+    assert _prompts_by_index(dropped, epoch=1, num_workers=0) != serial  # the epoch does
+    # p = 0: prompts unchanged; the rest of every sample (random history included) is the same either way.
+    kept = _prompts_by_index(build_dataset(_random_cfg(tmp_path / "a"), "train"), epoch=0, num_workers=0)
+    assert all(p != "" for p, _ in kept)
+    for (p_drop, proprio_drop), (p_keep, proprio_keep) in zip(serial, kept):
+        assert proprio_drop == proprio_keep and p_drop in ("", p_keep)
+    # Val never drops (a train-split augmentation).
+    _write_source(tmp_path / "b", [60, 60], splits={"train": "0:2", "val": "0:2"})
+    val = build_dataset(_random_cfg(tmp_path / "b", caption_dropout_p=1.0), "val")
+    assert all(p != "" for p, _ in _prompts_by_index(val, epoch=0, num_workers=0))
+
+
+def _videos_by_index(ds, epoch: int, num_workers: int) -> list:
+    """The video bytes of every mixture index, read through a DataLoader.
+
+    Args:
+        ds: MultiYamSharpaDataset. epoch: int, ``set_epoch`` value. num_workers: int, forked DataLoader workers.
+
+    Returns:
+        list of bytes (all frames of one sample concatenated), one per index in order.
+    """
+    import torch
+
+    ds.set_epoch(epoch)
+    with _mock_decoder():
+        loader = torch.utils.data.DataLoader(
+            ds, batch_size=None, num_workers=num_workers, multiprocessing_context="fork" if num_workers else None
+        )
+        return [b"".join(np.asarray(f).tobytes() for f in s["video"]) for s in loader]
+
+
+def test_color_jitter_draws_from_the_sample_rng(tmp_path):
+    # The jitter factors come from the per-sample (seed, epoch, idx) RNG, not python's global random: the samples
+    # do not depend on the global RNG state or the worker count, and change with the epoch.
+    import random
+
+    _write_source(tmp_path / "a", [60, 60])
+    ds = build_dataset(_random_cfg(tmp_path / "a", color_jitter=True), "train")
+    random.seed(0)
+    serial = _videos_by_index(ds, epoch=0, num_workers=0)
+    random.seed(1)
+    assert serial == _videos_by_index(ds, epoch=0, num_workers=0)
+    assert serial == _videos_by_index(ds, epoch=0, num_workers=4)
+    assert _videos_by_index(ds, epoch=1, num_workers=0) != serial
+    # Jitter is on: the frames differ from the un-jittered reader's.
+    plain = build_dataset(_random_cfg(tmp_path / "a"), "train")
+    assert _videos_by_index(plain, epoch=0, num_workers=0) != serial
+
+
+def test_visualizer_sample_has_eval_semantics(tmp_path):
+    # The training visualizer's fixed sample comes from eval_view(): no caption dropout, the fixed history offsets.
+    from openwam.train.utils.visualization import TrainVisualizer
+
+    _write_source(tmp_path / "a", [60, 60])
+    train = build_dataset(_random_cfg(tmp_path / "a", caption_dropout_p=1.0), "train")
+    fixed = build_dataset(_random_cfg(tmp_path / "a", history_sampling="fixed"), "train")
+    view = train.eval_view()
+    assert view.datasets[0]._data_tables is train.datasets[0]._data_tables  # shares the preloaded shards
+    with _mock_decoder():
+        with patch("openwam.dataloader.yam_sharpa.sample_history_offsets", side_effect=AssertionError("drew")):
+            vis = TrainVisualizer(view, rank=0)
+        want = fixed[vis.sample_index]
+        assert train[vis.sample_index]["prompt"] == ""  # the training dataset itself is unchanged
+    assert vis.sample["prompt"] == want["prompt"] != ""
+    assert vis.sample["proprio"].numpy().tobytes() == want["proprio"].numpy().tobytes()
+
+
+def test_eval_view_turns_every_train_augmentation_off(tmp_path):
+    # eval_view applies the val split's rule (_select_augmentations(train=False)): no color jitter, the fixed
+    # history offsets; the training dataset keeps its augmentations.
+    _write_source(tmp_path / "a", [60, 60])
+    reader = build_dataset(_random_cfg(tmp_path / "a", color_jitter=True), "train").datasets[0]
+    assert reader._color_jitter is not None
+    assert reader._draw_history_offsets == reader._random_history_offsets
+    view = reader.eval_view()
+    assert view._color_jitter is None
+    assert view._draw_history_offsets == view._fixed_history_offsets
+    assert reader._color_jitter is not None and reader._draw_history_offsets == reader._random_history_offsets
+    # Behaviour: the view's samples are those of an un-augmented reader over the same windows.
+    plain = build_dataset(_random_cfg(tmp_path / "a", history_sampling="fixed"), "train").datasets[0]
+    with patch("openwam.dataloader.yam_sharpa.sample_history_offsets", side_effect=AssertionError("drew")):
+        got = _all_samples(view)
+    for g, w in zip(got, _all_samples(plain)):
+        assert [np.asarray(f).tobytes() for f in g["video"]] == [np.asarray(f).tobytes() for f in w["video"]]
+        assert g["proprio"].numpy().tobytes() == w["proprio"].numpy().tobytes()
 
 
 # ── video layout ────────────────────────────────────────────────────────────

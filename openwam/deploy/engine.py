@@ -39,16 +39,9 @@ def build_schedule(inf_cfg, architecture, conditions: dict):
     # ``init_training_schedulers`` via the same properties) and the
     # inference trajectory match. Deploy carries no independent shift knob.
     # ``conditions[...]`` allows a per-request override (smoke tests /
-    # ablations). ``getattr`` guards lightweight stub architectures.
-    _ab = getattr(architecture, "action_backbone", None)
-    shift = conditions.get("shift", getattr(_ab, "shift_action", None) if _ab is not None else None)
-    if shift is None:
-        shift = 5.0
-    _vb = getattr(architecture, "video_backbone", None)
-    shift_video = conditions.get(
-        "shift_video",
-        getattr(_vb, "shift_video", None) if _vb is not None else None,
-    )
+    # ablations).
+    shift = conditions.get("shift", architecture.action_backbone.shift_action)
+    shift_video = conditions.get("shift_video", architecture.video_backbone.shift_video)
 
     schedule = make_schedule(
         denoise_mode,

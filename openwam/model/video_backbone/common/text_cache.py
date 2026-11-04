@@ -16,14 +16,15 @@ class PromptCache:
     Args:
         encode: callable list[str] -> list of per-prompt entries (whatever the family's text encoder yields for
             one prompt, e.g. a tuple ``(context (1, L, D), seq_lens (1,))``), in input order.
-        prompts: list[str], every prompt the cache must answer, encoded in this order (the family decides
-            order and dedup; a repeated prompt keeps its last encoding).
+        prompts: list[str], every prompt the cache must answer. The cache encodes ``dict.fromkeys(prompts + [""])``:
+            each prompt once in first-seen order, plus the empty prompt a caption-dropped sample asks for.
         batch_size: int, prompts per ``encode`` call while building.
     """
 
     def __init__(self, encode: Callable[[list], list], prompts: list, batch_size: int):
         self.entries: dict[str, Any] = {}
-        prompts = list(prompts)
+        # The one build order of every family (it decides which prompts share an encoder batch).
+        prompts = list(dict.fromkeys(list(prompts) + [""]))
         for i in range(0, len(prompts), batch_size):
             chunk = prompts[i : i + batch_size]
             # Each entry stays on the device the encoder produced it on.

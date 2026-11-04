@@ -32,3 +32,40 @@ def test_architecture_derives_bridge_layers_from_backbone_num_layers():
     cfg = {**_CFG, "video_dim": 128, "bridge_interval": 5}
     arch = build_test_arch("dual_system_cross_attn", cfg, _MockVideoBackbone(dim=128, num_layers=20))
     assert arch.bridge_layers == (0, 5, 10, 15)
+
+
+def test_video_backbone_yaml_must_declare_its_temporal_contract():
+    """``temporal_compression`` and ``causal_temporal`` are required yaml keys (no code default to fall back on)."""
+    import pytest
+
+    from openwam.model.architectures.base import BaseWAMArchitecture
+    from openwam.model.video_backbone import LoadMode
+    from tests._arch import backbone_double
+
+    with backbone_double(_MockVideoBackbone()):
+        with pytest.raises(KeyError, match="causal_temporal"):
+            BaseWAMArchitecture._build_video_backbone({"name": "x", "temporal_compression": 4}, LoadMode.PRETRAINED, None)
+
+
+def test_architecture_requires_the_proprio_and_action_keys():
+    """``use_proprioception`` / ``action_dim`` come from configs/model/dual_system.yaml; a missing one raises."""
+    import pytest
+
+    from openwam.model import build_architecture
+    from openwam.model.video_backbone import LoadMode
+    from tests._arch import TEST_TRAIN_OPTIONS, arch_params, backbone_double
+    from tests._layout import make_layout
+
+    for key in ("use_proprioception", "action_dim"):
+        backbone = _MockVideoBackbone()
+        params = arch_params({**_CFG, "bridge_interval": 1}, backbone)
+        del params[key]
+        with backbone_double(backbone), pytest.raises(KeyError, match=key):
+            build_architecture(
+                "dual_system_cross_attn",
+                params,
+                layout=make_layout(),
+                mode=LoadMode.PRETRAINED,
+                ckpt_dir=None,
+                train_options=TEST_TRAIN_OPTIONS,
+            )

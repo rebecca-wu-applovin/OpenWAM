@@ -17,6 +17,7 @@ run on CPU with no checkpoint; everything up to it — reading the ckpt config, 
 import pytest
 from omegaconf import OmegaConf, open_dict
 
+from openwam.config import resolve_config
 from openwam.train.utils import ckpt_model_loader as cml
 from tests._arch import TEST_TRAIN_OPTIONS
 
@@ -56,6 +57,7 @@ CKPT_CFG = {
         "num_frames": 33,
         "history_sampling": "fixed",
         "history_window": 100,
+        "caption_dropout_p": 0.0,
     },
     "training": {"batch_size": 24},
 }
@@ -218,7 +220,7 @@ def test_resume_keeps_the_ckpt_config(tmp_path, capture):
     file lie about the model being trained. Its shell gets storage instead of a
     safetensors load (accelerate's load_state fills it after prepare)."""
     ckpt_dir = _write_ckpt_cfg(tmp_path)
-    cfg = _live_cfg(architecture__clean_attention="causal")
+    cfg = resolve_config(_live_cfg(architecture__clean_attention="causal"))
 
     _, ckpt_cfg = cml.build_for_resume(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
 
@@ -229,6 +231,55 @@ def test_resume_keeps_the_ckpt_config(tmp_path, capture):
     assert cfg.model.architecture.clean_attention == "causal", "resume must not rewrite the live cfg"
     assert capture["materialized"] == "cpu"
     assert "loaded" not in capture, "resume must not load safetensors"
+
+
+def test_resume_rejects_layout_mismatch(tmp_path, capture):
+    """The resumed model is built from the ckpt layout but the dataset from the live dataloader keys: a layout
+    disagreement would train silently on a different sample layout, so it raises and names the source keys."""
+    ckpt_dir = _write_ckpt_cfg(tmp_path)
+    cfg = _live_cfg()
+    with open_dict(cfg):
+        cfg.dataloader.history_offsets = [-4, 0]  # H = 2: one more clean latent than the ckpt's H = 1
+    resolve_config(cfg)
+
+    with pytest.raises(ValueError, match="layout") as err:
+        cml.build_for_resume(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
+
+    msg = str(err.value)
+    # The differing layout fields, and the differing dataloader key with both values (equal keys are not named).
+    assert "num_hist_frames" in msg and "num_hist_latents" in msg
+    assert "dataloader.history_offsets: live [-4, 0] vs ckpt [0]" in msg
+    assert "future_offsets" not in msg and "num_frames:" not in msg
+    assert "model_cfg" not in capture, "the check runs before the shell is built"
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("history_offsets", [-4, 0]),  # same H as the ckpt's [-8, 0], other rows
+        ("future_offsets", [2, 4, 6, 8, 10, 12, 14, 16]),  # same F, other spacing
+        ("history_sampling", "random"),
+        ("history_window", 50),
+    ],
+)
+def test_resume_rejects_layout_source_value_change(tmp_path, capture, key, value):
+    """Same frame counts (same common.layout) but other dataloader values: the dataset would draw other rows than
+    the ckpt was trained on, so resume raises and names the key with both values."""
+    ckpt_dir = _write_ckpt_cfg(tmp_path)
+    ckpt_cfg = OmegaConf.load(tmp_path / "config.yaml")
+    ckpt_cfg.dataloader.history_offsets = [-8, 0]
+    OmegaConf.save(ckpt_cfg, tmp_path / "config.yaml")
+    cfg = _live_cfg()
+    with open_dict(cfg):
+        cfg.dataloader.history_offsets = [-8, 0]
+        OmegaConf.update(cfg, f"dataloader.{key}", value)
+    resolve_config(cfg)
+
+    with pytest.raises(ValueError, match=f"dataloader.{key}") as err:
+        cml.build_for_resume(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
+
+    assert repr(value) in str(err.value) or str(value) in str(err.value)
+    assert "model_cfg" not in capture, "the check runs before the shell is built"
 
 
 def test_resume_reports_the_live_keys_it_discards(tmp_path, caplog):
@@ -382,7 +433,8 @@ def test_trainer_resume_reads_model_decisions_from_the_ckpt_cfg(tmp_path, monkey
 
     from openwam.train.openwam_trainer import OpenWAMTrainer
 
-    trainer = OpenWAMTrainer(cfg, accelerator=None, dataset=None)
+    # The training entry resolves the live config before the trainer (scripts/train.py).
+    trainer = OpenWAMTrainer(resolve_config(cfg), accelerator=None, dataset=None)
 
     assert frozen["names"] == ["video_backbone.vae"], "freeze must come from the ckpt cfg on resume"
     assert trainer.model_cfg.video_backbone.text_cache is True, "text_cache must come from the ckpt cfg on resume"

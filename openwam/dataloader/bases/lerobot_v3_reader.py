@@ -1,12 +1,10 @@
 """Unified single-bucket LeRobot v3 reader base.
 
-One base class for every LeRobot v3 single-bucket reader in this package —
-the 4 OXE readers (BC-Z / Bridge / Fractal / DROID), RoboCOIN, and EgoDex are
-all **direct, equal subclasses** of :class:`LeRobotV3Reader`. There is no
-per-family intermediate base; the differences between readers are expressed
-through a small set of hook methods + class attributes, and the genuinely
-shared building blocks (single-arm EEF assembly, stats materialization,
-prompt resolution, multi-bucket construction) live as stateless helpers in
+One base class for the LeRobot v3 single-bucket source readers in this package
+(today: :class:`~openwam.dataloader.yam_sharpa.YamSharpaDataset`, a direct
+subclass). The differences between readers are expressed through a small set
+of hook methods + class attributes; the shared building blocks (episode table,
+offsets, splits, stats materialization) live as stateless helpers in
 ``openwam.dataloader.utils``.
 
 The base owns the episode index, prompts, stats and the action / proprio
@@ -27,6 +25,7 @@ Class attributes:
   * ``ACTION_DIM``          — per-step action/proprio width (20 = EEF).
   * ``PROMPT_FILE_REQUIRED``— default :meth:`_load_prompts` behavior on a
     missing ``tasks.parquet`` (True = raise, False = empty map).
+  * ``STATS_FILENAME`` / ``STATS_DIM`` / ``STATS_STRICT_MINMAX`` — the default :meth:`_load_stats`.
 
 Hooks (override as needed; defaults cover the common case):
   * ``_resolve_cameras(info)``     — (head, left_wrist, right_wrist).
@@ -39,16 +38,12 @@ Hooks (override as needed; defaults cover the common case):
   * ``_action_20d(win)``           — normalized (..., 20) action payload,
     or ``None`` to emit zeros (video-only / disabled supervision).
   * ``_post_init(info)``           — one-time per-dataset setup.
-  * ``_multibucket_wrapper()``     — root-mode aggregate wrapper class or None.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
-import os
-import pickle
-import socket
-import uuid
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
@@ -57,7 +52,6 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from openwam.dataloader.bases.dataset import BaseDataset
 from openwam.dataloader.transforms.video import VideoColorJitter, color_jitter_enabled
 from openwam.dataloader.utils.eef import (
     EEF_DIM,
@@ -66,14 +60,10 @@ from openwam.dataloader.utils.eef import (
 )
 from openwam.dataloader.utils.lerobotv3 import (
     apply_info_splits,
-    build_multibucket,
     compute_file_local_offsets,
     effective_episode_frames,
     load_episodes_parquet,
-    load_tasks_annotated,
     parse_info_json,
-    resolve_prompt_by_episode,
-    subsample_episodes_by_hours,
 )
 from openwam.dataloader.utils.normalization import materialize_eef_stats
 from openwam.dataloader.utils.unify_action import UNIFY_DIM, map_to_unify, parse_unify_spec
@@ -85,10 +75,6 @@ _GETITEM_MAX_RETRIES = 64
 # Sentinel so an explicit ``normalize_mode=None`` (disable normalization) is
 # distinguishable from "not passed" (fall back to the subclass default).
 _NORMALIZE_MODE_UNSET = object()
-
-# Sentinel for from_config key-presence checks: distinguishes a config key that
-# is absent from one explicitly set to None.
-_CONFIG_MISSING = object()
 
 
 def _read_data_table(path: str, columns: Tuple[str, ...]):
@@ -113,8 +99,11 @@ def _read_data_table(path: str, columns: Tuple[str, ...]):
         return pq.read_table(path)
 
 
-class LeRobotV3Reader(BaseDataset):
-    """Shared single-bucket LeRobot v3 reading machinery (see module docstring)."""
+class LeRobotV3Reader:
+    """Shared single-bucket LeRobot v3 reading machinery (see module docstring).
+
+    A source reader, not a torch Dataset: the registered mixture samples it with ``sample(idx, rng)``.
+    """
 
     # --- subclass-overridable class attributes ---
     DATASET_NAME: ClassVar[str] = "LeRobotV3"
@@ -129,9 +118,7 @@ class LeRobotV3Reader(BaseDataset):
     # ``_resolve_cameras``.
     PROPRIO_DIM_MASK: ClassVar[Optional[np.ndarray]] = None
     ACTION_DIM: ClassVar[int] = EEF_DIM
-    # Prompt convention: "task_index" (tasks.parquet, index=text — RoboCOIN /
-    # EgoDex) or "episode_annotated" (tasks_annotated.parquet by episode_index — OXE).
-    PROMPT_SOURCE: ClassVar[str] = "task_index"
+    # Prompts come from meta/tasks.parquet (index = text, "task_index" column = int).
     PROMPT_FILE_REQUIRED: ClassVar[bool] = True
     # In-reader normalization stats: when STATS_FILENAME is set, the default
     # ``_load_stats`` loads ``meta/<STATS_FILENAME>`` (a flat stats dict) with
@@ -140,15 +127,6 @@ class LeRobotV3Reader(BaseDataset):
     STATS_FILENAME: ClassVar[Optional[str]] = None
     STATS_DIM: ClassVar[int] = EEF_DIM
     STATS_STRICT_MINMAX: ClassVar[bool] = False
-    # Deploy denormalizer artifact (meta/normalization_stats.npy). A reader that
-    # serves a unified action and wants a deployable checkpoint sets this to the
-    # action_mode key its RAW stats are stored under, and calls
-    # ``_write_deploy_normalizer_stats(combined, keys)`` from its ``_load_stats``.
-    # At deploy the policy server's ``_UnifyAwareNormalizer`` gathers the model's
-    # unified output back to raw dims, THEN unnormalizes with these RAW stats —
-    # so the artifact is authored in RAW space (NOT scattered). None → no deploy
-    # stats written (default).
-    DEPLOY_ACTION_MODE: ClassVar[Optional[str]] = None
     # Default normalize_mode when the caller doesn't pass one. OXE readers
     # override to "quantile" (their historical default); RoboCOIN/EgoDex keep
     # None (no in-reader normalization unless a config opts in).
@@ -168,11 +146,6 @@ class LeRobotV3Reader(BaseDataset):
         dataset_id: Optional[str] = None,
         target_camera: Optional[str] = None,
         camera_layout: Optional[List[str]] = None,
-        # Octo-style head-view sampling: a list of >=2 camera keys (must include
-        # the resolved head camera). Each TRAIN window decodes the head slot from
-        # ONE uniformly sampled entry — viewpoint augmentation at unchanged window
-        # count. Val / None / single entry → always the resolved head camera.
-        head_camera_choices: Optional[List[str]] = None,
         # Unified action space. unify_action=True scatters this reader's raw
         # ACTION_DIM-wide action/proprio into a UNIFY_DIM-wide vector and marks
         # only the mapped dims valid. unify_action_map is the yaml spec (see
@@ -187,9 +160,6 @@ class LeRobotV3Reader(BaseDataset):
         # (default). Truthy → enabled; a dict overrides
         # the per-channel strengths {brightness, contrast, saturation, hue}.
         color_jitter: Optional[Any] = None,
-        # Optional data-budget knobs (None = use the full bucket).
-        max_hours: Optional[float] = None,
-        subsample_seed: int = 42,
         **_unused: Any,
     ):
         self._dataset_dir = Path(dataset_dir)
@@ -205,17 +175,16 @@ class LeRobotV3Reader(BaseDataset):
         )
         self._target_camera = target_camera
         self._camera_layout_param = list(camera_layout) if camera_layout else None
-        self._max_hours = max_hours
-        self._subsample_seed = int(subsample_seed)
 
         # ── load-time video augmentation ──────────────────────────────────
         # Color jitter is applied in _getitem_impl to the decoded clip (same
-        # random factors across all frames, via VideoColorJitter). Built only
-        # for the train split; val / disabled keeps video byte-identical.
-        self._color_jitter = None
-        if color_jitter_enabled(color_jitter) and split == "train":
+        # random factors across all frames, via VideoColorJitter). Built from
+        # the config for any split; _select_augmentations turns it on for train
+        # only, so val / eval / disabled keeps video byte-identical.
+        self._train_color_jitter = None
+        if color_jitter_enabled(color_jitter):
             cj_get = color_jitter.get if hasattr(color_jitter, "get") else (lambda k, d: d)
-            self._color_jitter = VideoColorJitter(
+            self._train_color_jitter = VideoColorJitter(
                 brightness=float(cj_get("brightness", 0.2)),
                 contrast=float(cj_get("contrast", 0.2)),
                 saturation=float(cj_get("saturation", 0.2)),
@@ -264,8 +233,8 @@ class LeRobotV3Reader(BaseDataset):
             # the action_dim property, and the model action head are all unify_dim.
             self.ACTION_DIM = self._unify_dim
 
-        # Deploy denormalizer artifact path (set by _write_deploy_normalizer_stats
-        # when a reader emits meta/normalization_stats.npy; None otherwise).
+        # Deploy denormalizer artifact path: the stats file the trainer copies into checkpoints
+        # (yam_sharpa's _load_stats sets it to the pooled file; None otherwise).
         self.normalization_stats_path: Optional[str] = None
 
         # Rate-limited failure counter for sample().
@@ -282,23 +251,8 @@ class LeRobotV3Reader(BaseDataset):
         self._head_camera, self._left_wrist_camera, self._right_wrist_camera = self._resolve_cameras(info)
         if self._head_camera is None:
             raise ValueError(f"{self.DATASET_NAME}({self._dataset_id}): no head camera resolved")
-        # Octo-style head-view sampling (see __init__ arg docs). Resolved BEFORE
-        # _build_episode_index so _video_cameras() covers every choice when the
-        # per-camera frame offsets are computed. Randomness comes from the
-        # module-level ``random`` RNG — per-worker seeded by the torch worker
-        # loop (and by dataloader_worker_init_fn in deterministic mode), the
-        # same source the video transforms use.
-        # Val keeps the resolved head camera so eval stays deterministic.
-        self._head_camera_choices: Optional[List[str]] = None
-        if head_camera_choices:
-            cams = list(dict.fromkeys(str(c) for c in head_camera_choices))
-            if self._head_camera not in cams:
-                raise ValueError(
-                    f"{self.DATASET_NAME}({self._dataset_id}): head_camera_choices {cams} must include "
-                    f"the resolved head camera {self._head_camera!r} (the val/default view)."
-                )
-            if self._split == "train" and len(cams) > 1:
-                self._head_camera_choices = cams
+        # The split's train-only augmentations, switched in the one place eval_view uses too.
+        self._select_augmentations(train=self._split == "train")
         if self._multiview:
             self._camera_layout = self._camera_layout_param or [
                 self._head_camera,
@@ -348,29 +302,9 @@ class LeRobotV3Reader(BaseDataset):
         # default.
         self._eps_df = self._filter_episodes(self._eps_df)
 
-        # ── optional episode-level subsample to fit a per-bucket hour budget ──
-        if self._max_hours is not None:
-            self._select_episodes_by_hours(float(self._max_hours), self._subsample_seed)
-
         self._rebuild_episode_arrays()
         # Data shards are read once here (the parent, before DataLoader workers fork); samples never re-read.
         self._data_tables = self._read_all_data_tables()
-        if self._head_camera_choices:
-            # Fail fast on a mistyped choice: a camera without video index
-            # columns would otherwise surface as an opaque empty-head-decode
-            # retry storm in sample().
-            missing = [c for c in self._head_camera_choices if c not in self._ep_video_frame_offsets]
-            if missing:
-                raise ValueError(
-                    f"{self.DATASET_NAME}({self._dataset_id}): head_camera_choices cameras {missing} "
-                    "have no videos/<cam>/chunk_index + file_index columns in the episodes table."
-                )
-            logger.info(
-                "%s(%s): head-view sampling active over %s",
-                self.DATASET_NAME,
-                self._dataset_id,
-                self._head_camera_choices,
-            )
 
         # ── prompts + per-dataset normalization stats (hooks) ─────────────
         self._load_prompts()
@@ -422,44 +356,6 @@ class LeRobotV3Reader(BaseDataset):
             self._normalize_mode,
         )
 
-    def _select_episodes_by_hours(self, target_hours: float, seed: int) -> None:
-        """Select whole episodes against a post-filter, effective-hour budget.
-
-        This helper only changes ``_eps_df``.  The caller must rebuild the
-        derived episode/window arrays afterwards.  Keeping selection separate
-        lets root-mode multi-bucket construction first build every leaf against
-        its complete split/exclusion/trim population, water-fill using those
-        *effective* capacities, and then apply each allocation in place.
-        """
-        n_before = len(self._eps_df)
-        if n_before == 0:
-            raise ValueError(
-                f"{self.DATASET_NAME}({self._dataset_id}): eps_df is already empty before "
-                "subsample (likely split/info.json mismatch)."
-            )
-        self._max_hours = float(target_hours)
-        self._subsample_seed = int(seed)
-        self._eps_df = subsample_episodes_by_hours(
-            self._eps_df,
-            target_hours=self._max_hours,
-            fps=self._fps,
-            seed=self._subsample_seed,
-            episode_frames=self._sampleable_episode_frames(self._eps_df),
-        )
-        if len(self._eps_df) == 0:
-            raise ValueError(
-                f"{self.DATASET_NAME}({self._dataset_id}): subsampling to max_hours={self._max_hours}h left 0 episodes."
-            )
-        logger.info(
-            "%s(%s): subsampled %d/%d episodes (max_hours=%.3f effective h, seed=%d)",
-            self.DATASET_NAME,
-            self._dataset_id,
-            len(self._eps_df),
-            n_before,
-            self._max_hours,
-            self._subsample_seed,
-        )
-
     def _rebuild_episode_arrays(self) -> None:
         """Rebuild every array derived from the current ``_eps_df`` rows."""
         effective_length = effective_episode_frames(self._eps_df)
@@ -488,32 +384,6 @@ class LeRobotV3Reader(BaseDataset):
         ).astype(np.int64)
         self._cum_n_starts = np.concatenate([[0], np.cumsum(n_starts)]).astype(np.int64)
         self._n_total = int(self._cum_n_starts[-1])
-
-    def _sampleable_episode_frames(self, eps_df: pd.DataFrame) -> np.ndarray:
-        """Effective frames, with non-window-producing episodes charged as zero."""
-        frames = effective_episode_frames(eps_df)
-        min_window_len = self._min_window_len()
-        return np.where(frames >= min_window_len, frames, 0).astype(np.int64)
-
-    def _apply_effective_hour_budget(self, target_hours: float, seed: int) -> None:
-        """Apply a root-mode water-fill allocation to an initialized leaf.
-
-        Multi-bucket construction deliberately initializes leaves uncapped so
-        their split/exclusion/trim filters and data-contract checks run against
-        the complete population.  It then calls this method once with the
-        effective-hours allocation.  Prompt tables, normalization stats and
-        static action masks do not depend on the selected episode subset; only
-        the episode dispatch arrays need rebuilding. This must run before the
-        multi-bucket wrapper snapshots child lengths into its cumulative index.
-        """
-        self._select_episodes_by_hours(target_hours, seed)
-        self._rebuild_episode_arrays()
-
-    @property
-    def effective_hours(self) -> float:
-        """Post-split/exclusion/trim footage represented by this leaf."""
-        frames = self._sampleable_episode_frames(self._eps_df)
-        return float(frames.sum()) / self._fps / 3600.0
 
     # ----- hooks (defaults) -------------------------------------------------
 
@@ -606,13 +476,7 @@ class LeRobotV3Reader(BaseDataset):
         return eps_df
 
     def _load_prompts(self) -> None:
-        """Populate the prompt lookup according to ``PROMPT_SOURCE``."""
-        if self.PROMPT_SOURCE == "episode_annotated":
-            self._episode_idx_to_text = load_tasks_annotated(
-                self._dataset_dir, source_name=f"{self.DATASET_NAME}({self._dataset_id})"
-            )
-            return
-        # "task_index": meta/tasks.parquet, index=text, "task_index" column=int.
+        """Populate the prompt lookup from ``meta/tasks.parquet`` (index = text, ``task_index`` column = int)."""
         tasks_path = self._dataset_dir / "meta" / "tasks.parquet"
         if not self.PROMPT_FILE_REQUIRED and not tasks_path.exists():
             self._task_idx_to_text: Dict[int, str] = {}
@@ -622,25 +486,20 @@ class LeRobotV3Reader(BaseDataset):
         task_str = tasks_df.index.to_numpy()
         self._task_idx_to_text = dict(zip(task_idx.tolist(), task_str.tolist()))
 
-    def all_prompts(self) -> Optional[List[str]]:
+    def all_prompts(self) -> List[str]:
         """Every prompt string ``_resolve_prompt`` can return (for text-embedding caching).
 
         Returns: sorted list[str] of unique prompts (stripped, as ``_resolve_prompt`` returns
-            them; a superset of the split's prompts), or None for ``episode_annotated``
-            sources (not supported; the caller must then encode online).
+            them; a superset of the split's prompts).
         """
-        if self.PROMPT_SOURCE != "task_index":
-            return None
         return sorted({t.strip() for t in self._task_idx_to_text.values() if t.strip()})
 
     def _resolve_prompt(self, row, win: pd.DataFrame) -> str:
-        """Resolve this window's prompt text according to ``PROMPT_SOURCE``.
+        """Resolve this window's prompt text from its ``task_index``.
 
         Raises on a missing entry / empty string (a data bug should not slip
         into training as a fabricated prompt).
         """
-        if self.PROMPT_SOURCE == "episode_annotated":
-            return resolve_prompt_by_episode(self._episode_idx_to_text, int(row["episode_index"]), self.DATASET_NAME)
         task_idx = int(win["task_index"].iloc[0])
         if task_idx not in self._task_idx_to_text:
             raise KeyError(
@@ -686,92 +545,6 @@ class LeRobotV3Reader(BaseDataset):
             source_hint=str(stats_path),
         )
 
-    def _write_deploy_normalizer_stats(self, combined: dict, keys) -> None:
-        """Write ``meta/normalization_stats.npy`` — the deploy denormalizer artifact.
-
-        ``combined`` is this reader's RAW-space per-mode stats (the values the
-        reader normalizes against, BEFORE the unify scatter). The model emits the
-        unified action; at deploy the policy server's ``_UnifyAwareNormalizer``
-        gathers that unified output back to raw dims, THEN unnormalizes with these
-        RAW stats — so the artifact is authored in RAW space (NOT scattered to the
-        unified width). Schema is the nested ``{DEPLOY_ACTION_MODE: {mean, std, min,
-        max, q01, q99}}`` that ``load_mode_stats`` / ``_build_normalizer`` consume
-        unchanged. Shared by every reader that serves the unified action: set
-        ``DEPLOY_ACTION_MODE`` and call this from ``_load_stats``.
-
-        The file may legitimately hold MORE than one ``action_mode`` (a bucket used
-        by both a ``unified`` and a ``joint`` run): this MERGES this mode's entry into
-        whatever the file already holds rather than overwriting. Overwriting would
-        drop the other mode's key, and the deploy side (``_build_inner_normalizer``)
-        now hard-fails on a missing key — so a blind overwrite would turn a stale
-        artifact into a refused deployment. (Merge closes the sequential case; the
-        deploy-side raise backstops the residual same-instant two-writer race.)
-
-        Best-effort on the write: a read-only dataset mount raises ``OSError``, which
-        is caught and logged — the artifact is skipped (``normalization_stats_path``
-        stays ``None``) instead of crashing construction. Training itself never reads
-        this file (it normalizes in-process from the reader stats), so a RO mount
-        degrades to "no deploy artifact" rather than an ``__init__`` failure.
-        """
-        if self.DEPLOY_ACTION_MODE is None:
-            raise ValueError(
-                f"{self.DATASET_NAME}: _write_deploy_normalizer_stats called but DEPLOY_ACTION_MODE is None; "
-                "set it on the reader class to the action_mode key the deploy stats are stored under."
-            )
-        entry = {k: np.asarray(combined[k], dtype=np.float32) for k in keys}
-        out = self._dataset_dir / "meta" / "normalization_stats.npy"
-        try:
-            # Read-modify-write: preserve other modes' keys already in the file.
-            # A genuinely corrupt file (truncated / not a pickle) is caught below and
-            # rewritten with just this mode. A bare OSError on the READ (e.g. a
-            # transient NFS/fuseblk blip) is NOT treated as corruption — it propagates
-            # to the outer handler, which skips the write and leaves the existing
-            # (valid) file intact rather than clobbering another mode's key with a
-            # single-key rewrite (which the deploy-side raise would then reject).
-            payload: Dict[str, Any] = {}
-            if out.exists():
-                try:
-                    prev = np.load(out, allow_pickle=True).item()
-                    if isinstance(prev, dict):
-                        payload.update(prev)
-                except (ValueError, EOFError, pickle.UnpicklingError) as e:
-                    logger.warning(
-                        "%s(%s): existing %s is corrupt (%s); rewriting with only the %r key.",
-                        self.DATASET_NAME,
-                        self._dataset_id,
-                        out.name,
-                        e,
-                        self.DEPLOY_ACTION_MODE,
-                    )
-            payload[self.DEPLOY_ACTION_MODE] = entry
-            # Atomic write (unique temp + replace) so concurrent per-rank constructors
-            # never observe a half-written file. pid ALONE collides on a shared
-            # filesystem (same local-rank across nodes → same pid), so the temp name
-            # also carries hostname + a uuid. Ends in '.npy' so np.save adds no suffix.
-            tmp = out.with_name(f".{out.stem}.{socket.gethostname()}.{os.getpid()}.{uuid.uuid4().hex}.npy")
-            try:
-                np.save(tmp, payload, allow_pickle=True)
-                tmp.replace(out)
-            finally:
-                if tmp.exists():
-                    tmp.unlink()
-        except OSError as e:
-            # Read-only mount (write) or transient IO fault (read): leave any existing
-            # file untouched and skip the artifact. normalization_stats_path stays None
-            # so the trainer copy is skipped and deploy fails loud on the missing key.
-            logger.warning(
-                "%s(%s): could not read/write deploy stats artifact %s (%s); "
-                "normalization_stats.npy left unchanged (deploy artifact not (re)generated). "
-                "Training is unaffected (in-process normalization uses the reader stats); to "
-                "deploy this run, pre-generate the artifact on a writable copy of the meta/ dir.",
-                self.DATASET_NAME,
-                self._dataset_id,
-                out,
-                e,
-            )
-            return
-        self.normalization_stats_path = str(out)
-
     def _action_20d(self, win: pd.DataFrame) -> Optional[np.ndarray]:
         """Return normalized ``(actual_raw_len, ACTION_DIM)`` action, or None (disabled)."""
         return None
@@ -779,18 +552,11 @@ class LeRobotV3Reader(BaseDataset):
     def _post_init(self, info: dict) -> None:
         """Optional one-time per-dataset setup (e.g. Fractal quat sanity check)."""
 
-    @classmethod
-    def _multibucket_wrapper(cls):
-        """Root-mode aggregate wrapper class, or None when only single-bucket is supported."""
-        return None
-
     # ----- offsets / IO -----------------------------------------------------
 
     def _video_cameras(self) -> Tuple[str, ...]:
-        """Cameras needing per-episode video frame offsets: the resolved trio
-        plus every head-view sampling choice, deduped, order-stable."""
+        """Cameras needing per-episode video frame offsets: the resolved trio, deduped, order-stable."""
         cams = [self._head_camera, self._left_wrist_camera, self._right_wrist_camera]
-        cams.extend(self._head_camera_choices or ())
         return tuple(dict.fromkeys(c for c in cams if c is not None))
 
     def _add_episode_offsets(self, eps: pd.DataFrame) -> None:
@@ -809,6 +575,8 @@ class LeRobotV3Reader(BaseDataset):
         """Read every data shard the kept episodes reference (``NEEDED_COLS`` only) into memory.
 
         The process-global LRU this replaced re-decoded a whole shard on most shuffled samples (Modal step stalls).
+        The tables belong to this reader (and its :meth:`eval_view` copies): a second reader built in the same
+        process over the same shards (e.g. a val split) preloads them again.
 
         Returns:
             dict ``(chunk_idx, file_idx) -> pyarrow.Table``; yam_sharpa: ~2.7 GB per rank for the two default sources.
@@ -833,16 +601,38 @@ class LeRobotV3Reader(BaseDataset):
         """chunk_idx, file_idx: int data shard indices. Returns: pyarrow.Table of ``NEEDED_COLS`` for that shard."""
         return self._data_tables[(chunk_idx, file_idx)]
 
-    # ----- Dataset ----------------------------------------------------------
+    # ----- sampling ---------------------------------------------------------
 
     def __len__(self) -> int:
+        """Returns: int, the number of windows (valid sample indices)."""
         return self._n_total
 
-    def __getitem__(self, idx: int) -> dict:
-        """Not supported: a source reader samples with its caller's per-sample RNG, see :meth:`sample`."""
-        raise TypeError(
-            f"{type(self).__name__} is read through sample(idx, rng) (MultiYamSharpaDataset passes the rng)"
-        )
+    def _select_augmentations(self, train: bool) -> None:
+        """Switch the train-only augmentations on or off: the one place the split rule lives.
+
+        Called from ``__init__`` (before the episode index is built), so a subclass that extends it must set the
+        fields its override reads before calling ``super().__init__`` (yam_sharpa: ``_history_sampling``,
+        ``_history_offsets``, ``_history_window``).
+
+        Args:
+            train: bool, True for the train split; False for val and :meth:`eval_view`.
+
+        Returns:
+            None. Sets ``_color_jitter`` (None = off). Subclasses with more train-only augmentations extend it
+            (yam_sharpa: random history).
+        """
+        self._color_jitter = self._train_color_jitter if train else None
+
+    def eval_view(self) -> "LeRobotV3Reader":
+        """This reader with eval semantics, sharing its preloaded shards (no re-read).
+
+        Returns:
+            a shallow copy over the same windows with every train-only augmentation off
+            (:meth:`_select_augmentations` with ``train=False``, the val split's rule).
+        """
+        view = copy.copy(self)
+        view._select_augmentations(train=False)
+        return view
 
     def sample(self, idx: int, rng: np.random.Generator) -> dict:
         """One sample; on a read failure retries the next window (up to ``_GETITEM_MAX_RETRIES`` times).
@@ -972,19 +762,13 @@ class LeRobotV3Reader(BaseDataset):
         # (1, D) dim mask -> one copy per proprio row.
         return proprio, np.repeat(mask, len(proprio), axis=0)
 
-    # ----- BaseDataset ------------------------------------------------------
+    # ----- metadata ---------------------------------------------------------
 
     @property
     def action_dim(self) -> int:
         return self.ACTION_DIM
 
-    @property
-    def normalization_stats(self) -> Optional[dict]:
-        # Samples leave the reader pre-normalized; downstream layers see None.
-        return None
-
-    # ----- from_config ------------------------------------------------------
-
+    # Reader keys a dataset's ``from_config`` may forward (yam_sharpa filters and extends them).
     CONFIG_KEYS: ClassVar[Tuple[str, ...]] = (
         "num_frames",
         "window_stride",
@@ -994,72 +778,10 @@ class LeRobotV3Reader(BaseDataset):
         "normalize_mode",
         "target_camera",
         "camera_layout",
-        "head_camera_choices",
         "unify_action",
         "unify_action_map",
         "unify_state_map",
         "color_jitter",
     )
-
-    @classmethod
-    def from_config(cls, config, split: str = "train") -> "BaseDataset":
-        from openwam.dataloader.utils import get_cfg as _get
-
-        dataset_dir = _get(config, "dataset_dir")
-        if dataset_dir is None:
-            raise ValueError(f"{cls.__name__}: missing dataset_dir")
-        root = Path(dataset_dir)
-
-        common: Dict[str, Any] = {"split": split}
-        for key in cls.CONFIG_KEYS:
-            v = _get(config, key, _CONFIG_MISSING)
-            if v is _CONFIG_MISSING:
-                continue
-            # ``normalize_mode`` uses key-presence semantics: an explicit
-            # ``null`` in the config must reach the ctor as None (disable
-            # normalization) instead of being dropped — otherwise the ctor's
-            # _NORMALIZE_MODE_UNSET sentinel falls back to DEFAULT_NORMALIZE_MODE
-            # (e.g. OXE "quantile"). Other keys keep treating None as "unset".
-            if v is None and key != "normalize_mode":
-                continue
-            common[key] = v
-
-        # Single-bucket mode.
-        if (root / "meta" / "info.json").is_file():
-            kwargs = dict(common)
-            dataset_id = _get(config, "dataset_id")
-            if dataset_id is not None:
-                kwargs["dataset_id"] = dataset_id
-            # Honor total_hours in single-bucket mode too (subsample this bucket
-            # to the budget) — otherwise a yaml-level total_hours would be
-            # silently ignored when dataset_dir points at one bucket.
-            total_hours = _get(config, "total_hours")
-            if total_hours is not None:
-                kwargs["max_hours"] = float(total_hours)
-                kwargs["subsample_seed"] = int(_get(config, "seed", 42))
-            return cls(dataset_dir=str(root), **kwargs)
-
-        # Root mode (only when the reader declares a multi-bucket wrapper).
-        wrapper = cls._multibucket_wrapper()
-        if wrapper is None:
-            raise FileNotFoundError(f"{cls.__name__}: {root}/meta/info.json missing")
-        if not root.is_dir():
-            raise FileNotFoundError(f"{cls.__name__}: {root} does not exist")
-        sub_dirs = sorted(d for d in root.iterdir() if d.is_dir() and (d / "meta" / "info.json").is_file())
-        if not sub_dirs:
-            raise FileNotFoundError(f"{cls.__name__}: no sub-buckets with meta/info.json under {root}")
-        logger.info("%s.from_config: root mode, %d buckets under %s", cls.__name__, len(sub_dirs), root)
-        base_seed = int(_get(config, "seed", 42))
-        total_hours = _get(config, "total_hours")
-        return build_multibucket(
-            cls,
-            sub_dirs,
-            common,
-            base_seed=base_seed,
-            total_hours=total_hours,
-            wrapper_cls=wrapper,
-            source_name=cls.__name__,
-        )
-
 
 __all__ = ["LeRobotV3Reader"]

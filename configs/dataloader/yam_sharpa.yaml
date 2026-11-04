@@ -40,6 +40,9 @@ future_offsets: [4, 8, 12, 16, 20, 24, 28, 32]
 # (resolve_config checks that history_window reaches the oldest offset).
 history_sampling: fixed
 history_window: 100
+# Caption dropout (train split only): the prompt becomes "" with this probability, drawn from the same per-sample
+# (seed, epoch, idx) RNG after the history offsets. Launch scripts set the backbone's recipe value (GE 0.06, flux 0.1).
+caption_dropout_p: 0.0
 window_stride: 1
 split: train
 

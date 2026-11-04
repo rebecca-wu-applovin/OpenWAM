@@ -105,6 +105,10 @@ class OpenWAMTrainer:
             lambda_video=float(t.lambda_video),
             lambda_action=float(t.lambda_action),
         )
+        # Checked here, not in TrainOptions / compute_loss: INFERENCE_ONLY legitimately has both weights 0, and only
+        # a training run needs a loss with at least one term.
+        if train_options.lambda_video == 0 and train_options.lambda_action == 0:
+            raise ValueError("training.lambda_video and training.lambda_action are both 0: the loss has no term.")
         finetune_path = cfg_get(t, "finetune_ckpt_path", None) or None
         resume_path = cfg_get(t, "resume_ckpt_path", None) or None
         if finetune_path and resume_path:
@@ -239,8 +243,9 @@ class OpenWAMTrainer:
         vis_steps = int(cfg_get(t, "vis_steps", 0) or 0)
         visualizer = None
         if vis_steps > 0 and self.dataset is not None:
+            # Eval semantics (no caption dropout, fixed history, no jitter), sharing the preloaded readers.
             visualizer = TrainVisualizer(
-                self.dataset,
+                self.dataset.eval_view(),
                 rank=self._rank,
                 num_samples=int(cfg_get(t, "vis_num_samples", 4)),
                 denoise_steps=int(cfg_get(t, "vis_denoise_steps", 10)),
@@ -586,8 +591,8 @@ class OpenWAMTrainer:
         result = self.architecture.compute_loss(batch.to(arch.device, arch.dtype))
         return {
             "total": result["loss"],
-            "video": result.get("loss_video", torch.tensor(0.0)),
-            "action": result.get("loss_action", torch.tensor(0.0)),
+            "video": result["loss_video"],
+            "action": result["loss_action"],
         }
 
     # (10) Called each step in train()'s loop — progress bar, wandb log, debug loss-history CSV.

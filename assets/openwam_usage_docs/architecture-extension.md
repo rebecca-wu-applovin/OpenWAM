@@ -18,89 +18,79 @@ Source locations:
 The current registry keys are:
 
 ~~~text
-# Video backbone
-wan22_ti2v_5b
-cosmos3_edge
+# Video backbone (configs/model/video_backbone/<key>.yaml; one directory per family under openwam/model/video_backbone/)
+wan22_ti2v_5b  longlive2_robot_s        # wan/      (wan22_ti2v_tiny is a debug yaml of wan22_ti2v_5b)
+cosmos3_edge   cosmos3_nano             # cosmos3/
+ge_base_fast                            # ge/
+flux3_action_base                       # flux/
 
 # Architecture
 dual_system_cross_attn
 dual_system_self_attn
 ~~~
 
-Architecture keys are resolved from `architecture.framework` and `architecture.variant`. A new registration should declare its current support status and fail clearly when a required capability is unavailable.
+Architecture keys are resolved from `architecture.framework` and `architecture.variant`. A new registration should fail clearly when a required capability is unavailable.
 
 ## Add a video DiT backbone
 
-Subclass `VideoBackbone` in [openwam/model/video_backbone/base.py](../../openwam/model/video_backbone/base.py), implement the execution lifecycle, and register the class in [openwam/model/video_backbone/__init__.py](../../openwam/model/video_backbone/__init__.py).
+Adding a backbone = **implement the 14 abstract members of `VideoBackbone` + write one yaml**. Everything else
+(pixel conversion, history / future encoding, text of the latent clip, decoding, frame-major attention masks) is
+implemented once in [openwam/model/video_backbone/base.py](../../openwam/model/video_backbone/base.py) on top of them.
+
+1. Create `openwam/model/video_backbone/<family>/backbone.py` (plus a short `README.md`: upstream source / commit,
+   the yamls, anything vendored) and subclass `VideoBackbone`. Keep the method order of the other families:
+   construction → geometry → video and text IO → block loop → deploy assets.
 
 ~~~python
-from openwam.model.video_backbone import VideoBackbone, BlockLoopState, register_video_backbone
+from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
 
-@register_video_backbone('my_video')
 class MyVideoBackbone(VideoBackbone):
-    # Construction and geometry
+    # Construction: 2 abstract classmethods + __init__. cfg = cfg.model.video_backbone, read-only; the entry point picks the constructor (LoadMode).
+    def __init__(self, ...):                     # set _shift_video, _causal_temporal, _temporal_compression
+        ...
     @classmethod
-    def from_pretrained(cls, source, **kwargs): ...
-    @property
-    def dim(self) -> int: ...
-    @property
-    def num_layers(self) -> int: ...
-    @property
-    def num_heads(self) -> int: ...
-    @property
-    def head_dim(self) -> int: ...
-    @property
-    def scheduler(self): ...
+    def from_pretrained(cls, cfg): ...           # upstream weights, checked against the yaml geometry (raise on mismatch)
+    @classmethod
+    def from_checkpoint_dir(cls, cfg, ckpt_dir): ...  # meta-device shell of one of our checkpoints; the caller loads weights
 
-    # Video and text IO (the base class runs the shared preprocessing flow on top of these)
-    def encode_pixels(self, pixels): ...        # (N, 3, T, H, W) in [-1, 1] -> (N, z, 1 + (T-1)/tc, h, w)
-    def decode_latents(self, latents): ...      # (N, z, T_lat, h, w) -> (N, 3, T, H, W) in [-1, 1]
-    def encode_text(self, prompts, *, grid, num_frames) -> TextCondition: ...
+    # Geometry (6 properties)
+    dim, num_layers, num_heads, head_dim, text_dim  # ints
+    scheduler                                        # set_timesteps / timesteps / sigmas / step + sample_train(B, *, device, dtype)
 
-    # Block loop
-    # layout = cfg.common.layout; proprio (B, H, D) is always passed, only a proprio_input=backbone_stream family reads it
+    # Video and text IO (3)
+    def encode_pixels(self, pixels): ...         # (N, 3, T, H, W) in [-1, 1] -> (N, z, 1 + (T-1)/tc, h, w) normalized
+    def decode_latents(self, latents): ...       # (N, z, T_lat, h, w) -> (N, 3, T, H, W) in [-1, 1]
+    def encode_text(self, prompts, *, grid, num_frames) -> TextCondition: ...  # context (B, L, text_dim) + mask (B, L)
+
+    # Block loop (3). layout = cfg.common.layout; proprio (B, H, D) is always passed
     def prepare(self, *, latents, timestep, text, layout, proprio,
                 use_gradient_checkpointing, use_gradient_checkpointing_offload) -> BlockLoopState: ...
-    def run_block(self, block_id, state, attn_mask): ...  # video-only layer with this layer's token mask
-    def finalize(self, state): ...
+    def run_block(self, block_id, state, attn_mask) -> BlockLoopState: ...  # video-only layer with this layer's mask
+    def finalize(self, state): ...               # -> (B, z, T_lat, h, w) predicted velocity
 ~~~
 
-The base class implements `to_pixels`, `encode_frames` / `encode_clip`, `preprocess_condition` (deploy),
-`preprocess_train` (training) and `decode_future` once on top of `encode_pixels` / `decode_latents` / `encode_text`;
-all of them take the latent layout (`cfg.common.layout`, derived by `openwam.config.resolve_config`).
+2. Register it at the bottom of [openwam/model/video_backbone/__init__.py](../../openwam/model/video_backbone/__init__.py):
+   `register_video_backbone("my_video")(MyVideoBackbone)`.
 
-The execution order is `prepare → run_block → finalize`. `prepare` returns a `BlockLoopState` containing hidden tokens, timestep data, RoPE, context, and grid metadata. `finalize` returns video noise with shape `(B, C, T, H, W)`. Preserve gradient-checkpointing data in the state.
+3. Write `configs/model/video_backbone/my_video.yaml`: `name: my_video`, the module geometry (checked against the
+   weights at build), `temporal_compression`, `shift_video`, `text_cache`, weight paths. Pin what the backbone
+   requires with `required_clean_attention` / `required_proprio_input`; `resolve_config` checks them once.
 
-Expose structural metadata used by token geometry and masks:
-
-~~~python
-# openwam/model/video_backbone/<my_video>.py
-self._dit_patch_size = (1, 2, 2)  # temporal, height, width
-self._temporal_compression = 4
-self._causal_temporal = True
-self._shift_video = 5.0            # scheduler shift, when supported
-~~~
-
-Implement only the capability hooks that the backbone supports:
+Optional hooks have working defaults; override only what the family supports:
 
 ~~~text
-# MoT
-pre_attn_at_layer / post_attn_at_layer
-
-# Masks and deployment
-build_joint_attention_masks   # only when the token order is not frame-major (views, extra tokens, prefix keys)
-build_text_cache / save_deploy_assets
+pre_attn_at_layer / post_attn_at_layer   # joint_self_attn (MoT); default raises
+build_joint_attention_masks              # only when the token order is not frame-major (views, extra tokens, prefix keys)
+build_text_cache                         # text_cache: true; base caches text_lookup (needs text_lookup / text_encoder /
+                                         # _text_cache_batch_size); override to raise if the text cannot be cached
+save_deploy_assets                       # non-weight files (tokenizer, configs) copied into the checkpoint; default none
+apply_compile_optimizations / set_dtype_device
 ~~~
 
-Add a matching Hydra group under [configs/model/video_backbone/](../../configs/model/video_backbone/):
-
-~~~yaml
-# configs/model/video_backbone/my_video.yaml
-name: my_video                         # registry key
-model_path: /path/to/video_backbone_checkpoint  # weights or bundle root
-~~~
-
-Use `build_video_backbone('my_video', cfg)` to instantiate it. Keep architecture code on the public backbone contract and do not reach into implementation details such as `backbone.dit`.
+Never override the shared flow (`to_pixels`, `encode_frames`, `encode_clip`, `preprocess_condition`,
+`preprocess_train`, `decode_future`): `tests/test_video_backbone_base.py::test_families_do_not_override_base_flow`
+checks every registered family. Build it through `build_video_backbone(cfg.model.video_backbone, mode, ckpt_dir)`
+(the architecture does this); architecture code stays on the public contract and never reaches into `backbone.dit`.
 
 ## Add an action backbone
 

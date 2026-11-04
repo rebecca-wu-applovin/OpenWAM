@@ -119,7 +119,7 @@ def load_from_checkpoint_dir(
     # 6. Attach the action normalizer built from saved normalization_stats.npy + config.
     architecture.attach_normalizer(_build_normalizer(cfg, ckpt_dir))
     # 6b. Optional raw-space action decoder (relative → absolute) applied after unnormalize.
-    architecture.action_decoder = _build_action_decoder(cfg)
+    architecture.deploy_action_decoder = _build_action_decoder(cfg)
 
     # 7. Binary command dims for the final legality projection at WAMPolicy.predict_action.
     # Authoritative source is the CKPT's dataloader config, never the deploy yaml: the training data
@@ -218,8 +218,8 @@ def _build_inner_normalizer(cfg: DictConfig, ckpt_dir: str):
     mode_stats = load_mode_stats(stats_path, action_mode)
     if mode_stats is None:
         raise KeyError(
-            f"[normalizer] Stats file {stats_path} has no '{action_mode}' entry (its keys are written from the "
-            f"training reader's DEPLOY_ACTION_MODE). Refusing to deploy with normalization silently disabled: "
+            f"[normalizer] Stats file {stats_path} has no '{action_mode}' entry (its keys are the training "
+            f"readers' action_mode keys). Refusing to deploy with normalization silently disabled: "
             "the model emits normalized actions for this action_mode and unnormalize would be skipped, sending "
             "normalized [-1, 1] values to the robot as physical poses/velocities. Regenerate "
             "normalization_stats.npy so it contains the checkpoint's action_mode key."

@@ -274,12 +274,8 @@ class DualSystemMoTDriver:
         two ``use_gradient_*`` flags are forwarded to :meth:`step` so each layer
         may opt into step-level activation checkpointing.
         """
-        payload = astate.payload
-        if payload is None or not hasattr(payload, "x_action"):
-            raise RuntimeError(
-                "DualSystemMoTDriver: astate.payload must expose `x_action` (populated by ActionDiT.prepare_state)."
-            )
-        s_action = payload.x_action.shape[1]
+        # Action tokens in the joint sequence: ``payload`` is the ActionDiTState from ActionDiT.prepare_state.
+        s_action = astate.payload.x_action.shape[1]
         # The backbone owns its token order (views, text / proprio tokens, prefix keys); the rules are the frame mask's.
         layer_masks = self.vb.build_joint_attention_masks(self.frame_mask, vstate, s_action)
         if len(layer_masks) != self.num_layers:

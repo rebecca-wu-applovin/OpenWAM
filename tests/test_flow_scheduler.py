@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from openwam.model.video_backbone.common.flow_scheduler import FlowScheduler
+from openwam.model.video_backbone.cosmos3.scheduler import Cosmos3FlowSchedulerAdapter
 
 
 def test_set_timesteps_training_populates_all_fields():
@@ -71,3 +72,28 @@ def test_shift_video_changes_sigmas():
     sch_high.set_timesteps(num_inference_steps=20, training=False)
     # shift=1 collapses to identity; shift=5 pushes sigmas toward 1.
     assert not torch.allclose(sch_low.sigmas, sch_high.sigmas)
+
+
+# Cosmos3 adapter (merged from the former test_cosmos3_scheduler.py)
+
+
+def test_cosmos3_training_grid_matches_shift_formula():
+    shift = 5.0
+    sched = Cosmos3FlowSchedulerAdapter(shift_video=shift)
+    sched.set_timesteps(1000, training=True, shift=shift)
+
+    base = torch.linspace(1.0, 0.0, 1001)[:-1]
+    expected = shift * base / (1 + (shift - 1) * base)
+    assert torch.allclose(sched.sigmas, expected, atol=1e-6)
+    assert torch.allclose(sched.timesteps, sched.sigmas * sched.num_train_timesteps, atol=1e-4)
+    assert sched.linear_timesteps_weights is not None
+    assert torch.all(sched.linear_timesteps_weights == 1.0)
+
+
+def test_cosmos3_inference_grid_respects_shift_override():
+    sched = Cosmos3FlowSchedulerAdapter(shift_video=5.0)
+    sched.set_timesteps(10, shift=3.0)
+    base = torch.linspace(1.0, 0.0, 11)[:-1]
+    expected = 3.0 * base / (1 + 2.0 * base)
+    assert torch.allclose(sched.sigmas, expected, atol=1e-6)
+    assert sched.linear_timesteps_weights is None

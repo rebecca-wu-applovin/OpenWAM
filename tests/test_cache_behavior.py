@@ -83,6 +83,15 @@ def test_cache_matches_online_and_skips_the_encoder():
     assert enc.weight.device.type == "cpu" and "text_encoder.weight" in vb.state_dict()
 
 
+def test_cache_answers_the_empty_prompt():
+    # A caption-dropped sample asks for "": the cache always holds it.
+    online = _encode(_wan(_MockTextEncoder()), [""])
+    vb = _wan(_MockTextEncoder())
+    vb.build_text_cache(["ab"])
+    cached = _encode(vb, [""])
+    assert torch.equal(cached.context, online.context) and torch.equal(cached.context_mask, online.context_mask)
+
+
 def test_cache_miss_raises():
     vb = _wan(_MockTextEncoder())
     vb.build_text_cache(["ab"])

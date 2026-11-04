@@ -13,11 +13,15 @@ state_dict lives at ``action_backbone.<param>`` with no wrapping prefix.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 from torch import nn
 
 from openwam.model.action_backbone.scheduler import ActionScheduler
+
+if TYPE_CHECKING:
+    from openwam.model.architectures.base import ActionState
 
 
 class ActionDiTBackbone(nn.Module, ABC):
@@ -29,31 +33,25 @@ class ActionDiTBackbone(nn.Module, ABC):
     validates against the video backbone are declared abstract here.
     """
 
+    # Set by the subclass __init__ (no default: a subclass that forgets them fails on first read).
+    _shift_action: float
+    _bridge_layers: tuple[int, ...]
+
     def __init__(self):
         super().__init__()
         self.scheduler = ActionScheduler()
-        self._shift_action = None
 
     @property
-    def shift_action(self):
-        """Optional α-shift for the action scheduler — single source of truth read by
-        the architecture for both training and inference. ``None`` (the default) falls
-        back to the scheduler template; concrete backbones may set ``self._shift_action``
-        in ``__init__``. Symmetric to ``VideoBackbone.shift_video``."""
+    def shift_action(self) -> float:
+        """α-shift for the action scheduler — single source of truth read by the architecture for both
+        training and inference. Symmetric to ``VideoBackbone.shift_video``."""
         return self._shift_action
 
     @property
     def bridge_layers(self) -> tuple[int, ...]:
-        """Video DiT blocks where the action stream couples to the video stream.
-        Default none. ActionDiT overrides with its bridge cross-attn layers — the
-        architecture iterates the video block loop and cross-attends at these
-        block ids."""
-        return getattr(self, "_bridge_layers", ())
-
-    def apply_expert(self, layer_id: int, x_action, t_mod):
-        """ActionDiT couples by cross-attention, not expert FFN — never called.
-        Kept for a uniform coupling contract; raises if reached."""
-        raise NotImplementedError(f"{type(self).__name__} has no expert FFN (couples by bridge cross-attention).")
+        """Video DiT blocks where the action stream couples to the video stream: the architecture iterates
+        the video block loop and cross-attends at these block ids."""
+        return self._bridge_layers
 
     def set_dtype_device(self, dtype, device) -> None:
         """Move action backbone params/buffers to (dtype, device)."""
@@ -89,29 +87,101 @@ class ActionDiTBackbone(nn.Module, ABC):
     def num_layers(self) -> int: ...
 
     @abstractmethod
-    def forward(self, *args, **kwargs) -> torch.Tensor:
-        """joint_cross_attn coupling: standalone action prediction from per-layer bridges."""
-        raise NotImplementedError
+    def forward(
+        self,
+        action_tokens: torch.Tensor,
+        bridges: Dict[int, torch.Tensor],
+        timestep: torch.Tensor,
+        *,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        use_gradient_checkpointing: bool = False,
+        use_gradient_checkpointing_offload: bool = False,
+    ) -> torch.Tensor:
+        """joint_cross_attn coupling: standalone action prediction from per-layer bridges.
+
+        Args:
+            action_tokens: (B, T_action, action_dim) noisy action sequence.
+            bridges: {block_id: (B, T_video, video_dim)} video hidden state captured at every
+                ``bridge_layers`` block.
+            timestep: (B,) or (1,) action diffusion timestep.
+            context: (B, L, text_dim) raw text/proprio context, or None.
+            context_mask: (B, L) bool, True = attend, or None.
+            use_gradient_checkpointing / use_gradient_checkpointing_offload: bool, per-block checkpointing.
+
+        Returns:
+            (B, T_action, action_dim) predicted action noise.
+        """
 
     @abstractmethod
-    def prepare_state(self, *args, **kwargs):
-        """MoT coupling: build the per-layer action state consumed by the driver."""
-        raise NotImplementedError
+    def prepare_state(
+        self,
+        noisy_actions: torch.Tensor,
+        timestep: torch.Tensor,
+        *,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        use_gradient_checkpointing: bool = False,
+        use_gradient_checkpointing_offload: bool = False,
+    ) -> ActionState:
+        """MoT coupling: embed the actions and build the per-layer state the driver threads through the blocks.
+
+        Args:
+            noisy_actions: (B, T_action, action_dim) noisy action sequence.
+            timestep: (B,) or (1,) action diffusion timestep.
+            context: (B, L, text_dim) raw text/proprio context, or None.
+            context_mask: (B, L) bool, True = attend, or None.
+            use_gradient_checkpointing / use_gradient_checkpointing_offload: bool (the driver checkpoints itself).
+
+        Returns:
+            ActionState whose ``payload`` holds the (B, T_action, dim) action hidden state and its modulation.
+        """
 
     @abstractmethod
-    def pre_attn_at_layer(self, *args, **kwargs):
-        """MoT coupling: first half of an action block (norm + AdaLN + Q/K/V + RoPE)."""
-        raise NotImplementedError
+    def pre_attn_at_layer(
+        self, layer_id: int, astate: ActionState
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        """MoT coupling: first half of an action block (norm + AdaLN + Q/K/V + RoPE).
+
+        Args:
+            layer_id: int, block index.
+            astate: ActionState from :meth:`prepare_state` (or the previous layer).
+
+        Returns:
+            (q, k, v, post_state): q / k / v (B, T_action, num_heads * head_dim), ready to join the video Q/K/V;
+            post_state, the dict :meth:`post_attn_at_layer` consumes.
+        """
 
     @abstractmethod
-    def post_attn_at_layer(self, *args, **kwargs):
-        """MoT coupling: second half of an action block (gate + context cross-attn + FFN)."""
-        raise NotImplementedError
+    def post_attn_at_layer(
+        self,
+        layer_id: int,
+        astate: ActionState,
+        attn_out: torch.Tensor,
+        post_state: dict,
+    ) -> ActionState:
+        """MoT coupling: second half of an action block (gate + context cross-attn + FFN).
+
+        Args:
+            layer_id: int, block index.
+            astate: ActionState of this layer.
+            attn_out: (B, T_action, num_heads * head_dim) unprojected joint-attention output of the action rows.
+            post_state: dict returned by :meth:`pre_attn_at_layer` for this layer.
+
+        Returns:
+            ActionState with the payload's action hidden state advanced by one block.
+        """
 
     @abstractmethod
-    def extract_prediction(self, *args, **kwargs) -> torch.Tensor:
-        """MoT coupling: decode the final action hidden state into a prediction."""
-        raise NotImplementedError
+    def extract_prediction(self, astate: ActionState) -> torch.Tensor:
+        """MoT coupling: decode the final action hidden state into a prediction.
+
+        Args:
+            astate: ActionState after the last block.
+
+        Returns:
+            (B, T_action, action_dim) predicted action noise.
+        """
 
 
 __all__ = ["ActionDiTBackbone"]

@@ -31,10 +31,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from openwam.model.video_backbone.base import BlockLoopState
-from openwam.model.video_backbone.common.checkpoint import (
+from openwam.model.grad_checkpoint import (
     gradient_checkpoint_forward,
 )
+from openwam.model.video_backbone.base import BlockLoopState
 
 __all__ = [
     "patchify_latents",
@@ -201,8 +201,7 @@ def _noisy_frames(grid_t: int, num_clean_prefix_frames: int, device) -> Tensor:
 def prepare_block_loop(
     net,
     *,
-    latents: Optional[Tensor] = None,
-    input_latents: Optional[Tensor] = None,
+    latents: Tensor,
     timestep: Tensor,
     context: Tensor,
     und_mask: Optional[Tensor] = None,
@@ -212,7 +211,6 @@ def prepare_block_loop(
     num_clean_prefix_frames: int = 0,
     use_gradient_checkpointing: bool = False,
     use_gradient_checkpointing_offload: bool = False,
-    **_ignored,
 ) -> BlockLoopState:
     """Pack the gen stream and assemble the loop state.
 
@@ -224,9 +222,7 @@ def prepare_block_loop(
     ``timestep`` is ``(B,)`` or per-frame ``(B, T)``; the additive timestep
     embedding is applied here to noisy frames only (upstream contract).
     """
-    x_in = latents if latents is not None else input_latents
-    if x_in is None:
-        raise ValueError("cosmos3 prepare_block_loop needs `latents` or `input_latents`.")
+    x_in = latents
     if und_kv is None or vision_positions is None:
         raise ValueError("cosmos3 prepare_block_loop needs `und_kv` and `vision_positions` from preprocess.")
 
@@ -290,7 +286,6 @@ def prepare_block_loop(
             "cos_gen": cos_gen,
             "sin_gen": sin_gen,
             "orig_hw": orig_hw,
-            "noisy_frames": noisy,
         },
     )
 
@@ -303,14 +298,13 @@ def _gen_block_forward(
     und_mask: Optional[Tensor],
     cos_gen: Tensor,
     sin_gen: Tensor,
-    gen_mask: Optional[Tensor] = None,
+    gen_mask: Tensor,
 ) -> Tensor:
     """One decoder layer's gen half: bidirectional attention over
     ``[und K/V ; gen K/V]`` (GQA) + gen MLP. Mirrors the upstream layer body.
 
-    ``gen_mask`` is an optional ``(S, S)`` (or ``(B, 1, S, S)``) bool mask over
-    the gen block of the key axis, passed by :func:`run_block`. ``None`` keeps the gen block fully visible (the plain
-    video path).
+    ``gen_mask`` is the ``(S, S)`` (or ``(B, 1, S, S)``) bool mask over the gen block of the key axis (the layer's
+    frame mask), passed by :func:`run_block`.
     """
     b, s, _ = gen_seq.shape
     attn = layer.self_attn
@@ -330,19 +324,12 @@ def _gen_block_forward(
     all_k = torch.cat([k_und.to(k.dtype), k], dim=1)
     all_v = torch.cat([v_und.to(v.dtype), v], dim=1)
     l_und = k_und.shape[1]
-    if und_mask is None and gen_mask is None:
-        # Nothing to express: every und key is real and the gen block is fully
-        # visible. Passing None here is what lets SDPA reach a fused kernel.
-        mask = None
-    else:
-        # (B, 1, S_q, L_und + S): und columns gated by the padding mask; the gen
-        # block is fully visible unless the caller supplied a cross-modal mask.
-        mask = torch.ones((b, 1, s, l_und + s), dtype=torch.bool, device=gen_seq.device)
-        if und_mask is not None:
-            mask[:, :, :, :l_und] = und_mask.view(b, 1, 1, l_und)
-        if gen_mask is not None:
-            gm = gen_mask if gen_mask.dim() == 4 else gen_mask.view(1, 1, s, s)
-            mask[:, :, :, l_und:] = gm.to(device=mask.device, dtype=torch.bool)
+    # (B, 1, S_q, L_und + S): und columns gated by the padding mask (None = no padding), gen columns by gen_mask.
+    mask = torch.ones((b, 1, s, l_und + s), dtype=torch.bool, device=gen_seq.device)
+    if und_mask is not None:
+        mask[:, :, :, :l_und] = und_mask.view(b, 1, 1, l_und)
+    gm = gen_mask if gen_mask.dim() == 4 else gen_mask.view(1, 1, s, s)
+    mask[:, :, :, l_und:] = gm.to(device=mask.device, dtype=torch.bool)
 
     out = F.scaled_dot_product_attention(
         q.transpose(1, 2), all_k.transpose(1, 2), all_v.transpose(1, 2), attn_mask=mask, enable_gqa=True
@@ -357,14 +344,14 @@ def run_block(
     block_id: int,
     state: BlockLoopState,
     *,
-    gen_mask: Optional[Tensor] = None,
+    gen_mask: Tensor,
     block_forward: Callable[..., Tensor] = _gen_block_forward,
 ) -> BlockLoopState:
     """One gen block over the packed gen stream.
 
     Args:
         net: the Cosmos3 transformer. block_id: int. state: BlockLoopState of :func:`prepare_block_loop`.
-        gen_mask: optional (S, S) / (B, 1, S, S) bool mask over the gen keys (None = fully visible).
+        gen_mask: (S, S) / (B, 1, S, S) bool mask over the gen keys.
         block_forward: the block body (eager or compiled ``_gen_block_forward``).
 
     Returns:

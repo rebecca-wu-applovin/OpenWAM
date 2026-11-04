@@ -5,12 +5,12 @@
 
 name: flux3_action_base
 temporal_compression: 4   # ViTNorm VAE (yaml contract checked against the backbone at build; the latent layout reads it)
+causal_temporal: true     # the VAE encodes frame 0 alone (yaml contract checked against the backbone at build)
 model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/flux-3-action-base  # [Required] flux-3-action-base.safetensors + video_vae.safetensors + text_encoder/
 
 shift_video: 5.0             # inference sampler shift (flux DROID_INFERENCE_SETTINGS); training uses the native law below
 train_timestep_width: 0.75   # PolicyConfig.train_timestep_width: logit(t) ~ Logistic(0, 0.75)
 train_timestep_shift: 42.0   # PolicyConfig.train_timestep_shift: rational shift
-text_dropout_p: 0.1          # PolicyConfig.caption_dropout ("" through the chat template)
 text_cache: true             # trainer encodes the dataset's prompt set once after the weights are in place, Qwen then on CPU
 action_cond_dim: 48          # P (proprio) stream input width; resolve_config requires it to equal model.architecture.state_dim
 required_proprio_input: backbone_stream  # proprio rides the P stream: launch with model.architecture.proprio_input=backbone_stream

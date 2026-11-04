@@ -1,7 +1,7 @@
 """Wan DiT forward-path helper: time modulation.
 
-Free function, dependency-injected, no backbone import: ``build_time_modulation``
-takes the DiT / timestep / latents / patch_size explicitly.
+Free function, dependency-injected, no backbone import: ``build_time_modulation`` takes the DiT and the
+plain layout numbers explicitly and has one output layout (per token); callers adapt to it.
 """
 
 from __future__ import annotations
@@ -15,64 +15,35 @@ from openwam.model.video_backbone.wan.dit import sinusoidal_embedding_1d
 
 
 def build_time_modulation(
-    dit,
-    timestep,
-    latents,
-    *,
-    patch_size,
-    fuse_vae_embedding_in_latents: bool,
-    force_per_token_t_mod: bool,
-    num_clean_prefix_frames: int,
-    zero_clean_prefix_t_mod: bool,
-    has_first_frame_latents: bool,
+    dit, timestep: Tensor, num_hist_latents: int, num_latents: int, tokens_per_frame: int
 ) -> Tuple[Tensor, Tensor]:
-    """Build ``(time_embed, time_modulation)`` for ``prepare``. TI2V uses
-    per-token t=0 on the clean prefix; ``force_per_token_t_mod`` broadcasts a
-    single (B,) embedding to (B, L, dim); else the plain (B,) path.
+    """Per-token time embedding and AdaLN modulation: clean history frames at t = 0, the rest at ``timestep``.
+
+    The time MLPs run once per latent frame (every token of a frame shares its timestep), then each frame's
+    rows are repeated over its tokens.
+
+    Args:
+        dit: WanModel (``freq_dim``, ``dim``, ``time_embedding``, ``time_projection``).
+        timestep: (B,) video timestep in the model dtype.
+        num_hist_latents: int, leading clean latent frames (``layout.num_hist_latents``).
+        num_latents: int, latent frames F of the clip (``layout.num_latents``).
+        tokens_per_frame: int, DiT tokens per latent frame (patchified h * w).
+
+    Returns:
+        time_embed: (B, L, dim) head time embedding, L = num_latents * tokens_per_frame (frame-major).
+        time_mod: (B, L, 6, dim) block modulation.
     """
-    if dit.seperated_timestep and fuse_vae_embedding_in_latents:
-        batch_size = latents.shape[0]
-        num_clean = max(num_clean_prefix_frames, 1)
-        f_lat = latents.shape[2]
-        tokens_per_frame = latents.shape[3] * latents.shape[4] // (patch_size[1] * patch_size[2])
-        token_timesteps = torch.ones(
-            batch_size, f_lat, tokens_per_frame, dtype=latents.dtype, device=latents.device
-        ) * timestep.view(batch_size, 1, 1)
-        token_timesteps[:, :num_clean, :] = 0
-        token_timesteps = token_timesteps.reshape(batch_size, -1)
-        time_sinusoid = sinusoidal_embedding_1d(dit.freq_dim, token_timesteps.reshape(-1))
-        time_embed = dit.time_embedding(time_sinusoid.to(latents.dtype)).reshape(batch_size, -1, dit.dim)
-        time_modulation = dit.time_projection(time_embed).unflatten(2, (6, dit.dim))
-    elif force_per_token_t_mod:
-        # Non-TI2V backbones under joint-attention need 4D
-        # t_mod. Compute the time embedding once on (B,) and broadcast to
-        # (B, L, dim) — a per-token MLP would repeat the stack L times.
-        batch_size = latents.shape[0]
-        f_lat = latents.shape[2]
-        tokens_per_frame = latents.shape[3] * latents.shape[4] // (patch_size[1] * patch_size[2])
-        L = f_lat * tokens_per_frame
-        time_embed_base = dit.time_embedding(
-            sinusoidal_embedding_1d(dit.freq_dim, timestep).to(latents.dtype)
-        )  # (B, dim)
-        time_embed = time_embed_base.unsqueeze(1).expand(batch_size, L, -1).contiguous()
-
-        # Optional clean-prefix alignment: when opted in AND a clean prefix
-        # is present, overwrite the first ``num_clean`` frames' time embedding
-        # with ``time_embedding(0)`` — mirrors TI2V's per-token t=0 pin but
-        # at the embedding layer, keeping the MLP a single (B, dim) call.
-        has_clean_ref = num_clean_prefix_frames > 0 or has_first_frame_latents
-        if zero_clean_prefix_t_mod and has_clean_ref:
-            num_clean = max(num_clean_prefix_frames, 1)
-            zero_ts = torch.zeros_like(timestep)
-            time_embed_zero = dit.time_embedding(
-                sinusoidal_embedding_1d(dit.freq_dim, zero_ts).to(latents.dtype)
-            )  # (B, dim)
-            time_embed = time_embed.view(batch_size, f_lat, tokens_per_frame, -1)
-            time_embed[:, :num_clean] = time_embed_zero.view(batch_size, 1, 1, -1)
-            time_embed = time_embed.reshape(batch_size, L, -1)
-
-        time_modulation = dit.time_projection(time_embed).unflatten(2, (6, dit.dim))
-    else:
-        time_embed = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
-        time_modulation = dit.time_projection(time_embed).unflatten(1, (6, dit.dim))
-    return time_embed, time_modulation
+    batch_size = timestep.shape[0]
+    # Per-frame timesteps: the sampled t everywhere, then the clean history pinned to 0.
+    frame_t = torch.ones(batch_size, num_latents, dtype=timestep.dtype, device=timestep.device) * timestep.view(
+        batch_size, 1
+    )
+    frame_t[:, :num_hist_latents] = 0
+    # Time MLPs on the (B * F) frame timesteps, in the timestep's (= model) dtype.
+    frame_embed = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, frame_t.reshape(-1)))
+    frame_embed = frame_embed.reshape(batch_size, num_latents, dit.dim)
+    frame_mod = dit.time_projection(frame_embed).unflatten(2, (6, dit.dim))
+    # Frame rows -> token rows (tokens of a frame are contiguous in the (f h w) sequence).
+    time_embed = frame_embed.repeat_interleave(tokens_per_frame, dim=1)
+    time_mod = frame_mod.repeat_interleave(tokens_per_frame, dim=1)
+    return time_embed, time_mod

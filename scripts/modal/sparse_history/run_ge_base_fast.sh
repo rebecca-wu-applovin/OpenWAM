@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 07 sparse-history arm on Modal: GE-Base-fast (8x VAE: 1+8 future frames).
 # 8xH100 by default (GPU_TYPE=H200 for 8xH200), bs 6/GPU (global 48), no gradient checkpointing. Layout as 07_sparse_history_backbones/smoke.sh:
+# Caption dropout 0.06 = the backbone's recipe (GE configs/ltx_model/video_model.yaml).
 # 5 history frames at 1 fps (rows t-80..t) + future rows [4,8,...,32] (8 frames: 1 latent at 8x), 5 proprio tokens, two 192x224 views stacked.
 #
 #   bash scripts/modal/sparse_history/run_ge_base_fast.sh                    # extra Hydra overrides are appended
@@ -17,4 +18,5 @@ exec bash run_modal.sh \
   'dataloader.history_offsets=[-80,-60,-40,-20,0]' 'dataloader.future_offsets=[4,8,12,16,20,24,28,32]' \
   model.architecture.clean_attention=bidirectional \
   training.batch_size=6 training.use_gradient_checkpointing=false \
+  dataloader.caption_dropout_p=0.06 \
   "$@"

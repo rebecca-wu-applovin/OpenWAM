@@ -5,6 +5,7 @@
 
 name: wan22_ti2v_5b
 temporal_compression: 4   # VAE38 (yaml contract checked against the backbone at build; the latent layout reads it)
+causal_temporal: true     # the VAE encodes frame 0 alone (yaml contract checked against the backbone at build)
 model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Wan2.2-TI2V-5B  # [Required] upstream weights dir
 init: pretrained          # pretrained: load `weights` from model_path | random: random init (debug only, no weight files)
 weights:                  # upstream file names under model_path
@@ -19,7 +20,7 @@ shift_video: 5.0          # flow-matching α-shift for the video scheduler (trai
 text_max_length: 512      # umT5 tokens per prompt
 text_cache: true          # trainer encodes the dataset's prompt set once after the weights are in place, umT5 then on CPU
 
-dit:                      # WanModel (TI2V: seperated_timestep / fuse_vae_embedding_in_latents are fixed in code)
+dit:                      # WanModel
   dim: 3072
   ffn_dim: 14336
   num_heads: 24

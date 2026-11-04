@@ -79,13 +79,51 @@ def test_video_only_masks(masks):
 
 def test_native_noise_sampler_matches_ge_trainer():
     # ge_trainer.py: idx = floor(u*1000), sigma = FlowMatchEuler(shift 1).sigmas[idx], t = floor(sigma*1000), w = 1.
-    from openwam.model.video_backbone.ge.backbone import GEBaseFastVideoBackbone
+    from openwam.model.video_backbone.ge.scheduler import GEFlowScheduler
 
     torch.manual_seed(0)
-    ts, sig, w = GEBaseFastVideoBackbone.sample_training_noise(None, 4096, device="cpu", dtype=torch.float32)
+    ts, sig, w = GEFlowScheduler(shift_video=1.0).sample_train(4096, device="cpu", dtype=torch.float32)
     assert ((sig > 0) & (sig <= 1)).all() and w.eq(1).all()
     torch.testing.assert_close(ts, torch.floor(sig * 1000))
     # Grid sigma_i = (1000 - i) / 1000: every sample sits on it, and it is covered ~uniformly.
     idx = torch.round(1000 - sig * 1000)
     torch.testing.assert_close(sig, (1000 - idx) / 1000)
     assert 0.45 < sig.mean().item() < 0.55
+
+
+def test_dropped_caption_is_the_empty_prompt_with_its_own_mask():
+    """Task 12: a caption-dropped sample reaches GE as "" and gets the empty prompt's embedding *and* mask.
+
+    (GE's native trainer swapped in the empty embedding but kept the original prompt's mask; that model-side
+    dropout is gone, the dataset now replaces the prompt itself.)
+    """
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from openwam.model.video_backbone.ge.backbone import GEBaseFastVideoBackbone
+
+    def _tokenizer(prompts, **kw):
+        """Token count = 1 + len(prompt) (EOS), max 4 tokens."""
+        mask = torch.zeros(len(prompts), 4, dtype=torch.long)
+        for i, p in enumerate(prompts):
+            mask[i, : min(len(p) + 1, 4)] = 1
+        return SimpleNamespace(input_ids=mask * 7, attention_mask=mask)
+
+    class _T5(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = nn.Parameter(torch.ones(1))
+
+        def forward(self, ids):
+            return (ids.float().unsqueeze(-1).expand(-1, -1, 3) * self.w,)
+
+    shell = GEBaseFastVideoBackbone.__new__(GEBaseFastVideoBackbone)
+    nn.Module.__init__(shell)
+    shell._tokenizer, shell.text_encoder, shell._text_max_length = _tokenizer, _T5(), 4
+    shell._device, shell._dtype = torch.device("cpu"), torch.float32
+    shell.text_lookup = shell._t5_entries
+    batch = shell.encode_text(["pick", ""], grid=None, num_frames=1)
+    alone = shell.encode_text([""], grid=None, num_frames=1)
+    assert torch.equal(batch.context[1:], alone.context)
+    assert batch.context_mask[1].tolist() == [True, False, False, False]  # "" -> EOS only, not "pick"'s mask

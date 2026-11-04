@@ -6,12 +6,12 @@
 # ActionDiT), diffusers' stock ``Attention`` replaces GE's verbatim copy of it
 # (same parameters / state-dict keys), and dead branches (gradient checkpointing,
 # video buffers) are removed. Parameter names are unchanged so
-# ``GE_base_fast_v0.1.safetensors`` loads strictly. The OpenWAM MoT path does not
-# call ``forward`` below; it drives the blocks through ``ge/backbone.py`` using the
-# same modules, and ``forward`` is kept for parity tests / standalone use.
+# ``GE_base_fast_v0.1.safetensors`` loads strictly. The upstream ``forward``s of the
+# model and the block are removed: OpenWAM drives the blocks through ``ge/backbone.py``
+# (pre / post attention halves) using the same modules.
 
 import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -146,7 +146,10 @@ class LTXVideoRotaryPosEmbed(nn.Module):
 
 
 class LTXVideoTransformerBlock(nn.Module):
-    """LTX block: RMSNorm + AdaLN self-attn (attn1), un-normed text cross-attn (attn2), FFN."""
+    """LTX block modules: RMSNorm + AdaLN self-attn (attn1), un-normed text cross-attn (attn2), FFN.
+
+    No ``forward``: ``ge/backbone.py`` runs them (``pre_attn_at_layer`` / ``post_attn_at_layer``).
+    """
 
     def __init__(
         self,
@@ -176,27 +179,6 @@ class LTXVideoTransformerBlock(nn.Module):
         )
         self.ff = FeedForward(dim, activation_fn=activation_fn)
         self.scale_shift_table = nn.Parameter(torch.randn(6, dim) / dim**0.5)
-
-    def forward(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb=None,
-                encoder_attention_mask=None, n_view=None, cross_view_attn=False, self_attention_mask=None):
-        """Upstream forward; ``hidden_states`` is ``((b v), L, dim)``."""
-        batch_size = hidden_states.size(0)
-        norm_hidden_states = self.norm1(hidden_states)
-        ada_values = self.scale_shift_table[None, None] + temb.reshape(batch_size, temb.size(1), 6, -1)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = ada_values.unbind(dim=2)
-        norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
-        attn_hidden_states = self.attn1(
-            hidden_states=norm_hidden_states, encoder_hidden_states=None, image_rotary_emb=image_rotary_emb,
-            n_view=n_view, cross_view_attn=cross_view_attn, attention_mask=self_attention_mask,
-        )
-        hidden_states = hidden_states + attn_hidden_states * gate_msa
-        attn_hidden_states = self.attn2(
-            hidden_states, encoder_hidden_states=encoder_hidden_states, image_rotary_emb=None,
-            attention_mask=encoder_attention_mask, n_view=n_view,
-        )
-        hidden_states = hidden_states + attn_hidden_states
-        norm_hidden_states = self.norm2(hidden_states) * (1 + scale_mlp) + shift_mlp
-        return hidden_states + self.ff(norm_hidden_states) * gate_mlp
 
 
 class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin):
@@ -252,50 +234,6 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin):
         )
         self.norm_out = nn.LayerNorm(inner_dim, eps=1e-6, elementwise_affine=False)
         self.proj_out = nn.Linear(inner_dim, out_channels)
-
-    def forward(self, hidden_states, encoder_hidden_states, timestep, encoder_attention_mask=None, n_view=1,
-                rope_interpolation_scale=None, num_frames=None, height=None, width=None, video_attention_mask=None):
-        """Upstream video forward (``return_video=True`` branch).
-
-        Args:
-            hidden_states: ((b v), F*H*W, C) packed latents.
-            encoder_hidden_states: (b, L, caption_channels) text.
-            timestep: ((b v), F*H*W) per-token timesteps (pixel-wise) or ((b v),).
-            encoder_attention_mask: (b, L) 1 = keep.
-
-        Returns:
-            ((b v), F*H*W, out_channels) velocity prediction.
-        """
-        image_rotary_emb = self.rope(hidden_states, rope_interpolation_scale, num_frames, height, width)
-        if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
-            encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
-            encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
-        if video_attention_mask is not None and video_attention_mask.ndim == 2:
-            video_attention_mask = (1 - video_attention_mask.to(hidden_states.dtype)) * -10000.0
-            video_attention_mask = video_attention_mask.unsqueeze(0)
-        batch_size = hidden_states.size(0)
-        hidden_states = self.proj_in(hidden_states)
-        temb, embedded_timestep = self.time_embed(timestep.flatten(), batch_size=batch_size, hidden_dtype=hidden_states.dtype)
-        temb = temb.view(batch_size, -1, temb.size(-1))
-        embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1))
-        if self.use_view_embed:
-            embedded_view = self.view_embed[:n_view].unsqueeze(0).repeat(batch_size // n_view, 1, 1)
-            embedded_view = rearrange(embedded_view, "b v c -> (b v) c").unsqueeze(1)
-            temb = temb + self.view_ada(embedded_view)
-            embedded_timestep = embedded_timestep + embedded_view
-        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states.view(hidden_states.size(0) // n_view, -1, hidden_states.size(-1))
-        for block_idx, block in enumerate(self.transformer_blocks):
-            # Every 3rd block attends across views; the rest stay within a view.
-            hidden_states = block(
-                hidden_states=hidden_states, encoder_hidden_states=encoder_hidden_states, temb=temb,
-                image_rotary_emb=image_rotary_emb, encoder_attention_mask=encoder_attention_mask, n_view=n_view,
-                cross_view_attn=block_idx % 3 == 0, self_attention_mask=video_attention_mask,
-            )
-        scale_shift_values = self.scale_shift_table[None, None] + embedded_timestep[:, :, None]
-        shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
-        hidden_states = self.norm_out(hidden_states) * (1 + scale) + shift
-        return self.proj_out(hidden_states)
 
 
 def apply_rotary_emb(x, freqs):

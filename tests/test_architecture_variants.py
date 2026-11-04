@@ -164,6 +164,21 @@ def test_dual_system_cross_attn_explicit_bridge_layers():
     _run_compute_loss(arch)
 
 
+@pytest.mark.parametrize("bridge_layers", [[], [0, WAN_NUM_LAYERS]])
+def test_dual_system_cross_attn_rejects_bridge_layers_outside_the_video_dit(bridge_layers):
+    """Bridge layers the video DiT never produces would leave the ActionDiT without inputs: raise at build."""
+    cfg = {
+        "variant": "joint_cross_attn",
+        "action_dim": ACTION_DIM,
+        "bridge_layers": bridge_layers,
+        "dim": 128,
+        "ffn_dim": 512,
+        "num_heads": 4,
+    }
+    with pytest.raises(ValueError, match="bridge_layers"):
+        _build_arch("dual_system_cross_attn", cfg)
+
+
 def test_dual_system_cross_attn_heterogeneous_dim():
     """cross_attn must accept ``dim != num_heads * attn_head_dim`` (FastWAM-Joint layout).
 
@@ -276,13 +291,6 @@ def test_text_dim_explicit_cfg_wins_over_backbone():
     assert arch.action_backbone.text_dim == 777
 
 
-def test_text_dim_falls_back_to_4096_when_backbone_silent():
-    """A backbone that doesn't expose ``text_dim`` (base property → None) keeps the
-    historical 4096 (Wan T5-XXL) fallback, so Wan behavior is unchanged."""
-    arch = _build_self_attn_with_backbone(_MockVideoBackbone)
-    assert arch.action_backbone.text_dim == 4096
-
-
 # ---------------------------------------------------------------------------
 # 2. dual_system_self_attn
 # ---------------------------------------------------------------------------
@@ -314,8 +322,8 @@ def test_dual_system_self_attn_bridge_interval_1():
     # The new MoT path no longer keeps video_projs / video_back_projs — Q/K/V
     # are concatenated in the per-head space and each backbone owns its own
     # projections.
-    assert not hasattr(arch.action_backbone, "video_projs")
-    assert not hasattr(arch.action_backbone, "video_back_projs")
+    members = dir(arch.action_backbone)
+    assert "video_projs" not in members and "video_back_projs" not in members
     # Driver should be wired up.
     assert arch._mot_driver is not None
     assert arch._mot_driver.num_layers == WAN_NUM_LAYERS
@@ -393,10 +401,7 @@ def test_all_variants_load_and_run(registry_name, cfg, expected_selected_count):
     """Parametric smoke: every variant builds, has expected selected layer count, runs loss."""
     arch = _build_arch(registry_name, cfg)
 
-    if hasattr(arch.action_backbone, "bridge_layers"):
-        selected_layers = arch.action_backbone.bridge_layers
-    else:
-        selected_layers = arch.action_backbone.bridge_layers
+    selected_layers = arch.action_backbone.bridge_layers
     assert len(selected_layers) == expected_selected_count
 
     n_params = _count_params(arch.action_backbone)

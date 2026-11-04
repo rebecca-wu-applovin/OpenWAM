@@ -31,9 +31,17 @@ class LoadMode(Enum):
 
 
 def register_video_backbone(name: str):
-    """Decorator to register a VideoBackbone implementation by name."""
+    """Decorator registering a VideoBackbone class under ``name``.
+
+    Args:
+        name: str registry key (the yaml's ``video_backbone.name``); one class may register several names.
+
+    Returns:
+        the decorator; it returns the class unchanged and raises ValueError for a name already taken.
+    """
 
     def _wrap(cls: Type[VideoBackbone]) -> Type[VideoBackbone]:
+        """cls: the VideoBackbone subclass. Returns: cls, now registered under ``name``."""
         if name in _VIDEO_BACKBONE_REGISTRY:
             raise ValueError(f"Video backbone '{name}' already registered")
         _VIDEO_BACKBONE_REGISTRY[name] = cls

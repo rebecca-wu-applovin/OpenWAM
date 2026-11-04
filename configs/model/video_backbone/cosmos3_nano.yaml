@@ -7,6 +7,7 @@
 
 name: cosmos3_nano
 temporal_compression: 4   # Wan2.2 VAE (yaml contract checked against the backbone at build; the latent layout reads it)
+causal_temporal: true     # the VAE encodes frame 0 alone (yaml contract checked against the backbone at build)
 model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Cosmos3-Nano  # [Required] diffusers-style bundle root (transformer/ + vae/ + text_tokenizer/)
 
 # Flow-matching α-shift for the video scheduler (train + deploy single source of
@@ -24,9 +25,6 @@ max_text_tokens: 512
 # scaling (inert while it equals the model's base_fps of 24).
 fps: 24.0
 prompt_duration_template: true
-
-text_encoder_dropout: 0.0  # CFG dropout: prob of substituting "" for prompts (training only)
-text_encoder_dropout_seed: null  # int seeds that dropout's RNG; null = unseeded
 
 freeze_und: true   # freeze the und (text) pathway + token embedding at build
 text_cache: false  # the text encode needs the clip's latent grid (prompt templates, vision positions): no prompt cache

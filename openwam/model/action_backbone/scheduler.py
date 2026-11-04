@@ -17,7 +17,12 @@ this class directly (e.g. in receding-horizon control loops):
 
 from __future__ import annotations
 
+from typing import Tuple
+
 import torch
+from torch import Tensor
+
+from openwam.model.flow_grid import sample_grid
 
 
 class ActionScheduler:
@@ -116,14 +121,18 @@ class ActionScheduler:
         """Flow-matching training target: ``noise - original``."""
         return noise - original_samples
 
-    def training_weight(self, timestep_ids: torch.Tensor) -> torch.Tensor:
-        """Look up per-timestep loss weights by integer ID.
+    def sample_train(self, batch_size: int, *, device, dtype) -> Tuple[Tensor, Tensor, Tensor]:
+        """Training noise levels: uniform over the ``set_timesteps(training=True)`` grid (same law as the video grid).
 
-        Requires ``set_timesteps(..., training=True)`` to have been called.
+        Args:
+            batch_size: int, B. device / dtype: target device and action dtype.
+
+        Returns:
+            (timesteps (B,), sigmas (B,), loss_weights (B,) float32), see :func:`sample_grid`.
         """
-        if self.linear_timesteps_weights is None:
-            raise RuntimeError("ActionScheduler.training_weight called before set_timesteps(..., training=True)")
-        return self.linear_timesteps_weights[timestep_ids]
+        return sample_grid(
+            self.timesteps, self.sigmas, self.linear_timesteps_weights, batch_size, device=device, dtype=dtype
+        )
 
     # ------------------------------------------------------------------
     # Inference-side math

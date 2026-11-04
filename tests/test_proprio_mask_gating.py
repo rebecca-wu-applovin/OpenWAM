@@ -153,3 +153,37 @@ def test_mask_shape_mismatch_raises():
     arch = proprio_context_arch(state_dim=7, text_dim=16)
     with pytest.raises(ValueError, match="proprio must be"):
         arch.build_contexts(_make_text(B=2), torch.randn(2, 1, 7), torch.ones(3, 1, 7, dtype=torch.bool))
+
+
+def test_proprio_token_follows_the_padded_text():
+    """The proprio token is appended after the padded text, so valid context tokens are not a prefix any more."""
+    arch = proprio_context_arch(state_dim=7, text_dim=16)
+    text = TextCondition(
+        context=torch.randn(2, 4, 16), context_mask=torch.arange(4)[None] < torch.tensor([2, 4])[:, None]
+    )
+
+    _, out = arch.build_contexts(text, torch.randn(2, 1, 7), torch.ones(2, 1, 7, dtype=torch.bool))
+
+    assert out.context.shape == (2, 5, 16) and out.context_mask.shape == (2, 5)
+    assert out.context_mask[0].tolist() == [True, True, False, False, True]
+    assert out.context_mask[:, -1].all()
+
+
+def test_action_dit_rejects_per_token_timestep():
+    from openwam.model.action_backbone.separate_action_dit import ActionDiT
+
+    dit = ActionDiT(
+        shift_action=5.0,
+        action_dim=7,
+        dim=32,
+        ffn_dim=64,
+        num_heads=4,
+        num_layers=1,
+        video_dim=32,
+        bridge_layers=(0,),
+        variant="joint_self_attn",
+    )
+    with pytest.raises(ValueError, match="action timestep must be 1D"):
+        context = torch.randn(2, 4, dit.text_dim)
+        context_mask = torch.ones(2, 4, dtype=torch.bool)
+        dit.prepare_state(torch.randn(2, 5, 7), torch.randn(2, 5), context=context, context_mask=context_mask)

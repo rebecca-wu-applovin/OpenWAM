@@ -63,47 +63,44 @@ def _masked_action_context(dit: ActionDiT, batch_size: int):
 
 
 # ---------------------------------------------------------------------------
-# Video DiTBlock equivalence — drives the WanVideoBackbone split-attention path
-# (without booting the full Wan pipeline).
+# Video DiTBlock equivalence: DiTBlock.forward is pre_attn -> attention -> post_attn; pin it against the
+# block math written out inline (the one-piece forward it replaced), so the halves cannot drift.
 # ---------------------------------------------------------------------------
 
 
-def _wan_pre_post_via_adapter(block: DiTBlock, state: BlockLoopState, num_heads: int) -> torch.Tensor:
-    """Replay what WanVideoBackbone does at one layer without instantiating the
-    full backbone (which requires loading a real Wan pipeline).
+def _wan_block_inline(block: DiTBlock, state: BlockLoopState, context_mask: torch.Tensor) -> torch.Tensor:
+    """One Wan DiT block written out in one piece (the pre-split ``DiTBlock.forward``).
 
-    Mirrors ``WanVideoBackbone.pre_attn_at_layer`` / ``post_attn_at_layer``;
-    the implementation lives there and we copy it here so the test fails if
-    the adapter drifts from the plain block forward.
+    Args:
+        block: DiTBlock. state: BlockLoopState (hidden_states (B, S, dim), time_mod (B, S, 6, dim), rope_freqs,
+            context (B, L, dim)). context_mask: (B, 1, S, L) bool.
+
+    Returns:
+        (B, S, dim) block output.
     """
-    del num_heads  # plumbed via block.self_attn.num_heads
     from openwam.model.video_backbone.wan.dit import modulate, rope_apply
 
     t_mod = state.time_mod
-    chunks = (block.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
-    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = chunks
+    chunks = (block.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=2)
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (c.squeeze(2) for c in chunks)
 
     residual_x = state.hidden_states
     attn_input = modulate(block.norm1(state.hidden_states), shift_msa, scale_msa)
 
     sa = block.self_attn
-    q = sa.norm_q(sa.q(attn_input))
-    k = sa.norm_k(sa.k(attn_input))
+    q = rope_apply(sa.norm_q(sa.q(attn_input)), state.rope_freqs, sa.num_heads)
+    k = rope_apply(sa.norm_k(sa.k(attn_input)), state.rope_freqs, sa.num_heads)
     v = sa.v(attn_input)
-    q = rope_apply(q, state.rope_freqs, sa.num_heads)
-    k = rope_apply(k, state.rope_freqs, sa.num_heads)
-
     attn_out = _attention_single_stream(q, k, v, sa.num_heads)
 
     x = block.gate(residual_x, gate_msa, sa.o(attn_out))
-    x = x + block.cross_attn(block.norm3(x), state.context)
+    x = x + block.cross_attn(block.norm3(x), state.context, ctx_mask=context_mask)
     mlp_input = modulate(block.norm2(x), shift_mlp, scale_mlp)
-    x = block.gate(x, gate_mlp, block.ffn(mlp_input))
-    return x
+    return block.gate(x, gate_mlp, block.ffn(mlp_input))
 
 
 def test_wan_dit_block_split_equivalence():
-    """split(norm1+attn+post) ≡ DiTBlock.forward, exact (atol=0)."""
+    """DiTBlock.forward (pre_attn -> attention -> post_attn) == the inline block math, exact (atol=0)."""
     torch.manual_seed(0)
     # head_dim must be divisible by 6 so precompute_freqs_cis_3d's f/h/w split
     # produces full-coverage (matches Wan2.x production heads which are 64/96/128).
@@ -112,24 +109,24 @@ def test_wan_dit_block_split_equivalence():
 
     block = _make_wan_dit_block(dim=dim, num_heads=num_heads, ffn_dim=ffn_dim)
     x = torch.randn(B, S, dim)
-    t_mod = torch.randn(B, 6, dim)
+    t_mod = torch.randn(B, S, 6, dim)  # per-token modulation, the only layout build_time_modulation emits
     context = torch.randn(B, 4, dim)
+    context_mask = torch.ones(B, 1, S, 4, dtype=torch.bool)
+    context_mask[1, :, :, -1] = False  # one padded text key
+    attn_mask = torch.ones(S, S, dtype=torch.bool)
     freqs = _wan_freqs(S, dim, num_heads)
 
-    # Reference: original DiTBlock.forward
     with torch.no_grad():
-        out_ref = block(x, context, t_mod, freqs)
-
-    # Split: pre_attn → attention → post_attn
+        out_block = block(x, context, t_mod, freqs, context_mask, attn_mask)
     state = BlockLoopState(
         hidden_states=x, time_mod=t_mod, rope_freqs=freqs, context=context, grid_frames=S, grid_height=1, grid_width=1
     )
     with torch.no_grad():
-        out_split = _wan_pre_post_via_adapter(block, state, num_heads)
+        out_inline = _wan_block_inline(block, state, context_mask)
 
     # Hard equivalence — bf16 wouldn't allow atol=0 but we're in fp32.
-    assert torch.allclose(out_ref, out_split, atol=0, rtol=0), (
-        f"split disagrees with DiTBlock.forward; max diff = {(out_ref - out_split).abs().max().item()}"
+    assert torch.equal(out_block, out_inline), (
+        f"DiTBlock.forward disagrees with the inline math; max diff = {(out_block - out_inline).abs().max().item()}"
     )
 
 
@@ -146,6 +143,7 @@ def test_action_mot_block_split_equivalence():
     bridge_layers = (0, 1)
 
     dit = ActionDiT(
+        shift_action=5.0,
         action_dim=action_dim,
         dim=dim,
         ffn_dim=ffn_dim,
@@ -205,6 +203,7 @@ def test_action_mot_block_heterogeneous_hidden_dim():
     bridge_layers = (0, 1)
 
     dit = ActionDiT(
+        shift_action=5.0,
         action_dim=action_dim,
         dim=dim,
         ffn_dim=ffn_dim,

@@ -74,6 +74,7 @@ class _FakeBackbone(VideoBackbone):
 
     dim = num_heads = head_dim = 1
     num_layers = 3
+    text_dim = 4
     scheduler = None
 
     def prepare(self, **kw):
@@ -223,6 +224,7 @@ def _cfg(h=5, f=8, encoding="per_frame", tc=4, clean="bidirectional", va="mutual
                 "num_frames": 33,
                 "history_sampling": "fixed",
                 "history_window": 100,
+                "caption_dropout_p": 0.0,
             },
             "model": {
                 "architecture": {
@@ -271,6 +273,32 @@ def test_resolve_config_layout():
     resolve_config(cfg)
 
 
+@pytest.mark.parametrize(
+    "name, key",
+    [
+        ("fake", "caption_dropout_p"),
+        ("ge_base_fast", "seed"),
+        ("fake", "text_dropout_p"),
+        ("fake", "text_encoder_dropout"),
+        ("fake", "text_encoder_dropout_seed"),
+    ],
+)
+def test_backbone_caption_dropout_keys_rejected(name, key):
+    """The old per-backbone caption-dropout keys (GE / flux / cosmos3) are stale: dataloader.caption_dropout_p."""
+    cfg = _cfg()
+    cfg.model.video_backbone.name = name
+    cfg.model.video_backbone[key] = 0.1
+    with pytest.raises(ValueError, match="caption-dropout"):
+        resolve_config(cfg)
+
+
+def test_seed_key_is_stale_for_ge_only():
+    """``seed`` was GE's caption-dropout seed; another backbone may own a ``seed`` key."""
+    cfg = _cfg()
+    cfg.model.video_backbone.seed = 0
+    resolve_config(cfg)
+
+
 def test_history_window_must_cover_offsets():
     # Random history must be able to draw the fixed (val / deploy) layout: window >= the oldest offset.
     cfg = _cfg()
@@ -298,6 +326,22 @@ def test_history_window_must_cover_offsets():
         cfg.dataloader.pop(key)
         with pytest.raises(ValueError, match=key):
             resolve_config(cfg)
+
+
+def test_caption_dropout_p_checked():
+    # Required and a probability; resolve_config is the one place it is checked (the dataset reads it as is).
+    cfg = _cfg()
+    cfg.dataloader.pop("caption_dropout_p")
+    with pytest.raises(ValueError, match="caption_dropout_p"):
+        resolve_config(cfg)
+    for bad in (-0.1, 1.5):
+        cfg = _cfg()
+        cfg.dataloader.caption_dropout_p = bad
+        with pytest.raises(ValueError, match="caption_dropout_p"):
+            resolve_config(cfg)
+    cfg = _cfg()
+    cfg.dataloader.caption_dropout_p = 1.0
+    resolve_config(cfg)
 
 
 def test_unverified_va_mode_raises():
@@ -506,7 +550,7 @@ _OLD_FLUX_SEGMENTS = ("txt", "video", "video_cond", "action_cond")
 
 
 def _old_build_flux_layer_masks(
-    seg_lens, s_action, text_valid: Optional[Tensor], *, num_mode_layers, num_layers, device, strict_clean_rows=False
+    seg_lens, s_action, text_valid: Optional[Tensor], *, num_mode_layers, num_layers, device
 ) -> List[Tensor]:
     names = list(_OLD_FLUX_SEGMENTS) + ["action"]
     lens = [seg_lens[n] for n in _OLD_FLUX_SEGMENTS] + [s_action]
@@ -519,10 +563,6 @@ def _old_build_flux_layer_masks(
     single = torch.ones((s, s), dtype=torch.bool, device=device)
     single[sl["video_cond"], sl["video"]] = False
     single[sl["video_cond"], sl["action"]] = False
-    if strict_clean_rows:
-        for clean in ("txt", "action_cond"):
-            single[sl[clean], sl["video"]] = False
-            single[sl[clean], sl["action"]] = False
 
     def with_text_padding(m):
         if text_valid is None or bool((text_valid == seg_lens["txt"]).all()):
@@ -602,22 +642,11 @@ def test_frame_mask_matches_old_mask(fake, h, old_mode, clean):
         hw = 4
         seg = {"txt": 5, "video": (t - h) * hw, "video_cond": h * hw, "action_cond": h}
         for text_valid in (None, torch.tensor([5, 3])):
-            for strict in (False, True):
-                old_fx = _old_build_flux_layer_masks(
-                    seg, s_action, text_valid, num_mode_layers=2, num_layers=4, device=cpu, strict_clean_rows=strict
-                )
-                new_fx = build_flux_layer_masks(
-                    frame_mask,
-                    seg,
-                    s_action,
-                    text_valid,
-                    n_hist=h,
-                    num_mode_layers=2,
-                    num_layers=4,
-                    device=cpu,
-                    strict_clean_rows=strict,
-                )
-                assert all(torch.equal(a, b) for a, b in zip(old_fx, new_fx))
+            old_fx = _old_build_flux_layer_masks(seg, s_action, text_valid, num_mode_layers=2, num_layers=4, device=cpu)
+            new_fx = build_flux_layer_masks(
+                frame_mask, seg, s_action, text_valid, n_hist=h, num_mode_layers=2, num_layers=4, device=cpu
+            )
+            assert all(torch.equal(a, b) for a, b in zip(old_fx, new_fx))
 
     # cosmos3: the frame-major mask with the und prefix keys prepended (shared, or gated per sample).
     shell = Cosmos3EdgeVideoBackbone.__new__(Cosmos3EdgeVideoBackbone)
@@ -648,3 +677,56 @@ def test_prompt_cache_matches_uncached():
     assert set(cache.entries) == set(prompts)
     with pytest.raises(KeyError):
         cache(["never seen"])
+
+
+# ---------------------------------------------------------------- no family exceptions in the base flow
+
+# The shared flow the base class owns: a family may only implement encode_pixels / decode_latents / encode_text.
+_BASE_FLOW = (
+    "to_pixels",
+    "encode_frames",
+    "encode_clip",
+    "_encode_history",
+    "_encode_layout_text",
+    "preprocess_condition",
+    "preprocess_train",
+    "decode_future",
+)
+
+
+@pytest.mark.parametrize("method", _BASE_FLOW)
+def test_families_do_not_override_base_flow(method):
+    """Every registered family inherits ``method`` from VideoBackbone unchanged."""
+    import openwam.model.video_backbone  # noqa: F401  (registers the built-in families)
+    from openwam.model.video_backbone.registry import _VIDEO_BACKBONE_REGISTRY
+
+    families = set(_VIDEO_BACKBONE_REGISTRY.values())
+    assert families, "no family registered"
+    overriding = sorted(cls.__name__ for cls in families if getattr(cls, method) is not getattr(VideoBackbone, method))
+    assert not overriding, f"{overriding} override VideoBackbone.{method}"
+
+
+def test_decode_future_converts_with_tensor_to_pil_frames(fake):
+    """decode_future turns the decoded pixels into PIL frames with the shared ``tensor_to_pil_frames`` alone."""
+    from openwam.model.video_backbone.common.pixels import tensor_to_pil_frames
+
+    layout = _layout(1)
+    pixels = torch.linspace(-1.2, 1.2, 9 * 3 * 32 * 32).reshape(1, 3, 9, 32, 32)
+    fake.decode_latents = lambda latents: pixels  # (1, 3, 1 + TC * 2, 32, 32), values past [-1, 1] too
+    frames = fake.decode_future(torch.zeros(1, Z, 3, 4, 4), layout)
+    want = tensor_to_pil_frames(pixels)[1:]
+    assert [f.tobytes() for f in frames] == [w.tobytes() for w in want]
+    assert "_pixels_to_frames" not in dir(VideoBackbone)  # no per-family conversion hook
+
+
+def test_prompt_cache_dedups_in_order_with_the_empty_prompt():
+    """One build order for every family: ``dict.fromkeys(prompts + [""])`` ("" = a caption-dropped sample)."""
+    calls = []
+
+    def _encode(chunk):
+        calls.append(list(chunk))
+        return _fake_text_encoder(chunk)
+
+    cache = PromptCache(_encode, ["place", "pick", "place"], batch_size=2)
+    assert list(cache.entries) == ["place", "pick", ""]
+    assert calls == [["place", "pick"], [""]]  # each prompt encoded once, in first-seen order

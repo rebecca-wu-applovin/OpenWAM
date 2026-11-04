@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from openwam.model.video_backbone.common.text_cache import PromptCache
+
 
 @dataclass
 class BlockLoopState:
@@ -69,49 +71,23 @@ class VideoBackbone(ABC, nn.Module):
 
     Inherits ``nn.Module`` so named children (``self.dit`` / ``self.vae`` / ...)
     are moved by :meth:`set_dtype_device` and serialized into the state_dict.
+
+    Every family's ``__init__`` sets the three fields declared below (``_shift_video``, ``_causal_temporal``,
+    ``_temporal_compression``); the properties read them directly.
     """
 
-    # ================================================================
-    # Required: structural metadata
-    # ================================================================
-
-    @property
-    @abstractmethod
-    def dim(self) -> int:
-        """Hidden dim of the video DiT."""
-
-    @property
-    @abstractmethod
-    def num_layers(self) -> int:
-        """Number of DiT blocks."""
-
-    @property
-    @abstractmethod
-    def num_heads(self) -> int:
-        """Attention heads per block."""
-
-    @property
-    @abstractmethod
-    def head_dim(self) -> int:
-        """Per-head attention dim."""
-
-    @property
-    @abstractmethod
-    def scheduler(self):
-        """Flow-matching scheduler; must support set_timesteps / timesteps / sigmas."""
-
-    @property
-    def dit_patch_size(self) -> Tuple[int, int, int]:
-        """DiT ``(T, H, W)`` patch size; set ``self._dit_patch_size`` in ``__init__``."""
-        return self._dit_patch_size
-
-    @property
-    def temporal_compression(self) -> int:
-        """``T_pixel / T_lat``; set ``self._temporal_compression`` in ``__init__``."""
-        return self._temporal_compression
+    # Device / dtype before the first set_dtype_device (which overrides them per instance).
+    _device: torch.device = torch.device("cuda")
+    _dtype: torch.dtype = torch.bfloat16
+    # Set by every family's __init__ (no default: a family that forgets them fails on first read).
+    _shift_video: float
+    _causal_temporal: bool
+    _temporal_compression: int
+    # Prompts per text-encoder forward while build_text_cache fills the cache (class attribute of each caching family).
+    _text_cache_batch_size: int
 
     # ================================================================
-    # Required: construction
+    # Construction
     # ================================================================
 
     @classmethod
@@ -142,8 +118,83 @@ class VideoBackbone(ABC, nn.Module):
             ``assign=True`` load, or ``materialize_meta`` + an accelerate state load (resume).
         """
 
+    def set_dtype_device(self, dtype: torch.dtype, device: torch.device) -> None:
+        """Move every registered child to ``(dtype, device)``; overrides call ``super()`` first.
+
+        Args:
+            dtype: torch.dtype of the compute (bf16 in training and deploy).
+            device: torch.device to run on.
+
+        Returns:
+            None. Must NOT ``.eval()``: trainable submodules stay in train mode.
+        """
+        self._dtype = dtype
+        self._device = device
+        self.to(dtype=dtype, device=device)
+
     # ================================================================
-    # Required: video and text IO (the only encoding code a family writes)
+    # Geometry
+    # ================================================================
+
+    @property
+    @abstractmethod
+    def dim(self) -> int:
+        """Hidden dim of the video DiT."""
+
+    @property
+    @abstractmethod
+    def num_layers(self) -> int:
+        """Number of DiT blocks."""
+
+    @property
+    @abstractmethod
+    def num_heads(self) -> int:
+        """Attention heads per block."""
+
+    @property
+    @abstractmethod
+    def head_dim(self) -> int:
+        """Per-head attention dim."""
+
+    @property
+    @abstractmethod
+    def text_dim(self) -> int:
+        """Per-token raw text-context width (the context the framework appends proprio tokens to)."""
+
+    @property
+    @abstractmethod
+    def scheduler(self):
+        """Flow-matching scheduler: ``set_timesteps`` / ``timesteps`` / ``sigmas`` / ``step`` for deploy, and
+        ``sample_train(batch_size, *, device, dtype) -> (timesteps (B,), sigmas (B,), loss_weights (B,) fp32)``
+        for the training noise (the grid draw, or a family's native law)."""
+
+    @property
+    def temporal_compression(self) -> int:
+        """``T_pixel / T_lat``; set ``self._temporal_compression`` in ``__init__``."""
+        return self._temporal_compression
+
+    @property
+    def device(self) -> torch.device:
+        """torch.device the backbone runs on (set by :meth:`set_dtype_device`)."""
+        return self._device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """torch.dtype of the backbone's compute (set by :meth:`set_dtype_device`)."""
+        return self._dtype
+
+    @property
+    def shift_video(self) -> float:
+        """α-shift for the video scheduler (single source of truth for train + inference)."""
+        return self._shift_video
+
+    @property
+    def causal_temporal(self) -> bool:
+        """Whether the first frame is encoded into its own standalone latent token."""
+        return self._causal_temporal
+
+    # ================================================================
+    # Video and text IO (families implement the first three; the shared flow below runs on top of them)
     # ================================================================
 
     @abstractmethod
@@ -182,86 +233,30 @@ class VideoBackbone(ABC, nn.Module):
             TextCondition with context (B, L, D_text), context_mask (B, L) bool and the family's ``extra``.
         """
 
-    # ================================================================
-    # Required: three-step execution
-    # ================================================================
+    @torch.no_grad()
+    def build_text_cache(self, prompts: list) -> None:
+        """Encode every prompt once with the (already loaded) text encoder, then park the encoder on the CPU.
 
-    @abstractmethod
-    def prepare(
-        self,
-        *,
-        latents: Tensor,
-        timestep: Tensor,
-        text: TextCondition,
-        layout,
-        proprio: Tensor,
-        use_gradient_checkpointing: bool,
-        use_gradient_checkpointing_offload: bool,
-    ) -> BlockLoopState:
-        """Pre-loop: patchify / freqs / time_mod / text. Returns a BlockLoopState.
+        Builds a :class:`~openwam.model.video_backbone.common.text_cache.PromptCache` from the family's
+        ``text_lookup`` slot (the online encoder), ``_text_cache_batch_size`` prompts per encoder forward, swaps it
+        into that slot and moves ``text_encoder`` to the CPU (still a registered child: state_dict keys unchanged).
+        ``encode_text`` reads ``text_lookup`` either way. A family that cannot cache (cosmos3) overrides this to raise.
 
         Args:
-            latents: (B, z, T_lat, h, w) latents, T_lat = ``layout.num_latents``; the first
-                ``layout.num_hist_latents`` are clean (t = 0).
-            timestep: (B,) video timestep.
-            text: TextCondition (the architecture may have appended proprio tokens to context / context_mask).
-            layout: ``cfg.common.layout`` (DictConfig); read for the clean prefix length.
-            proprio: (B, H, D) normalized proprio, always passed; only a ``proprio_input=backbone_stream`` family
-                (flux) embeds it in its own stream, the others ignore it (they read the context's proprio tokens).
-            use_gradient_checkpointing / use_gradient_checkpointing_offload: bool loop flags.
-        """
-
-    @abstractmethod
-    def run_block(self, block_id: int, state: BlockLoopState, attn_mask: Tensor) -> BlockLoopState:
-        """Run a single DiT block on the video stream alone (no action tokens).
-
-        Args:
-            block_id: int, layer index.
-            state: BlockLoopState from :meth:`prepare`.
-            attn_mask: bool token mask of this layer, ``build_joint_attention_masks(frame_mask, state, 0)[block_id]``.
+            prompts: list[str], every prompt training can draw (dataset ``all_prompts()``); the cache adds the ""
+                of caption-dropped samples itself.
 
         Returns:
-            BlockLoopState with the layer applied. Gradient checkpointing is transparent to the architecture.
+            None.
         """
+        self.text_lookup = PromptCache(self.text_lookup, prompts, batch_size=self._text_cache_batch_size)
+        # Free the encoder's GPU memory; its weights stay in the module tree for checkpointing.
+        self.text_encoder.to("cpu")
+        torch.cuda.empty_cache()
 
-    @abstractmethod
-    def finalize(self, state: BlockLoopState) -> Tensor:
-        """Post-loop: head + SP gather + unpatchify. Returns ``(B, C, T, H, W)``."""
-
-    # ================================================================
-    # Optional metadata (defaults)
-    # ================================================================
-
-    @property
-    def device(self) -> torch.device:
-        return getattr(self, "_device", torch.device("cuda"))
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return getattr(self, "_dtype", torch.bfloat16)
-
-    @property
-    def shift_video(self) -> Optional[float]:
-        """α-shift for the video scheduler (single source of truth for train +
-        inference). ``None`` falls back to the scheduler default (Wan = 5.0)."""
-        return getattr(self, "_shift_video", None)
-
-    @property
-    def text_dim(self) -> Optional[int]:
-        """Per-token raw text/context embedding dim. ``None`` keeps the 4096 fallback."""
-        return None
-
-    @property
-    def causal_temporal(self) -> bool:
-        """Whether the first frame is encoded into its own standalone latent token."""
-        return getattr(self, "_causal_temporal", True)
-
-    # ================================================================
-    # Shared preprocessing flow (implemented once here; families only encode)
-    # ================================================================
-    # One latent layout (cfg.common.layout): past frames (per_frame | clip) + the current frame t alone, both
-    # clean, then the future: the clip [t, future] encoded as one with its latent 0 (= t) dropped.
-
+    # Shared preprocessing flow (implemented once here; families only encode). One latent layout
+    # (cfg.common.layout): past frames (per_frame | clip) + the current frame t alone, both clean, then the future:
+    # the clip [t, future] encoded as one with its latent 0 (= t) dropped.
     def to_pixels(self, clips: list) -> Tensor:
         """PIL clips -> pixels.
 
@@ -397,12 +392,6 @@ class VideoBackbone(ABC, nn.Module):
             raise ValueError(f"clip encoded to {latents.shape[2]} latents, layout says {layout.num_latents}")
         return latents, self._encode_layout_text(prompts, layout, latents.shape[3:])
 
-    def _pixels_to_frames(self, pixels: Tensor) -> list:
-        """(1, 3, T, H, W) decoded pixels in [-1, 1] -> list of T PIL frames (transitional hook, see Wan)."""
-        from openwam.model.video_backbone.common.pixels import tensor_to_pil_frames
-
-        return tensor_to_pil_frames(pixels.float().clamp(-1, 1))
-
     @torch.no_grad()
     def decode_future(self, latents: Tensor, layout) -> list:
         """Decode the future of one latent clip.
@@ -419,12 +408,90 @@ class VideoBackbone(ABC, nn.Module):
             raise ValueError(f"decode_future decodes one clip, got a batch of {latents.shape[0]}")
         if latents.shape[2] != int(layout.num_latents):
             raise ValueError(f"got {latents.shape[2]} latents, layout says {layout.num_latents}")
+        from openwam.model.video_backbone.common.pixels import tensor_to_pil_frames
+
         segment = latents[:, :, int(layout.num_hist_latents) - 1 :]
-        return self._pixels_to_frames(self.decode_latents(segment))[1:]
+        # One pixel -> uint8 conversion for every family (clamp, (x + 1) * 127.5, truncate).
+        return tensor_to_pil_frames(self.decode_latents(segment))[1:]
 
     # ================================================================
-    # Joint attention masks
+    # Block loop (prepare / run_block / finalize required; MoT split, masks and compile optional)
     # ================================================================
+
+    @abstractmethod
+    def prepare(
+        self,
+        *,
+        latents: Tensor,
+        timestep: Tensor,
+        text: TextCondition,
+        layout,
+        proprio: Tensor,
+        use_gradient_checkpointing: bool,
+        use_gradient_checkpointing_offload: bool,
+    ) -> BlockLoopState:
+        """Pre-loop: patchify / freqs / time_mod / text. Returns a BlockLoopState.
+
+        Args:
+            latents: (B, z, T_lat, h, w) latents, T_lat = ``layout.num_latents``; the first
+                ``layout.num_hist_latents`` are clean (t = 0).
+            timestep: (B,) video timestep.
+            text: TextCondition (the architecture may have appended proprio tokens to context / context_mask).
+            layout: ``cfg.common.layout`` (DictConfig); read for the clean prefix length.
+            proprio: (B, H, D) normalized proprio, always passed; only a ``proprio_input=backbone_stream`` family
+                (flux) embeds it in its own stream, the others ignore it (they read the context's proprio tokens).
+            use_gradient_checkpointing / use_gradient_checkpointing_offload: bool loop flags.
+        """
+
+    @abstractmethod
+    def run_block(self, block_id: int, state: BlockLoopState, attn_mask: Tensor) -> BlockLoopState:
+        """Run a single DiT block on the video stream alone (no action tokens).
+
+        Args:
+            block_id: int, layer index.
+            state: BlockLoopState from :meth:`prepare`.
+            attn_mask: bool token mask of this layer, ``build_joint_attention_masks(frame_mask, state, 0)[block_id]``.
+
+        Returns:
+            BlockLoopState with the layer applied. Gradient checkpointing is transparent to the architecture.
+        """
+
+    @abstractmethod
+    def finalize(self, state: BlockLoopState) -> Tensor:
+        """Post-loop: head + unpatchify.
+
+        Args:
+            state: BlockLoopState after the last block.
+
+        Returns:
+            (B, z, T_lat, h, w) predicted velocity (noise - x0) of the whole latent clip.
+        """
+
+    def pre_attn_at_layer(self, layer_id: int, state: BlockLoopState) -> Tuple[Tensor, Tensor, Tensor, dict]:
+        """Block first half (norm + modulate + Q/K/V + RoPE, no attention), for the MoT driver's joint attention.
+
+        Args:
+            layer_id: int, block index. state: BlockLoopState of the video stream.
+
+        Returns:
+            (q, k, v) each (B, S, num_heads * head_dim), and ``post_state`` that :meth:`post_attn_at_layer` consumes.
+            Default: raises NotImplementedError (a family without the split cannot run ``joint_self_attn``).
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support joint self-attention.")
+
+    def post_attn_at_layer(
+        self, layer_id: int, state: BlockLoopState, attn_out: Tensor, post_state: dict
+    ) -> BlockLoopState:
+        """Block second half from :meth:`pre_attn_at_layer`: gate → cross-attn → FFN.
+
+        Args:
+            layer_id: int, block index. state: BlockLoopState. attn_out: (B, S, num_heads * head_dim) attention
+                output of the video tokens (before the output projection). post_state: from :meth:`pre_attn_at_layer`.
+
+        Returns:
+            ``state`` with ``hidden_states`` updated. Default: raises NotImplementedError.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support joint self-attention.")
 
     def build_joint_attention_masks(self, frame_mask: Tensor, state: BlockLoopState, s_action: int) -> list:
         """Token-level masks of the joint ``[video tokens, action tokens]`` sequence, one per layer.
@@ -446,42 +513,19 @@ class VideoBackbone(ABC, nn.Module):
         mask = expand_frame_mask(frame_mask, [tpf] * (frame_mask.shape[0] - 1), s_action, state.hidden_states.device)
         return [mask] * self.num_layers
 
-    # ================================================================
-    # Optional: deploy compile
-    # ================================================================
-
     def apply_compile_optimizations(self, compile_cfg) -> None:
-        """Optional deploy-time compile hook; backbones default to eager execution."""
+        """Deploy-time compile hook.
+
+        Args:
+            compile_cfg: the deploy ``optimization.compile`` block (see ``openwam.model.compile_options``).
+
+        Returns:
+            None. Default: eager execution, nothing to compile.
+        """
         return None
 
     # ================================================================
-    # Optional: joint self-attention split (default raise)
-    # ================================================================
-
-    def pre_attn_at_layer(self, layer_id: int, state: BlockLoopState) -> Tuple[Tensor, Tensor, Tensor, dict]:
-        """Block first half (norm + modulate + Q/K/V + RoPE, no attention). Returns
-        ``(q, k, v, post_state)``; ``post_state`` feeds :meth:`post_attn_at_layer`."""
-        raise NotImplementedError(f"{type(self).__name__} does not support joint self-attention.")
-
-    def post_attn_at_layer(
-        self, layer_id: int, state: BlockLoopState, attn_out: Tensor, post_state: dict
-    ) -> BlockLoopState:
-        """Block second half from :meth:`pre_attn_at_layer`: gate → cross-attn → FFN."""
-        raise NotImplementedError(f"{type(self).__name__} does not support joint self-attention.")
-
-    # ================================================================
-    # Lifecycle: device/dtype (default moves all registered children)
-    # ================================================================
-
-    def set_dtype_device(self, dtype: torch.dtype, device: torch.device) -> None:
-        """Move everything to ``(dtype, device)``. Overrides call ``super()`` first.
-        Must NOT ``.eval()`` — trainable submodules stay in train mode."""
-        self._dtype = dtype
-        self._device = device
-        self.to(dtype=dtype, device=device)
-
-    # ================================================================
-    # Optional deploy-asset hook (orchestrated by the architecture)
+    # Deploy assets
     # ================================================================
 
     def save_deploy_assets(self, output_dir: str) -> None:
@@ -494,25 +538,6 @@ class VideoBackbone(ABC, nn.Module):
             None. Only copies files (tokenizer / processor / third-party ``config.json``); never writes cfg.
             Default: nothing to copy.
         """
-
-    # ================================================================
-    # Text cache (switched by cfg.model.video_backbone.text_cache)
-    # ================================================================
-
-    def build_text_cache(self, prompts: list) -> None:
-        """Encode every prompt once with the (already loaded) text encoder, then park the encoder on the CPU.
-
-        A caching family builds a :class:`~openwam.model.video_backbone.common.text_cache.PromptCache` from its
-        ``text_lookup`` slot (the online encoder), swaps it into that slot and moves the text encoder to the CPU
-        (still a registered child: state_dict keys unchanged). ``encode_text`` reads ``text_lookup`` either way.
-
-        Args:
-            prompts: list[str], the dataset's full prompt set.
-
-        Returns:
-            None. Default: the family cannot cache its text; its yaml must say ``text_cache: false``.
-        """
-        raise NotImplementedError(f"{type(self).__name__} has no text cache; set model.video_backbone.text_cache=false")
 
 
 def frame_tokens(frame_mask: Tensor, state: BlockLoopState, s_video: int) -> int:

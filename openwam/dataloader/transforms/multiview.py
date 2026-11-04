@@ -1,11 +1,8 @@
-"""Multi-view image composition and RoboTwin prompt formatting.
+"""Multi-view image composition.
 
-These helpers used to live inside ``robotwin.py``. The image utilities
-(``crop_and_resize`` / ``assemble_multiview_layout``) are dataset-neutral and
-reused by both the RoboTwin dataloader and the deployment ``policy_server``.
-``format_prompt_for_inference`` is RoboTwin's training-time prompt template —
-deploy no longer uses it (the server is prompt-agnostic).
-Keeping these in a transform module avoids deploy → dataset hard-coupling.
+The image utilities (``crop_and_resize`` / ``assemble_multiview_layout``) are dataset-neutral; the deployment
+observation preprocessing (``deploy/obs_preprocess.py``) and the yam_sharpa reader use them. Keeping them in a
+transform module avoids deploy → dataset hard-coupling.
 """
 
 from typing import Tuple, Union
@@ -173,20 +170,9 @@ def assemble_vstack_layout(
     return canvas
 
 
-def format_prompt_for_inference(base_prompt: str) -> str:
-    """RoboTwin training-time prompt template.
-
-    The RoboTwin dataloader wraps every instruction with this before the model
-    sees it. Deploy is prompt-agnostic on the server side, so an eval client
-    must apply the same template to keep prompts in-distribution with training.
-    """
-    return "A video recorded from a robot's point of view executing the following instruction: " + base_prompt
-
-
 __all__ = [
     "DEFAULT_MULTIVIEW_CAMERA_LAYOUT",
     "crop_and_resize",
     "assemble_multiview_layout",
     "assemble_vstack_layout",
-    "format_prompt_for_inference",
 ]

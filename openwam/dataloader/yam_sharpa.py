@@ -27,6 +27,7 @@ derived from ``action_mode``; do not set ``unify_action`` in the config.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
@@ -36,7 +37,6 @@ from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from openwam.config.resolve import HISTORY_SAMPLINGS
 from openwam.dataloader.bases import BaseDataset, LeRobotV3Reader
 from openwam.dataloader.transforms.multiview import assemble_vstack_layout
 from openwam.dataloader.utils import get_cfg
@@ -172,7 +172,7 @@ class YamSharpaDataset(LeRobotV3Reader):
             future_offsets: list[int] of F increasing row offsets > 0 (e.g. [4,8,...,32]).
             history_sampling: str, ``fixed`` (always ``history_offsets``) or ``random`` (train split only: per
                 sample, H-1 distinct random rows of the past ``history_window`` rows + frame t; val stays fixed).
-                ``resolve_config`` checks that the window covers ``history_offsets``.
+                ``resolve_config`` validates the value and that the window covers ``history_offsets``.
             history_window: int, rows back the random history may reach (100 = 5 s at 20 Hz); unused when fixed.
             **kwargs: forwarded to :class:`LeRobotV3Reader` (num_frames, height, width, split, ...).
         """
@@ -184,10 +184,8 @@ class YamSharpaDataset(LeRobotV3Reader):
         self._state_normalization_stats: Optional[dict] = None  # filled by _load_stats
         self._layout_cams = [str(c) for c in (camera_layout or DEFAULT_CAMERA_LAYOUT)]
         self._history_offsets, self._future_offsets = _validate_sparse_offsets(history_offsets, future_offsets)
-        if history_sampling not in HISTORY_SAMPLINGS:
-            raise ValueError(
-                f"yam_sharpa: history_sampling must be one of {HISTORY_SAMPLINGS}, got {history_sampling!r}"
-            )
+        # Read by _select_augmentations, which the base __init__ calls.
+        self._history_sampling = str(history_sampling)
         self._history_window = int(history_window)
 
         # Raw (pre-unify) width; the base class scatters it to 80 when unify is on.
@@ -200,11 +198,22 @@ class YamSharpaDataset(LeRobotV3Reader):
             unify_action_map=unify_action_map(self.action_mode),
             **kwargs,
         )
-        # Resolved once from (history_sampling, split): random history is a train-split augmentation, val keeps
-        # the deploy layout. Every sample calls the one slot below with its RNG.
-        random_history = history_sampling == "random" and self._split == "train"
-        self._draw_history_offsets = self._random_history_offsets if random_history else self._fixed_history_offsets
-        if random_history:
+
+    def _select_augmentations(self, train: bool) -> None:
+        """The base's train-only augmentations plus random history (the base's single split rule, extended).
+
+        Args:
+            train: bool, True for the train split; False for val and ``eval_view`` (the deploy layout).
+
+        Returns:
+            None. Binds ``_draw_history_offsets``, the one slot every sample calls with its RNG.
+        """
+        super()._select_augmentations(train)
+        samplers = {"fixed": self._fixed_history_offsets, "random": self._random_history_offsets}
+        # Random history is a train-split augmentation; resolve_config validated the mode.
+        mode = self._history_sampling if train else "fixed"
+        self._draw_history_offsets = samplers[mode]
+        if mode == "random":
             logger.info(
                 "YamSharpa(%s): random history, %d frames from the past %d rows + frame t",
                 self._dataset_id,
@@ -315,7 +324,7 @@ class YamSharpaDataset(LeRobotV3Reader):
 
         Args:
             idx: int in [0, len).
-            rng: numpy Generator of this sample (draws the random history offsets).
+            rng: numpy Generator of this sample (draws the random history offsets, then the color-jitter factors).
 
         Returns:
             dict with ``video`` (H+F PIL images: history then future), ``proprio`` (H, D) + ``proprio_mask``
@@ -346,8 +355,8 @@ class YamSharpaDataset(LeRobotV3Reader):
         rel = np.concatenate([hist_rows - offset, self._future_offsets]).astype(np.int64)
         video = self._decode_window_video(row, ep_local, offset, rel, idx)
         if self._color_jitter is not None:
-            # Same jitter factors across all H+F frames.
-            video = self._color_jitter.apply(video)
+            # Same jitter factors across all H+F frames, drawn after the history offsets.
+            video = self._color_jitter.apply(video, rng)
 
         return {
             "video": video,
@@ -427,6 +436,9 @@ class MultiYamSharpaDataset(BaseDataset):
     Each index draws a source with probability ``weight_i / sum(weight)`` and a
     uniformly random window of that source, from an RNG seeded by
     ``(seed, epoch, idx)`` — stateless per index, so DataLoader workers agree.
+    Draw order of that RNG: source, window, the source's random history offsets
+    (random mode only), its color-jitter factors (jitter on only), then caption
+    dropout (the prompt becomes ``""`` with probability ``caption_dropout_p``).
     ``len`` is the total window count of all sources (one epoch = that many
     draws). ``set_epoch`` re-draws; it reaches worker copies only with
     ``persistent_workers=False``.
@@ -442,6 +454,8 @@ class MultiYamSharpaDataset(BaseDataset):
         *,
         names: Sequence[str],
         weights: Sequence[float],
+        caption_dropout_p: float,
+        split: str,
         seed: int = 42,
         normalization_stats_path: Optional[str] = None,
     ):
@@ -450,6 +464,9 @@ class MultiYamSharpaDataset(BaseDataset):
             datasets: list of S readers sharing one action_mode / stats file.
             names: list of S source names (``sample['source']``).
             weights: list of S non-negative sampling weights (normalized to probabilities).
+            caption_dropout_p: float in [0, 1], the configured probability that a train sample's prompt is replaced
+                by ``""`` (``resolve_config`` checks the range); :meth:`_select_augmentations` applies the split rule.
+            split: str, ``train`` turns the train-only augmentations on (caption dropout here, the readers' own).
             seed: int, base RNG seed.
             normalization_stats_path: str, pooled stats file copied into checkpoints.
         """
@@ -467,6 +484,9 @@ class MultiYamSharpaDataset(BaseDataset):
         self._datasets = list(datasets)
         self._names = list(names)
         self._probs = w / w.sum()
+        # The configured value; the effective one (_caption_dropout_p) follows the split.
+        self._train_caption_dropout_p = float(caption_dropout_p)
+        self._select_augmentations(train=split == "train")
         self._seed = int(seed)
         self._epoch = 0
         self._len = int(sum(len(ds) for ds in self._datasets))
@@ -489,22 +509,45 @@ class MultiYamSharpaDataset(BaseDataset):
         rng = np.random.default_rng([self._seed, self._epoch, int(idx)])
         di = int(rng.choice(len(self._datasets), p=self._probs))
         ds = self._datasets[di]
-        # The same RNG goes on into the source's sample (random history offsets).
+        # The same RNG goes on into the source's sample (random history offsets, color jitter).
         sample = ds.sample(int(rng.integers(len(ds))), rng)
         sample["source"] = self._names[di]
+        # Caption dropout last: one draw per sample whatever p is, so p never shifts the draws above.
+        if rng.random() < self._caption_dropout_p:
+            sample["prompt"] = ""
         return sample
 
     def set_epoch(self, epoch: int) -> None:
         """Args: epoch: int. Changes every index's draw (called by the trainer each epoch)."""
         self._epoch = int(epoch)
 
+    def _select_augmentations(self, train: bool) -> None:
+        """Switch the mixture's train-only augmentation (caption dropout): the one place its split rule lives.
+
+        Args:
+            train: bool, True for the train split; False for val and :meth:`eval_view`.
+
+        Returns:
+            None. Sets the effective ``_caption_dropout_p`` (0 = every prompt kept).
+        """
+        self._caption_dropout_p = self._train_caption_dropout_p if train else 0.0
+
+    def eval_view(self) -> "MultiYamSharpaDataset":
+        """This mixture with eval semantics (the training visualizer's fixed samples), sharing the preloaded readers.
+
+        Returns:
+            a shallow copy over the same sources, probabilities, seed, epoch and windows (same index -> same window),
+            with the val split's rule (:meth:`_select_augmentations` with ``train=False``: no caption dropout) and
+            each reader's ``eval_view`` (fixed history, no jitter).
+        """
+        view = copy.copy(self)
+        view._datasets = [ds.eval_view() for ds in self._datasets]
+        view._select_augmentations(train=False)
+        return view
+
     @property
     def action_dim(self) -> int:
         return int(self._datasets[0].action_dim)
-
-    @property
-    def normalization_stats(self) -> Optional[dict]:
-        return None  # samples leave the readers pre-normalized
 
     @property
     def names(self) -> List[str]:
@@ -578,6 +621,9 @@ class MultiYamSharpaDataset(BaseDataset):
             datasets,
             names=[n for n, _, _ in entries],
             weights=[w for _, _, w in entries],
+            # Required key, validated (present, in [0, 1]) by resolve_config; the split rule is applied inside.
+            caption_dropout_p=float(config["caption_dropout_p"]),
+            split=split,
             seed=int(get_cfg(config, "seed", 42)),
             normalization_stats_path=str(stats_path) if stats_path else None,
         )

@@ -25,6 +25,7 @@ class _StubBackbone(torch.nn.Module):
         super().__init__()
         self.size = None  # (w, h) of the frames to return, taken from the history
         self.prompts = None
+        self.shift_video = 5.0
 
     def preprocess_condition(self, history, prompts, layout):
         torch.rand(3)  # consumes the global RNG like an encoder may
@@ -47,6 +48,8 @@ class _StubArch(torch.nn.Module):
         self.dit = torch.nn.Linear(2, 2)  # trainable part (train mode)
         self.vae = torch.nn.Linear(2, 2).eval()  # frozen part (eval mode)
         self.video_backbone = _StubBackbone()
+        self.action_backbone = torch.nn.Module()
+        self.action_backbone.shift_action = 5.0
         self.video_scheduler, self.action_scheduler = _Sched(), _Sched()
         self.calls = []
 

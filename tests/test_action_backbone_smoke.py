@@ -54,6 +54,7 @@ def test_action_dit_small_instantiate():
     from openwam.model.action_backbone.separate_action_dit import ActionDiT
 
     dit = ActionDiT(
+        shift_action=5.0,
         action_dim=7,
         dim=64,
         ffn_dim=128,
@@ -84,6 +85,7 @@ def test_action_dit_forward_shape():
     from openwam.model.action_backbone.separate_action_dit import ActionDiT
 
     dit = ActionDiT(
+        shift_action=5.0,
         action_dim=7,
         dim=64,
         ffn_dim=128,
@@ -107,6 +109,7 @@ def test_action_dit_joint_cross_attn_context_shape_and_effect():
 
     torch.manual_seed(0)
     dit = ActionDiT(
+        shift_action=5.0,
         action_dim=7,
         dim=32,
         ffn_dim=64,
@@ -130,3 +133,19 @@ def test_action_dit_joint_cross_attn_context_shape_and_effect():
 
     assert out_a.shape == (2, 5, 7)
     assert not torch.allclose(out_a, out_b, atol=1e-5)
+
+
+def test_action_backbone_does_not_import_the_video_package():
+    """Shared model helpers (flow grid, gradient checkpointing) live at the model level, not in video_backbone."""
+    import ast
+    from pathlib import Path
+
+    import openwam.model.action_backbone as action_pkg
+
+    bad = []
+    for path in sorted(Path(action_pkg.__file__).parent.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            names = [node.module or ""] if isinstance(node, ast.ImportFrom) else []
+            names += [a.name for a in node.names] if isinstance(node, ast.Import) else []
+            bad += [f"{path.name}: {n}" for n in names if n.startswith("openwam.model.video_backbone")]
+    assert not bad, bad

@@ -1,18 +1,12 @@
 """``BaseWAMArchitecture._compute_action_loss`` on the per-element (B, K, A) ``action_is_pad`` of a Batch.
 
-Uses a thin stub that supplies just the scheduler + device arguments the method needs; no diffusion model is
-constructed.
+Calls the method on a thin stub with unit per-sample weights; no diffusion model is constructed.
 """
 
 from __future__ import annotations
 
 import pytest
 import torch
-
-
-class _SchedulerStub:
-    def training_weight(self, timestep_ids):
-        return torch.ones_like(timestep_ids, dtype=torch.float32)
 
 
 class _ModelStub:
@@ -26,8 +20,7 @@ class _ModelStub:
 
 def _loss(pred, target, action_is_pad):
     """pred / target: (B, K, A). action_is_pad: (B, K, A) bool. Returns: 0-dim loss (unit timestep weights)."""
-    timestep_ids = torch.zeros(pred.shape[0], dtype=torch.long)
-    return _ModelStub()._compute_action_loss(pred, target, timestep_ids, _SchedulerStub(), action_is_pad, "cpu")
+    return _ModelStub()._compute_action_loss(pred, target, torch.ones(pred.shape[0]), action_is_pad)
 
 
 class TestComputeActionLoss:
@@ -69,3 +62,16 @@ class TestComputeActionLoss:
     def test_mask_shape_must_match_the_action(self):
         with pytest.raises(ValueError, match="action_is_pad"):
             _loss(torch.randn(2, 4, 20), torch.randn(2, 4, 20), torch.zeros(2, 4, dtype=torch.bool))
+
+
+def test_video_loss_skips_the_clean_prefix():
+    """The layout's history latents are the condition, never a denoising target."""
+    from tests.test_openwam_trainer import _make_tiny_arch
+
+    arch = _make_tiny_arch()
+    target = torch.zeros(1, 1, 3, 1, 1)
+    pred = torch.zeros(1, 1, 3, 1, 1)
+    pred[0, 0, 0] = 999.0  # the one clean latent of the first-frame layout
+    pred[0, 0, 1:] = 2.0
+    loss = arch._compute_video_loss(pred, target, torch.ones(1))
+    assert abs(loss.item() - 4.0) < 1e-5

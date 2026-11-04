@@ -274,7 +274,8 @@ def test_required_clean_attention_checked_by_resolve_config(longlive_cfg):
     def _cfg(clean):
         return OmegaConf.create({
             "dataloader": {"history_offsets": [-20, 0], "future_offsets": [4, 8, 12, 16], "num_frames": 33,
-                           "history_sampling": "fixed", "history_window": 100},
+                           "history_sampling": "fixed", "history_window": 100,
+                           "caption_dropout_p": 0.0},
             "model": {
                 "architecture": {"history_encoding": "per_frame", "clean_attention": clean,
                                  "attention_mask_mode": "mutual", "proprio_input": "context_token"},
@@ -317,3 +318,108 @@ def test_longlive_from_pretrained_real_weights():
     ref = torch.load(cfg.dit_weights, map_location="cpu", mmap=True, weights_only=True)
     for k, v in bb.dit.state_dict().items():
         assert torch.equal(v, ref[f"model.{k}"].to(torch.bfloat16)), k
+
+
+# ---------------------------------------------------------------------------
+# Tiny CPU WanBackbone: time modulation + prepare (merged from the former test_video_backbone_smoke.py)
+# ---------------------------------------------------------------------------
+
+
+def _build_tiny_wan_backbone():
+    """A minimal real WanBackbone wrapping a CPU WanModel (no VAE / text encoder).
+
+    Returns:
+        (backbone, model): WanBackbone and its WanModel (dim 64, 4 latent channels, patch (1, 2, 2)).
+    """
+    from openwam.model.video_backbone.wan.backbone import WanBackbone
+    from openwam.model.video_backbone.wan.dit import WanModel
+
+    model = WanModel(
+        dim=64,
+        in_dim=4,
+        ffn_dim=128,
+        out_dim=4,
+        text_dim=32,
+        freq_dim=32,
+        eps=1e-6,
+        patch_size=(1, 2, 2),
+        num_heads=4,
+        num_layers=1,
+    )
+    backbone = WanBackbone(
+        dit=model,
+        vae=None,
+        text_encoder=None,
+        tokenizer=None,
+        tokenizer_dir="",
+        shift_video=5.0,
+        text_max_length=512,
+    )
+    return backbone, model
+
+
+def _time_embedding(model, t: float):
+    """model: WanModel. t: scalar timestep. Returns: (dim,) ``time_embedding(t)`` computed on its own."""
+    from openwam.model.video_backbone.wan.dit import sinusoidal_embedding_1d
+
+    return model.time_embedding(sinusoidal_embedding_1d(model.freq_dim, torch.tensor([t])))[0]
+
+
+def test_time_modulation_single_path():
+    """One layout: num_hist_latents = 2, F = 4 -> the first 2 frames' tokens carry time_embedding(0), the rest
+    time_embedding(t); time_mod is time_projection of those rows, (B, L, 6, dim)."""
+    from openwam.model.video_backbone.wan.dit_forward import build_time_modulation
+
+    _, model = _build_tiny_wan_backbone()
+    batch, frames, tokens_per_frame, t = 2, 4, 3, 500.0
+    with torch.no_grad():
+        time_embed, time_mod = build_time_modulation(
+            model, torch.full((batch,), t), num_hist_latents=2, num_latents=frames, tokens_per_frame=tokens_per_frame
+        )
+        e0, et = _time_embedding(model, 0.0), _time_embedding(model, t)
+        m0 = model.time_projection(e0).unflatten(0, (6, model.dim))
+        mt = model.time_projection(et).unflatten(0, (6, model.dim))
+    seq = frames * tokens_per_frame
+    assert time_embed.shape == (batch, seq, model.dim) and time_mod.shape == (batch, seq, 6, model.dim)
+    clean = slice(0, 2 * tokens_per_frame)
+    noisy = slice(2 * tokens_per_frame, seq)
+    # Every token of a frame shares one row; clean frames at t = 0, the others at t.
+    torch.testing.assert_close(time_embed[:, clean], e0.expand(batch, 2 * tokens_per_frame, -1))
+    torch.testing.assert_close(time_embed[:, noisy], et.expand(batch, 2 * tokens_per_frame, -1))
+    torch.testing.assert_close(time_mod[:, clean], m0.expand(batch, 2 * tokens_per_frame, -1, -1))
+    torch.testing.assert_close(time_mod[:, noisy], mt.expand(batch, 2 * tokens_per_frame, -1, -1))
+    assert not torch.allclose(e0, et)
+
+
+def test_wan_prepare_takes_text_condition_and_layout():
+    """``WanBackbone.prepare`` reads context / context_mask from the TextCondition and gives the first
+    ``layout.num_hist_latents`` latent frames t = 0 (``build_time_modulation`` on the layout)."""
+    from omegaconf import OmegaConf
+
+    from openwam.model.video_backbone.base import TextCondition
+    from openwam.model.video_backbone.wan.dit_forward import build_time_modulation
+
+    backbone, model = _build_tiny_wan_backbone()
+    latents = torch.randn(1, 4, 3, 4, 4)
+    timestep = torch.tensor([500.0])
+    mask = torch.tensor([[True, True, False]])
+    text = TextCondition(context=torch.randn(1, 3, 32), context_mask=mask)
+
+    layout = OmegaConf.create({"num_hist_latents": 2, "num_latents": 3})
+    state = backbone.prepare(
+        latents=latents, timestep=timestep, text=text, layout=layout, proprio=torch.zeros(1, 2, 3),
+        use_gradient_checkpointing=False, use_gradient_checkpointing_offload=False,
+    )
+    assert torch.equal(state.context_mask, mask)
+    # Frames 0-1 (4 tokens each) carry the t = 0 modulation, frame 2 the sampled one.
+    time_embed, expected = build_time_modulation(model, timestep, num_hist_latents=2, num_latents=3, tokens_per_frame=4)
+    assert torch.equal(state.time_mod, expected) and torch.equal(state.extras["time_embed"], time_embed)
+    assert torch.equal(state.time_mod[:, 0], state.time_mod[:, 7])
+    assert not torch.allclose(state.time_mod[:, 0], state.time_mod[:, 8])
+
+
+def test_unknown_backbone_name_raises():
+    from openwam.model.video_backbone import LoadMode, build_video_backbone
+
+    with pytest.raises(KeyError, match="Unknown video backbone"):
+        build_video_backbone(OmegaConf.create({"name": "nonexistent_backbone"}), LoadMode.PRETRAINED, None)

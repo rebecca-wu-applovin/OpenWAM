@@ -110,12 +110,10 @@ class SparseHistoryInferenceEngine(BaseInferenceEngine):
         latents, actions = arch.sample(hist_latents, text, proprio, schedule, seed=int(conditions.get("seed", 42)))
 
         actions = actions[0].float().cpu().numpy()
-        normalizer = getattr(arch, "normalizer", None)
-        if normalizer is not None:
-            actions = normalizer.unnormalize(actions)
+        if arch.normalizer is not None:
+            actions = arch.normalizer.unnormalize(actions)
         # Relative action modes: compose the chunk with the frame-t proprio (set by model_loader).
-        decoder = getattr(arch, "action_decoder", None)
-        if decoder is not None:
-            actions = decoder(actions, raw_t)
+        if arch.deploy_action_decoder is not None:
+            actions = arch.deploy_action_decoder(actions, raw_t)
         video = arch.video_backbone.decode_future(latents, layout) if self._decode_video else None
         return {"actions": actions, "video": video}

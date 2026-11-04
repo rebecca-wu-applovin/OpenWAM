@@ -59,7 +59,7 @@ def test_released_geometry(variant):
     assert vb.text_dim == text_dim
     assert vb.temporal_compression == 4
     assert vb.causal_temporal is True
-    assert getattr(vb.dit, "lm_head", None) is None
+    assert vb.dit.lm_head is None
 
 
 def test_preprocess_and_block_loop_shapes(variant):

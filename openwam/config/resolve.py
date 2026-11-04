@@ -11,7 +11,9 @@ Latent layout of one sample (H history frames, the last one is the current frame
 * current frame t (clean): encoded alone, 1 latent;
 * future (noisy target): the clip [t, F future frames] encoded as one, its latent 0 (= t) dropped: F/tc latents.
 
-It also runs the cross-block checks (attention keys, proprio routing, random-history window). Later blocks of this
+It also runs the cross-block checks (attention keys, proprio routing, random-history window) and validates the
+dataloader's sampling keys (``history_sampling`` / ``history_window`` / ``caption_dropout_p``) in this one place: the
+dataset reads them without re-checking. Later blocks of this
 function (the config refactor) add the remaining derived values (action_dim / state_dim) and freeze the whole
 config; for now only ``common.layout`` is frozen.
 """
@@ -35,6 +37,16 @@ UNVERIFIED_VA_MODES = ("action_sees_video", "video_sees_action", "isolated")
 HISTORY_SAMPLINGS = ("fixed", "random")
 # Hand-written architecture keys the layout replaced; a launch that still sets them is stale.
 REMOVED_ARCH_KEYS = ("num_history_frames", "num_proprio_tokens", "video_attention_mask_mode")
+# Per-backbone caption-dropout keys -> their old meaning: caption dropout moved to the dataset
+# (dataloader.caption_dropout_p, drawn from the per-sample RNG), so a config that still sets them is stale.
+REMOVED_BACKBONE_KEYS = {
+    "caption_dropout_p": "GE caption-dropout probability",
+    "text_dropout_p": "flux caption-dropout probability",
+    "text_encoder_dropout": "cosmos3 caption-dropout probability",
+    "text_encoder_dropout_seed": "cosmos3 caption-dropout RNG seed",
+}
+# GE's generic-named ``seed`` only seeded its caption dropout; checked for GE alone (another backbone may own a seed).
+REMOVED_GE_KEYS = {"seed": "GE caption-dropout RNG seed"}
 
 
 def latent_layout(
@@ -177,6 +189,22 @@ def _check_history_sampling(dl: DictConfig) -> None:
         )
 
 
+def _check_caption_dropout(dl: DictConfig) -> None:
+    """Check ``dataloader.caption_dropout_p`` (the dataset reads it without re-checking).
+
+    Args:
+        dl: ``cfg.dataloader``.
+
+    Returns:
+        None. ValueError when the key is missing / null or the probability is outside [0, 1].
+    """
+    p = dl.get("caption_dropout_p")
+    if p is None:
+        raise ValueError("dataloader.caption_dropout_p is required (0.0 = no caption dropout)")
+    if not 0.0 <= float(p) <= 1.0:
+        raise ValueError(f"dataloader.caption_dropout_p must be in [0, 1], got {p!r}")
+
+
 def resolve_config(cfg: DictConfig) -> DictConfig:
     """Derive the latent layout into ``cfg.common.layout`` (read-only) and run the cross-block checks.
 
@@ -186,7 +214,8 @@ def resolve_config(cfg: DictConfig) -> DictConfig:
 
     Returns:
         ``cfg`` itself, with ``cfg.common.layout`` set and read-only. Raises ValueError when a stale hand-written
-        key is present, an existing layout disagrees with the derived one, or a check above fails.
+        architecture key or a removed backbone caption-dropout key is present, an existing layout disagrees with
+        the derived one, or a check above fails.
     """
     arch = cfg.model.architecture
     stale = [k for k in REMOVED_ARCH_KEYS if k in arch]
@@ -194,6 +223,14 @@ def resolve_config(cfg: DictConfig) -> DictConfig:
         raise ValueError(
             f"model.architecture.{stale} were replaced by the derived cfg.common.layout / clean_attention; "
             "remove them (the history length comes from dataloader.history_offsets alone)"
+        )
+    video_backbone = cfg.model.video_backbone
+    removed = {**REMOVED_BACKBONE_KEYS, **(REMOVED_GE_KEYS if video_backbone.get("name") == "ge_base_fast" else {})}
+    stale = {k: meaning for k, meaning in removed.items() if k in video_backbone}
+    if stale:
+        raise ValueError(
+            f"model.video_backbone keys {stale} were removed: caption dropout is dataloader.caption_dropout_p "
+            "(the dataset drops prompts with the per-sample RNG); remove them and set that key instead"
         )
     _check_attention(cfg.model)
     _check_proprio_input(cfg.model)
@@ -210,6 +247,7 @@ def resolve_config(cfg: DictConfig) -> DictConfig:
     )
     # After the layout: history_offsets is known to hold at least frame t.
     _check_history_sampling(dl)
+    _check_caption_dropout(dl)
     have = OmegaConf.select(cfg, "common.layout", default=None)
     if have is not None:
         # Re-resolving a saved config (deploy / resume): the stored layout must be exactly the derived one.

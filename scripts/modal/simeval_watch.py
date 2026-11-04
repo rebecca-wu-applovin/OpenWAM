@@ -90,7 +90,7 @@ image = (
     # Sources last, so code edits never invalidate the dependency layers. .git: the results record its commit.
     .add_local_dir(SIM_EVAL_LOCAL, SIM_EVAL, ignore=[".venv", "outputs", "**/__pycache__", "**/*.pyc", ".pytest_cache"])
     .add_local_dir(REPO_ROOT, REMOTE_REPO, ignore=[".venv", ".git", "outputs", "assets", "wandb", "**/__pycache__",
-                                                   "third_party", "docs", "**/*.mp4", "**/logs"])
+                                                   "docs", "**/*.mp4", "**/logs"])
 )
 app = modal.App(APP, image=image)
 

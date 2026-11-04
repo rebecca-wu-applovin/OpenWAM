@@ -3,9 +3,9 @@
 Moved verbatim from the deleted ``cosmos_predict25/scheduler.py`` (class renamed to
 :class:`FlowScheduler`); the notes below describe where its defaults come from.
 
-OpenWAM's training loop pulls four attributes off ``video_backbone.scheduler``:
-``timesteps``, ``sigmas``, ``linear_timesteps_weights``, ``num_train_timesteps``
-(see ``openwam/model/architectures/base.py``). Cosmos-Predict2.5 is rectified flow with an
+OpenWAM's training loop draws its noise levels with ``video_backbone.scheduler.sample_train``
+(see ``openwam/model/architectures/base.py``); deploy reads ``timesteps`` / ``sigmas`` /
+``num_train_timesteps``. Cosmos-Predict2.5 is rectified flow with an
 optional shift parameter; this adapter mirrors the Wan ``FlowMatchScheduler``
 public surface so both backbones look identical to the trainer.
 
@@ -25,9 +25,12 @@ Defaults are calibrated against upstream Cosmos-Predict2.5:
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
+from torch import Tensor
+
+from openwam.model.flow_grid import sample_grid
 
 
 class FlowScheduler:
@@ -61,8 +64,17 @@ class FlowScheduler:
         denoising_strength: float = 1.0,
         shift: Optional[float] = None,
         training: bool = False,
-        **_: object,
     ) -> None:
+        """Build the sigma / timestep grid (and, for training, the per-step loss weights).
+
+        Args:
+            num_inference_steps: int, grid size (1000 for training, the denoise steps at deploy).
+            denoising_strength: float, start sigma (1.0 = pure noise). shift: float α-shift, None = ``shift_video``.
+            training: bool, also set ``linear_timesteps_weights`` (uniform) for ``sample_train``.
+
+        Returns:
+            None; sets ``sigmas`` / ``timesteps`` (N,) and ``linear_timesteps_weights`` (N,) or None.
+        """
         shift_val = self.shift_video if shift is None else float(shift)
         self.sigmas = self._flow_match_sigmas(num_inference_steps, shift_val, denoising_strength)
         self.timesteps = self.sigmas * self.num_train_timesteps
@@ -90,6 +102,19 @@ class FlowScheduler:
         """
         return torch.ones_like(timesteps, dtype=torch.float32)
 
+    def sample_train(self, batch_size: int, *, device, dtype) -> Tuple[Tensor, Tensor, Tensor]:
+        """Training noise levels: uniform over the ``set_timesteps(training=True)`` grid.
+
+        Args:
+            batch_size: int, B. device / dtype: target device and latent dtype.
+
+        Returns:
+            (timesteps (B,), sigmas (B,), loss_weights (B,) float32), see :func:`sample_grid`.
+        """
+        return sample_grid(
+            self.timesteps, self.sigmas, self.linear_timesteps_weights, batch_size, device=device, dtype=dtype
+        )
+
     # --- Inference / loss helpers (mirror Wan FlowMatchScheduler API) ---
 
     def step(self, model_output: torch.Tensor, timestep, sample: torch.Tensor, to_final: bool = False, **_):
@@ -111,13 +136,6 @@ class FlowScheduler:
 
     def training_target(self, sample: torch.Tensor, noise: torch.Tensor, timestep) -> torch.Tensor:
         return noise - sample
-
-    def training_weight(self, timestep) -> torch.Tensor:
-        if self.linear_timesteps_weights is None:
-            raise RuntimeError("training_weight requires set_timesteps(training=True) first")
-        ts = timestep.to(self.timesteps.device) if isinstance(timestep, torch.Tensor) else timestep
-        idx = torch.argmin((self.timesteps - ts).abs())
-        return self.linear_timesteps_weights[idx]
 
 
 __all__ = ["FlowScheduler"]

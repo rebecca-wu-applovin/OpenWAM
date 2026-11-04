@@ -7,10 +7,12 @@ All tests run on CPU.
 import tempfile
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
 
 from openwam.dataloader.collate import Batch
+from openwam.model.flow_grid import sample_grid
 from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
 from tests._arch import TEST_TRAIN_OPTIONS, build_test_arch
 
@@ -26,41 +28,11 @@ class _MockDiT(nn.Module):
         super().__init__()
         self.dim = dim
         self.in_dim = in_dim
-        self.fuse_vae_embedding_in_latents = False
-        self.seperated_timestep = False
         self.freq_dim = dim
         self.blocks = nn.ModuleList([nn.Linear(dim, dim) for _ in range(num_blocks)])
 
     def forward(self, x):
         return x
-
-
-class _MockScheduler:
-    """Mock flow-match scheduler with timestep / sigma tables."""
-
-    num_train_timesteps = 1000
-
-    def __init__(self, num_timesteps=1000):
-        self.timesteps = torch.linspace(0, 1, num_timesteps)
-        self.sigmas = torch.linspace(1, 0, num_timesteps)
-        self.linear_timesteps_weights = torch.ones(num_timesteps)
-
-    def set_timesteps(self, n, **kwargs):
-        self.timesteps = torch.linspace(0, 1, n)
-        self.sigmas = torch.linspace(1, 0, n)
-        self.linear_timesteps_weights = torch.ones(n)
-
-    def add_noise(self, original, noise, sigma):
-        return (1 - sigma) * original + sigma * noise
-
-    def training_target(self, original, noise):
-        return noise - original
-
-    def training_weight(self, timestep_ids):
-        return self.linear_timesteps_weights[timestep_ids]
-
-    def flow_step(self, pred, sigma, sigma_next, sample):
-        return sample + pred * (sigma_next - sigma)
 
 
 class _MockPipeline:
@@ -133,8 +105,8 @@ class _MockVideoBackbone(VideoBackbone):
         self._dtype = torch.float32
         # ABC-property backings (mirror Wan native so legacy mask code stays
         # bit-for-bit identical).
-        self._dit_patch_size = (1, 2, 2)
         self._temporal_compression, self._causal_temporal = 4, True
+        self._shift_video = 5.0
         self.last_injected = None
         self.last_extracted = None
 
@@ -167,6 +139,10 @@ class _MockVideoBackbone(VideoBackbone):
         return self._scheduler
 
     @property
+    def text_dim(self) -> int:
+        return 4096
+
+    @property
     def submodule_names(self) -> list:
         return ["dit", "vae", "text_encoder"]
 
@@ -177,9 +153,7 @@ class _MockVideoBackbone(VideoBackbone):
         f, h, w = (latents.shape[2], latents.shape[3], latents.shape[4]) if latents.ndim >= 5 else (1, 1, 1)
         num_tokens = f * h * w
         x = torch.randn(B, num_tokens, self._dim)
-        # Per-token t_mod (B, T, 6, dim) mirrors Wan2.2-TI2V-5B's
-        # ``seperated_timestep=True + fuse_vae_embedding_in_latents=True`` mode,
-        # which is what production runs.
+        # Per-token t_mod (B, T, 6, dim), the one layout Wan's build_time_modulation emits.
         t_mod = torch.zeros(B, num_tokens, 6, self._dim)
         freq_dim = self._dim // 2
         freqs = torch.polar(torch.ones(num_tokens, 1, freq_dim), torch.zeros(num_tokens, 1, freq_dim))
@@ -282,8 +256,11 @@ class _MockScheduler:
     def training_target(self, original, noise):
         return noise - original
 
-    def training_weight(self, timestep_ids):
-        return self.linear_timesteps_weights[timestep_ids]
+    def sample_train(self, batch_size, *, device, dtype):
+        """Uniform grid draw, like the real grid schedulers. Returns (timesteps, sigmas, weights), each (B,)."""
+        return sample_grid(
+            self.timesteps, self.sigmas, self.linear_timesteps_weights, batch_size, device=device, dtype=dtype
+        )
 
     def flow_step(self, pred, sigma, sigma_next, sample):
         return sample + pred * (sigma_next - sigma)
@@ -445,10 +422,21 @@ def test_multi_batch_loss():
     assert result["loss"].item() > 0
 
 
-def test_video_only_loss():
-    """lambda_action=0: only video loss is computed."""
+def _video_only_loss(lambda_video: float) -> float:
+    """lambda_video: video loss weight. Returns: ``loss`` of one seeded compute_loss with lambda_action = 0."""
     from dataclasses import replace
 
+    torch.manual_seed(0)
+    arch = _make_tiny_arch(replace(TEST_TRAIN_OPTIONS, lambda_video=lambda_video, lambda_action=0.0))
+    arch.action_backbone.scheduler = _MockScheduler()
+    return arch.compute_loss(_make_batch(B=1))["loss"].item()
+
+
+def test_video_only_loss():
+    """lambda_action=0: the action stream still runs (one forward path), but its term is left out of ``loss``."""
+    from dataclasses import replace
+
+    torch.manual_seed(0)  # same noise draw as _video_only_loss
     arch = _make_tiny_arch(replace(TEST_TRAIN_OPTIONS, lambda_action=0.0))
     arch.action_backbone.scheduler = _MockScheduler()
 
@@ -456,6 +444,61 @@ def test_video_only_loss():
 
     assert result["loss"].item() > 0
     assert result["loss_action"].item() == 0.0
+    assert result["loss"].item() == result["loss_video"].item()
+    # The action term contributes nothing to the value: with the same noise draw, halving lambda_video halves
+    # the loss exactly (the mock video stream has no trainable params, so grad_fn cannot tell the terms apart).
+    raw = _video_only_loss(1.0)
+    assert result["loss"].item() == _video_only_loss(TEST_TRAIN_OPTIONS.lambda_video)
+    assert _video_only_loss(0.5) == 0.5 * raw
+
+
+def test_action_only_loss():
+    """lambda_video=0: the video term is left out of ``loss``, mirroring lambda_action=0."""
+    from dataclasses import replace
+
+    arch = _make_tiny_arch(replace(TEST_TRAIN_OPTIONS, lambda_video=0.0, lambda_action=0.5))
+    arch.action_backbone.scheduler = _MockScheduler()
+
+    result = arch.compute_loss(_make_batch(B=1))
+
+    # loss_action is already weighted (lambda_action * raw); loss is exactly that term.
+    assert result["loss_video"].item() == 0.0
+    assert result["loss_action"].item() > 0
+    assert result["loss"].item() == result["loss_action"].item()
+
+
+def test_video_only_loss_is_weighted_video_term():
+    """lambda_action=0 with a non-unit lambda_video: loss == lambda_video * raw video loss."""
+    from dataclasses import replace
+
+    arch = _make_tiny_arch(replace(TEST_TRAIN_OPTIONS, lambda_video=0.5, lambda_action=0.0))
+    arch.action_backbone.scheduler = _MockScheduler()
+
+    result = arch.compute_loss(_make_batch(B=1))
+
+    assert result["loss_action"].item() == 0.0
+    assert result["loss"].item() == result["loss_video"].item() > 0
+
+
+def test_trainer_rejects_both_lambdas_zero():
+    """A training run with both loss weights 0 has no loss term: the trainer fails at construction."""
+    from omegaconf import OmegaConf
+
+    from openwam.train.openwam_trainer import OpenWAMTrainer
+
+    cfg = OmegaConf.create(
+        {
+            "project": {"seed": None},
+            "training": {
+                "use_gradient_checkpointing": False,
+                "use_gradient_checkpointing_offload": False,
+                "lambda_video": 0.0,
+                "lambda_action": 0.0,
+            },
+        }
+    )
+    with pytest.raises(ValueError, match="both 0"):
+        OpenWAMTrainer(cfg, accelerator=None, dataset=None)
 
 
 def test_loss_backward():
@@ -524,6 +567,34 @@ def test_save_load_checkpoint():
         ):
             assert k1 == k2
             assert torch.equal(v1, v2), f"Weight mismatch for {k1}"
+
+
+def test_load_checkpoint_rejects_leftover_meta():
+    """The strict rule on checkpoint loads: a tensor still on meta after the load raises (it would be garbage)."""
+    arch = _make_tiny_arch()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = str(Path(tmpdir) / "ckpt.safetensors")
+        arch.save_checkpoint(ckpt_path)
+        # A non-persistent buffer is in no checkpoint, so no key check sees it.
+        shell = _make_tiny_arch()
+        shell.action_backbone.register_buffer("table", torch.empty(4, device="meta"), persistent=False)
+        with pytest.raises(ValueError, match="meta"):
+            shell.load_checkpoint(ckpt_path)
+
+
+def test_load_checkpoint_rejects_shape_mismatch():
+    """The strict rule on checkpoint loads: a shape mismatch raises before anything is loaded."""
+    from safetensors.torch import save_file
+
+    arch = _make_tiny_arch()
+    state = {k: v.clone().contiguous() for k, v in arch.state_dict().items()}
+    key = next(k for k, v in state.items() if v.ndim == 2)
+    state[key] = torch.zeros(state[key].shape[0] + 1, state[key].shape[1])
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = str(Path(tmpdir) / "ckpt.safetensors")
+        save_file(state, ckpt_path)
+        with pytest.raises(ValueError, match="shape"):
+            _make_tiny_arch().load_checkpoint(ckpt_path)
 
 
 def test_manage_checkpoints():

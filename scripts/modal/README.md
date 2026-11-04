@@ -97,8 +97,7 @@ Pull a run with `modal volume get openwam-runs /yjw/outputs/<group>/<index>_<run
   `OPENWAM_STAGE_DATA=0 bash run_modal.sh`. Every retry gets a fresh container, so it copies again.
 - **Volume commits.** `train.py` commits `openwam-runs` every 10 min and once on exit.
   On preemption you can lose at most about 10 min of writes.
-- **Environment.** `requirements-frozen.txt` is a freeze of the local `.venv`, not
-  `docker/requirements-cu128.txt`, so Modal and local runs use the same versions. If the local
+- **Environment.** `requirements-frozen.txt` is a freeze of the local `.venv`, so Modal and local runs use the same versions. If the local
   venv changes, regenerate it with the command in the header of that file. The next run then
   rebuilds the image.
 - **Code is uploaded on every run.** Uncommitted local edits run too. Commit before a real run

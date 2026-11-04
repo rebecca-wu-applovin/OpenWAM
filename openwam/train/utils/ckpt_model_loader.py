@@ -31,6 +31,7 @@ import os
 
 from omegaconf import DictConfig, OmegaConf, open_dict
 
+from openwam.model.architectures.base import TrainOptions
 from openwam.train.utils.checkpointing import find_latest_weights
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,47 @@ def warn_live_model_cfg_ignored(ckpt_cfg: DictConfig, cfg: DictConfig, ckpt_dir:
         print(line, flush=True)
 
 
+# The dataloader keys that decide which rows a sample holds: the layout's sources (offsets, window length) and the
+# history draw. Equal frame counts with other values give the same common.layout but other samples.
+_LAYOUT_SOURCE_KEYS = ("history_offsets", "future_offsets", "num_frames", "history_sampling", "history_window")
+
+
+def check_resume_layout(cfg: DictConfig, ckpt_cfg: DictConfig, ckpt_dir: str) -> None:
+    """Reject a resume whose live sample layout differs from the checkpoint's.
+
+    The resumed model is built from ``ckpt_cfg.common.layout`` while the training dataset is built from the live
+    ``cfg.dataloader``; a disagreement in the layout or in the values it comes from would train the checkpoint on
+    other samples without any error.
+
+    Args:
+        cfg: the live run config, resolved (``cfg.common.layout`` set by the entry point).
+        ckpt_cfg: the checkpoint's config, resolved.
+        ckpt_dir: str, the checkpoint dir (error message only).
+
+    Returns:
+        None. Raises ValueError naming every differing layout field and every differing ``_LAYOUT_SOURCE_KEYS``
+        dataloader key, each with its live and ckpt value.
+    """
+    live = OmegaConf.to_container(cfg.common.layout)
+    ckpt = OmegaConf.to_container(ckpt_cfg.common.layout)
+    # Both come from the same latent_layout(), so they have the same fields.
+    diffs = [f"common.layout.{k}: live {live[k]!r} vs ckpt {ckpt[k]!r}" for k in sorted(live) if live[k] != ckpt[k]]
+    for key in _LAYOUT_SOURCE_KEYS:
+        # Plain containers, so list values compare by content.
+        live_val = OmegaConf.to_container(cfg.dataloader)[key]
+        ckpt_val = OmegaConf.to_container(ckpt_cfg.dataloader)[key]
+        if live_val != ckpt_val:
+            diffs.append(f"dataloader.{key}: live {live_val!r} vs ckpt {ckpt_val!r}")
+    if not diffs:
+        return
+    raise ValueError(
+        f"[resume] the live sample layout differs from {os.path.join(ckpt_dir, 'config.yaml')}'s: "
+        f"{'; '.join(diffs)}. The model and its training so far follow the checkpoint's layout but the dataset is "
+        "built from the live config; set these live keys to the checkpoint's values, or start a new run with "
+        "training.finetune_ckpt_path."
+    )
+
+
 def _load_ckpt_cfg(ckpt_dir: str) -> DictConfig:
     """Read a run dir's ``config.yaml``.
 
@@ -231,7 +273,7 @@ def _load_ckpt_cfg(ckpt_dir: str) -> DictConfig:
     return ckpt_cfg
 
 
-def build_for_finetune(source: str, cfg: DictConfig, train_options):
+def build_for_finetune(source: str, cfg: DictConfig, train_options: TrainOptions):
     """Warm-start: the checkpoint's architecture with the live model config on top, weights loaded strictly.
 
     Args:
@@ -261,7 +303,7 @@ def build_for_finetune(source: str, cfg: DictConfig, train_options):
     return architecture
 
 
-def build_for_resume(source: str, cfg: DictConfig, train_options):
+def build_for_resume(source: str, cfg: DictConfig, train_options: TrainOptions):
     """Resume: the checkpoint's own architecture, with zeroed storage for accelerate ``load_state`` to fill.
 
     The safetensors are not read: ``load_state`` restores a strict superset (module weights incl. frozen
@@ -270,7 +312,8 @@ def build_for_resume(source: str, cfg: DictConfig, train_options):
 
     Args:
         source: str, ``training.resume_ckpt_path`` (the run dir).
-        cfg: the live run config; only compared with the ckpt's (the ckpt config wins, divergence is logged).
+        cfg: the live run config, resolved; only compared with the ckpt's (the ckpt model config wins and a
+            divergence is logged; a different ``common.layout`` raises, since the dataset is built from the live one).
         train_options: TrainOptions the trainer decided (passed to the architecture constructor).
 
     Returns:
@@ -284,6 +327,7 @@ def build_for_resume(source: str, cfg: DictConfig, train_options):
 
     ckpt_dir, _explicit_weights = _resolve_ckpt_path(source)
     ckpt_cfg = resolve_config(_load_ckpt_cfg(ckpt_dir))
+    check_resume_layout(cfg, ckpt_cfg, ckpt_dir)
     warn_live_model_cfg_ignored(ckpt_cfg, cfg, ckpt_dir)
     logger.info("[resume] building architecture from ckpt dir: %s", ckpt_dir)
     architecture = build_architecture_from_ckpt_dir(ckpt_dir, ckpt_cfg.model, ckpt_cfg.common.layout, train_options)

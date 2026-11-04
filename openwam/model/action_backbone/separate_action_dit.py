@@ -42,7 +42,7 @@ from openwam.model.action_backbone.components import (
     precompute_freqs_cis_1d,
     rope_apply_1d,
 )
-from openwam.model.video_backbone.common.checkpoint import gradient_checkpoint_forward
+from openwam.model.grad_checkpoint import gradient_checkpoint_forward
 
 if TYPE_CHECKING:
     from openwam.model.architectures.base import ActionState
@@ -361,6 +361,7 @@ class ActionDiT(ActionDiTBackbone):
             ``range(num_layers)`` — the driver runs joint attention at every
             layer regardless and this is informational only.
         variant: ``"joint_cross_attn"`` or ``"joint_self_attn"``.
+        shift_action: α-shift of the action scheduler's sigma grid (yaml ``shift_action``, train + deploy).
     """
 
     def __init__(
@@ -378,7 +379,8 @@ class ActionDiT(ActionDiTBackbone):
         freq_dim: int = 256,
         max_action_len: int = 1024,
         eps: float = 1e-6,
-        shift_action: Optional[float] = None,
+        *,
+        shift_action: float,
     ):
         super().__init__()
         if variant not in ("joint_cross_attn", *_MOT_VARIANTS):
@@ -403,7 +405,7 @@ class ActionDiT(ActionDiTBackbone):
         self._head_dim = attn_head_dim
         self._num_heads = num_heads
         self._num_layers = num_layers
-        self._shift_action = None if shift_action is None else float(shift_action)
+        self._shift_action = float(shift_action)
         self.freq_dim = freq_dim
         self.max_action_len = max_action_len
         self._bridge_layers = tuple(bridge_layers)
@@ -715,6 +717,19 @@ class ActionDiT(ActionDiTBackbone):
         use_gradient_checkpointing: bool = False,  # noqa: ARG002 — driver handles ckpt itself
         use_gradient_checkpointing_offload: bool = False,  # noqa: ARG002
     ) -> "ActionState":
+        """MoT coupling: embed the actions and build the per-layer state the driver threads through the blocks.
+
+        Args:
+            noisy_actions: (B, T_action, action_dim) noisy action sequence.
+            timestep: (B,) or (1,) action diffusion timestep.
+            context: (B, L, text_dim) raw text/proprio context (required for ``joint_self_attn``), or None.
+            context_mask: (B, L) bool, True = attend, or None.
+            use_gradient_checkpointing / use_gradient_checkpointing_offload: bool, unused (the driver checkpoints).
+
+        Returns:
+            ActionState whose ``payload`` is an :class:`ActionDiTState` (x_action (B, T_action, dim), modulation,
+            RoPE, projected context).
+        """
         from openwam.model.architectures.base import ActionState
 
         x = self._embed_actions(noisy_actions)
@@ -866,5 +881,6 @@ class ActionDiT(ActionDiTBackbone):
         return astate
 
     def extract_prediction(self, astate: "ActionState") -> torch.Tensor:
+        """astate: ActionState after the last block. Returns: (B, T_action, action_dim) decoded prediction."""
         payload: ActionDiTState = astate.payload
         return self.action_decoder(payload.x_action)

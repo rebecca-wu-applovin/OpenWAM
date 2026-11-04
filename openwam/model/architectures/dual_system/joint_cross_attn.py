@@ -63,12 +63,17 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
             **cfg,
         }
         bl = resolve_bridge_layers(cfg)
+        # The ActionDiT reads one bridge per layer: each must be a video DiT layer the forward actually runs.
+        num_video_layers = self.video_backbone.num_layers
+        if not bl or not all(0 <= b < num_video_layers for b in bl):
+            raise ValueError(
+                f"joint_cross_attn: bridge_layers {list(bl)} must be a non-empty subset of the video DiT's "
+                f"layers 0..{num_video_layers - 1}"
+            )
         video_dim = int(cfg["video_dim"])
         # Default the action-side raw context width to the loaded backbone's
-        # text_dim (Wan T5-XXL=4096); explicit cfg/CLI
-        # still wins. Falls back to 4096 when the backbone doesn't expose it.
-        _vb_text_dim = getattr(self.video_backbone, "text_dim", None)
-        text_dim = int(self._cfg_get(cfg, "text_dim", _vb_text_dim or 4096))
+        # text_dim (Wan T5-XXL=4096); explicit cfg/CLI still wins.
+        text_dim = int(cfg.get("text_dim", self.video_backbone.text_dim))
         self._init_proprio_context(cfg, text_dim=text_dim)
         self._detach_bridge = bool(cfg.get("detach_bridge", False))
 
@@ -84,7 +89,7 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
             attn_head_dim = int(attn_head_dim)
 
         self.action_backbone = ActionDiT(
-            action_dim=int(cfg.get("action_dim", 20)),
+            action_dim=int(cfg["action_dim"]),
             dim=action_dim_hidden,
             ffn_dim=int(cfg.get("ffn_dim", 3072)),
             num_heads=num_heads,
@@ -94,7 +99,7 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
             variant="joint_cross_attn",
             attn_head_dim=attn_head_dim,
             text_dim=text_dim,
-            shift_action=cfg.get("shift_action"),
+            shift_action=float(cfg["shift_action"]),
         )
 
     @property
@@ -113,17 +118,10 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
         if not section_enabled(section, default=True):
             logger.info("cross-attn action compile disabled by config; running eager.")
             return
-        if self.action_backbone is None:
-            logger.warning("cross-attn action compile requested but action_backbone is None; running eager.")
-            return
 
         kwargs = torch_compile_kwargs(section, default_mode="reduce-overhead")
-        try:
-            self._compiled_action_forward = torch.compile(self.action_backbone.forward_with_bridge_tuple, **kwargs)
-        except Exception as exc:  # pragma: no cover - defensive setup fallback
-            self._compiled_action_forward = None
-            logger.warning("cross-attn action torch.compile setup failed; running eager: %s", exc)
-            return
+        # A compile setup failure propagates: no silent eager fallback.
+        self._compiled_action_forward = torch.compile(self.action_backbone.forward_with_bridge_tuple, **kwargs)
         logger.info("Enabled cross-attn action compile with torch.compile kwargs=%s", kwargs)
 
     def _predict_actions_from_bridges(
@@ -140,25 +138,20 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
         """Predict actions from collected bridge tensors, using compile when active."""
 
         ab = self.action_backbone
-        if ab is None:
-            raise RuntimeError("action_backbone is None — cannot predict cross-attn actions.")
         compiled_forward = self._compiled_action_forward
         if compiled_forward is not None and not use_gradient_checkpointing and not use_gradient_checkpointing_offload:
             bridge_tuple = ab.bridge_tuple_from_dict(bridges)
-            try:
-                torch.compiler.cudagraph_mark_step_begin()
-                return compiled_forward(
-                    noisy_actions,
-                    bridge_tuple,
-                    action_timestep,
-                    context=context,
-                    context_mask=context_mask,
-                    use_gradient_checkpointing=use_gradient_checkpointing,
-                    use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-                )
-            except Exception as exc:
-                self._compiled_action_forward = None
-                logger.warning("cross-attn compiled action forward failed; falling back to eager: %s", exc)
+            # A failure of the compiled forward propagates: no silent eager fallback.
+            torch.compiler.cudagraph_mark_step_begin()
+            return compiled_forward(
+                noisy_actions,
+                bridge_tuple,
+                action_timestep,
+                context=context,
+                context_mask=context_mask,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+            )
 
         return ab(
             noisy_actions,
@@ -172,8 +165,8 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
 
     def forward(
         self,
-        noisy_actions: Optional[Tensor],
-        action_timestep: Optional[Tensor],
+        noisy_actions: Tensor,
+        action_timestep: Tensor,
         *,
         latents: Tensor,
         timestep: Tensor,
@@ -182,7 +175,7 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
         proprio_mask: Tensor,
         use_gradient_checkpointing: bool,
         use_gradient_checkpointing_offload: bool,
-    ) -> Tuple[Tensor, Optional[Tensor]]:
+    ) -> Tuple[Tensor, Tensor]:
         """Joint forward; arguments as in :meth:`BaseWAMArchitecture.forward`. Returns (video pred, action pred)."""
         video_backbone = self.video_backbone
         action_backbone = self.action_backbone
@@ -201,11 +194,6 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
 
         # The video's own self-attention reads the frame mask's video block (no action tokens in this stream).
         masks = video_backbone.build_joint_attention_masks(self.frame_mask, vstate, 0)
-        if noisy_actions is None:
-            for block_id in range(video_backbone.num_layers):
-                vstate = video_backbone.run_block(block_id, vstate, masks[block_id])
-            return video_backbone.finalize(vstate), None
-
         bridge_set = frozenset(action_backbone.bridge_layers)
         bridges: dict[int, Tensor] = {}
         detach_bridge = self._detach_bridge
@@ -216,10 +204,8 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
                 bridge = vstate.hidden_states
                 bridges[block_id] = bridge.detach() if detach_bridge else bridge
 
+        # Every bridge layer is a video layer (checked at construction), so the bridge set is complete here.
         video_pred = video_backbone.finalize(vstate)
-        if not bridges:
-            return video_pred, None
-
         action_pred = self._predict_actions_from_bridges(
             noisy_actions,
             bridges,

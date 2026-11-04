@@ -29,6 +29,7 @@ from tests.test_openwam_trainer import _MockVideoBackbone
 
 def _make_action_dit(*, dim: int = 32, num_heads: int = 4, num_layers: int = 2, action_dim: int = 7) -> ActionDiT:
     return ActionDiT(
+        shift_action=5.0,
         action_dim=action_dim,
         dim=dim,
         ffn_dim=dim * 2,
@@ -201,6 +202,7 @@ def test_driver_handles_heterogeneous_hidden_dim_end_to_end():
     vb = _MockVideoBackbone(dim=64, num_layers=2, num_heads=4)
     # Action: hidden=32, attn_hidden = 4*16 = 64 (matches video's per-head layout).
     ab = ActionDiT(
+        shift_action=5.0,
         action_dim=7,
         dim=32,
         ffn_dim=64,

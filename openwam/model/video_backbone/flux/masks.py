@@ -52,13 +52,13 @@ def build_stream_ids(n_hist: int, n_fut: int, h: int, w: int, text_len: int, n_p
     """
 
     def grid(first: int, n: int) -> Tensor:
-        # (t h w) token order of prc_vid; l = 0 for video.
+        # Video tokens in (t h w) order, l = 0.
         t = video_time_ids(torch.arange(first, first + n))
         return torch.cartesian_prod(t, torch.arange(h), torch.arange(w), torch.zeros(1, dtype=torch.long))
 
     txt = torch.stack(
         [torch.zeros(text_len, dtype=torch.long)] * 3 + [torch.arange(text_len)], dim=-1
-    )  # prc_txt: (0, 0, 0, l)
+    )  # text token l: (0, 0, 0, l)
     # history_profile pack_actions: times (j - (n - 1)) / fps, l = -1.
     t_prop = times_to_ids((torch.arange(n_prop).float() - (n_prop - 1)) / _STATE_FPS)
     zeros = torch.zeros(n_prop, dtype=torch.long)
@@ -76,7 +76,6 @@ def build_flux_layer_masks(
     num_mode_layers: int,
     num_layers: int,
     device,
-    strict_clean_rows: bool = False,
 ) -> list[Tensor]:
     """Per-layer joint masks over ``[T | F | H | P | A]`` (True = attend).
 
@@ -93,8 +92,6 @@ def build_flux_layer_masks(
         num_mode_layers: int, leading mode-block layers (5).
         num_layers: int, total layers (33).
         device: torch device.
-        strict_clean_rows: bool, test-only: also hide the noisy latents / action from the T and P rows (native
-            flux lets them read everything, so H reads noisy content one layer later through T / P).
 
     Returns:
         list of ``num_layers`` masks, each (S, S) or (B, 1, S, S) when text lengths differ per sample;
@@ -111,9 +108,6 @@ def build_flux_layer_masks(
     # Extended frame mask: index T + 1 = the text / proprio tokens, visible to and seeing every token.
     ext = torch.ones((t + 2, t + 2), dtype=torch.bool)
     ext[: t + 1, : t + 1] = frame_mask.cpu()
-    if strict_clean_rows:
-        ext[t + 1, n_hist:] = False  # T / P rows: no noisy latent, no action
-        ext[t + 1, t + 1] = True
     # Frame index of every token, in sequence order.
     frame_of = torch.cat([
         torch.full((seg_lens["txt"],), t + 1),

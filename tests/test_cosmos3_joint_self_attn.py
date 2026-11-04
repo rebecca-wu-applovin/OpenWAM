@@ -29,6 +29,7 @@ from openwam.model.video_backbone.cosmos3 import text as cosmos3_text  # noqa: E
 from openwam.model.video_backbone.cosmos3._vendor.transformer_cosmos3 import (  # noqa: E402
     Cosmos3OmniTransformer,
 )
+from tests._cosmos3_shell import unused_io_kwargs  # noqa: E402
 
 MINI = dict(
     attention_bias=False,
@@ -53,6 +54,12 @@ MINI = dict(
 # Nano-flavoured twin (SiLU + RMSNorm, und QK-norm, no k_norm_und_for_gen).
 NANO_MINI = dict(MINI, qk_norm_for_text=True, use_und_k_norm_for_gen=False, hidden_act="silu", rms_norm_eps=1e-6)
 
+
+
+def _visible(state):
+    """state: BlockLoopState with hidden_states (B, S, dim). Returns: (S, S) all-True gen mask (fully visible)."""
+    s = state.hidden_states.shape[1]
+    return torch.ones(s, s, dtype=torch.bool)
 
 def _fm(t: int, n_clean: int, clean_attention: str = "bidirectional"):
     """Frame mask of t latents, the first n_clean clean (mutual). Returns: (t+1, t+1) bool."""
@@ -100,7 +107,7 @@ def test_split_parity_matches_run_block(padded_und, cfg):
         assert (split.prefix_kv_mask is not None) is padded_und
 
         for i in range(len(net.layers)):
-            ref = cosmos3_dit.run_block(net, i, ref)
+            ref = cosmos3_dit.run_block(net, i, ref, gen_mask=_visible(ref))
 
             q, k, v, post = cosmos3_dit.state_pre_attn(net, i, split)
             assert k.shape[1] == q.shape[1] + split.prefix_kv_len
@@ -150,13 +157,13 @@ def test_driver_video_blind_to_action_matches_run_block_loop(padded_und):
 
     vb = Cosmos3EdgeVideoBackbone(
         net=net,
-        vae=None,
-        tokenizer=None,
+        **unused_io_kwargs(),
         dim=MINI["hidden_size"],
         num_layers=MINI["num_hidden_layers"],
         num_heads=MINI["num_attention_heads"],
         head_dim=MINI["head_dim"],
         context_dim=MINI["hidden_size"],
+        clip_fps=24.0,
     ).eval()
     ab = _TinyActionBackbone(
         MINI["hidden_size"], MINI["num_hidden_layers"], MINI["num_attention_heads"], MINI["head_dim"]
@@ -167,7 +174,7 @@ def test_driver_video_blind_to_action_matches_run_block_loop(padded_und):
     with torch.no_grad():
         ref = _build_state(net, ids, lat, padded_und=padded_und)
         for i in range(len(net.layers)):
-            ref = cosmos3_dit.run_block(net, i, ref)
+            ref = cosmos3_dit.run_block(net, i, ref, gen_mask=_visible(ref))
 
         joint = _build_state(net, ids, lat, padded_und=padded_und)
         astate = types.SimpleNamespace(payload=types.SimpleNamespace(x_action=torch.randn(1, 5, MINI["hidden_size"])))
@@ -222,13 +229,13 @@ def test_joint_loop_keeps_padded_und_keys_out(n_clean):
     net = Cosmos3OmniTransformer(**MINI).eval()
     vb = Cosmos3EdgeVideoBackbone(
         net=net,
-        vae=None,
-        tokenizer=None,
+        **unused_io_kwargs(),
         dim=MINI["hidden_size"],
         num_layers=MINI["num_hidden_layers"],
         num_heads=MINI["num_attention_heads"],
         head_dim=MINI["head_dim"],
         context_dim=MINI["hidden_size"],
+        clip_fps=24.0,
     ).eval()
     ab = _TinyActionBackbone(
         MINI["hidden_size"], MINI["num_hidden_layers"], MINI["num_attention_heads"], MINI["head_dim"]
@@ -266,7 +273,7 @@ def test_padded_und_poison_is_detectable():
         state.extras = {**state.extras, "und_mask": None}
         with torch.no_grad():
             for i in range(len(net.layers)):
-                state = cosmos3_dit.run_block(net, i, state)
+                state = cosmos3_dit.run_block(net, i, state, gen_mask=_visible(state))
             outs.append(cosmos3_dit.finalize_block_loop(net, state))
     assert (outs[0] - outs[1]).abs().max().item() > 1e-3, "poison is inert; the leak tests prove nothing"
 
@@ -281,11 +288,13 @@ def test_action_blind_video_matches_direct_blocks_with_matching_mask(batch, padd
     net = Cosmos3OmniTransformer(**MINI).eval()
     vb = Cosmos3EdgeVideoBackbone(
         net=net,
+        **unused_io_kwargs(),
         dim=MINI["hidden_size"],
         num_layers=MINI["num_hidden_layers"],
         num_heads=MINI["num_attention_heads"],
         head_dim=MINI["head_dim"],
         context_dim=MINI["hidden_size"],
+        clip_fps=24.0,
     ).eval()
     ab = _TinyActionBackbone(
         MINI["hidden_size"], MINI["num_hidden_layers"], MINI["num_attention_heads"], MINI["head_dim"]

@@ -37,7 +37,9 @@ def sample_history_offsets(num_history: int, window: int, rng: np.random.Generat
         (H,) int64 offsets, strictly increasing, in [-window, 0], last one 0. Feed them to :func:`history_rows`,
         which clamps rows before the episode start (sample first, then clamp, like deploy).
     """
-    # Uniform without replacement over rows 1 .. window back; oldest first.
+    # Uniform without replacement over rows 1 .. window back; oldest first. The offsets are distinct, but the
+    # episode-start clamp in history_rows can still map several of them to one row (duplicate frames near the
+    # start): by design, the same rows deploy's buffer repeats.
     back = rng.choice(np.arange(1, int(window) + 1), size=int(num_history) - 1, replace=False)
     return np.append(-np.sort(back)[::-1], 0).astype(np.int64)
 

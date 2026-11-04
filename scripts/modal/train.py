@@ -63,7 +63,7 @@ image = (
         {
             "PYTHONPATH": REMOTE_REPO,  # replaces `pip install -e .`
             "PYTHONUNBUFFERED": "1",
-            "NCCL_RAS_ENABLE": "0",  # same H100 shutdown-SIGSEGV workaround as docker/Dockerfile
+            "NCCL_RAS_ENABLE": "0",  # avoids the NCCL RAS SIGSEGV at H100 shutdown
             "HF_HOME": "/root/.cache/huggingface",
         }
     )
@@ -71,7 +71,7 @@ image = (
     .add_local_dir(
         REPO_ROOT,
         REMOTE_REPO,
-        ignore=[".venv", ".git", "outputs", "assets", "wandb", "**/__pycache__", "third_party", "docs", "**/*.mp4", "**/logs"],
+        ignore=[".venv", ".git", "outputs", "assets", "wandb", "**/__pycache__", "docs", "**/*.mp4", "**/logs"],
     )
 )
 

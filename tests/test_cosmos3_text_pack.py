@@ -15,8 +15,6 @@ from openwam.model.video_backbone.cosmos3 import text as cosmos3_text
 def test_prompt_templates_match_upstream_strings():
     text = cosmos3_text.apply_prompt_templates("A robot.", num_frames=29, height=480, width=832, fps=24.0)
     assert text == ("A robot. The video is 1.2 seconds long and is of 24 FPS. This video is of 480x832 resolution.")
-    neg = cosmos3_text.apply_prompt_templates("", num_frames=29, height=480, width=832, fps=24.0, negative=True)
-    assert neg == ("The video is not 1.2 seconds long and is not of 24 FPS. This video is not of 480x832 resolution.")
     img = cosmos3_text.apply_prompt_templates("X", num_frames=1, height=480, width=832, fps=24.0)
     assert img == "X. This image is of 480x832 resolution."
 

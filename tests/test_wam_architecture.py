@@ -124,7 +124,6 @@ def _make_tiny_wan_backbone_for_compile_test():
             super().__init__()
             self.dim = 8
             self.freq_dim = 4
-            self.fuse_vae_embedding_in_latents = False
             self.blocks = torch.nn.ModuleList([_Block()])
             self.text_embedding = torch.nn.Linear(8, 8)
 
@@ -492,6 +491,7 @@ def test_action_dit_joint_cross_attn_uses_rope():
     from openwam.model.action_backbone.separate_action_dit import ActionDiT
 
     dit = ActionDiT(
+        shift_action=5.0,
         action_dim=7,
         dim=64,
         ffn_dim=128,
@@ -516,6 +516,7 @@ def test_action_dit_rope_freqs_preserve_complex_dtype_on_dtype_to():
     from openwam.model.action_backbone.separate_action_dit import ActionDiT
 
     dit = ActionDiT(
+        shift_action=5.0,
         action_dim=7,
         dim=64,
         ffn_dim=128,
@@ -540,6 +541,7 @@ def test_action_dit_rope_freqs_follow_cuda_to_without_dtype_cast():
     from openwam.model.action_backbone.separate_action_dit import ActionDiT
 
     dit = ActionDiT(
+        shift_action=5.0,
         action_dim=7,
         dim=64,
         ffn_dim=128,
@@ -573,6 +575,7 @@ def test_action_dit_joint_self_attn_uses_only_rope():
     from openwam.model.action_backbone.separate_action_dit import ActionDiT
 
     dit = ActionDiT(
+        shift_action=5.0,
         action_dim=7,
         dim=64,
         ffn_dim=128,
@@ -650,7 +653,7 @@ def test_dual_system_joint_cross_attn_no_per_layer_state():
         "ffn_dim": 128,
         "num_heads": 4,
         "video_dim": 128,
-        "bridge_layers": (0, 2),
+        "bridge_layers": (0, 1),  # every layer of the 2-layer stub backbone
     }
     arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
 
@@ -743,7 +746,7 @@ def test_dual_system_detached_joint_cross_attn_blocks_grad_to_video():
     arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     # detach is owned by the architecture; the action backbone has no such flag.
     assert arch.detach_bridge is True
-    assert not hasattr(arch.action_backbone, "detach_bridge")
+    assert "detach_bridge" not in dir(arch.action_backbone)
 
 
 def test_action_dit_cross_attn_bridge_tuple_matches_dict():
@@ -840,6 +843,28 @@ def test_dual_system_joint_cross_attn_compiled_action_path_matches_eager():
     assert torch.allclose(compiled_out, eager_out, atol=1e-6)
 
 
+@pytest.mark.parametrize("at_setup", [False, True])
+def test_dual_system_joint_cross_attn_compile_failure_raises(at_setup):
+    """A failing compile (setup or compiled call) raises: no silent eager fallback."""
+    from omegaconf import OmegaConf
+
+    arch = _make_dual_system_cross_attn_fixture()
+    actions, bridges, timestep, context, context_mask = _dual_system_cross_attn_inputs(arch, 11)
+
+    def _broken(*_args, **_kwargs):
+        raise RuntimeError("compiler failed")
+
+    # at_setup: torch.compile itself fails; else it returns a callable that fails when run.
+    with patch("torch.compile", side_effect=_broken if at_setup else (lambda fn, **_kw: _broken)):
+        if at_setup:
+            with pytest.raises(RuntimeError, match="compiler failed"):
+                arch.apply_compile_optimizations(OmegaConf.create({"mode": "auto", "cross_attn": {}}))
+            return
+        arch.apply_compile_optimizations(OmegaConf.create({"mode": "auto", "cross_attn": {}}))
+    with torch.no_grad(), pytest.raises(RuntimeError, match="compiler failed"):
+        arch._predict_actions_from_bridges(actions, bridges, timestep, context=context, context_mask=context_mask)
+
+
 def test_dual_system_joint_cross_attn_compile_skips_checkpointed_path():
     from omegaconf import OmegaConf
 
@@ -930,6 +955,34 @@ def test_dual_system_joint_self_attn_compile_auto_sets_mot_loop():
     mock_compile.assert_called_once()
     assert mock_compile.call_args.kwargs == {"dynamic": False, "mode": "reduce-overhead"}
     assert arch._compiled_mot_run_joint_loop is not None
+
+
+def test_dual_system_joint_self_attn_compile_setup_failure_raises():
+    """A failing MoT-loop torch.compile raises at setup: no silent eager fallback."""
+    from omegaconf import OmegaConf
+
+    from tests.test_openwam_trainer import _MockVideoBackbone
+
+    cfg = {
+        "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
+        "variant": "joint_self_attn",
+        "action_dim": 7,
+        "dim": 32,
+        "ffn_dim": 64,
+        "num_heads": 4,
+        "video_dim": 32,
+        "bridge_layers": (0, 1),
+        "text_dim": 16,
+    }
+    arch = build_test_arch("dual_system_self_attn", cfg, stub_backbone(cfg), layout=make_layout())
+    arch.video_backbone = _MockVideoBackbone(dim=32, num_layers=2, num_heads=4)
+    arch.build_mot_driver()
+
+    with patch("torch.compile", side_effect=RuntimeError("compiler failed")):
+        with pytest.raises(RuntimeError, match="compiler failed"):
+            arch.apply_compile_optimizations(OmegaConf.create({"mode": "auto", "self_attn": {}}))
 
 
 def test_normalize_architecture_spec_dual_system_joint_cross_attn_detach_false():
@@ -1125,7 +1178,7 @@ def test_freeze_modules_disables_grad_and_wraps_forward_in_no_grad():
     arch.freeze_modules(["frozen_mod"])
     out = arch.frozen_mod(x)
     assert out.requires_grad is False
-    assert getattr(arch.frozen_mod, "_openwam_no_grad_wrapped", False) is True
+    assert arch.frozen_mod._openwam_no_grad_wrapped is True
 
 
 def test_freeze_modules_skips_unknown_paths():
@@ -1430,3 +1483,33 @@ def test_sample_infers_inactive_dims_from_unify_normalizer(monkeypatch):
     mismatch_arch = _make_inactive_dim_probe_arch()
     mismatch_arch.attach_normalizer(_MismatchNormalizer())
     np.testing.assert_array_equal(_probe_actions(mismatch_arch, schedule), baseline)
+
+
+# ---------------------------------------------------------------------------
+# resolve_architecture_config error paths (merged from the former test_architecture_registry_scope.py)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_model_cfg(framework, variant):
+    """framework / variant: str or None. Returns: the minimal model cfg resolve_architecture_config reads."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        architecture={"framework": framework, "variant": variant, "action_dim": 7}, action_backbone={}
+    )
+
+
+def test_unknown_variant_raises_unsupported():
+    from openwam.model.architectures.registry import resolve_architecture_config
+
+    # A removed / unknown architecture must not resolve to any surviving class.
+    with pytest.raises(KeyError, match="Unsupported"):
+        resolve_architecture_config(_resolve_model_cfg("single_system", "vanilla"))
+
+
+def test_variant_none_is_ambiguous():
+    from openwam.model.architectures.registry import resolve_architecture_config
+
+    # Two dual_system variants remain, so an unset variant cannot pick one silently.
+    with pytest.raises(KeyError, match="Ambiguous"):
+        resolve_architecture_config(_resolve_model_cfg("dual_system", None))

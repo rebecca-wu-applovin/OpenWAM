@@ -18,6 +18,7 @@ from openwam.model.video_backbone.cosmos3 import text as cosmos3_text  # noqa: E
 from openwam.model.video_backbone.cosmos3._vendor.transformer_cosmos3 import (  # noqa: E402
     Cosmos3OmniTransformer,
 )
+from tests._cosmos3_shell import unused_io_kwargs  # noqa: E402
 
 MINI = dict(
     attention_bias=False,
@@ -43,6 +44,12 @@ MINI = dict(
 # QK-norm on, no k_norm_und_for_gen) that the Edge MINI never exercises.
 NANO_MINI = dict(MINI, qk_norm_for_text=True, use_und_k_norm_for_gen=False, hidden_act="silu", rms_norm_eps=1e-6)
 
+
+
+def _visible(state):
+    """state: BlockLoopState with hidden_states (B, S, dim). Returns: (S, S) all-True gen mask (fully visible)."""
+    s = state.hidden_states.shape[1]
+    return torch.ones(s, s, dtype=torch.bool)
 
 def _build(cfg):
     torch.manual_seed(0)
@@ -89,7 +96,7 @@ def _mine_velocity(net, ids, lat, text_pos, vis_pos, ncp, t_val):
             num_clean_prefix_frames=ncp,
         )
         for i in range(len(net.layers)):
-            state = cosmos3_dit.run_block(net, i, state)
+            state = cosmos3_dit.run_block(net, i, state, gen_mask=_visible(state))
         return cosmos3_dit.finalize_block_loop(net, state)
 
 
@@ -160,7 +167,7 @@ def test_batched_engine_consistent_with_single():
             num_clean_prefix_frames=1,
         )
         for i in range(len(net.layers)):
-            state = cosmos3_dit.run_block(net, i, state)
+            state = cosmos3_dit.run_block(net, i, state, gen_mask=_visible(state))
         batched = cosmos3_dit.finalize_block_loop(net, state)
 
     single = _mine_velocity(net, ids[0], lat1, text_pos, vis_pos, ncp=1, t_val=500.0)
@@ -193,7 +200,7 @@ def test_none_und_mask_matches_all_true_tensor():
                 num_clean_prefix_frames=1,
             )
             for i in range(len(net.layers)):
-                state = cosmos3_dit.run_block(net, i, state)
+                state = cosmos3_dit.run_block(net, i, state, gen_mask=_visible(state))
             outs.append((ctx, cosmos3_dit.finalize_block_loop(net, state), state.prefix_kv_mask))
 
     (ctx_a, out_a, pm_a), (ctx_b, out_b, pm_b) = outs
@@ -207,13 +214,13 @@ def _mini_backbone(net):
 
     return Cosmos3EdgeVideoBackbone(
         net=net,
-        vae=None,
-        tokenizer=None,
+        **unused_io_kwargs(),
         dim=MINI["hidden_size"],
         num_layers=MINI["num_hidden_layers"],
         num_heads=MINI["num_attention_heads"],
         head_dim=MINI["head_dim"],
         context_dim=MINI["hidden_size"],
+        clip_fps=24.0,
     )
 
 
@@ -321,7 +328,7 @@ def test_gradients_reach_gen_pathway():
         num_clean_prefix_frames=1,
     )
     for i in range(len(net.layers)):
-        state = cosmos3_dit.run_block(net, i, state)
+        state = cosmos3_dit.run_block(net, i, state, gen_mask=_visible(state))
     out = cosmos3_dit.finalize_block_loop(net, state)
     out[:, :, 1:].square().mean().backward()
 
@@ -351,14 +358,14 @@ def _tokenizer_backbone():
 
     vb = Cosmos3EdgeVideoBackbone(
         net=_build(MINI),
-        vae=None,
-        tokenizer=_VocabSafeTokenizer(),
+        **{**unused_io_kwargs(), "tokenizer": _VocabSafeTokenizer()},
         dim=MINI["hidden_size"],
         num_layers=MINI["num_hidden_layers"],
         num_heads=MINI["num_attention_heads"],
         head_dim=MINI["head_dim"],
         context_dim=MINI["hidden_size"],
         prompt_templates=False,
+        clip_fps=24.0,
     ).eval()
     # ``device``/``dtype`` default to cuda/bf16 on the ABC; pin them so
     # ``_encode_prompts`` runs on CPU.
@@ -372,11 +379,11 @@ def test_encode_prompts_signals_padding_only_when_lengths_differ():
     Equal-length prompts must yield ``None`` (the fused-kernel path); unequal
     ones must yield a real per-sample gate. Replacing the predicate with a bare
     ``None`` leaves every other cosmos3 test green while the padded sample
-    silently attends its own padding — ``text_encoder_dropout`` rewrites prompts
+    silently attends its own padding — caption dropout (``dataloader.caption_dropout_p``) rewrites prompts
     to ``""``, so the predicate flips on real training data.
     """
     vb = _tokenizer_backbone()
-    kw = dict(num_frames=9, height=8, width=8, fps=24.0)
+    kw = dict(num_frames=9, height=8, width=8)
 
     with torch.no_grad():
         same = vb._encode_prompts(["abcd", "efgh"], **kw)
@@ -401,7 +408,7 @@ def test_padding_gate_changes_the_padded_sample_only():
     """
     vb = _tokenizer_backbone()
     net = vb.dit
-    tok = vb._require_tokenizer()
+    tok = vb._tokenizer
     ids_list = [cosmos3_text.tokenize_prompt(tok, t, max_length=512) for t in ("abcd", "ef")]
     input_ids, real_gate, _ = cosmos3_text.pad_und_batch(ids_list, pad_token_id=int(tok.pad_token_id))
     und_len = input_ids.shape[1]
@@ -424,7 +431,7 @@ def test_padding_gate_changes_the_padded_sample_only():
                 num_clean_prefix_frames=0,
             )
             for i in range(len(net.layers)):
-                state = cosmos3_dit.run_block(net, i, state)
+                state = cosmos3_dit.run_block(net, i, state, gen_mask=_visible(state))
             return cosmos3_dit.finalize_block_loop(net, state)
 
     gated, ungated = velocity(real_gate), velocity(None)

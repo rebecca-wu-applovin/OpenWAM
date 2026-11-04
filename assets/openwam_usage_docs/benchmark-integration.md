@@ -13,7 +13,7 @@ The benchmark owns action ordering, units, signs, ranges, and gripper meaning. K
 
 For a custom source, subclass `BaseDataset` in [openwam/dataloader/bases/dataset.py](../../openwam/dataloader/bases/dataset.py). For LeRobot v3 data, subclass `LeRobotV3Reader` in [openwam/dataloader/bases/lerobot_v3_reader.py](../../openwam/dataloader/bases/lerobot_v3_reader.py), which provides parquet windows, video decoding, prompts, statistics, masks, and multiview composition.
 
-Override only the source hooks that differ, such as `_getitem_impl(idx, rng)` (required: builds the sample; `rng` is the per-sample generator, the only random source a reader may use), `_action_20d`, `_resolve_cameras`, `_resolve_prompt`, and `_load_stats`. A `LeRobotV3Reader` is a source: the registered mixture (e.g. `MultiYamSharpaDataset`) calls its `sample(idx, rng)` with a `(seed, epoch, idx)` generator, and the reader reads every data shard into memory at construction. Register the class in [openwam/dataloader/registry.py](../../openwam/dataloader/registry.py):
+Override only the source hooks that differ, such as `_getitem_impl(idx, rng)` (required: builds the sample; `rng` is the per-sample generator, the only random source a reader may use), `_action_20d`, `_resolve_cameras`, `_resolve_prompt`, and `_load_stats`. A `LeRobotV3Reader` is a source: the registered mixture (e.g. `MultiYamSharpaDataset`) calls its `sample(idx, rng)` with a `(seed, epoch, idx)` generator, and the reader reads every data shard into memory at construction. Register the trainer-facing `BaseDataset` (the mixture, not the reader) in [openwam/dataloader/registry.py](../../openwam/dataloader/registry.py):
 
 ~~~python
 from openwam.dataloader.bases import BaseDataset
@@ -27,6 +27,9 @@ class MyBenchmarkDataset(BaseDataset):
 
     def __len__(self): ...
     def __getitem__(self, index): ...
+    # Required (abstract): the same windows with every train-only augmentation off; the trainer's
+    # visualization samples from it. A dataset without augmentations can return a view of itself.
+    def eval_view(self): ...
 ~~~
 
 Import the module before calling `build_dataset(config)`. Every registered class must implement `from_config`; built-in readers are imported by the registry.
@@ -48,7 +51,8 @@ action_mask       bool Tensor, shape (num_frames - 1, D)
 proprio           float32 Tensor, shape (H, D_state), one row per history frame
 proprio_mask      bool Tensor, shape (H, D_state)
 
-# Added by the mixture dataset: the name of the source the sample came from
+# Required: the name of the source the sample came from (collate reads it); a registered
+# reader / mixture must set it (MultiYamSharpaDataset writes the source's name)
 source            str
 ~~~
 
@@ -101,7 +105,7 @@ multiview: false
 normalize_mode: min-max              # min-max, z-score, quantile, or null
 ~~~
 
-Use [openwam/dataloader/utils/normalization.py](../../openwam/dataloader/utils/normalization.py) for normalization, [openwam/dataloader/utils/rotation.py](../../openwam/dataloader/utils/rotation.py) for the 6D rotation conversion and [openwam/dataloader/transforms/video.py](../../openwam/dataloader/transforms/video.py) for color jitter (train split, inside the dataset). Compute statistics from the training split and store them under `meta/`. A deployable reader writes `meta/normalization_stats.npy`; deployment gathers unified slots back to raw dimensions before unnormalizing. Keep the same statistics artifact with the checkpoint.
+Use [openwam/dataloader/utils/normalization.py](../../openwam/dataloader/utils/normalization.py) for normalization, [openwam/dataloader/utils/rotation.py](../../openwam/dataloader/utils/rotation.py) for the 6D rotation conversion and [openwam/dataloader/transforms/video.py](../../openwam/dataloader/transforms/video.py) for color jitter (train split, inside the dataset). Compute statistics from the training split; the reader exposes the stats file as `normalization_stats_path`, which the trainer copies into the checkpoint as `normalization_stats.npy`. Deployment gathers unified slots back to raw dimensions before unnormalizing. Keep the same statistics artifact with the checkpoint.
 
 Inspect one sample through the registry:
 

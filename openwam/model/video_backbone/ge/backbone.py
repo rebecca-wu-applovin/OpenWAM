@@ -5,8 +5,8 @@ Components (all GE-native):
     weights ``GE_base_fast_v0.1.safetensors``; vendored in ``ge/transformer.py``.
   * VAE: LTX-Video ``AutoencoderKLLTXVideo`` (8x temporal causal, 32x spatial,
     128 ch), latents normalized with the VAE's ``latents_mean/std``.
-  * Text: LTX-Video T5-XXL encoder, 128 tokens, 6% caption dropout (GE swaps the
-    dropped prompt's embedding for the empty prompt's and keeps its mask).
+  * Text: LTX-Video T5-XXL encoder, 128 tokens. Caption dropout is the dataset's
+    (``dataloader.caption_dropout_p``; GE's 6% is set by the GE launch script).
 
 Views: the dataloader stacks the cameras vertically (ego over chest). The
 backbone splits the canvas into ``n_view`` tiles, VAE-encodes each tile on its
@@ -31,9 +31,8 @@ from __future__ import annotations
 
 import logging
 import os
-import random
 import shutil
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -42,9 +41,8 @@ from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 
 from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
-from openwam.model.video_backbone.common.flow_scheduler import FlowScheduler
-from openwam.model.video_backbone.common.text_cache import PromptCache
 from openwam.model.video_backbone.common.weights import load_strict
+from openwam.model.video_backbone.ge.scheduler import GEFlowScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +50,6 @@ _GE_TEMPORAL_COMPRESSION = 8
 _GE_SPATIAL_COMPRESSION = 32
 _GE_LATENT_CHANNELS = 128
 _GE_FRAME_RATE = 30.0  # GE's forward_pass hard-codes frame_rate=30 for the RoPE time scale
-_GE_NUM_TRAIN_TIMESTEPS = 1000
 
 
 # LTX-Video files a checkpoint needs to rebuild the frozen VAE / T5 / tokenizer without the weights
@@ -64,20 +61,25 @@ _LTX_ASSETS = (os.path.join("vae", "config.json"), os.path.join("text_encoder", 
 class GEBaseFastVideoBackbone(VideoBackbone):
     """GE multi-view LTX transformer + LTX VAE + T5 behind the VideoBackbone ABC."""
 
+    # Prompts per T5 forward while build_text_cache fills the cache.
+    _text_cache_batch_size = 8
+
+    # ================================================================
+    # Construction
+    # ================================================================
+
     def __init__(
         self,
         *,
         dit,
-        vae=None,
-        tokenizer=None,
-        text_encoder=None,
-        assets_dir: Optional[str] = None,
+        vae,
+        tokenizer,
+        text_encoder,
+        assets_dir: str,
         shift_video: float = 1.0,
         n_view: int = 2,
         text_max_length: int = 128,
-        caption_dropout_p: float = 0.06,
         vae_sample: bool = True,
-        seed: Optional[int] = None,
     ) -> None:
         """Wrap built modules; use :meth:`from_pretrained` / :meth:`from_checkpoint_dir` instead.
 
@@ -87,16 +89,13 @@ class GEBaseFastVideoBackbone(VideoBackbone):
                 (``ltx_path`` or ``<ckpt>/ltx``); save_deploy_assets copies from it.
             shift_video: float, deploy-grid α-shift (GE trains on the shift-1 grid).
             n_view: int, camera tiles stacked in the canvas. text_max_length: int, T5 tokens.
-            caption_dropout_p: float, training caption dropout. vae_sample: bool, sample the VAE posterior.
-            seed: int | None, seed of the caption-dropout RNG.
+            vae_sample: bool, sample the VAE posterior.
         """
         super().__init__()
         # Flat named children so the model yaml freeze list hits vae / text_encoder.
         self.dit = dit
-        if vae is not None:
-            self.vae = vae
-        if text_encoder is not None:
-            self.text_encoder = text_encoder
+        self.vae = vae
+        self.text_encoder = text_encoder
         self._tokenizer = tokenizer
         self._assets_dir = assets_dir
         cfg = dit.config
@@ -106,52 +105,17 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         self._head_dim = int(cfg.attention_head_dim)
         self._n_view = int(n_view)
         self._text_max_length = int(text_max_length)
-        self._caption_dropout_p = float(caption_dropout_p)
         self._vae_sample = bool(vae_sample)
-        self._rng = random.Random(seed)
         # GE trains with diffusers' default FlowMatchEulerDiscreteScheduler (shift 1): with the yaml's
-        # shift_video 1.0 the adapter's 1000-step grid sigma_i = 1 - i/1000 is the same grid (used by deploy).
+        # shift_video 1.0 the adapter's 1000-step grid sigma_i = 1 - i/1000 is the same grid (used by deploy);
+        # its sample_train is GE's native training-noise draw.
         self._shift_video = float(shift_video)
-        self._scheduler = FlowScheduler(shift_video=self._shift_video, num_train_timesteps=_GE_NUM_TRAIN_TIMESTEPS)
-        self._dit_patch_size = (1, 1, 1)
+        self._scheduler = GEFlowScheduler(shift_video=self._shift_video)
         self._temporal_compression = _GE_TEMPORAL_COMPRESSION
         self._causal_temporal = True
         # Text slot read by encode_text: the online T5 here, a PromptCache after build_text_cache.
         self.text_lookup = self._t5_entries
         self._mask_cache: dict = {}
-
-    # ================================================================
-    # Structural metadata
-    # ================================================================
-
-    @property
-    def dim(self) -> int:
-        return self._dim
-
-    @property
-    def num_layers(self) -> int:
-        return self._num_layers
-
-    @property
-    def num_heads(self) -> int:
-        return self._num_heads
-
-    @property
-    def head_dim(self) -> int:
-        return self._head_dim
-
-    @property
-    def scheduler(self):
-        return self._scheduler
-
-    @property
-    def text_dim(self) -> Optional[int]:
-        """T5-XXL hidden width (the context the framework appends proprio to)."""
-        return int(self.dit.config.caption_channels)
-
-    # ================================================================
-    # Construction
-    # ================================================================
 
     @classmethod
     def from_pretrained(cls, cfg: DictConfig) -> "GEBaseFastVideoBackbone":
@@ -180,6 +144,7 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         except ValueError as err:
             raise ValueError(f"GE DiT weights do not match the yaml dit={dict(cfg.dit)}: {err}") from err
         dit.to(torch.bfloat16)
+        # The frozen LTX-Video VAE / T5 / tokenizer come from their libraries' own loaders.
         vae = AutoencoderKLLTXVideo.from_pretrained(ltx_path, subfolder="vae", torch_dtype=torch.bfloat16)
         tokenizer = T5Tokenizer.from_pretrained(ltx_path, subfolder="tokenizer")
         text_encoder = T5EncoderModel.from_pretrained(ltx_path, subfolder="text_encoder", torch_dtype=torch.bfloat16)
@@ -202,6 +167,7 @@ class GEBaseFastVideoBackbone(VideoBackbone):
 
         from openwam.model.video_backbone.ge.dit import LTXVideoTransformer3DModel
 
+        # The VAE / T5 configs and the tokenizer were copied into <ckpt>/ltx/ by save_deploy_assets.
         assets = os.path.join(ckpt_dir, _CKPT_ASSET_SUBDIR)
         if not os.path.isdir(assets):
             raise FileNotFoundError(f"GE assets not found at {assets} (written by save_deploy_assets)")
@@ -219,7 +185,9 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         return cls._assemble(cfg, modules[0], modules[1], tokenizer, modules[2], assets)
 
     @classmethod
-    def _assemble(cls, cfg: DictConfig, dit, vae, tokenizer, text_encoder, assets_dir: str) -> "GEBaseFastVideoBackbone":
+    def _assemble(
+        cls, cfg: DictConfig, dit, vae, tokenizer, text_encoder, assets_dir: str
+    ) -> "GEBaseFastVideoBackbone":
         """Shared tail of both constructors: wrap the modules with the yaml's scalar knobs.
 
         Args:
@@ -238,81 +206,71 @@ class GEBaseFastVideoBackbone(VideoBackbone):
             shift_video=float(cfg.shift_video),
             n_view=int(cfg.n_view),
             text_max_length=int(cfg.text_max_length),
-            caption_dropout_p=float(cfg.caption_dropout_p),
             vae_sample=bool(cfg.vae_sample),
-            seed=None if cfg.seed is None else int(cfg.seed),
         )
 
     # ================================================================
-    # Text
+    # Geometry
     # ================================================================
 
-    @torch.no_grad()
-    def _t5(self, prompts: List[str]) -> Tuple[Tensor, Tensor]:
-        """GE ``_encode_prompt``: (B, 128, 4096) embeddings + (B, 128) bool mask."""
-        tok = self._tokenizer(
-            prompts, padding="max_length", max_length=self._text_max_length, truncation=True,
-            add_special_tokens=True, return_tensors="pt",
-        )
-        dev = next(self.text_encoder.parameters()).device
-        emb = self.text_encoder(tok.input_ids.to(dev))[0]
-        return emb.to(device=self.device, dtype=self.dtype), tok.attention_mask.bool().to(self.device)
+    @property
+    def dim(self) -> int:
+        """DiT hidden width, heads * head_dim (2048)."""
+        return self._dim
 
-    def _t5_entries(self, prompts: List[str]) -> list:
-        """Online T5 encode (the default ``text_lookup``).
+    @property
+    def num_layers(self) -> int:
+        """Number of transformer blocks (28)."""
+        return self._num_layers
 
-        Args:
-            prompts: list[str] of B prompts.
+    @property
+    def num_heads(self) -> int:
+        """Attention heads per block (32)."""
+        return self._num_heads
 
-        Returns:
-            list of B entries ``(embedding (1, 128, 4096), mask (1, 128) bool)`` on ``self.device``.
-        """
-        emb, mask = self._t5(prompts)
-        return [(emb[j : j + 1], mask[j : j + 1]) for j in range(len(prompts))]
+    @property
+    def head_dim(self) -> int:
+        """Per-head width (64)."""
+        return self._head_dim
 
-    @torch.no_grad()
-    def build_text_cache(self, prompts: list) -> None:
-        """Encode every training prompt (+ the empty dropout prompt) once, then park T5 on the CPU.
+    @property
+    def text_dim(self) -> int:
+        """T5-XXL hidden width (the context the framework appends proprio to)."""
+        return int(self.dit.config.caption_channels)
 
-        Args:
-            prompts: list[str], the dataset's prompt set.
-
-        Returns:
-            None. ``text_lookup`` becomes a PromptCache (8 prompts per T5 forward, prompts + "" deduplicated in
-            order); T5 stays a registered child.
-        """
-        self.text_lookup = PromptCache(self.text_lookup, list(dict.fromkeys(list(prompts) + [""])), batch_size=8)
-        self.text_encoder.to("cpu")
-        torch.cuda.empty_cache()
-
-    def encode_text(self, prompts: list, *, grid, num_frames: int) -> TextCondition:
-        """T5 context of B prompts with GE's training-time caption dropout.
-
-        Dropped samples (p = caption_dropout_p, training only) take the empty prompt's embedding but keep their
-        own mask, exactly as ge_trainer.py does (transitional: Task 12 moves caption dropout into the dataset).
-
-        Args:
-            prompts: list[str] of B prompts. grid / num_frames: unused.
-
-        Returns:
-            TextCondition: context (B, 128, 4096), context_mask (B, 128) the tokenizer attention mask, extra {}.
-        """
-        # The empty prompt rides in the same lookup: it is the dropout replacement.
-        entries = self.text_lookup(list(prompts) + [""])
-        emb = torch.cat([e[0] for e in entries], dim=0)
-        mask = torch.cat([e[1] for e in entries], dim=0)
-        emb, mask, uncond = emb[:-1].clone(), mask[:-1].clone(), emb[-1:]
-        if self.training and self._caption_dropout_p > 0:
-            drop = torch.tensor([self._rng.random() < self._caption_dropout_p for _ in prompts], device=emb.device)
-            emb = torch.where(drop[:, None, None], uncond.expand_as(emb), emb)
-        return TextCondition(context=emb, context_mask=mask, extra={})
+    @property
+    def scheduler(self):
+        """GEFlowScheduler: the shared grid for deploy, GE's native training-noise law for ``sample_train``."""
+        return self._scheduler
 
     # ================================================================
-    # Video IO (views: split the canvas, encode / decode each tile, stack back along height)
+    # Video and text IO
     # ================================================================
+
+    def encode_pixels(self, pixels: Tensor) -> Tensor:
+        """Each view tile of each canvas clip encoded as its own causal clip.
+
+        Args:
+            pixels: (N, 3, T, V*h_px, W) canvas pixels in [-1, 1], T = 1 + 8k.
+
+        Returns: (N, 128, 1 + (T-1)//8, V*h, w) latents, views stacked along height.
+        """
+        # One VAE batch of N*V tiles, clip-major (the base encode_frames' N = B*T 1-frame clips: sample, frame, view).
+        lat = self._vae_encode(self._split_views(pixels))
+        return rearrange(lat, "(b v) c t h w -> b c t (v h) w", b=pixels.shape[0])
+
+    def decode_latents(self, latents: Tensor) -> Tensor:
+        """latents: (N, 128, T, V*h, w) normalized. Returns: (N, 3, 1 + 8 (T-1), V*h_px, W) canvas pixels, views stacked."""
+        vae = self.vae
+        lat = rearrange(latents, "b c t (v h) w -> (b v) c t h w", v=self._n_view)
+        mean = vae.latents_mean.view(1, -1, 1, 1, 1).to(lat.device, lat.dtype)
+        std = vae.latents_std.view(1, -1, 1, 1, 1).to(lat.device, lat.dtype)
+        lat = lat * std / float(vae.config.scaling_factor) + mean
+        video = vae.decode(lat.to(next(vae.parameters()).dtype)).sample  # (N*V, 3, T, h, w)
+        return rearrange(video, "(b v) c t h w -> b c t (v h) w", v=self._n_view)
 
     def _split_views(self, frames: Tensor) -> Tensor:
-        """(B, 3, T, V*h_px, W) canvas → (B*V, 3, T, h_px, W) per-view clips (top tile = view 0)."""
+        """frames: (B, 3, T, V*h_px, W) canvas. Returns: (B*V, 3, T, h_px, W) per-view clips (top tile = view 0)."""
         return rearrange(frames, "b c t (v h) w -> (b v) c t h w", v=self._n_view)
 
     @torch.no_grad()
@@ -329,78 +287,58 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         std = vae.latents_std.view(1, -1, 1, 1, 1).to(lat.device, lat.dtype)
         return (lat - mean) * float(vae.config.scaling_factor) / std
 
-    def encode_pixels(self, pixels: Tensor) -> Tensor:
-        """Each view tile of each canvas clip encoded as its own causal clip.
+    def encode_text(self, prompts: list, *, grid, num_frames: int) -> TextCondition:
+        """T5 context of B prompts (through ``text_lookup``: online or cached).
 
         Args:
-            pixels: (N, 3, T, V*h_px, W) canvas pixels in [-1, 1], T = 1 + 8k.
-
-        Returns: (N, 128, 1 + (T-1)//8, V*h, w) latents, views stacked along height.
-        """
-        lat = self._vae_encode(self._split_views(pixels))
-        return rearrange(lat, "(b v) c t h w -> b c t (v h) w", b=pixels.shape[0])
-
-    def encode_frames(self, pixels: Tensor) -> Tensor:
-        """Every frame encoded alone, per view, in GE's sample -> view -> frame batch order.
-
-        Transitional override of the base (sample -> frame order, views split inside :meth:`encode_pixels`): in
-        training the VAE posterior is sampled, and the draw order of the noise follows the batch order, so only
-        this order keeps GE's latents bitwise equal (Task 12 unifies it).
-
-        Args:
-            pixels: (B, 3, H, V*h_px, W) canvas pixels in [-1, 1].
-
-        Returns: (B, 128, H, V*h, w) latents, views stacked along height.
-        """
-        b, h = pixels.shape[0], pixels.shape[2]
-        views = self._split_views(pixels)  # (B*V, 3, H, h_px, W)
-        hist = views.transpose(1, 2).flatten(0, 1).unsqueeze(2)  # (B*V*H, 3, 1, h_px, W)
-        lat = self._vae_encode(hist).unflatten(0, (views.shape[0], h)).squeeze(3).transpose(1, 2)
-        return rearrange(lat, "(b v) c t h w -> b c t (v h) w", b=b)
-
-    def decode_latents(self, latents: Tensor) -> Tensor:
-        """(N, 128, T, V*h, w) normalized latents → (N, 3, 1 + 8 (T-1), V*h_px, W) canvas pixels, views stacked."""
-        vae = self.vae
-        lat = rearrange(latents, "b c t (v h) w -> (b v) c t h w", v=self._n_view)
-        mean = vae.latents_mean.view(1, -1, 1, 1, 1).to(lat.device, lat.dtype)
-        std = vae.latents_std.view(1, -1, 1, 1, 1).to(lat.device, lat.dtype)
-        lat = lat * std / float(vae.config.scaling_factor) + mean
-        video = vae.decode(lat.to(next(vae.parameters()).dtype)).sample  # (N*V, 3, T, h, w)
-        return rearrange(video, "(b v) c t h w -> b c t (v h) w", v=self._n_view)
-
-    # ================================================================
-    # Native training noise (ge_trainer.py:574-596, 646-648)
-    # ================================================================
-
-    def sample_training_noise(self, batch_size: int, *, device, dtype) -> Tuple[Tensor, Tensor, Tensor]:
-        """GE's ``flow_weighting_scheme: none`` sampling.
-
-        u ~ U[0, 1) per sample; index = floor(u * 1000) into the shift-1 FlowMatchEuler grid
-        sigma_i = (1000 - i) / 1000; transformer timestep = floor(sigma * 1000); loss weight 1.
+            prompts: list[str] of B prompts. grid / num_frames: unused.
 
         Returns:
-            (timesteps (B,), sigmas (B,), loss_weights (B,)).
+            TextCondition: context (B, 128, 4096), context_mask (B, 128) the tokenizer attention mask, extra {}.
         """
-        u = torch.rand(batch_size)
-        idx = (u * _GE_NUM_TRAIN_TIMESTEPS).long()
-        sigmas = (_GE_NUM_TRAIN_TIMESTEPS - idx).float() / _GE_NUM_TRAIN_TIMESTEPS
-        timesteps = (sigmas * _GE_NUM_TRAIN_TIMESTEPS).long().float()
-        return (
-            timesteps.to(device=device, dtype=dtype),
-            sigmas.to(device=device, dtype=dtype),
-            torch.ones(batch_size, device=device, dtype=torch.float32),
+        entries = self.text_lookup(list(prompts))
+        emb = torch.cat([e[0] for e in entries], dim=0)
+        mask = torch.cat([e[1] for e in entries], dim=0)
+        return TextCondition(context=emb, context_mask=mask, extra={})
+
+    def _t5_entries(self, prompts: List[str]) -> list:
+        """Online T5 encode (the default ``text_lookup``).
+
+        Args:
+            prompts: list[str] of B prompts.
+
+        Returns:
+            list of B entries ``(embedding (1, 128, 4096), mask (1, 128) bool)`` on ``self.device``.
+        """
+        emb, mask = self._t5(prompts)
+        return [(emb[j : j + 1], mask[j : j + 1]) for j in range(len(prompts))]
+
+    @torch.no_grad()
+    def _t5(self, prompts: List[str]) -> Tuple[Tensor, Tensor]:
+        """GE ``_encode_prompt``: T5 over a padded batch.
+
+        Args:
+            prompts: list[str] of B prompts.
+
+        Returns:
+            ((B, 128, 4096) embeddings in the backbone dtype, (B, 128) bool attention mask), on ``self.device``.
+        """
+        # Pad / truncate to text_max_length tokens; T5 runs wherever it is parked (GPU, or CPU after the cache).
+        tok = self._tokenizer(
+            prompts,
+            padding="max_length",
+            max_length=self._text_max_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
         )
+        dev = next(self.text_encoder.parameters()).device
+        emb = self.text_encoder(tok.input_ids.to(dev))[0]
+        return emb.to(device=self.device, dtype=self.dtype), tok.attention_mask.bool().to(self.device)
 
     # ================================================================
-    # Three-step execution
+    # Block loop
     # ================================================================
-
-    def _grid(self, latents: Tensor) -> Tuple[int, int, int]:
-        """(T, h_view, w) of a (B, C, T, V*h, w) latent."""
-        t, vh, w = latents.shape[2:]
-        if vh % self._n_view:
-            raise ValueError(f"latent height {vh} does not split into {self._n_view} views")
-        return t, vh // self._n_view, w
 
     def prepare(
         self,
@@ -481,18 +419,62 @@ class GEBaseFastVideoBackbone(VideoBackbone):
             extras={"cos": cos, "sin": sin, "emb_t": emb_t, "view_h": vh},
         )
 
-    def _ada(self, layer_id: int, state: BlockLoopState):
-        """Six AdaLN tensors (each (B, S, dim)) of block ``layer_id``."""
-        block = self.dit.transformer_blocks[layer_id]
-        b, s = state.hidden_states.shape[:2]
-        ada = block.scale_shift_table[None, None] + state.time_mod.reshape(b, s, 6, -1)
-        return ada.unbind(dim=2)
+    def run_block(self, block_id: int, state: BlockLoopState, attn_mask: Tensor) -> BlockLoopState:
+        """Video-only block (no action stream).
+
+        Args:
+            block_id: int. state: BlockLoopState. attn_mask: (S, S) bool mask of this layer.
+
+        Returns:
+            ``state`` with ``hidden_states`` updated.
+        """
+
+        def _body(x):
+            """x: (B, S, dim) hidden states. Returns: (B, S, dim) after this block (checkpointable closure)."""
+            # A state copy carrying x, so the checkpointed closure has no side effect on ``state``.
+            local = BlockLoopState(**{**state.__dict__, "hidden_states": x})
+            q, k, v, post = self.pre_attn_at_layer(block_id, local)
+            # (B, S, H*D) -> (B, H, S, D) for SDPA, and back.
+            n = self._num_heads
+            q, k, v = (t.unflatten(2, (n, -1)).transpose(1, 2) for t in (q, k, v))
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask).transpose(1, 2).flatten(2, 3)
+            return self.post_attn_at_layer(block_id, local, out, post).hidden_states
+
+        # Checkpoint only when training with gradients; inference runs the body directly.
+        if state.use_gradient_checkpointing and torch.is_grad_enabled():
+            state.hidden_states = torch.utils.checkpoint.checkpoint(_body, state.hidden_states, use_reentrant=False)
+        else:
+            state.hidden_states = _body(state.hidden_states)
+        return state
+
+    def finalize(self, state: BlockLoopState) -> Tensor:
+        """Final AdaLN (time + view embedding) + proj_out.
+
+        Args:
+            state: BlockLoopState after the last block (``extras["emb_t"]`` from :meth:`prepare`).
+
+        Returns:
+            (B, 128, T, V*h, w) predicted velocity.
+        """
+        dit = self.dit
+        ss = dit.scale_shift_table[None, None] + state.extras["emb_t"][:, :, None]
+        shift, scale = ss[:, :, 0], ss[:, :, 1]
+        out = dit.proj_out(dit.norm_out(state.hidden_states) * (1 + scale) + shift)
+        return rearrange(out, "b (t h w) c -> b c t h w", t=state.grid_frames, h=state.grid_height, w=state.grid_width)
 
     def pre_attn_at_layer(self, layer_id: int, state: BlockLoopState) -> Tuple[Tensor, Tensor, Tensor, dict]:
-        """norm1 + AdaLN → attn1 q/k/v (RMS-normed across heads, RoPE'd), each (B, S, 2048)."""
+        """norm1 + AdaLN → attn1 q/k/v (RMS-normed across heads, RoPE'd).
+
+        Args:
+            layer_id: int. state: BlockLoopState.
+
+        Returns:
+            q, k, v each (B, S, 2048), and the post dict (gates / MLP modulation) :meth:`post_attn_at_layer` reads.
+        """
         from openwam.model.video_backbone.ge.dit import apply_rotary_emb
 
         block = self.dit.transformer_blocks[layer_id]
+        # Per-token AdaLN (time + view), then attn1's QK RMS-norm and RoPE (each view on its own grid).
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._ada(layer_id, state)
         x = block.norm1(state.hidden_states) * (1 + scale_msa) + shift_msa
         attn = block.attn1
@@ -503,8 +485,18 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         post = {"gate_msa": gate_msa, "shift_mlp": shift_mlp, "scale_mlp": scale_mlp, "gate_mlp": gate_mlp}
         return q, k, v, post
 
-    def post_attn_at_layer(self, layer_id: int, state: BlockLoopState, attn_out: Tensor, post_state: dict) -> BlockLoopState:
-        """attn1 out-proj + gate, text cross-attn (attn2, no pre-norm, as GE), gated FFN."""
+    def post_attn_at_layer(
+        self, layer_id: int, state: BlockLoopState, attn_out: Tensor, post_state: dict
+    ) -> BlockLoopState:
+        """attn1 out-proj + gate, text cross-attn (attn2, no pre-norm, as GE), gated FFN.
+
+        Args:
+            layer_id: int. state: BlockLoopState. attn_out: (B, S, 2048) attention output. post_state: from
+                :meth:`pre_attn_at_layer`.
+
+        Returns:
+            ``state`` with ``hidden_states`` updated.
+        """
         block = self.dit.transformer_blocks[layer_id]
         x = state.hidden_states + block.attn1.to_out[1](block.attn1.to_out[0](attn_out)) * post_state["gate_msa"]
         x = x + self._cross_attn(block.attn2, x, state.context, state.context_mask)
@@ -512,8 +504,30 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         state.hidden_states = x + block.ff(h) * post_state["gate_mlp"]
         return state
 
+    def _grid(self, latents: Tensor) -> Tuple[int, int, int]:
+        """latents: (B, C, T, V*h, w). Returns: (T, h_view, w); raises ValueError when V*h does not split into V views."""
+        t, vh, w = latents.shape[2:]
+        if vh % self._n_view:
+            raise ValueError(f"latent height {vh} does not split into {self._n_view} views")
+        return t, vh // self._n_view, w
+
+    def _ada(self, layer_id: int, state: BlockLoopState):
+        """layer_id: int. state: BlockLoopState (``time_mod`` (B, S, 6*dim)). Returns: six AdaLN tensors, each (B, S, dim)."""
+        block = self.dit.transformer_blocks[layer_id]
+        b, s = state.hidden_states.shape[:2]
+        ada = block.scale_shift_table[None, None] + state.time_mod.reshape(b, s, 6, -1)
+        return ada.unbind(dim=2)
+
     def _cross_attn(self, attn, x: Tensor, context: Tensor, mask: Tensor) -> Tensor:
-        """All views' queries of a sample attend that sample's text (+ proprio) tokens."""
+        """All views' queries of a sample attend that sample's text (+ proprio) tokens.
+
+        Args:
+            attn: the block's attn2. x: (B, S, dim) queries. context: (B, L, dim) projected text.
+            mask: (B, L) bool, True = attend.
+
+        Returns:
+            (B, S, dim) cross-attention output (after out-proj).
+        """
         heads = attn.heads
         q = attn.norm_q(attn.to_q(x)).unflatten(2, (heads, -1)).transpose(1, 2)
         k = attn.norm_k(attn.to_k(context)).unflatten(2, (heads, -1)).transpose(1, 2)
@@ -536,7 +550,13 @@ class GEBaseFastVideoBackbone(VideoBackbone):
 
         frame_tokens(frame_mask, state, int(state.hidden_states.shape[1]))  # latent count must match the layout
         # The frame mask is fixed per architecture: the grid / action length / device identify the masks.
-        key = (state.grid_frames, state.extras["view_h"], state.grid_width, int(s_action), str(state.hidden_states.device))
+        key = (
+            state.grid_frames,
+            state.extras["view_h"],
+            state.grid_width,
+            int(s_action),
+            str(state.hidden_states.device),
+        )
         if key not in self._mask_cache:
             self._mask_cache[key] = build_ge_joint_masks(
                 frame_mask,
@@ -548,40 +568,6 @@ class GEBaseFastVideoBackbone(VideoBackbone):
                 device=state.hidden_states.device,
             )
         return self._mask_cache[key]
-
-    def run_block(self, block_id: int, state: BlockLoopState, attn_mask: Tensor) -> BlockLoopState:
-        """Video-only block (no action stream).
-
-        Args:
-            block_id: int. state: BlockLoopState. attn_mask: (S, S) bool mask of this layer.
-
-        Returns:
-            ``state`` with ``hidden_states`` updated.
-        """
-
-        def _body(x):
-            local = BlockLoopState(**{**state.__dict__, "hidden_states": x})
-            q, k, v, post = self.pre_attn_at_layer(block_id, local)
-            n = self._num_heads
-            q, k, v = (t.unflatten(2, (n, -1)).transpose(1, 2) for t in (q, k, v))
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask).transpose(1, 2).flatten(2, 3)
-            return self.post_attn_at_layer(block_id, local, out, post).hidden_states
-
-        if state.use_gradient_checkpointing and torch.is_grad_enabled():
-            state.hidden_states = torch.utils.checkpoint.checkpoint(_body, state.hidden_states, use_reentrant=False)
-        else:
-            state.hidden_states = _body(state.hidden_states)
-        return state
-
-    def finalize(self, state: BlockLoopState) -> Tensor:
-        """Final AdaLN (time + view embedding) + proj_out → (B, 128, T, V*h, w) velocity."""
-        dit = self.dit
-        ss = dit.scale_shift_table[None, None] + state.extras["emb_t"][:, :, None]
-        shift, scale = ss[:, :, 0], ss[:, :, 1]
-        out = dit.proj_out(dit.norm_out(state.hidden_states) * (1 + scale) + shift)
-        return rearrange(
-            out, "b (t h w) c -> b c t h w", t=state.grid_frames, h=state.grid_height, w=state.grid_width
-        )
 
     # ================================================================
     # Deploy assets
@@ -596,6 +582,7 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         Returns:
             None. Files already present are left as they are.
         """
+        # Per asset: skip what a previous save already copied.
         for rel in _LTX_ASSETS:
             src = os.path.join(self._assets_dir, rel)
             dst = os.path.join(output_dir, _CKPT_ASSET_SUBDIR, rel)

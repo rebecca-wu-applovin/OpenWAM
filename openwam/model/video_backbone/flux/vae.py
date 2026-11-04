@@ -1,5 +1,7 @@
 # Vendored into OpenWAM from black-forest-labs/flux-action @ 830f1ce (src/flux_action/models/video_vae.py),
-# Apache-2.0. Changes: the Hub / DCP / random-init loader paths and the flux_action package imports were removed (local safetensors only).
+# Apache-2.0. Changes: the Hub / DCP / random-init loader paths, the flux_action package imports and the policy-side
+# VideoVAE / load_video_vae wrapper were removed (local safetensors only); Task 13 removed the torch.compile hooks
+# (apply_compile / compile_encoder / compile_looped_core and their params), which OpenWAM never enabled.
 # Copyright 2026 Black Forest Labs. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +20,6 @@
 import logging
 import math
 import os
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
 
@@ -89,9 +90,6 @@ class ViTNormInferenceParams:
     qk_norm: bool = True
     patch_norm: bool = False
     dtype: str = "bfloat16"
-    use_compile: bool = True
-    compile_config: dict | None = field(default_factory=lambda: {"dynamic_compile": True})
-    compile_decoder: bool = False
     chunked_encode: bool = False
     chunk_size_frames: int = 45
     chunked_decode: bool = False
@@ -385,7 +383,6 @@ class SwinTransformerBlock(nn.Module):
         self.norm2 = _norm_layer(dim)
         self.mlp = GLU_MLP(dim)
         self.max_t = max_t
-        self._compiled_looped_core: Callable[..., Tensor] | None = None
 
     def forward(self, x: Tensor) -> Tensor:
         if self.max_t is None or x.shape[1] <= self.max_t:
@@ -411,12 +408,6 @@ class SwinTransformerBlock(nn.Module):
         )
         return x + self.mlp(self.norm2(x))
 
-    def compile_looped_core(self, **compile_kwargs) -> None:
-        """Compile the per-window core (``torch.compile`` keywords); the window loop itself stays eager."""
-        if self.max_t is None:
-            raise RuntimeError("compile_looped_core needs max_t")
-        self._compiled_looped_core = torch.compile(self._forward_looped_core, **compile_kwargs)
-
     @torch.compiler.disable(recursive=False)
     def _forward_looped(self, x: Tensor) -> Tensor:
         if torch.is_grad_enabled():
@@ -425,7 +416,7 @@ class SwinTransformerBlock(nn.Module):
             )
         length = x.shape[1]
         kernel = self.attn.window_size[0]
-        core = self._compiled_looped_core or self._forward_looped_core
+        core = self._forward_looped_core
         # The halo of a window reaches at most kernel - 1 < max_t frames back into the previous window, so
         # that window's output is held back for one iteration and written only after this halo was read.
         pending: tuple[int, int, Tensor] | None = None
@@ -678,56 +669,6 @@ class ViTNormInference(nn.Module):
         elif params.dtype != "float32":
             raise ValueError(f"unsupported video VAE dtype {params.dtype!r}")
         self.model.eval()
-        self._encoder_compiled = False
-
-    def compile_encoder(self) -> None:
-        """Compile the encoder blocks used by inference without compiling the decoder."""
-        if self._encoder_compiled:
-            return
-        cfg = self.params.compile_config or {}
-        for layer_id, layer in self.model.encoder.features.named_children():
-            self.model.encoder.features.register_module(
-                layer_id,
-                torch.compile(
-                    layer,
-                    mode="reduce-overhead",
-                    fullgraph=cfg.get("fullgraph", False),
-                    dynamic=cfg.get("dynamic_compile", False),
-                    backend=cfg.get("backend", "inductor"),
-                ),
-            )
-        self._encoder_compiled = True
-
-    def apply_compile(self):
-        params = self.params
-        if not (params.use_compile or params.compile_decoder):
-            return
-        cfg = params.compile_config or {}
-        mode = cfg.get("compile_mode", "default")
-        fullgraph = cfg.get("fullgraph", False)
-        dynamic = cfg.get("dynamic_compile", False)
-        backend = cfg.get("backend", "inductor")
-        if params.use_compile:
-            self.compile_encoder()
-        if params.compile_decoder and params.decoder_max_t is not None:
-            # Looped blocks loop eagerly over windows; only the per-window core is compiled.
-            for module in self.model.decoder.features.modules():
-                if isinstance(module, SwinTransformerBlock):
-                    module.compile_looped_core(
-                        mode=mode, fullgraph=fullgraph, dynamic=dynamic, backend=backend
-                    )
-        elif params.compile_decoder:
-            for layer_id, layer in self.model.decoder.features.named_children():
-                self.model.decoder.features.register_module(
-                    layer_id,
-                    torch.compile(
-                        layer,
-                        mode=mode,
-                        fullgraph=fullgraph,
-                        dynamic=dynamic,
-                        backend=backend,
-                    ),
-                )
 
     def min_chunk_enc(self, video: Tensor, target_num_frames: int | None = None) -> Tensor:
         """Encode ``(B, 3, T, H, W)`` in ``chunk_size_frames``-frame chunks overlapping by one frame; the first
@@ -857,9 +798,9 @@ class ViTNormInference(nn.Module):
 
 
 # ---------------------------------------------------------------------------------------------
-# Policy-side wrapper and loader. The KinoVAE is frozen,
-# loaded from a local file / directory or a Hub repo, and never part of the policy's own
-# ``model.safetensors``.
+# Chunk-length helper of the encode path (``FluxActionVideoBackbone.encode_pixels``). The upstream
+# policy-side wrapper / loader (VideoVAE, load_video_vae) is removed: the backbone builds and calls
+# ViTNormInference itself.
 # ---------------------------------------------------------------------------------------------
 
 
@@ -868,94 +809,3 @@ def padded_chunk_length(num_frames: int, chunk: int, overlap: int = 1) -> int:
     stride = chunk - overlap
     n = max(0, -(-(num_frames - chunk) // stride))  # ceil division
     return chunk + n * stride
-
-
-VIDEO_VAE_WEIGHTS_FILENAME = "video_vae.safetensors"
-class VideoVAE:
-    """Frozen video VAE behind the encode/decode contract the packing code relies on.
-
-    ``encode`` takes ``(B, 3, T, H, W)`` in ``[-1, 1]`` with ``T == 1 (mod 4)`` and returns normalized
-    latents ``(B, 96, 1 + (T - 1) // 4, H // 32, W // 32)``. Encoding is chunked (45-frame chunks,
-    1-frame overlap, first latent of each later chunk dropped); shorter clips are padded by repeating
-    the last frame and trimmed back. ``packing.encode_video`` pads with black to the chunk length
-    *before* calling this, so training and deployment see the same latent distribution.
-
-    ``decode`` is the looped decode (``ViTNormInference.decode``): the full-sequence result with the
-    decoder's activations bounded by an 8-frame window.
-    """
-
-    def __init__(self, model: "ViTNormInference"):
-        self._model = model
-
-    @property
-    def module(self) -> "ViTNormInference":
-        return self._model
-
-    @torch.inference_mode()
-    def encode(self, video: Tensor) -> Tensor:
-        num_frames = video.shape[2]
-        if (num_frames - 1) % 4 != 0:
-            raise ValueError(
-                f"video VAE encode expects T == 1 (mod 4) frames, got T={num_frames}; "
-                "trim or pad the clip to the 4k+1 grid (e.g. 45, 49, 121)"
-            )
-        chunk = self._model.chunk_size_frames
-        padded = padded_chunk_length(num_frames, chunk)
-        if padded > num_frames:
-            tail = video[:, :, -1:].expand(-1, -1, padded - num_frames, -1, -1)
-            video = torch.cat([video, tail], dim=2)
-        return self._model.min_chunk_enc(video, target_num_frames=num_frames)
-
-    @torch.inference_mode()
-    def encode_task(self, video: Tensor) -> Tensor:
-        """Independent history snapshot or future clip, without padding or chunk overlap."""
-        return self._model.encode(video, chunked_encode=False)
-
-    @torch.inference_mode()
-    def encode_frame(self, frame: Tensor) -> Tensor:
-        """``(B, 3, H, W)`` -> ``(B, 96, 1, H // 32, W // 32)``: the frame alone, without the 45-frame padding
-        of ``encode``. See ``PolicyConfig.single_frame_encode``."""
-        return self._model.encode(frame[:, :, None], chunked_encode=False)
-
-    @torch.inference_mode()
-    def decode(self, latents: Tensor) -> Tensor:
-        return self._model.decode(latents)
-
-
-def load_video_vae(
-    weights: str | None,
-    device: str | torch.device = "cpu",
-    *,
-    compile_model: bool = False,
-    decoder_max_t: int | None = 8,
-) -> VideoVAE:
-    """Build the frozen KinoVAE.
-
-    ``weights``: ``None`` -> random init (shapes only, for wiring tests), a ``.safetensors`` file, a
-    distributed-checkpoint directory (``.metadata`` + ``__*.distcp``), or a Hub ``repo_id[:filename]``
-    (default filename ``video_vae.safetensors``). Requires NATTEN (``natten`` package) at import.
-
-    ``decoder_max_t``: temporal window of the looped decode (8 is the reference setting; it must be at
-    least the temporal attention kernel, 5). ``None`` restores the plain full decode with the
-    latent-chunked fallback.
-    """
-    params = ViTNormInferenceParams(
-        use_compile=compile_model,
-        compile_decoder=compile_model,
-        chunked_decode=True,
-        chunked_encode=True,
-        decoder_max_t=decoder_max_t,
-    )
-    if weights is None:
-        raise ValueError("flux video VAE needs a weights file (video_vae.safetensors)")
-    from safetensors.torch import load_file
-
-    model = ViTNormInference(params)
-    model.load_state_dict(load_file(str(weights), device="cpu"))
-    model.to(device)
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
-    if compile_model:
-        model.apply_compile()
-    return VideoVAE(model)

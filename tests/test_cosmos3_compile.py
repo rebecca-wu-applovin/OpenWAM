@@ -14,6 +14,7 @@ from openwam.model.video_backbone.cosmos3 import dit as cosmos3_dit  # noqa: E40
 from openwam.model.video_backbone.cosmos3._vendor.transformer_cosmos3 import (  # noqa: E402
     Cosmos3OmniTransformer,
 )
+from tests._cosmos3_shell import unused_io_kwargs  # noqa: E402
 
 
 def _backbone():
@@ -35,7 +36,9 @@ def _backbone():
         use_und_k_norm_for_gen=True,
         hidden_act="relu2",
     )
-    return Cosmos3EdgeVideoBackbone(net=net, dim=12, num_layers=2, num_heads=2, head_dim=6, context_dim=12).eval()
+    return Cosmos3EdgeVideoBackbone(
+        net=net, **unused_io_kwargs(), dim=12, num_layers=2, num_heads=2, head_dim=6, context_dim=12, clip_fps=24.0
+    ).eval()
 
 
 def _state(*, batch=1, seq=6, padded=False, masked=False, mask_4d=False):
@@ -43,7 +46,8 @@ def _state(*, batch=1, seq=6, padded=False, masked=False, mask_4d=False):
     und_mask = torch.ones(batch, 4, dtype=torch.bool) if padded else None
     if padded:
         und_mask[-1, -1] = False
-    gen_mask = torch.ones(seq, seq, dtype=torch.bool) if masked else None
+    # All-True gen mask unless the case is masked (the gen block fully visible).
+    gen_mask = torch.ones(seq, seq, dtype=torch.bool)
     if masked:
         gen_mask[: seq // 2, seq // 2 :] = False
         if mask_4d:
@@ -62,18 +66,15 @@ def _state(*, batch=1, seq=6, padded=False, masked=False, mask_4d=False):
             "und_mask": und_mask,
             "cos_gen": angle.cos(),
             "sin_gen": angle.sin(),
-            "test_gen_mask": gen_mask,  # what the tests pass as the layer mask (None = fully visible)
+            "test_gen_mask": gen_mask,  # what the tests pass as the layer mask
             "orig_hw": (1, seq),
         },
     )
 
 
 def _run(vb, block_id, state):
-    """``vb.run_block`` with the state's test gen mask (all-True when it has none). Returns: the new state."""
-    mask = state.extras["test_gen_mask"]
-    if mask is None:
-        mask = torch.ones(state.hidden_states.shape[1], state.hidden_states.shape[1], dtype=torch.bool)
-    return vb.run_block(block_id, state, mask)
+    """``vb.run_block`` with the state's test gen mask. Returns: the new state."""
+    return vb.run_block(block_id, state, state.extras["test_gen_mask"])
 
 
 def test_default_options():
@@ -167,7 +168,8 @@ def test_inference_only(monkeypatch, gate):
 
 
 @pytest.mark.parametrize("at_setup", [False, True])
-def test_failure_retries_eager_once_and_can_reenable(monkeypatch, caplog, at_setup):
+def test_failure_raises_and_can_reenable(monkeypatch, at_setup):
+    """A compile failure (at torch.compile or at the compiled call) raises: no silent eager fallback."""
     vb = _backbone()
     with torch.no_grad():
         expected = _run(vb, 0, _state()).hidden_states
@@ -175,12 +177,11 @@ def test_failure_retries_eager_once_and_can_reenable(monkeypatch, caplog, at_set
     compiler = broken if at_setup else Mock(return_value=broken)
     monkeypatch.setattr(torch, "compile", compiler)
     vb.apply_compile_optimizations({"enabled": True})
-    with torch.no_grad():
-        for _ in range(2):
-            torch.testing.assert_close(_run(vb, 0, _state()).hidden_states, expected)
-    assert compiler.call_count == 1
-    assert vb._compiled_gen_block is None and not vb._gen_block_compile_enabled
-    assert "falling back to eager" in caplog.text
+    with torch.no_grad(), pytest.raises(RuntimeError, match="compiler failed"):
+        _run(vb, 0, _state())
+    # The config still asks for compile: the failure did not switch it off behind the caller's back.
+    assert vb._gen_block_compile_enabled
+    # A fresh apply with a working compiler runs the compiled path.
     monkeypatch.setattr(torch, "compile", lambda fn, **kw: fn)
     vb.apply_compile_optimizations({"enabled": True})
     with torch.no_grad():
@@ -214,14 +215,14 @@ def test_fullgraph_block_loop_parity(monkeypatch, padded, masked, mask_4d):
             for i in range(2):
                 cosmos3_dit.run_block(vb.dit, i, eager, gen_mask=eager.extras["test_gen_mask"])
                 _run(vb, i, fast)
-                assert vb._gen_block_compile_enabled  # Do not let fallback hide a capture failure.
                 torch.testing.assert_close(fast.hidden_states, eager.hidden_states, rtol=1e-5, atol=1e-5)
             torch.testing.assert_close(vb.finalize(fast), vb.finalize(eager), rtol=1e-5, atol=1e-5)
     assert graphs
     torch._dynamo.reset()
 
 
-def test_late_failure_preserves_previous_layer_progress(monkeypatch, caplog):
+def test_late_failure_raises_after_earlier_layers(monkeypatch):
+    """A compiled block failing at a later layer raises there; earlier layers already ran compiled."""
     vb = _backbone()
 
     def fail_at_second_layer(layer, *args):
@@ -234,13 +235,12 @@ def test_late_failure_preserves_previous_layer_progress(monkeypatch, caplog):
     vb.apply_compile_optimizations({"enabled": True})
     eager, fast = _state(), _state()
     with torch.no_grad():
-        for i in range(2):
-            cosmos3_dit.run_block(vb.dit, i, eager, gen_mask=eager.extras["test_gen_mask"])
-            _run(vb, i, fast)
-            torch.testing.assert_close(fast.hidden_states, eager.hidden_states)
+        cosmos3_dit.run_block(vb.dit, 0, eager, gen_mask=eager.extras["test_gen_mask"])
+        _run(vb, 0, fast)
+        torch.testing.assert_close(fast.hidden_states, eager.hidden_states)
+        with pytest.raises(RuntimeError, match="second layer failed"):
+            _run(vb, 1, fast)
     assert compiled.call_count == 2
-    assert vb._compiled_gen_block is None and not vb._gen_block_compile_enabled
-    assert caplog.text.count("falling back to eager") == 1
 
 
 @pytest.mark.parametrize("warm_inner", [False, True])
@@ -255,7 +255,8 @@ def test_actual_outer_compile_does_not_nest_inner_compile(monkeypatch, warm_inne
         if warm_inner:
             _run(vb, 0, _state())
         calls_before = compiler.call_count
-        expected = cosmos3_dit.run_block(vb.dit, 0, _state()).hidden_states  # no mask = fully visible
+        ref = _state()
+        expected = cosmos3_dit.run_block(vb.dit, 0, ref, gen_mask=ref.extras["test_gen_mask"]).hidden_states
         outer = real_compile(lambda state: _run(vb, 0, state).hidden_states, backend="eager", fullgraph=True)
         torch.testing.assert_close(outer(_state()), expected)
         assert compiler.call_count == calls_before

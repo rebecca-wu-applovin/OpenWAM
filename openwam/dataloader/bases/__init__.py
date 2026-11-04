@@ -2,10 +2,11 @@
 
 Two classes live here:
 
-- ``BaseDataset`` — abstract root of every reader. Every dataset
-  in this package inherits from it directly or transitively.
+- ``BaseDataset`` — abstract root of the registered (trainer-facing) datasets,
+  e.g. :class:`~openwam.dataloader.yam_sharpa.MultiYamSharpaDataset`.
 
-- ``LeRobotV3Reader`` — unified single-bucket LeRobot v3 reader base.
+- ``LeRobotV3Reader`` — unified single-bucket LeRobot v3 source reader (a plain
+  class, sampled with ``sample(idx, rng)`` by the registered dataset).
   Direct parent of :class:`~openwam.dataloader.yam_sharpa.YamSharpaDataset`.
 
 Both are re-exported here so callers can ``from openwam.dataloader.bases

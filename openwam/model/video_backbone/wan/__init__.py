@@ -6,11 +6,11 @@ vendored DiffSynth-Studio integration.
 
 from openwam.model.video_backbone.wan.dit import WanModel
 from openwam.model.video_backbone.wan.text_encoder import HuggingfaceTokenizer, WanTextEncoder
-from openwam.model.video_backbone.wan.vae import WanVideoVAE
+from openwam.model.video_backbone.wan.vae import WanVideoVAE38
 
 __all__ = [
     "HuggingfaceTokenizer",
     "WanModel",
     "WanTextEncoder",
-    "WanVideoVAE",
+    "WanVideoVAE38",
 ]

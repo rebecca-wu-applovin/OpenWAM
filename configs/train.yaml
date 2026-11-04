@@ -40,8 +40,12 @@ training:
   offload_optimizer_device: none         # DeepSpeed ZeRO optimizer-state offload: none / cpu
 
   # --- Loss weights ---
+  # 0 = that term is left out of the loss (same rule for both); both 0 is rejected when the trainer is built.
   lambda_video: 1.0               # Video flow-matching loss weight
-  lambda_action: 1.0              # Action flow-matching loss weight
+  # Action flow-matching loss weight. 0 does NOT switch the action stream off: it still runs (joint_self_attn: video
+  # attends to the noisy action tokens), so its params get grad=None. Under DeepSpeed ZeRO-2 (what training uses)
+  # None grads are zero-filled, so AdamW weight decay still moves them: freeze them to keep them fixed.
+  lambda_action: 1.0
 
   # --- Checkpoint ---
   output_path: outputs/openwam_checkpoints            # Base directory for checkpoint output (relative to the launch cwd)
