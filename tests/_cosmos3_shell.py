@@ -40,7 +40,8 @@ def edge_scalar_kwargs() -> dict:
 
     Returns:
         dict with ``shift_video`` (float), ``train_timestep`` (the grid / uniform law), ``use_system_prompt`` / ``prompt_templates`` / ``duration_template``
-        (bool) and ``max_text_tokens`` (int), at the edge yaml's values.
+        (bool) and ``max_text_tokens`` (int), at the edge yaml's values; ``text_pad_length`` None and
+        ``proprio_in_und_prefix`` False (the batch-max pad, text-only und prefix) unless a test sets them.
     """
     return {
         "shift_video": 5.0,
@@ -49,4 +50,6 @@ def edge_scalar_kwargs() -> dict:
         "prompt_templates": True,
         "duration_template": True,
         "max_text_tokens": 512,
+        "text_pad_length": None,
+        "proprio_in_und_prefix": False,
     }

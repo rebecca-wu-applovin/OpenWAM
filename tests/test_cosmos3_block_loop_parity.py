@@ -84,7 +84,7 @@ def _mine_velocity(net, ids, lat, text_pos, vis_pos, ncp, t_val):
     with torch.no_grad():
         cos_und, sin_und = cosmos3_dit.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
         und_mask = torch.ones(1, ids.numel(), dtype=torch.bool)
-        context, und_kv = cosmos3_dit.run_und_tower(net, ids.unsqueeze(0), und_mask, cos_und, sin_und)
+        context, und_kv, _ = cosmos3_dit.run_und_tower(net, ids.unsqueeze(0), und_mask, cos_und, sin_und)
         state = cosmos3_dit.prepare_block_loop(
             net,
             latents=lat,
@@ -155,7 +155,7 @@ def test_batched_engine_consistent_with_single():
     with torch.no_grad():
         cos_und, sin_und = cosmos3_dit.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
         und_mask = torch.ones(2, 4, dtype=torch.bool)
-        context, und_kv = cosmos3_dit.run_und_tower(net, ids, und_mask, cos_und, sin_und)
+        context, und_kv, _ = cosmos3_dit.run_und_tower(net, ids, und_mask, cos_und, sin_und)
         state = cosmos3_dit.prepare_block_loop(
             net,
             latents=lat,
@@ -188,7 +188,7 @@ def test_none_und_mask_matches_all_true_tensor():
     for und_mask in (all_true, None):
         with torch.no_grad():
             cos_u, sin_u = cosmos3_dit.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
-            ctx, und_kv = cosmos3_dit.run_und_tower(net, ids.unsqueeze(0), und_mask, cos_u, sin_u)
+            ctx, und_kv, _ = cosmos3_dit.run_und_tower(net, ids.unsqueeze(0), und_mask, cos_u, sin_u)
             state = cosmos3_dit.prepare_block_loop(
                 net,
                 latents=lat,
@@ -317,7 +317,7 @@ def test_gradients_reach_gen_pathway():
 
     cos_und, sin_und = cosmos3_dit.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
     und_mask = torch.ones(1, 4, dtype=torch.bool)
-    context, und_kv = cosmos3_dit.run_und_tower(net, ids.unsqueeze(0), und_mask, cos_und, sin_und)
+    context, und_kv, _ = cosmos3_dit.run_und_tower(net, ids.unsqueeze(0), und_mask, cos_und, sin_und)
     state = cosmos3_dit.prepare_block_loop(
         net,
         latents=lat,
@@ -411,7 +411,9 @@ def test_padding_gate_changes_the_padded_sample_only():
     net = vb.dit
     tok = vb._tokenizer
     ids_list = [cosmos3_text.tokenize_prompt(tok, t, max_length=512) for t in ("abcd", "ef")]
-    input_ids, real_gate, _ = cosmos3_text.pad_und_batch(ids_list, pad_token_id=int(tok.pad_token_id))
+    input_ids, real_gate, _ = cosmos3_text.pad_und_batch(
+        ids_list, pad_token_id=int(tok.pad_token_id), length=max(len(i) for i in ids_list)
+    )
     und_len = input_ids.shape[1]
     torch.manual_seed(3)
     lat = torch.randn(2, MINI["latent_channel"], 2, 2, 2)
@@ -420,7 +422,7 @@ def test_padding_gate_changes_the_padded_sample_only():
     def velocity(gate):
         with torch.no_grad():
             cos_u, sin_u = cosmos3_dit.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
-            _, und_kv = cosmos3_dit.run_und_tower(net, input_ids, gate, cos_u, sin_u)
+            _, und_kv, _ = cosmos3_dit.run_und_tower(net, input_ids, gate, cos_u, sin_u)
             state = cosmos3_dit.prepare_block_loop(
                 net,
                 latents=lat,

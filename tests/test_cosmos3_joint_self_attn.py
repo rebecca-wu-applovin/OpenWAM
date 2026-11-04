@@ -78,7 +78,7 @@ def _build_state(net, ids, lat, ncp=0, *, padded_und: bool = True):
     cos_und, sin_und = cosmos3_dit.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
     und_mask = torch.ones(lat.shape[0], ids.numel(), dtype=torch.bool) if padded_und else None
     ids_b = ids.unsqueeze(0).expand(lat.shape[0], -1)
-    context, und_kv = cosmos3_dit.run_und_tower(net, ids_b, und_mask, cos_und, sin_und)
+    context, und_kv, _ = cosmos3_dit.run_und_tower(net, ids_b, und_mask, cos_und, sin_und)
     state = cosmos3_dit.prepare_block_loop(
         net,
         latents=lat,
@@ -199,7 +199,7 @@ def _padded_state(net, poison: bool, pad: int = 2):
         5, grid, modality_margin=15000, fps=24.0, temporal_compression_factor=4
     )
     cos_u, sin_u = cosmos3_dit.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
-    ctx, und_kv = cosmos3_dit.run_und_tower(net, ids, und_mask, cos_u, sin_u)
+    ctx, und_kv, _ = cosmos3_dit.run_und_tower(net, ids, und_mask, cos_u, sin_u)
     if poison:
         und_kv = [(k.clone(), v.clone()) for k, v in und_kv]
         for k, v in und_kv:  # sample 1's padded slots only

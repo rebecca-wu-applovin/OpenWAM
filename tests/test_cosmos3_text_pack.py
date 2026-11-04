@@ -7,6 +7,7 @@ compression; H/W restart at 0 with W the fastest axis; positions are float32
 when fps modulation is on.
 """
 
+import pytest
 import torch
 
 from openwam.model.video_backbone.cosmos3 import text as cosmos3_text
@@ -20,10 +21,16 @@ def test_prompt_templates_match_upstream_strings():
 
 
 def test_pad_und_batch_right_pads_and_masks():
-    ids, mask, lens = cosmos3_text.pad_und_batch([[1, 2, 3], [4, 5]], pad_token_id=0)
-    assert ids.tolist() == [[1, 2, 3], [4, 5, 0]]
-    assert mask.tolist() == [[True, True, True], [True, True, False]]
+    ids, mask, lens = cosmos3_text.pad_und_batch([[1, 2, 3], [4, 5]], pad_token_id=0, length=4)
+    assert ids.tolist() == [[1, 2, 3, 0], [4, 5, 0, 0]]
+    assert mask.tolist() == [[True, True, True, False], [True, True, False, False]]
     assert lens.tolist() == [3, 2]
+
+
+def test_pad_und_batch_rejects_a_prompt_longer_than_the_pad():
+    """A prompt over the pad length raises instead of being truncated."""
+    with pytest.raises(ValueError, match="more than the pad length 2"):
+        cosmos3_text.pad_und_batch([[1, 2, 3]], pad_token_id=0, length=2)
 
 
 def test_text_positions_shared_axes():

@@ -83,6 +83,9 @@ def test_double_registration_raises():
     [
         ({"max_text_tokens": 2}, ValueError, "max_text_tokens"),
         ({"fps": 0}, ValueError, "fps"),
+        ({"text_pad_length": 4}, ValueError, "text_pad_length"),
+        ({"text_pad_length": 1024}, ValueError, "text_pad_length"),
+        ({"proprio_in_und_prefix": None}, ValueError, "proprio_in_und_prefix"),
     ],
 )
 def test_bad_cfg_rejected_in_both_modes(change, error, match, tmp_path):

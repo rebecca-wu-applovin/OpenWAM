@@ -185,19 +185,26 @@ def vision_mrope_positions(
 
 
 def pad_und_batch(
-    ids_per_sample: Sequence[Sequence[int]], *, pad_token_id: int
+    ids_per_sample: Sequence[Sequence[int]], *, pad_token_id: int, length: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Right-pad per-sample und token lists to the batch max.
+    """Right-pad per-sample und token lists to ``length``.
+
+    Args:
+        ids_per_sample: B token-id lists, each at most ``length`` long.
+        pad_token_id: int, id written into the padded slots.
+        length: int L, the padded length of every row.
 
     Returns ``(input_ids (B, L) long, und_mask (B, L) bool — True at real tokens,
-    seq_lens (B,) long)``.
+    seq_lens (B,) long)``. ValueError for a list longer than ``length``.
     """
     if not ids_per_sample:
         raise ValueError("pad_und_batch needs at least one sample.")
     lens = [len(ids) for ids in ids_per_sample]
-    max_len = max(lens)
-    batch = torch.full((len(ids_per_sample), max_len), int(pad_token_id), dtype=torch.long)
-    mask = torch.zeros((len(ids_per_sample), max_len), dtype=torch.bool)
+    # Truncating here would silently drop prompt text; the caller must size L.
+    if max(lens) > length:
+        raise ValueError(f"pad_und_batch: a prompt has {max(lens)} und tokens, more than the pad length {length}.")
+    batch = torch.full((len(ids_per_sample), length), int(pad_token_id), dtype=torch.long)
+    mask = torch.zeros((len(ids_per_sample), length), dtype=torch.bool)
     for i, ids in enumerate(ids_per_sample):
         batch[i, : len(ids)] = torch.tensor(list(ids), dtype=torch.long)
         mask[i, : len(ids)] = True

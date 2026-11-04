@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -85,6 +85,14 @@ def _check_cfg(cfg: DictConfig) -> None:
     # Room for the chat-template tokens around the prompt.
     if int(cfg.max_text_tokens) < 8:
         raise ValueError(f"cosmos3 max_text_tokens must be >= 8, got {cfg.max_text_tokens}.")
+    # Fixed und pad length (null = the batch max); it also sets the vision mRoPE t-offset.
+    pad = cfg.text_pad_length
+    if pad is not None and (
+        isinstance(pad, bool) or not isinstance(pad, int) or not 8 <= pad <= int(cfg.max_text_tokens)
+    ):
+        raise ValueError(f"cosmos3 text_pad_length must be null or an int in [8, max_text_tokens], got {pad!r}.")
+    if not isinstance(cfg.proprio_in_und_prefix, bool):
+        raise ValueError(f"cosmos3 proprio_in_und_prefix must be true / false, got {cfg.proprio_in_und_prefix!r}.")
 
 
 def _norm_cfg_value(value):
@@ -219,6 +227,8 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         duration_template: bool,
         clip_fps: float,
         max_text_tokens: int,
+        text_pad_length: Optional[int],
+        proprio_in_und_prefix: bool,
     ) -> None:
         """Wrap built modules; use :meth:`from_pretrained` / :meth:`from_checkpoint_dir` instead.
 
@@ -231,6 +241,9 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             shift_video: float, α-shift of the scheduler built here. train_timestep: DictConfig, its training law.
             use_system_prompt / prompt_templates / duration_template: bool prompt knobs.
             clip_fps: float, assumed clip frame rate (yaml ``fps``). max_text_tokens: int.
+            text_pad_length: int, the und length every prompt is padded to (yaml); None pads to the batch max.
+            proprio_in_und_prefix: bool (yaml); True runs the architecture's proprio tokens through the und tower
+                after the text, so the video stream reads them in its und prefix.
         """
         super().__init__()
         # --- Flat named children (freeze list hits video_backbone.vae) ---
@@ -263,6 +276,10 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         # is a configured assumption rather than a measurement (yaml ``fps``).
         self._clip_fps = float(clip_fps)
         self._max_text_tokens = int(max_text_tokens)
+        # A fixed pad keeps the vision mRoPE t-offset (padded und length + margin) independent of the batch, so
+        # training (B > 1) and deploy (B = 1) see the same positions.
+        self._text_pad_length = text_pad_length
+        self._proprio_in_und_prefix = proprio_in_und_prefix
         self._pristine_inv_freq = self._capture_pristine_inv_freq()
 
     @classmethod
@@ -386,6 +403,8 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             duration_template=bool(cfg.prompt_duration_template),
             clip_fps=float(cfg.fps),
             max_text_tokens=int(cfg.max_text_tokens),
+            text_pad_length=cfg.text_pad_length,
+            proprio_in_und_prefix=cfg.proprio_in_und_prefix,
         )
 
     def _capture_pristine_inv_freq(self) -> Tensor:
@@ -536,7 +555,8 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         Returns:
             TextCondition: context (B, L, 2048) und final hidden, context_mask (B, L) = position < the prompt's
             token count; extra ``und_kv`` (per-layer gen-facing K/V), ``und_mask`` ((B, L) bool, or None when no
-            prompt is padded) and ``vision_positions`` [3, 1, N].
+            prompt is padded), ``vision_positions`` [3, 1, N], and with ``proprio_in_und_prefix`` ``und_k``
+            (per-layer und-side keys, for :meth:`prepare` to continue the tower).
         """
         t_lat, h, w = (int(v) for v in grid)
         # The template states the pixel size of the latent grid (16x spatial compression).
@@ -554,6 +574,9 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             "und_kv": enc["und_kv"],
             "vision_positions": self._vision_positions(enc["und_len_padded"], (t_lat, h, w)),
         }
+        # The und-side keys are only read to append the proprio tokens; otherwise they are not kept.
+        if self._proprio_in_und_prefix:
+            extra["und_k"] = enc["und_k"]
         return TextCondition(
             context=context, context_mask=positions < seq_lens.to(context.device).unsqueeze(1), extra=extra
         )
@@ -567,7 +590,8 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
 
         Returns:
             dict: ``context`` (B, L, 2048) und final hidden, ``context_mask`` (B, L) bool or None (no padding),
-            ``seq_lens`` (B,), ``und_kv`` per-layer gen-facing K/V, ``und_len_padded`` int L.
+            ``seq_lens`` (B,), ``und_kv`` per-layer gen-facing K/V, ``und_k`` per-layer und-side keys,
+            ``und_len_padded`` int L (``text_pad_length``, or the batch max when it is null).
         """
         tokenizer = self._tokenizer
         texts = prompts
@@ -596,26 +620,28 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             for t in texts
         ]
         pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-        input_ids, und_mask, seq_lens = cosmos3_text.pad_und_batch(ids, pad_token_id=int(pad_id))
+        pad_len = max(len(i) for i in ids) if self._text_pad_length is None else self._text_pad_length
+        input_ids, und_mask, seq_lens = cosmos3_text.pad_und_batch(ids, pad_token_id=int(pad_id), length=pad_len)
         input_ids = input_ids.to(self.device)
         # Whether any prompt is padded is host-side knowledge (Python list
         # lengths), so decide it here and hand ``None`` down when there is no
         # padding — that is what keeps SDPA on a fused kernel and keeps the
-        # MoT loop free of a ``.all()`` device sync. Every B=1 request
-        # and any uniform-length batch takes this path.
-        und_mask = und_mask.to(self.device) if len(set(len(i) for i in ids)) > 1 else None
+        # MoT loop free of a ``.all()`` device sync. With the batch-max pad,
+        # every B=1 request and any uniform-length batch takes this path.
+        und_mask = und_mask.to(self.device) if any(len(i) < pad_len for i in ids) else None
 
         # Text mRoPE positions, then the frozen und tower once (context + per-layer K/V for the gen stream).
         net = self.dit
         float_pos = bool(net.config.enable_fps_modulation)
         text_pos = cosmos3_text.text_mrope_positions(input_ids.shape[1], float_positions=float_pos)
         cos_und, sin_und = cosmos3_dit.compute_rotary(net, text_pos.unsqueeze(1), self.device, self.dtype)
-        context, und_kv = cosmos3_dit.run_und_tower(net, input_ids, und_mask, cos_und, sin_und)
+        context, und_kv, und_k = cosmos3_dit.run_und_tower(net, input_ids, und_mask, cos_und, sin_und)
         return {
             "context": context,
             "context_mask": und_mask,
             "seq_lens": seq_lens.to(self.device),
             "und_kv": und_kv,
+            "und_k": und_k,
             "und_len_padded": int(input_ids.shape[1]),
         }
 
@@ -676,13 +702,18 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
 
         Args:
             latents: (B, 48, T_lat, h, w); the first ``layout.num_hist_latents`` get no timestep embedding.
-            timestep: (B,). text: TextCondition from :meth:`encode_text` (context may carry proprio tokens).
+            timestep: (B,). text: TextCondition from :meth:`encode_text`; under ``proprio_input=context_token``
+                its context is the L und tokens followed by the architecture's N proprio tokens.
             layout: ``cfg.common.layout`` (clean prefix length). proprio: (B, H, D); unused (context tokens).
             use_gradient_checkpointing(_offload): bool loop flags.
 
         Returns:
             BlockLoopState.
         """
+        und_kv, und_mask = text.extra["und_kv"], text.extra["und_mask"]
+        # proprio_in_und_prefix: the proprio tokens join the und prefix the gen blocks attend.
+        if self._proprio_in_und_prefix:
+            und_kv, und_mask = self._append_proprio_to_und_prefix(text, und_kv, und_mask)
         # The und bundle (K/V, mask, vision positions) was built by encode_text; the clean prefix gets no t-embedding.
         return cosmos3_dit.prepare_block_loop(
             self.dit,
@@ -690,13 +721,53 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             timestep=timestep,
             context=text.context,
             context_mask=text.context_mask,
-            und_mask=text.extra["und_mask"],
-            und_kv=text.extra["und_kv"],
+            und_mask=und_mask,
+            und_kv=und_kv,
             vision_positions=text.extra["vision_positions"],
             num_clean_prefix_frames=int(layout.num_hist_latents),
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         )
+
+    def _append_proprio_to_und_prefix(
+        self, text: TextCondition, und_kv: list, und_mask: Optional[Tensor]
+    ) -> Tuple[list, Tensor]:
+        """Run the proprio tokens through the und tower after the text and append their K/V to the und prefix.
+
+        Args:
+            text: TextCondition whose context is the L und tokens followed by N proprio tokens (B, L + N, 2048) and
+                context_mask (B, L + N); ``extra["und_k"]`` holds the text's per-layer und-side keys.
+            und_kv: per layer ``(k_for_gen, v)`` (B, L, kv_heads, head_dim) of the text.
+            und_mask: (B, L) bool real-text mask, or None (no prompt padded).
+
+        Returns:
+            (und_kv, und_mask): per layer (B, L + N, kv_heads, head_dim) K/V and the (B, L + N) bool mask. The suffix
+            sits at und positions L..L+N-1, inside the 15000-token margin before the vision t-offset.
+        """
+        und_k = text.extra["und_k"]
+        length = und_k[0].shape[1]
+        tokens = text.context[:, length:]
+        if tokens.shape[1] == 0:
+            raise ValueError(
+                "cosmos3 proprio_in_und_prefix=true needs proprio tokens after the text in the context "
+                "(model.architecture.use_proprioception=true); set model.video_backbone.proprio_in_und_prefix=false"
+            )
+        token_mask = text.context_mask[:, length:].to(dtype=torch.bool)
+        b, n = tokens.shape[:2]
+
+        # Suffix positions continue the text axis: L .. L+N-1.
+        net = self.dit
+        float_pos = bool(net.config.enable_fps_modulation)
+        pos = cosmos3_text.text_mrope_positions(length + n, float_positions=float_pos)[:, length:]
+        cos_p, sin_p = cosmos3_dit.compute_rotary(net, pos.unsqueeze(1), tokens.device, und_k[0].dtype)
+        suffix_kv = cosmos3_dit.run_und_suffix(
+            net, tokens.to(und_k[0].dtype), token_mask, und_k, und_kv, und_mask, cos_p, sin_p
+        )
+
+        und_kv = [(torch.cat([k, sk], dim=1), torch.cat([v, sv], dim=1)) for (k, v), (sk, sv) in zip(und_kv, suffix_kv)]
+        # A masked-off proprio slot makes the prefix padded even when the text is not.
+        text_mask = torch.ones((b, length), dtype=torch.bool, device=tokens.device) if und_mask is None else und_mask
+        return und_kv, torch.cat([text_mask.to(tokens.device), token_mask], dim=1)
 
     def run_block(self, block_id: int, state: BlockLoopState, attn_mask: Tensor) -> BlockLoopState:
         """One gen block on the video stream alone.

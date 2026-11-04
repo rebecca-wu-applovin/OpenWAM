@@ -42,6 +42,7 @@ __all__ = [
     "compute_rotary",
     "rotary_inv_freq",
     "run_und_tower",
+    "run_und_suffix",
     "prepare_block_loop",
     "run_block",
     "finalize_block_loop",
@@ -136,7 +137,7 @@ def run_und_tower(
     und_mask: Optional[Tensor],
     cos_und: Tensor,
     sin_und: Tensor,
-) -> Tuple[Tensor, List[Tuple[Tensor, Tensor]]]:
+) -> Tuple[Tensor, List[Tuple[Tensor, Tensor]], List[Tensor]]:
     """Run the full und (text) tower once, batched.
 
     The und pathway is frozen and computationally independent of gen, so it runs
@@ -146,11 +147,13 @@ def run_und_tower(
     the batch is padded — the unpadded case then runs as plain causal attention
     (``is_causal=True``, no explicit mask), which keeps the fused kernels.
 
-    Returns ``(context, und_kv)`` where ``context`` is ``net.norm``-finalized
+    Returns ``(context, und_kv, und_k)`` where ``context`` is ``net.norm``-finalized
     hidden states ``(B, L, D)`` and ``und_kv[i] = (k_for_gen, v)`` with shapes
     ``(B, L, kv_heads, head_dim)``; ``k_for_gen`` already has
     ``k_norm_und_for_gen`` (when present) and rotary applied, matching the
-    processor's ``k_und_for_gen``.
+    processor's ``k_und_for_gen``. ``und_k[i]`` ``(B, L, kv_heads, head_dim)`` is
+    the und stream's own rotated key, which :func:`run_und_suffix` needs to
+    continue the tower with more tokens.
     """
     b, length = input_ids.shape
     n_heads = int(net.config.num_attention_heads)
@@ -162,6 +165,7 @@ def run_und_tower(
     is_causal = und_mask is None
 
     und_kv: List[Tuple[Tensor, Tensor]] = []
+    und_k: List[Tensor] = []
     for layer in net.layers:
         attn = layer.self_attn
         normed = layer.input_layernorm(und_seq)
@@ -175,6 +179,7 @@ def run_und_tower(
         k = _apply_rope(k, cos_und, sin_und)
         k_for_gen = _apply_rope(k_for_gen, cos_und, sin_und)
         und_kv.append((k_for_gen, v))
+        und_k.append(k)
 
         out = F.scaled_dot_product_attention(
             q.transpose(1, 2),
@@ -189,7 +194,73 @@ def run_und_tower(
         und_seq = residual + layer.mlp(layer.post_attention_layernorm(residual))
 
     context = net.norm(und_seq)
-    return context, und_kv
+    return context, und_kv, und_k
+
+
+def run_und_suffix(
+    net,
+    suffix_seq: Tensor,
+    suffix_mask: Tensor,
+    prefix_k: List[Tensor],
+    prefix_kv: List[Tuple[Tensor, Tensor]],
+    prefix_mask: Optional[Tensor],
+    cos_suffix: Tensor,
+    sin_suffix: Tensor,
+) -> List[Tuple[Tensor, Tensor]]:
+    """Continue the und tower with N extra input embeddings after a cached prefix.
+
+    Same math as :func:`run_und_tower` on ``[prefix ; suffix]``: suffix queries attend the real prefix keys plus
+    the earlier real suffix keys (causal); the prefix never sees the suffix. Not under ``no_grad``: the und
+    weights are frozen, but gradients flow back into ``suffix_seq``.
+
+    Args:
+        net: the vendored Cosmos3 transformer.
+        suffix_seq: (B, N, D) input embeddings (embed_tokens space).
+        suffix_mask: (B, N) bool, True at real suffix tokens.
+        prefix_k: per layer (B, L, kv_heads, head_dim) und-side rotated keys of the prefix (``run_und_tower``).
+        prefix_kv: per layer ``(k_for_gen, v)`` of the prefix; only ``v`` is read.
+        prefix_mask: (B, L) bool real-prefix mask, or None (every prefix key is real).
+        cos_suffix, sin_suffix: (B or 1, N, head_dim) rotary of the suffix positions.
+
+    Returns:
+        per layer ``(k_for_gen, v)``, each (B, N, kv_heads, head_dim), of the suffix only.
+    """
+    b, n, _ = suffix_seq.shape
+    n_heads = int(net.config.num_attention_heads)
+    kv_heads = int(net.config.num_key_value_heads)
+    head_dim = int(net.config.head_dim)
+    length = prefix_k[0].shape[1]
+    # (B, 1, N, L + N): the real prefix keys, then causal over the real suffix keys.
+    pre = torch.ones((b, length), dtype=torch.bool, device=suffix_seq.device) if prefix_mask is None else prefix_mask
+    causal = torch.tril(torch.ones((n, n), dtype=torch.bool, device=suffix_seq.device))
+    attn_mask = torch.cat(
+        [pre.view(b, 1, 1, length).expand(b, 1, n, length), causal.view(1, 1, n, n) & suffix_mask.view(b, 1, 1, n)],
+        dim=-1,
+    )
+
+    seq = suffix_seq
+    suffix_kv: List[Tuple[Tensor, Tensor]] = []
+    for i, layer in enumerate(net.layers):
+        attn = layer.self_attn
+        normed = layer.input_layernorm(seq)
+        # Same projections / norms / rotary as run_und_tower, on the suffix rows.
+        q = attn.norm_q(attn.to_q(normed).view(b, n, n_heads, head_dim))
+        k = attn.norm_k(attn.to_k(normed).view(b, n, kv_heads, head_dim))
+        v = attn.to_v(normed).view(b, n, kv_heads, head_dim)
+        k_for_gen = attn.k_norm_und_for_gen(k) if attn.k_norm_und_for_gen is not None else k
+        q = _apply_rope(q, cos_suffix, sin_suffix)
+        k = _apply_rope(k, cos_suffix, sin_suffix)
+        suffix_kv.append((_apply_rope(k_for_gen, cos_suffix, sin_suffix), v))
+
+        # Keys / values = the cached prefix + this suffix.
+        all_k = torch.cat([prefix_k[i].to(k.dtype), k], dim=1)
+        all_v = torch.cat([prefix_kv[i][1].to(v.dtype), v], dim=1)
+        out = F.scaled_dot_product_attention(
+            q.transpose(1, 2), all_k.transpose(1, 2), all_v.transpose(1, 2), attn_mask=attn_mask, enable_gqa=True
+        )
+        residual = seq + attn.to_out(out.transpose(1, 2).reshape(b, n, n_heads * head_dim))
+        seq = residual + layer.mlp(layer.post_attention_layernorm(residual))
+    return suffix_kv
 
 
 def _noisy_frames(grid_t: int, num_clean_prefix_frames: int, device) -> Tensor:
