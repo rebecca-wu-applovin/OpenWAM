@@ -4,6 +4,7 @@
 # at build time. longlive2_robot_s / wan22_ti2v_tiny start from this file and override a few keys.
 
 name: wan22_ti2v_5b
+temporal_compression: 4   # VAE38 (yaml contract checked against the backbone at build; the latent layout reads it)
 model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Wan2.2-TI2V-5B  # [Required] upstream weights dir
 init: pretrained          # pretrained: load `weights` from model_path | random: random init (debug only, no weight files)
 weights:                  # upstream file names under model_path

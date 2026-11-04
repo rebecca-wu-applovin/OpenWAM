@@ -1,9 +1,12 @@
-"""Deploy engine for sparse-history checkpoints (07 layout: H history frames + H proprio tokens -> action chunk).
+"""Deploy engine of every checkpoint: H history frames + H proprio tokens -> action chunk (+ future video).
+
+The first-frame layout is the H = 1 history; the latent layout is the checkpoint's ``cfg.common.layout``
+(``architecture.layout``).
 
 The request carries the H history observations picked by :class:`ObsHistoryBuffer` (``conditions["history"]``).
 The engine turns them into the training representation with the same functions the dataset uses
-(``encode_proprio_in_anchor_cam``, the checkpoint's normalizer), conditions the model through
-``architecture.prepare_sparse_condition`` (the backbone's training condition encode) and denoises the future
+(``encode_proprio_in_anchor_cam``, the checkpoint's normalizer), encodes the history + prompt with
+``video_backbone.preprocess_condition`` (the history half of the training encode) and denoises the future
 latents + action chunk with ``architecture.sample``. It depends on the model and the data-representation
 functions only; nothing from the training loop or the training visualization.
 
@@ -51,13 +54,13 @@ class SparseHistoryInferenceEngine(BaseInferenceEngine):
             raise ValueError(f"sparse-history deploy supports yam_sharpa checkpoints only, got {dl.get('type')}")
         self.history_offsets = [int(o) for o in history_offsets]
         self.action_mode = str(dl.action_mode)
-        self.num_future_frames = len(dl.future_offsets)
-        # Action chunk = rows t .. t + num_frames - 2 (the dataset keeps num_frames - 1 targets).
-        self.action_horizon = int(dl.num_frames) - 1
+        layout = architecture.layout
+        if len(self.history_offsets) != int(layout.num_hist_frames):
+            raise ValueError(f"{len(self.history_offsets)} history offsets, layout has {layout.num_hist_frames} frames")
         self._decode_video = bool(OmegaConf.select(cfg, "optimization.decode_video", default=False))
         logger.info(
-            "[sparse] history_offsets=%s, future frames=%d, action chunk=%d, action_mode=%s",
-            self.history_offsets, self.num_future_frames, self.action_horizon, self.action_mode,
+            "[sparse] history_offsets=%s, latents %d (%d history), action chunk=%d, action_mode=%s",
+            self.history_offsets, layout.num_latents, layout.num_hist_latents, layout.action_horizon, self.action_mode,
         )
 
     def _proprio(self, history: list):
@@ -92,28 +95,19 @@ class SparseHistoryInferenceEngine(BaseInferenceEngine):
             ``video`` list of F decoded future PIL canvases, or None unless ``optimization.decode_video``.
         """
         arch = self.architecture
+        layout = arch.layout
         history = conditions["history"]
         if len(history) != len(self.history_offsets):
             raise ValueError(f"expected {len(self.history_offsets)} history observations, got {len(history)}")
         schedule, _, _ = build_schedule(self.cfg.inference, arch, conditions)
 
         raw, raw_t = self._proprio(history)
-        proprio = arch.normalize_deploy_proprio(raw).unsqueeze(0)  # (1, H, D) normalized
-        cond = arch.prepare_sparse_condition(
-            [[o["image"] for o in history]],
-            [conditions.get("prompt", "") or ""],
-            proprio,
-            num_future_frames=self.num_future_frames,
+        # (1, H, D) normalized, on the model device / dtype.
+        proprio = arch.normalize_deploy_proprio(raw).unsqueeze(0).to(device=arch.device, dtype=arch.dtype)
+        hist_latents, text = arch.video_backbone.preprocess_condition(
+            [[o["image"] for o in history]], [conditions.get("prompt", "") or ""], layout
         )
-        b, z, h, hl, wl = cond["clean_latents"].shape
-        t_lat = h + arch.video_backbone.num_future_latents(self.num_future_frames)
-        latents, actions = arch.sample(
-            cond,
-            schedule,
-            latent_shape=(b, z, t_lat, hl, wl),
-            action_shape=(1, self.action_horizon, arch.action_dim),
-            seed=int(conditions.get("seed", 42)),
-        )
+        latents, actions = arch.sample(hist_latents, text, proprio, schedule, seed=int(conditions.get("seed", 42)))
 
         actions = actions[0].float().cpu().numpy()
         normalizer = getattr(arch, "normalizer", None)
@@ -123,5 +117,5 @@ class SparseHistoryInferenceEngine(BaseInferenceEngine):
         decoder = getattr(arch, "action_decoder", None)
         if decoder is not None:
             actions = decoder(actions, raw_t)
-        video = arch.video_backbone.decode_video(latents[:, :, h:]) if self._decode_video else None
+        video = arch.video_backbone.decode_future(latents, layout) if self._decode_video else None
         return {"actions": actions, "video": video}

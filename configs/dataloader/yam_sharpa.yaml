@@ -27,10 +27,19 @@ action_mode: fingertips_abs
 normalize_mode: min-max
 normalization_stats_path: /root/projects/2610_policy_model/norm_stats/yam_sharpa_${.action_mode}.npy
 
-# ── Frame sampling (OpenWAM contract) ────────────────────────────────────────
-# 33 raw rows → 32 actions; video every 4th row → 9 frames.
+# ── Frame sampling ───────────────────────────────────────────────────────────
+# 33 raw rows → 32 actions. Video = the history rows t + history_offsets (the last one = the current frame t)
+# then the future rows t + future_offsets. The default is the first-frame layout: frame t + 8 future frames
+# every 4th row (rows t .. t+32). history_offsets alone sets H (the latent layout is derived from it).
 num_frames: 33
-video_stride: 4
+history_offsets: [0]
+future_offsets: [4, 8, 12, 16, 20, 24, 28, 32]
+# How the train split picks the history rows: fixed = always history_offsets; random = per sample, H-1 distinct
+# rows of the past history_window rows (100 = 5 s at 20 Hz) + frame t, drawn from the sample's (seed, epoch, idx)
+# RNG, then clamped to the episode start. H stays len(history_offsets); val and deploy always use history_offsets
+# (resolve_config checks that history_window reaches the oldest offset).
+history_sampling: fixed
+history_window: 100
 window_stride: 1
 split: train
 

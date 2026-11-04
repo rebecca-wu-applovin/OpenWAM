@@ -63,11 +63,6 @@ def build_dataset(config, split: str = "train") -> BaseDataset:
     return cls.from_config(config, split=split)
 
 
-def list_registered_datasets():
-    """Return list of registered dataset type names."""
-    return sorted(DATASET_REGISTRY.keys())
-
-
 # ---- Auto-registration of built-in datasets ----
 # This runs when the module is first imported.
 

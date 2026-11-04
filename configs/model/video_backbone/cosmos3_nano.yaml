@@ -6,6 +6,7 @@
 # (text_dim=4096) and ActionDiT geometry auto-derive.
 
 name: cosmos3_nano
+temporal_compression: 4   # Wan2.2 VAE (yaml contract checked against the backbone at build; the latent layout reads it)
 model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Cosmos3-Nano  # [Required] diffusers-style bundle root (transformer/ + vae/ + text_tokenizer/)
 
 # Flow-matching α-shift for the video scheduler (train + deploy single source of

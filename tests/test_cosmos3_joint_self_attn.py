@@ -4,8 +4,8 @@
    tiny random Edge-flavoured config. The split path uses the driver's exact
    flat single-``num_heads`` layout (KV heads pre-expanded 8→16-style), so this
    is the canary for GQA-expand / rope / residual mistakes.
-2. Driver integration: with ``attention_mask_mode="isolated"`` (video cannot
-   see action) and bidirectional v↔v, the video stream that comes out of
+2. Driver integration: with a frame mask whose latents are all clean (video cannot
+   see action) and bidirectional among them, the video stream that comes out of
    ``DualSystemMoTDriver.run_joint_loop`` must equal the pure ``run_block``
    loop — exercising the rectangular prefix-KV mask end to end.
 """
@@ -19,8 +19,10 @@ import torch.nn.functional as F
 
 pytest.importorskip("diffusers")
 
+from omegaconf import OmegaConf  # noqa: E402
+
 from openwam.model.architectures.dual_system.mot_driver import DualSystemMoTDriver  # noqa: E402
-from openwam.model.architectures.utils.mask_modes import widen_mask_for_prefix_kv  # noqa: E402
+from openwam.model.architectures.utils.mask_modes import build_frame_mask  # noqa: E402
 from openwam.model.video_backbone import Cosmos3EdgeVideoBackbone  # noqa: E402
 from openwam.model.video_backbone.cosmos3 import dit as cosmos3_dit  # noqa: E402
 from openwam.model.video_backbone.cosmos3 import text as cosmos3_text  # noqa: E402
@@ -50,6 +52,12 @@ MINI = dict(
 
 # Nano-flavoured twin (SiLU + RMSNorm, und QK-norm, no k_norm_und_for_gen).
 NANO_MINI = dict(MINI, qk_norm_for_text=True, use_und_k_norm_for_gen=False, hidden_act="silu", rms_norm_eps=1e-6)
+
+
+def _fm(t: int, n_clean: int, clean_attention: str = "bidirectional"):
+    """Frame mask of t latents, the first n_clean clean (mutual). Returns: (t+1, t+1) bool."""
+    layout = OmegaConf.create({"num_latents": t, "num_hist_latents": n_clean})
+    return build_frame_mask(layout, clean_attention, "mutual")
 
 
 def _build_state(net, ids, lat, ncp=0, *, padded_und: bool = True):
@@ -134,7 +142,7 @@ class _TinyActionBackbone(nn.Module):
 
 
 @pytest.mark.parametrize("padded_und", [True, False], ids=["und_mask_tensor", "und_mask_none"])
-def test_driver_isolated_mode_matches_run_block_loop(padded_und):
+def test_driver_video_blind_to_action_matches_run_block_loop(padded_und):
     torch.manual_seed(0)
     net = Cosmos3OmniTransformer(**MINI).eval()
     ids = torch.tensor([1, 2, 3, 4])
@@ -153,7 +161,8 @@ def test_driver_isolated_mode_matches_run_block_loop(padded_und):
     ab = _TinyActionBackbone(
         MINI["hidden_size"], MINI["num_hidden_layers"], MINI["num_attention_heads"], MINI["head_dim"]
     ).eval()
-    driver = DualSystemMoTDriver(vb, ab, attention_mask_mode="isolated")
+    # All 3 latents clean: the video rows read neither the action nor anything outside the (bidirectional) video.
+    driver = DualSystemMoTDriver(vb, ab, frame_mask=_fm(3, 3))
 
     with torch.no_grad():
         ref = _build_state(net, ids, lat, padded_und=padded_und)
@@ -165,7 +174,7 @@ def test_driver_isolated_mode_matches_run_block_loop(padded_und):
         joint_v, joint_a = driver.run_joint_loop(joint, astate)
 
     diff = (joint_v.hidden_states - ref.hidden_states).abs().max().item()
-    assert diff < 1e-5, f"isolated-mode video stream deviates from run_block: {diff}"
+    assert diff < 1e-5, f"action-blind video stream deviates from run_block: {diff}"
     assert torch.isfinite(joint_a.payload.x_action).all()
 
 
@@ -200,14 +209,14 @@ def _padded_state(net, poison: bool, pad: int = 2):
     )
 
 
-@pytest.mark.parametrize("mode", ["action_sees_video", "mutual", "isolated"])
-def test_joint_loop_keeps_padded_und_keys_out(mode):
+@pytest.mark.parametrize("n_clean", [1, 2], ids=["noisy_latent", "all_clean"])
+def test_joint_loop_keeps_padded_und_keys_out(n_clean):
     """Padded und keys must not reach the video or action stream through MoT.
 
     ``run_joint_loop`` widens its cross-modal mask by ``prefix_kv_len`` and gates
     the prefix columns with ``prefix_kv_mask``. Poisoning the padded und K/V is
-    the end-to-end check that the gate survives the widening for every mask mode
-    — the mask helper's own unit tests cannot see a wiring mistake here.
+    the end-to-end check that the gate survives the widening whether or not the
+    video rows see the action — the mask helper's own unit tests cannot see a wiring mistake here.
     """
     torch.manual_seed(0)
     net = Cosmos3OmniTransformer(**MINI).eval()
@@ -224,7 +233,8 @@ def test_joint_loop_keeps_padded_und_keys_out(mode):
     ab = _TinyActionBackbone(
         MINI["hidden_size"], MINI["num_hidden_layers"], MINI["num_attention_heads"], MINI["head_dim"]
     ).eval()
-    driver = DualSystemMoTDriver(vb, ab, attention_mask_mode=mode, mot_checkpoint_mixed_attn=False)
+    mode = f"n_clean={n_clean}"
+    driver = DualSystemMoTDriver(vb, ab, frame_mask=_fm(2, n_clean), mot_checkpoint_mixed_attn=False)
 
     outs = []
     for poison in (False, True):
@@ -263,9 +273,10 @@ def test_padded_und_poison_is_detectable():
 
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("padded_und", [False, True])
-@pytest.mark.parametrize("video_mask_mode", ["bidirectional", "first_frame_causal"])
-def test_action_sees_video_matches_direct_blocks_with_matching_mask(batch, padded_und, video_mask_mode):
-    """Match the released policy's one-way coupling without dropping its video mask."""
+@pytest.mark.parametrize("clean_attention", ["bidirectional", "causal"])
+def test_action_blind_video_matches_direct_blocks_with_matching_mask(batch, padded_und, clean_attention):
+    """One-way coupling (video never reads the action) without dropping the video's own mask: the MoT step on
+    the joint mask equals the video-only ``run_block`` on the same frame mask's video block."""
     torch.manual_seed(17)
     net = Cosmos3OmniTransformer(**MINI).eval()
     vb = Cosmos3EdgeVideoBackbone(
@@ -279,9 +290,9 @@ def test_action_sees_video_matches_direct_blocks_with_matching_mask(batch, padde
     ab = _TinyActionBackbone(
         MINI["hidden_size"], MINI["num_hidden_layers"], MINI["num_attention_heads"], MINI["head_dim"]
     ).eval()
-    driver = DualSystemMoTDriver(
-        vb, ab, attention_mask_mode="action_sees_video", video_attention_mask_mode=video_mask_mode
-    )
+    # All latents clean: the video rows never read the action; the clean rule is the one under test.
+    frame_mask = _fm(3, 3, clean_attention)
+    driver = DualSystemMoTDriver(vb, ab, frame_mask=frame_mask)
     ids = torch.tensor([1, 2, 3, 4])
     lat = torch.randn(batch, MINI["latent_channel"], 3, 2, 2)
     astate = types.SimpleNamespace(payload=types.SimpleNamespace(x_action=torch.randn(batch, 5, MINI["hidden_size"])))
@@ -298,17 +309,12 @@ def test_action_sees_video_matches_direct_blocks_with_matching_mask(batch, padde
                 for k, v in state.extras["und_kv"]:
                     k[-1, -1] = 1e4
                     v[-1, -1] = 1e4
-        s_video = direct.hidden_states.shape[1]
-        tokens_per_frame = direct.grid_height * direct.grid_width
-        direct.extras["shared_attention_mask"] = vb.build_video_to_video_mask(
-            video_seq_len=s_video, video_tokens_per_frame=tokens_per_frame, device=lat.device
-        )
-        mask = driver._build_attention_mask(s_video, 5, tokens_per_frame, device=lat.device)
-        mask = widen_mask_for_prefix_kv(mask, joint)
-        assert mask.dim() == (4 if padded_und else 2)
+        video_masks = vb.build_joint_attention_masks(frame_mask, direct, 0)
+        joint_masks = vb.build_joint_attention_masks(frame_mask, joint, 5)
+        assert joint_masks[0].dim() == (4 if padded_und else 2)
         for i in range(vb.num_layers):
-            direct = vb.run_block(i, direct)
-            joint, astate = driver.step(i, joint, astate, attn_mask=mask)
+            direct = vb.run_block(i, direct, video_masks[i])
+            joint, astate = driver.step(i, joint, astate, attn_mask=joint_masks[i])
             torch.testing.assert_close(direct.hidden_states, joint.hidden_states, rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(vb.finalize(direct), vb.finalize(joint), rtol=1e-5, atol=1e-5)
         assert torch.isfinite(astate.payload.x_action).all()

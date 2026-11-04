@@ -13,7 +13,7 @@ The benchmark owns action ordering, units, signs, ranges, and gripper meaning. K
 
 For a custom source, subclass `BaseDataset` in [openwam/dataloader/bases/dataset.py](../../openwam/dataloader/bases/dataset.py). For LeRobot v3 data, subclass `LeRobotV3Reader` in [openwam/dataloader/bases/lerobot_v3_reader.py](../../openwam/dataloader/bases/lerobot_v3_reader.py), which provides parquet windows, video decoding, prompts, statistics, masks, and multiview composition.
 
-Override only the source hooks that differ, such as `_action_20d`, `_proprio_20d`, `_resolve_cameras`, `_resolve_prompt`, and `_load_stats`. Register the class in [openwam/dataloader/registry.py](../../openwam/dataloader/registry.py):
+Override only the source hooks that differ, such as `_getitem_impl(idx, rng)` (required: builds the sample; `rng` is the per-sample generator, the only random source a reader may use), `_action_20d`, `_resolve_cameras`, `_resolve_prompt`, and `_load_stats`. A `LeRobotV3Reader` is a source: the registered mixture (e.g. `MultiYamSharpaDataset`) calls its `sample(idx, rng)` with a `(seed, epoch, idx)` generator, and the reader reads every data shard into memory at construction. Register the class in [openwam/dataloader/registry.py](../../openwam/dataloader/registry.py):
 
 ~~~python
 from openwam.dataloader.bases import BaseDataset
@@ -33,12 +33,11 @@ Import the module before calling `build_dataset(config)`. Every registered class
 
 ### Return the canonical sample
 
-The trainer uses `collate_fn=list`, so one item remains one dictionary. Return the fields below:
+The trainer's `collate_fn` is [openwam/dataloader/collate.py](../../openwam/dataloader/collate.py) `collate`: it stacks the samples into one `Batch` (`video`, `prompt`, `action`, `action_is_pad = ~action_mask`, `proprio`, `proprio_mask`, `source`), which is the only input of `compute_loss`. A sample carries data only (no flag for a model branch). Return the fields below, with H = `len(history_offsets)` and F = `len(future_offsets)`:
 
 ~~~text
 # Video and prompt
-video             list[PIL.Image], length = num_video_frames
-first_frame_image list[PIL.Image], normally [video[0]]
+video             list[PIL.Image], length = H + F (history frames, the current frame t last, then the future)
 prompt            str
 
 # Action and state
@@ -46,14 +45,14 @@ prompt            str
 # state width D_state must match architecture.state_dim
 action            float32 Tensor, shape (num_frames - 1, D)
 action_mask       bool Tensor, shape (num_frames - 1, D)
-proprio           float32 Tensor, shape (1, D_state)
-proprio_mask      bool Tensor, shape (1, D_state)
+proprio           float32 Tensor, shape (H, D_state), one row per history frame
+proprio_mask      bool Tensor, shape (H, D_state)
 
-# Video validity
-video_mask        bool Tensor, shape (num_video_frames,)
+# Added by the mixture dataset: the name of the source the sample came from
+source            str
 ~~~
 
-For video-only data, emit zero actions with an all-false `action_mask`; zero values alone do not disable loss. Repeat the final real frame only when a source window is short and mark padded time steps false. A missing head frame should raise; an auxiliary-camera failure may be black-filled. Keep camera composition and frame stride identical between training and deployment.
+Every video frame is real (there is no video padding mask); a source window too short for the layout is not sampled. For video-only data, emit zero actions with an all-false `action_mask`; zero values alone do not disable loss. A missing head frame should raise; an auxiliary-camera failure may be black-filled. Keep camera composition and frame stride identical between training and deployment.
 
 ### Define an action space
 
@@ -87,7 +86,10 @@ Add a YAML file under [configs/dataloader/](../../configs/dataloader/):
 type: my_benchmark
 dataset_dir: /path/to/dataset
 num_frames: 33
-video_stride: 4
+history_offsets: [0]                  # rows of the history frames (last = the current frame t)
+future_offsets: [4, 8, 12, 16, 20, 24, 28, 32]
+history_sampling: fixed               # fixed | random (train split: H-1 random rows of the past history_window rows)
+history_window: 100                   # random only; must reach the oldest history offset
 window_stride: 1
 
 # Image layout
@@ -99,7 +101,7 @@ multiview: false
 normalize_mode: min-max              # min-max, z-score, quantile, or null
 ~~~
 
-Use [openwam/dataloader/transforms/builder.py](../../openwam/dataloader/transforms/builder.py) for rotation conversion, normalization, and video augmentation. Compute statistics from the training split and store them under `meta/`. A deployable reader writes `meta/normalization_stats.npy`; deployment gathers unified slots back to raw dimensions before unnormalizing. Keep the same statistics artifact with the checkpoint.
+Use [openwam/dataloader/utils/normalization.py](../../openwam/dataloader/utils/normalization.py) for normalization, [openwam/dataloader/utils/rotation.py](../../openwam/dataloader/utils/rotation.py) for the 6D rotation conversion and [openwam/dataloader/transforms/video.py](../../openwam/dataloader/transforms/video.py) for color jitter (train split, inside the dataset). Compute statistics from the training split and store them under `meta/`. A deployable reader writes `meta/normalization_stats.npy`; deployment gathers unified slots back to raw dimensions before unnormalizing. Keep the same statistics artifact with the checkpoint.
 
 Inspect one sample through the registry:
 

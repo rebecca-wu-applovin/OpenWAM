@@ -8,21 +8,22 @@ from __future__ import annotations
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
+from openwam.model.architectures.utils.mask_modes import build_frame_mask
 from openwam.model.video_backbone.ge.masks import build_ge_joint_masks, view_index
 
 T, V, HH, WW, H, A, L = 4, 2, 2, 3, 2, 5, 6
 TPF = V * HH * WW
 SV = T * TPF
 NH = H * TPF
+# T latents, the first H clean (bidirectional among themselves), mutual v<->a.
+FM = build_frame_mask(OmegaConf.create({"num_latents": T, "num_hist_latents": H}), "bidirectional", "mutual")
 
 
 @pytest.fixture(scope="module")
 def masks():
-    return build_ge_joint_masks(
-        n_frames=T, n_view=V, view_h=HH, view_w=WW, s_action=A, num_clean_frames=H,
-        attention_mask_mode="mutual", video_mask_mode="first_frame_causal", num_layers=L,
-    )
+    return build_ge_joint_masks(FM, n_view=V, view_h=HH, view_w=WW, s_action=A, num_layers=L)
 
 
 def test_layer_pattern(masks):
@@ -68,14 +69,12 @@ def test_history_view_pattern(masks):
     assert torch.equal(masks[1][:NH, :NH], same)  # per-view: own view only
 
 
-def test_ge_native_bidirectional_video_only():
-    m = build_ge_joint_masks(
-        n_frames=T, n_view=V, view_h=HH, view_w=WW, s_action=0, num_clean_frames=H,
-        attention_mask_mode="mutual", video_mask_mode="bidirectional", num_layers=3,
-    )
+def test_video_only_masks(masks):
+    m = build_ge_joint_masks(FM, n_view=V, view_h=HH, view_w=WW, s_action=0, num_layers=3)
     vid = view_index(T, V, HH, WW)
-    assert m[0].all()  # cross-view block = plain full attention
-    assert torch.equal(m[1], vid[:, None] == vid[None, :])  # per-view block = GE's (b v) batching
+    # Without action tokens the masks are the video blocks of the joint ones.
+    assert torch.equal(m[0], masks[0][:SV, :SV])
+    assert torch.equal(m[1], m[0] & (vid[:, None] == vid[None, :]))  # per-view block = GE's (b v) batching
 
 
 def test_native_noise_sampler_matches_ge_trainer():

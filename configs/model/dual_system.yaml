@@ -17,14 +17,21 @@ architecture:
   variant: joint_self_attn   # joint_self_attn | joint_cross_attn
 
   action_dim: 80             # 80 = unified action space (unify_action=true); raw width otherwise (e.g. yam_sharpa fingertips_* = 48)
-  use_proprioception: true   # true = dataloader must provide sample["proprio"], appended as one proprio token
+  use_proprioception: true   # true = one proprio token per history frame, appended to ActionDiT's text context
   state_dim: 80              # proprio width; required when use_proprioception=true
+  # How the video backbone sees the proprio: context_token (the same appended tokens as ActionDiT) |
+  # backbone_stream (the backbone embeds it in its own stream; flux, whose yaml requires it).
+  proprio_input: context_token
 
-  # Video<->action visibility (joint_self_attn only):
-  #   mutual | action_sees_video | video_sees_action | isolated
+  # Video<->action visibility (joint_self_attn only): mutual (the only implemented one;
+  # action_sees_video | video_sees_action | isolated are reserved and rejected by resolve_config)
   attention_mask_mode: mutual
-  # Video<->video visibility: first_frame_causal | per_frame_causal | bidirectional
-  video_attention_mask_mode: first_frame_causal
+  # Among the clean (history) latents: bidirectional | causal (latent i sees 0..i). Clean latents never see
+  # the noisy latents or the action; noisy latents and the action see everything.
+  clean_attention: bidirectional
+  # How the H - 1 past history frames are encoded: per_frame (each alone, H - 1 latents) | clip (one causal
+  # clip, 1 + (H - 2) / tc latents; needs H - 1 = 1 + tc*k). The current frame is always encoded alone.
+  history_encoding: per_frame
 
   # ActionDiT layer selection: explicit list, or null + bridge_interval (1 = every layer, 2 = every other).
   # joint_cross_attn: which video layers feed the bridge; joint_self_attn: sizes ActionDiT.

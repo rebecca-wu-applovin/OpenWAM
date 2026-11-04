@@ -11,13 +11,15 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from openwam.model.architectures.dual_system import DualSystemCrossAttnArchitecture
+from tests._arch import build_test_arch, stub_backbone
 
 
 def _make_tiny_architecture():
     """Create a minimal DualSystemCrossAttnArchitecture for testing."""
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "detach_bridge": False,
         "action_dim": 7,
@@ -28,7 +30,7 @@ def _make_tiny_architecture():
         "video_dim": 64,
         "bridge_layers": (0,),
     }
-    return DualSystemCrossAttnArchitecture(cfg=cfg)
+    return build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg))
 
 
 def test_e2e_train_save_load_infer():
@@ -99,12 +101,12 @@ def test_e2e_train_save_load_infer():
 
 def test_e2e_interleaved_forward_pass():
     """Smoke test: joint_self_attn architecture pre/post_attn_at_layer round-trip."""
-    from openwam.model.architectures.dual_system import DualSystemSelfAttnArchitecture
-
     B, T, action_dim, video_dim = 1, 4, 7, 64
 
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_self_attn",
         "action_dim": action_dim,
         "dim": video_dim,
@@ -114,7 +116,7 @@ def test_e2e_interleaved_forward_pass():
         "video_dim": video_dim,
         "bridge_layers": (0,),
     }
-    arch = DualSystemSelfAttnArchitecture(cfg=cfg)
+    arch = build_test_arch("dual_system_self_attn", cfg, stub_backbone(cfg))
     arch.eval()
 
     noisy_actions = torch.randn(B, T, action_dim)

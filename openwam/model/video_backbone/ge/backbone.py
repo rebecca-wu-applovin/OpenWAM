@@ -116,7 +116,6 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         self._dit_patch_size = (1, 1, 1)
         self._temporal_compression = _GE_TEMPORAL_COMPRESSION
         self._causal_temporal = True
-        self._video_attention_mask_mode = "bidirectional"
         # Text slot read by encode_text: the online T5 here, a PromptCache after build_text_cache.
         self.text_lookup = self._t5_entries
         self._mask_cache: dict = {}
@@ -149,15 +148,6 @@ class GEBaseFastVideoBackbone(VideoBackbone):
     def text_dim(self) -> Optional[int]:
         """T5-XXL hidden width (the context the framework appends proprio to)."""
         return int(self.dit.config.caption_channels)
-
-    @property
-    def video_attention_mask_mode(self) -> str:
-        return self._video_attention_mask_mode
-
-    @video_attention_mask_mode.setter
-    def video_attention_mask_mode(self, mode: str) -> None:
-        self._video_attention_mask_mode = str(mode)
-        self._mask_cache = {}
 
     # ================================================================
     # Construction
@@ -418,18 +408,20 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         latents: Tensor,
         timestep: Tensor,
         text: TextCondition,
-        num_clean_latents: int,
-        raw_proprio: Optional[Tensor] = None,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
+        layout,
+        proprio: Tensor,
+        use_gradient_checkpointing: bool,
+        use_gradient_checkpointing_offload: bool,
     ) -> BlockLoopState:
         """Patchify (patch 1: one token per latent pixel), per-token time / view modulation, RoPE, text.
 
         Args:
             latents: (B, 128, T, V*h, w). timestep: (B,) in [0, 1000].
             text: TextCondition, context (B, L, 4096) (text, + proprio appended by the framework), context_mask (B, L).
-            num_clean_latents: int H, clean prefix latents (their tokens get t = 0, GE pixel_wise_timestep).
-            raw_proprio: unused. use_gradient_checkpointing(_offload): bool loop flags.
+            layout: ``cfg.common.layout``; the first ``num_hist_latents`` latents are clean (their tokens get t = 0,
+                GE pixel_wise_timestep).
+            proprio: (B, H, D) normalized proprio; unused (context tokens). use_gradient_checkpointing(_offload):
+                bool loop flags.
 
         Returns:
             BlockLoopState.
@@ -439,7 +431,7 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         t_lat, vh, vw = self._grid(latents)
         n_view = self._n_view
         tpf = n_view * vh * vw
-        n_clean = int(num_clean_latents)
+        n_clean = int(layout.num_hist_latents)
 
         # Tokens: frame-major, views inside a frame (= flatten the stacked latent grid).
         hidden = dit.proj_in(rearrange(latents, "b c t h w -> b (t h w) c").to(dit.proj_in.weight.dtype))
@@ -486,7 +478,7 @@ class GEBaseFastVideoBackbone(VideoBackbone):
             grid_width=vw,
             use_gradient_checkpointing=bool(use_gradient_checkpointing),
             use_gradient_checkpointing_offload=bool(use_gradient_checkpointing_offload),
-            extras={"cos": cos, "sin": sin, "emb_t": emb_t, "view_h": vh, "n_clean": max(n_clean, 1)},
+            extras={"cos": cos, "sin": sin, "emb_t": emb_t, "view_h": vh},
         )
 
     def _ada(self, layer_id: int, state: BlockLoopState):
@@ -530,42 +522,49 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         out = out.transpose(1, 2).flatten(2, 3).to(q.dtype)
         return attn.to_out[1](attn.to_out[0](out))
 
-    def _layer_masks(self, state: BlockLoopState, s_action: int, attention_mask_mode: str, num_clean_frames: int):
-        """Cached per-layer masks for this grid (see ``ge/masks.py``)."""
-        key = (state.grid_frames, state.extras["view_h"], state.grid_width, s_action, attention_mask_mode,
-               num_clean_frames, self._video_attention_mask_mode, str(state.hidden_states.device))
-        if key not in self._mask_cache:
-            # Lazy: masks.py imports the architecture mask helpers.
-            from openwam.model.video_backbone.ge.masks import build_ge_joint_masks
+    def build_joint_attention_masks(self, frame_mask: Tensor, state: BlockLoopState, s_action: int) -> list:
+        """One (S_v + S_a)^2 bool mask per layer: the frame mask with GE's per-view / cross-view block pattern.
 
+        Args:
+            frame_mask: (T + 1, T + 1) bool frame mask. state: BlockLoopState (grid, ``view_h``). s_action: int.
+
+        Returns:
+            list of ``num_layers`` masks (cached per grid / action length / device).
+        """
+        from openwam.model.video_backbone.base import frame_tokens
+        from openwam.model.video_backbone.ge.masks import build_ge_joint_masks
+
+        frame_tokens(frame_mask, state, int(state.hidden_states.shape[1]))  # latent count must match the layout
+        # The frame mask is fixed per architecture: the grid / action length / device identify the masks.
+        key = (state.grid_frames, state.extras["view_h"], state.grid_width, int(s_action), str(state.hidden_states.device))
+        if key not in self._mask_cache:
             self._mask_cache[key] = build_ge_joint_masks(
-                n_frames=state.grid_frames,
+                frame_mask,
                 n_view=self._n_view,
                 view_h=state.extras["view_h"],
                 view_w=state.grid_width,
-                s_action=s_action,
-                num_clean_frames=num_clean_frames,
-                attention_mask_mode=attention_mask_mode,
-                video_mask_mode=self._video_attention_mask_mode,
+                s_action=int(s_action),
                 num_layers=self._num_layers,
                 device=state.hidden_states.device,
             )
         return self._mask_cache[key]
 
-    def build_joint_attention_masks(self, vstate: BlockLoopState, *, s_action: int, attention_mask_mode: str, num_clean_frames: int):
-        """MoT hook: one (S_v + S_a)^2 bool mask per layer (GE per-view / cross-view pattern + history rule)."""
-        return self._layer_masks(vstate, s_action, attention_mask_mode, num_clean_frames)
+    def run_block(self, block_id: int, state: BlockLoopState, attn_mask: Tensor) -> BlockLoopState:
+        """Video-only block (no action stream).
 
-    def run_block(self, block_id: int, state: BlockLoopState) -> BlockLoopState:
-        """Video-only block (no action stream): same masks with zero action tokens."""
+        Args:
+            block_id: int. state: BlockLoopState. attn_mask: (S, S) bool mask of this layer.
+
+        Returns:
+            ``state`` with ``hidden_states`` updated.
+        """
 
         def _body(x):
             local = BlockLoopState(**{**state.__dict__, "hidden_states": x})
             q, k, v, post = self.pre_attn_at_layer(block_id, local)
-            mask = self._layer_masks(state, 0, "mutual", state.extras["n_clean"])[block_id]
             n = self._num_heads
             q, k, v = (t.unflatten(2, (n, -1)).transpose(1, 2) for t in (q, k, v))
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask).transpose(1, 2).flatten(2, 3)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask).transpose(1, 2).flatten(2, 3)
             return self.post_attn_at_layer(block_id, local, out, post).hidden_states
 
         if state.use_gradient_checkpointing and torch.is_grad_enabled():
@@ -587,9 +586,6 @@ class GEBaseFastVideoBackbone(VideoBackbone):
     # ================================================================
     # Deploy assets
     # ================================================================
-
-    def build_video_to_video_mask(self, video_seq_len: int, video_tokens_per_frame: int, device) -> Tensor:
-        raise NotImplementedError("ge_base_fast builds its masks per layer (build_joint_attention_masks)")
 
     def save_deploy_assets(self, output_dir: str) -> None:
         """Copy the VAE / T5 ``config.json`` and the tokenizer into ``<output_dir>/ltx/`` (from_checkpoint_dir reads them).

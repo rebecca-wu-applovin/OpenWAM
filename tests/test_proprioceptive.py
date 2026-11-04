@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from openwam.model.architectures.dual_system.joint_self_attn import DualSystemSelfAttnArchitecture
 from openwam.model.video_backbone.base import TextCondition
+from tests._arch import proprio_context_arch
 
 
 def _text(context, seq_lens=None):
@@ -14,46 +14,29 @@ def _text(context, seq_lens=None):
     return TextCondition(context=context, context_mask=torch.arange(l)[None] < lens[:, None])
 
 
-class _ContextProprioArch(DualSystemSelfAttnArchitecture):
-    """Tiny architecture shell that only exercises BaseWAMArchitecture helpers."""
-
-    def __init__(self, *, state_dim: int = 14, text_dim: int = 32):
-        super().__init__(None)
-        self._device = torch.device("cpu")
-        self._dtype = torch.float32
-        self._init_proprio_context(
-            {
-                "use_proprioception": True,
-                "state_dim": state_dim,
-                "text_dim": text_dim,
-            },
-            text_dim=text_dim,
-        )
-
-
 def test_proprio_context_token_extends_context_and_mask():
-    arch = _ContextProprioArch(state_dim=7, text_dim=16)
+    arch = proprio_context_arch(state_dim=7, text_dim=16)
     text = _text(torch.randn(2, 4, 16), torch.tensor([2, 4]))
-    proprio = torch.randn(2, 7)
 
-    out = arch._append_proprio_context_token(text, proprio, None)
+    _, out = arch.build_contexts(text, torch.randn(2, 1, 7), torch.ones(2, 1, 7, dtype=torch.bool))
 
     assert out.context.shape == (2, 5, 16)
     assert out.context_mask.shape == (2, 5)
     assert out.context_mask[:, -1].all()
+    # The token follows the padded text, so the valid tokens are not a prefix any more.
     assert out.context_mask[0].tolist() == [True, True, False, False, True]
 
 
-def test_proprio_context_requires_dataset_field():
-    arch = _ContextProprioArch(state_dim=7, text_dim=16)
-    with pytest.raises(ValueError, match="requires `proprio`"):
-        arch._append_proprio_context_token(_text(torch.randn(1, 4, 16)), None, None)
+def test_proprio_context_needs_one_row_per_history_frame():
+    arch = proprio_context_arch(state_dim=7, text_dim=16, h=3)
+    with pytest.raises(ValueError, match="proprio must be"):
+        arch.build_contexts(_text(torch.randn(1, 4, 16)), torch.randn(1, 1, 7), torch.ones(1, 1, 7, dtype=torch.bool))
 
 
 def test_proprio_context_validates_dim():
-    arch = _ContextProprioArch(state_dim=7, text_dim=16)
-    with pytest.raises(ValueError, match="last dim must be 7"):
-        arch._append_proprio_context_token(_text(torch.randn(1, 4, 16)), torch.randn(1, 6), None)
+    arch = proprio_context_arch(state_dim=7, text_dim=16)
+    with pytest.raises(ValueError, match="proprio must be"):
+        arch.build_contexts(_text(torch.randn(1, 4, 16)), torch.randn(1, 1, 6), torch.ones(1, 1, 6, dtype=torch.bool))
 
 
 def test_action_dit_rejects_per_token_timestep():

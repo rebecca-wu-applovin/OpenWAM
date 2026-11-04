@@ -31,8 +31,9 @@ architecture:
   state_dim: 80                          # proprioception width
 
   # Attention visibility
-  attention_mask_mode: mutual            # mutual | action_sees_video | video_sees_action | isolated
-  video_attention_mask_mode: first_frame_causal  # first_frame_causal | per_frame_causal | bidirectional
+  attention_mask_mode: mutual            # only mutual is implemented (the other three values are rejected)
+  clean_attention: bidirectional         # among the clean history latents: bidirectional | causal
+  history_encoding: per_frame            # past history frames: per_frame | clip
 
   # Bridge and memory controls
   bridge_layers: null                    # explicit layers; null uses bridge_interval
@@ -97,7 +98,7 @@ bash scripts/train.sh \
   dataloader.action_mode=fingertips_rel
 ~~~
 
-Each registered class implements from_config(config, split) and returns window samples. The trainer keeps samples as a list of dictionaries. num_frames is the raw state/action window length; the action horizon is num_frames - 1. Video is subsampled by video_stride, so the standard 33/4 setting yields 9 video frames. Camera layout, transforms, normalization, action maps, and masks belong to the dataloader.
+Each registered class implements from_config(config, split) and returns window samples. The trainer keeps samples as a list of dictionaries. num_frames is the raw state/action window length; the action horizon is num_frames - 1. Video is the history rows t + history_offsets followed by the future rows t + future_offsets; the standard first-frame setting (history_offsets [0], future_offsets [4, 8, ..., 32]) yields 9 video frames. Camera layout, transforms, normalization, action maps, and masks belong to the dataloader.
 
 ## 2. Start training
 
@@ -208,8 +209,6 @@ optimization:
     self_attn: {torch_mode: default, dynamic: false}
     cross_attn: {torch_mode: default, dynamic: false}
 
-  # Reuse text features
-  prompt_embed_cache: {enabled: true, maxsize: 32}
 ~~~
 
 Compilation can add first-request warm-up latency. Source code: `scripts/train.py`, `openwam/train/openwam_trainer.py`, `scripts/deploy.py`, and `openwam/deploy/`.

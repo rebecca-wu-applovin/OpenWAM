@@ -6,15 +6,19 @@ from __future__ import annotations
 import pytest
 import torch
 from einops import rearrange
+from omegaconf import OmegaConf
 
+from openwam.model.architectures.utils.mask_modes import build_frame_mask
 from openwam.model.video_backbone.base import TextCondition
 from openwam.model.video_backbone.flux.backbone import _N_MODE, FluxActionVideoBackbone
+from openwam.model.video_backbone.flux.dit import JointSingleSeq, JointSingleSeqParams
 from openwam.model.video_backbone.flux.masks import build_flux_layer_masks, build_stream_ids, video_time_ids
 from openwam.model.video_backbone.flux.positional import batched_prc_action, batched_prc_txt, batched_prc_vid
-from openwam.model.video_backbone.flux.dit import JointSingleSeq, JointSingleSeqParams
 
 SEG = {"txt": 4, "video": 6, "video_cond": 9, "action_cond": 3}  # T, F, H, P token counts
 SA = 2  # OpenWAM action tokens
+# 3 clean (H) + 2 noisy (F) latents of 3 tokens each, as in SEG.
+FM = build_frame_mask(OmegaConf.create({"num_latents": 5, "num_hist_latents": 3}), "bidirectional", "mutual")
 ORDER = ["txt", "video", "video_cond", "action_cond", "action"]
 
 
@@ -44,7 +48,7 @@ def test_stream_ids():
 
 
 def test_layer_masks():
-    masks = build_flux_layer_masks(SEG, SA, None, num_mode_layers=5, num_layers=33, device="cpu")
+    masks = build_flux_layer_masks(FM, SEG, SA, None, n_hist=3, num_mode_layers=5, num_layers=33, device="cpu")
     assert len(masks) == 33
     sl = _slices()
     mode, single = masks[0], masks[5]
@@ -57,14 +61,16 @@ def test_layer_masks():
     assert single[sl["video_cond"], sl["txt"]].all() and single[sl["video_cond"], sl["action_cond"]].all()
     for rows in ("txt", "video", "action_cond", "action"):
         assert single[sl[rows]].all()
-    strict = build_flux_layer_masks(SEG, SA, None, num_mode_layers=5, num_layers=33, device="cpu",
+    strict = build_flux_layer_masks(FM, SEG, SA, None, n_hist=3, num_mode_layers=5, num_layers=33, device="cpu",
                                     strict_clean_rows=True)[5]
     for rows in ("txt", "action_cond"):
         assert not strict[sl[rows], sl["video"]].any() and not strict[sl[rows], sl["action"]].any()
 
 
 def test_text_padding_masks():
-    masks = build_flux_layer_masks(SEG, SA, torch.tensor([4, 2]), num_mode_layers=5, num_layers=33, device="cpu")
+    masks = build_flux_layer_masks(
+        FM, SEG, SA, torch.tensor([4, 2]), n_hist=3, num_mode_layers=5, num_layers=33, device="cpu"
+    )
     m = masks[5]
     assert m.shape == (2, 1, sum(SEG.values()) + SA, sum(SEG.values()) + SA)
     # sample 1: text keys 2, 3 hidden from every row except their own diagonal
@@ -114,8 +120,13 @@ def test_per_layer_path_matches_native_forward():
         x_action_cond=xp, x_action_cond_ids=ids["action_cond"][None],
         x_action_cond_timesteps=torch.zeros(xp.shape[:2]),
     )
-    text = TextCondition(context=ctx, context_mask=torch.ones(b, 5, dtype=torch.bool), extra={"text_len": 5})
-    st = vb.prepare(latents=lat, timestep=torch.full((b,), t * 1000), text=text, num_clean_latents=n_hist, raw_proprio=prop)
+    # proprio_input=backbone_stream: the text alone, the proprio rides the P stream.
+    text = TextCondition(context=ctx, context_mask=torch.ones(b, 5, dtype=torch.bool))
+    layout = OmegaConf.create({"num_hist_latents": n_hist, "num_proprio_tokens": n_hist})
+    st = vb.prepare(
+        latents=lat, timestep=torch.full((b,), t * 1000), text=text, layout=layout, proprio=prop,
+        use_gradient_checkpointing=False, use_gradient_checkpointing_offload=False,
+    )
     # native masks: mode blocks per stream, single blocks fully joint
     s = st.hidden_states.shape[1]
     sl = _slices({k: st.extras["seg_lens"][k] for k in SEG}, 0)
@@ -138,6 +149,8 @@ def test_per_layer_path_matches_native_forward():
 def test_mot_layer_count_and_geometry():
     vb = FluxActionVideoBackbone(dit=_tiny_trunk(), vae=torch.nn.Identity(), text_encoder=torch.nn.Identity(), text_encoder_dir="", action_cond_dim=4)
     assert vb.num_layers == _N_MODE + 2 and vb.head_dim * vb.num_heads == vb.dim
-    with pytest.raises(NotImplementedError):
-        st = type("S", (), {"extras": {"seg_lens": SEG, "text_valid": None}, "hidden_states": torch.zeros(1)})()
-        vb.build_joint_attention_masks(st, s_action=2, attention_mask_mode="isolated", num_clean_frames=5)
+    # The frame mask must describe exactly the stream's latents.
+    st = type("S", (), {"extras": {"seg_lens": SEG, "text_valid": None, "n_hist": 3}, "grid_frames": 4,
+                        "hidden_states": torch.zeros(1)})()
+    with pytest.raises(ValueError):
+        vb.build_joint_attention_masks(FM, st, 2)

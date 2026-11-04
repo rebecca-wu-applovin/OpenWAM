@@ -30,6 +30,7 @@ import os
 import torch
 from omegaconf import DictConfig
 
+from openwam.dataloader.collate import Batch, collate
 from openwam.train.utils.checkpointing import (
     compute_resume_position,
     finalize_keep_weights_only,
@@ -62,7 +63,8 @@ class OpenWAMTrainer:
     """Joint video-action trainer for OpenWAM. See module docstring for call order.
 
     Args:
-        cfg: Hydra DictConfig with model, training, data, project sections.
+        cfg: Hydra DictConfig with model, training, data, project sections, resolved by the entry point
+            (``openwam.config.resolve_config``: ``cfg.common.layout`` is set).
         accelerator: HuggingFace Accelerator instance.
         dataset: Training dataset (used for action stats loading).
     """
@@ -88,14 +90,21 @@ class OpenWAMTrainer:
                 logger.info("Reproducible mode: cfg.project.seed=%d (rank=%d)", self._run_seed, self._rank)
 
         t = cfg.training
-        m = cfg.model
 
         # Build architecture (creates video_backbone internally from config). The load mode is decided
         # here, once: no ckpt -> upstream pretrained weights; finetune / resume -> the checkpoint's shell
         # (same shell for both; they differ only in how its weights are filled, see ckpt_model_loader).
         from openwam.model import build_architecture, resolve_architecture_config
+        from openwam.model.architectures.base import TrainOptions
         from openwam.model.video_backbone import LoadMode
 
+        # Training knobs the architecture keeps from construction on (compute_loss reads them).
+        train_options = TrainOptions(
+            use_gradient_checkpointing=bool(t.use_gradient_checkpointing),
+            use_gradient_checkpointing_offload=bool(t.use_gradient_checkpointing_offload),
+            lambda_video=float(t.lambda_video),
+            lambda_action=float(t.lambda_action),
+        )
         finetune_path = cfg_get(t, "finetune_ckpt_path", None) or None
         resume_path = cfg_get(t, "resume_ckpt_path", None) or None
         if finetune_path and resume_path:
@@ -106,21 +115,29 @@ class OpenWAMTrainer:
             # Finetune starts a NEW run: this run's cfg.model is layered over the ckpt's and written back
             # in place, so the architecture built here and the config save_config() writes are the same.
             # Weights land here, BEFORE the freeze below.
-            self.architecture = build_for_finetune(finetune_path, cfg)
-            # The merge replaced the cfg.model node, so `m` (bound above) still points at the pre-merge
-            # one — rebind it before `freeze` and the architecture logging below read from it.
-            m = cfg.model
+            self.architecture = build_for_finetune(finetune_path, cfg, train_options)
+            model_cfg = cfg.model  # the merged model config, written back into cfg
         elif resume_path is not None:
             from openwam.train.utils.ckpt_model_loader import build_for_resume
 
             # Resume continues ONE run whose config.yaml is reused untouched (ckpt config authoritative);
             # its weights are restored by load_full_state after prepare.
-            self.architecture = build_for_resume(resume_path, cfg)
+            self.architecture, ckpt_cfg = build_for_resume(resume_path, cfg, train_options)
+            model_cfg = ckpt_cfg.model
         else:
-            resolved = resolve_architecture_config(m)
+            model_cfg = cfg.model
+            resolved = resolve_architecture_config(model_cfg)
             self.architecture = build_architecture(
-                resolved.registry_name, resolved.params, mode=LoadMode.PRETRAINED, ckpt_dir=None
+                resolved.registry_name,
+                resolved.params,
+                layout=cfg.common.layout,
+                mode=LoadMode.PRETRAINED,
+                ckpt_dir=None,
+                train_options=train_options,
             )
+        # Single source for every model-side decision below (freeze list, text cache): the model config the
+        # architecture was built from (resume: the checkpoint's, not the live one).
+        self.model_cfg = model_cfg
         logger.info("Architecture: %s", type(self.architecture).__name__)
 
         # Device placement: skip .to(device) when initialize_model_on_cpu and a real
@@ -131,25 +148,12 @@ class OpenWAMTrainer:
 
         # --- Freeze: declared per-architecture in the model yaml (freeze:);
         # freeze_modules silently skips paths absent on a given architecture.
-        freeze_list = list(getattr(m, "freeze", []))
+        freeze_list = list(getattr(self.model_cfg, "freeze", []))
         for name in self.architecture.freeze_modules(freeze_list):
             logger.info("Frozen: %s", name)
 
         # Initialize all schedulers (video + action) inside architecture
         self.architecture.init_training_schedulers(1000)
-
-        # Loss weights from the training config
-        self.lambda_video = float(t.lambda_video)
-        self.lambda_action = float(t.lambda_action)
-
-        # Push forward-time training flags onto the architecture so prepare_inputs
-        # is self-contained.
-        self.architecture.set_training_runtime(
-            use_gradient_checkpointing=bool(t.use_gradient_checkpointing),
-            use_gradient_checkpointing_offload=bool(t.use_gradient_checkpointing_offload),
-            max_timestep_boundary=float(t.max_timestep_boundary),
-            min_timestep_boundary=float(t.min_timestep_boundary),
-        )
 
         self.model = self  # self-reference some external callers expect
 
@@ -283,7 +287,7 @@ class OpenWAMTrainer:
 
         # Text cache only now that the weights are final (prepare -> resume load_full_state -> cache, the same
         # order for every mode): on resume the text encoder holds real values only after load_full_state.
-        if bool(self.cfg.model.video_backbone.text_cache):
+        if bool(self.model_cfg.video_backbone.text_cache):
             self.build_text_cache()
 
         _step_t0 = _time.monotonic()
@@ -410,7 +414,7 @@ class OpenWAMTrainer:
             batch_size=batch_size,
             shuffle=True,
             num_workers=int(t.dataset_num_workers),
-            collate_fn=list,
+            collate_fn=collate,
             pin_memory=True,
         )
         if self._run_seed is not None:
@@ -516,8 +520,8 @@ class OpenWAMTrainer:
         # AttributeError under a hypothetical plain-DDP accelerator (world_size>1).
         # unwrap_model returns the inner module for both backends (no-op single-GPU,
         # where Accelerate adds no wrapper). NB: this only covers these setup-time
-        # helpers — the training loop's self.architecture.prepare_inputs/compute_loss
-        # calls would hit the same non-forwarding wrapper if a non-DeepSpeed multi-GPU
+        # helpers — the training loop's self.architecture.compute_loss
+        # call would hit the same non-forwarding wrapper if a non-DeepSpeed multi-GPU
         # path is ever reintroduced.
         arch = self.accelerator.unwrap_model(self.architecture)
         # Propagate device down through architecture; frozen modules (T5/VAE) idempotent move.
@@ -569,24 +573,17 @@ class OpenWAMTrainer:
         return global_step, opt_step, start_epoch, skip
 
     # (9) Called each step in train()'s loop — joint video-action loss dict (total/video/action).
-    def compute_loss(self, batch) -> dict:
-        """Compute joint video-action loss. Returns dict: total/video/action."""
-        if not isinstance(batch, list):
-            batch = [batch]
+    def compute_loss(self, batch: Batch) -> dict:
+        """Joint video-action loss of one collated batch.
 
-        inputs = self.architecture.prepare_inputs(batch)
-        timer = getattr(self, "_timer", None)
-        if timer is not None:
-            timer.mark("encode")  # frozen VAE/T5 encode, split from the trainable forward
-        if self.lambda_action > 0 and inputs.get("actions") is None:
-            raise ValueError("lambda_action > 0 but no action in data.")
+        Args:
+            batch: Batch from the DataLoader (``collate``).
 
-        result = self.architecture.compute_loss(
-            **inputs,
-            lambda_video=self.lambda_video,
-            lambda_action=self.lambda_action,
-        )
-
+        Returns:
+            dict of 0-dim tensors: total (carries the graph), video, action.
+        """
+        arch = self.accelerator.unwrap_model(self.architecture)
+        result = self.architecture.compute_loss(batch.to(arch.device, arch.dtype))
         return {
             "total": result["loss"],
             "video": result.get("loss_video", torch.tensor(0.0)),

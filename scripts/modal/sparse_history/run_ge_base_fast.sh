@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 07 sparse-history arm on Modal: GE-Base-fast (8x VAE: 1+8 future frames).
 # 8xH100 by default (GPU_TYPE=H200 for 8xH200), bs 6/GPU (global 48), no gradient checkpointing. Layout as 07_sparse_history_backbones/smoke.sh:
-# 5 history frames at 1 fps (rows t-80..t) + future rows [5,10,15,20,25,30,35,40,45], 5 proprio tokens, two 192x224 views stacked.
+# 5 history frames at 1 fps (rows t-80..t) + future rows [4,8,...,32] (8 frames: 1 latent at 8x), 5 proprio tokens, two 192x224 views stacked.
 #
 #   bash scripts/modal/sparse_history/run_ge_base_fast.sh                    # extra Hydra overrides are appended
 #   GPU_TYPE=H200 bash scripts/modal/sparse_history/run_ge_base_fast.sh   # H100 (default) | H200
@@ -14,8 +14,7 @@ export WANDB_GROUP="${WANDB_GROUP:-1016_sparse_history_backbones}"
 export WANDB_RUN_NAME="${WANDB_RUN_NAME:-sparse_ge_base_fast_b48}"
 exec bash run_modal.sh \
   dataloader.height=384 dataloader.width=224 \
-  '+dataloader.history_offsets=[-80,-60,-40,-20,0]' '+dataloader.future_offsets=[5,10,15,20,25,30,35,40,45]' +dataloader.min_rows_ahead=45 \
-  +model.architecture.num_history_frames=5 +model.architecture.num_proprio_tokens=5 \
-  model.architecture.video_attention_mask_mode=first_frame_causal \
+  'dataloader.history_offsets=[-80,-60,-40,-20,0]' 'dataloader.future_offsets=[4,8,12,16,20,24,28,32]' \
+  model.architecture.clean_attention=bidirectional \
   training.batch_size=6 training.use_gradient_checkpointing=false \
   "$@"

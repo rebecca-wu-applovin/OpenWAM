@@ -8,21 +8,19 @@ Register a reader with [openwam/dataloader/registry.py](../../openwam/dataloader
 
 ~~~text
 # Video and prompt
-video              list[PIL.Image]
-first_frame_image  list[PIL.Image]
+video              list[PIL.Image], H + F frames (history, the current frame t last, then the future)
 prompt             str
 
 # Action and state; both use the fixed α width
 # action: (T - 1, 80), action_mask: (T - 1, 80)
-# proprio: (1, 80), proprio_mask: (1, 80)
+# proprio: (H, 80), proprio_mask: (H, 80), one row per history frame
 action             float Tensor
 action_mask        bool Tensor
 proprio            float Tensor
 proprio_mask       bool Tensor
-
-# Valid video positions
-video_mask         bool Tensor, shape (num_video_frames,)
 ~~~
+
+`collate` ([openwam/dataloader/collate.py](../../openwam/dataloader/collate.py)) stacks these into the `Batch` that `compute_loss` takes; the mixture dataset adds `source` (the sub-dataset name).
 
 Use [BaseDataset](../../openwam/dataloader/bases/dataset.py) for a custom source or [LeRobotV3Reader](../../openwam/dataloader/bases/lerobot_v3_reader.py) for LeRobot v3 data. Add a Hydra file under [configs/dataloader/](../../configs/dataloader/):
 
@@ -37,11 +35,14 @@ unify_action_map: [0-9, 34-43]       # source dimensions mapped to α slots
 # α preprocessing and temporal contract
 normalize_mode: min-max              # fixed for α fine-tuning
 num_frames: 33                       # 32-action chunk: num_frames - 1
-video_stride: 4                      # 9 sampled video frames from 33 source frames
+history_offsets: [0]                 # the current frame t ...
+future_offsets: [4, 8, 12, 16, 20, 24, 28, 32]   # ... + 8 future frames: 9 sampled video frames over 33 rows
+history_sampling: fixed              # history rows = history_offsets
+history_window: 100                  # only read by history_sampling: random
 window_stride: 1
 ~~~
 
-`num_frames=33`, `video_stride=4`, and the derived 32-action chunk are fixed. There is no separate `action_chunk` YAML key for the standard sampler; `inference_horizon` only limits how many generated actions are consumed before the next generation.
+`num_frames=33`, the 9-frame `history_offsets` / `future_offsets` layout, and the derived 32-action chunk are fixed. There is no separate `action_chunk` YAML key for the standard sampler; `inference_horizon` only limits how many generated actions are consumed before the next generation.
 
 ### The α action and preprocessing contract
 
@@ -86,7 +87,7 @@ max = +1
 
 Fit statistics on the training split. Set the rot6d statistics to the identity values above so those components are unchanged. If normalization runs before unified scatter, pin native rot6d dimensions before `map_to_unify`; if it runs after scatter, pin both α slot ranges. Apply the same rule to proprioception. Keep `normalization_stats.npy` with the run for deployment.
 
-Relevant helpers are [openwam/dataloader/utils/normalization.py](../../openwam/dataloader/utils/normalization.py), [openwam/dataloader/utils/unify_action.py](../../openwam/dataloader/utils/unify_action.py), and [openwam/dataloader/transforms/rotation.py](../../openwam/dataloader/transforms/rotation.py).
+Relevant helpers are [openwam/dataloader/utils/normalization.py](../../openwam/dataloader/utils/normalization.py), [openwam/dataloader/utils/unify_action.py](../../openwam/dataloader/utils/unify_action.py), and [openwam/dataloader/utils/rotation.py](../../openwam/dataloader/utils/rotation.py).
 
 ## 2. Download the foundation checkpoint
 

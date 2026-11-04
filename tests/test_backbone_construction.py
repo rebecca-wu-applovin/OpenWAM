@@ -184,16 +184,14 @@ def test_flux_checkpoint_shell_from_yaml(tmp_path):
     vb = FluxActionVideoBackbone.from_checkpoint_dir(_compose_vb("flux3_action_base"), ckpt)
     assert all(p.is_meta for p in vb.parameters())
     assert (vb.dim, vb.num_layers, vb.num_heads, vb.text_dim) == (3072, 33, 24, 20480)
-    assert vb.action_cond_dim == 48
+    assert vb.state_dim == 48  # the P stream width (yaml action_cond_dim)
 
 
-def test_flux_action_cond_dim_must_equal_state_dim(tmp_path):
-    """The P stream input width is declared in the backbone yaml; the architecture rejects a different state_dim."""
-    from openwam.model import build_architecture_from_ckpt_dir
-    from openwam.model.architectures import resolve_architecture_config  # noqa: F401  (registers architectures)
-
-    ckpt = _flux_ckpt_assets(tmp_path)
+def test_flux_action_cond_dim_must_equal_state_dim():
+    """The P stream input width is declared in the backbone yaml; resolve_config rejects a different state_dim."""
     from hydra import compose, initialize_config_dir
+
+    from openwam.config import resolve_config
 
     with initialize_config_dir(config_dir=os.path.join(REPO, "configs"), version_base=None):
         cfg = compose(
@@ -201,12 +199,13 @@ def test_flux_action_cond_dim_must_equal_state_dim(tmp_path):
             overrides=[
                 "model/video_backbone=flux3_action_base",
                 "model=dual_system",
+                "model.architecture.proprio_input=backbone_stream",
                 "model.architecture.state_dim=80",
                 "model.architecture.action_dim=80",
             ],
         )
     with pytest.raises(ValueError, match="action_cond_dim"):
-        build_architecture_from_ckpt_dir(ckpt, cfg.model)
+        resolve_config(cfg)
 
 
 # ----------------------------------------------------------------------------- real weights

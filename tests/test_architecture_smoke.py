@@ -9,13 +9,14 @@ These tests exercise each path with fake tensors; no GPU required.
 
 import torch
 
+from tests._arch import build_test_arch, stub_backbone
+
 
 def _make_dual_system(variant="joint_cross_attn", detach_bridge=True, dim=64, video_dim=64):
-    from openwam.model import build_architecture
-    from openwam.model.video_backbone import LoadMode
-
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": variant,
         "detach_bridge": detach_bridge,
         "action_dim": 7,
@@ -25,12 +26,8 @@ def _make_dual_system(variant="joint_cross_attn", detach_bridge=True, dim=64, vi
         "video_dim": video_dim,
         "bridge_layers": (0, 2),
     }
-    return build_architecture(
-        "dual_system_cross_attn" if variant == "joint_cross_attn" else "dual_system_self_attn",
-        cfg,
-        mode=LoadMode.PRETRAINED,
-        ckpt_dir=None,
-    )
+    name = "dual_system_cross_attn" if variant == "joint_cross_attn" else "dual_system_self_attn"
+    return build_test_arch(name, cfg, stub_backbone(cfg))
 
 
 def test_dual_system_joint_cross_attn_flow():
@@ -76,69 +73,20 @@ def test_dual_system_joint_self_attn_flow():
 
 
 def test_dual_system_self_attn_has_mot_driver():
-    """DualSystemSelfAttn must construct a DualSystemMoTDriver when wired with a video backbone."""
-    # The __init__ short-circuits when video_backbone is None, so this just checks
-    # the attribute is present on the architecture (MoT driver itself is exercised
-    # in tests/test_mot_driver.py).
-    arch = _make_dual_system("joint_self_attn", detach_bridge=False, dim=64, video_dim=64)
-    # No video backbone in the test factory → driver is None, but the slot exists.
-    assert hasattr(arch, "_mot_driver")
-
-
-def _build_dispatch_arch_with_fakes():
-    """Construct a ``DualSystemSelfAttnArchitecture`` with stub backbones for
-    dispatch unit tests.
-
-    The architecture's normal ``__init__`` requires a video backbone config
-    to build ActionDiT; here we sidestep that by constructing with
-    ``cfg=None`` and attaching stub backbones manually, so the test focuses
-    on :meth:`build_mot_driver` dispatch logic alone.
-    """
-    import torch.nn as nn
-
-    from openwam.model.architectures.dual_system.joint_self_attn import (
-        DualSystemSelfAttnArchitecture,
-    )
-
-    class _StubBackbone(nn.Module):
-        @property
-        def num_layers(self) -> int:
-            return 2
-
-        @property
-        def num_heads(self) -> int:
-            return 4
-
-        @property
-        def head_dim(self) -> int:
-            return 16
-
-        video_attention_mask_mode = "bidirectional"
-
-    arch = DualSystemSelfAttnArchitecture(cfg=None)
-    arch.video_backbone = _StubBackbone()
-    arch.action_backbone = _StubBackbone()
-    arch._mot_driver_kwargs = {
-        "mot_checkpoint_mixed_attn": True,
-        "attention_mask_mode": "action_sees_video",
-        "video_attention_mask_mode": "first_frame_causal",
-    }
-    return arch
-
-
-def test_build_mot_driver_dispatches_softmax_to_mot_driver():
-    """Default kernel routes to :class:`DualSystemMoTDriver` (Wan unaffected)."""
+    """DualSystemSelfAttn builds its DualSystemMoTDriver at construction (the default kernel; the driver itself
+    is exercised in tests/test_mot_driver.py)."""
     from openwam.model.architectures.dual_system.mot_driver import DualSystemMoTDriver
 
-    arch = _build_dispatch_arch_with_fakes()
+    arch = _make_dual_system("joint_self_attn", detach_bridge=False, dim=64, video_dim=64)
+    assert type(arch.mot_driver) is DualSystemMoTDriver
+    # Re-callable: a rebuild pairs the same two backbones.
     driver = arch.build_mot_driver()
-    assert type(driver) is DualSystemMoTDriver
+    assert type(driver) is DualSystemMoTDriver and driver.vb is arch.video_backbone and driver.ab is arch.action_backbone
 
 
 def test_all_architectures_registered():
     """Supported top-level architecture families should be in the registry."""
-    from openwam.model import list_supported_architectures
+    from openwam.model import ARCHITECTURE_REGISTRY
 
-    supported = list_supported_architectures()
-    assert "dual_system_cross_attn" in supported
-    assert "dual_system_self_attn" in supported
+    assert "dual_system_cross_attn" in ARCHITECTURE_REGISTRY
+    assert "dual_system_self_attn" in ARCHITECTURE_REGISTRY

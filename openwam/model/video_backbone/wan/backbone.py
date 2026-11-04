@@ -21,7 +21,7 @@ import glob
 import logging
 import os
 import shutil
-from typing import Callable, Optional, Tuple
+from typing import Callable, Tuple
 
 import torch
 import torch.nn as nn
@@ -293,61 +293,6 @@ class WanBackbone(VideoBackbone):
         """Raw text-context width the DiT's text embedding takes (= yaml ``dit.text_dim``)."""
         return int(self._dit.text_embedding[0].in_features)
 
-    @property
-    def video_attention_mask_mode(self) -> str:
-        """Video self-attention mask mode for joint MoT mask construction.
-
-        Modes: ``bidirectional`` (full v↔v, default), ``per_frame_causal``
-        (token-level causal block-diagonal), ``first_frame_causal`` (first frame
-        sees only itself, later frames see all). Explicit override wins, else
-        the DiT's value, else ``bidirectional``.
-        """
-        explicit = getattr(self, "_video_attention_mask_mode", None)
-        if explicit is not None:
-            return explicit
-        return getattr(self._dit, "video_attention_mask_mode", "bidirectional")
-
-    @video_attention_mask_mode.setter
-    def video_attention_mask_mode(self, mode: str) -> None:
-        self._video_attention_mask_mode = mode
-
-    def build_video_to_video_mask(
-        self,
-        video_seq_len: int,
-        video_tokens_per_frame: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Build the video↔video block of the joint MoT attention mask
-        (``True`` = attend to). Layout matches FastWAM's equivalent.
-        """
-        mode = self.video_attention_mask_mode
-        if mode == "bidirectional":
-            return torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
-
-        if mode == "per_frame_causal":
-            if video_seq_len % video_tokens_per_frame != 0:
-                raise ValueError(
-                    "video_seq_len must be divisible by video_tokens_per_frame in 'per_frame_causal' mode, "
-                    f"got {video_seq_len} and {video_tokens_per_frame}"
-                )
-            num_video_frames = video_seq_len // video_tokens_per_frame
-            frame_causal = torch.tril(torch.ones((num_video_frames, num_video_frames), dtype=torch.bool, device=device))
-            return frame_causal.repeat_interleave(video_tokens_per_frame, dim=0).repeat_interleave(
-                video_tokens_per_frame, dim=1
-            )
-
-        if mode == "first_frame_causal":
-            video_mask = torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
-            first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
-            # First-frame rows attend only to first-frame keys; later rows stay True.
-            video_mask[:first_frame_tokens, first_frame_tokens:] = False
-            return video_mask
-
-        raise ValueError(
-            f"Unsupported video_attention_mask_mode '{mode}'. "
-            "Choose from: bidirectional, per_frame_causal, first_frame_causal."
-        )
-
     def apply_compile_optimizations(self, compile_cfg) -> None:
         """Enable lazy per-layer Wan ``DiTBlock.forward`` compile for deploy."""
 
@@ -380,9 +325,19 @@ class WanBackbone(VideoBackbone):
         block_id: int,
         block: nn.Module,
         state: BlockLoopState,
-        block_context_mask: Optional[Tensor],
-        attn_mask: Optional[Tensor],
+        block_context_mask: Tensor,
+        attn_mask: Tensor,
     ) -> Tensor:
+        """One DiT block (compiled when deploy compile is on, else eager / gradient-checkpointed).
+
+        Args:
+            block_id: int. block: the DiTBlock. state: BlockLoopState.
+            block_context_mask: (B, S, L) bool text cross-attention mask. attn_mask: (S, S) bool self-attention mask.
+
+        Returns:
+            (B, S, dim) new hidden states.
+        """
+        args = (state.hidden_states, state.context, state.time_mod, state.rope_freqs, block_context_mask, attn_mask)
         compile_allowed = (
             self._wan_blocks_compile_enabled
             and not state.use_gradient_checkpointing
@@ -390,50 +345,13 @@ class WanBackbone(VideoBackbone):
         )
         if compile_allowed:
             try:
-                compiled = self._compiled_wan_block(block_id, block)
-                if attn_mask is not None:
-                    return compiled(
-                        state.hidden_states,
-                        state.context,
-                        state.time_mod,
-                        state.rope_freqs,
-                        block_context_mask,
-                        attn_mask,
-                    )
-                return compiled(
-                    state.hidden_states,
-                    state.context,
-                    state.time_mod,
-                    state.rope_freqs,
-                    block_context_mask,
-                )
+                return self._compiled_wan_block(block_id, block)(*args)
             except Exception as exc:
                 self._compiled_wan_blocks.clear()
                 self._wan_blocks_compile_enabled = False
                 logger.warning("Wan block torch.compile failed at block %s; falling back to eager: %s", block_id, exc)
-
-        if attn_mask is not None:
-            return gradient_checkpoint_forward(
-                block,
-                state.use_gradient_checkpointing,
-                state.use_gradient_checkpointing_offload,
-                state.hidden_states,
-                state.context,
-                state.time_mod,
-                state.rope_freqs,
-                block_context_mask,
-                attn_mask,
-            )
-
         return gradient_checkpoint_forward(
-            block,
-            state.use_gradient_checkpointing,
-            state.use_gradient_checkpointing_offload,
-            state.hidden_states,
-            state.context,
-            state.time_mod,
-            state.rope_freqs,
-            block_context_mask,
+            block, state.use_gradient_checkpointing, state.use_gradient_checkpointing_offload, *args
         )
 
     # ================================================================
@@ -446,17 +364,18 @@ class WanBackbone(VideoBackbone):
         latents: Tensor,
         timestep: Tensor,
         text: TextCondition,
-        num_clean_latents: int,
-        raw_proprio: Optional[Tensor] = None,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
+        layout,
+        proprio: Tensor,
+        use_gradient_checkpointing: bool,
+        use_gradient_checkpointing_offload: bool,
     ) -> BlockLoopState:
         """Pre-loop: per-token time modulation, text embedding, patchify, RoPE.
 
         Args:
-            latents: (B, z, T_lat, h, w); the first ``num_clean_latents`` are clean (per-token t = 0).
+            latents: (B, z, T_lat, h, w); the first ``layout.num_hist_latents`` are clean (per-token t = 0).
             timestep: (B,) video timestep. text: TextCondition (context (B, L, D_text), context_mask (B, L)).
-            num_clean_latents: int, clean prefix latents. raw_proprio: unused (Wan takes proprio as a context token).
+            layout: ``cfg.common.layout`` (clean prefix length).
+            proprio: (B, H, D) normalized proprio; unused (Wan reads proprio as context tokens).
             use_gradient_checkpointing / use_gradient_checkpointing_offload: bool loop flags.
 
         Returns:
@@ -471,7 +390,7 @@ class WanBackbone(VideoBackbone):
             patch_size=self._dit_patch_size,
             fuse_vae_embedding_in_latents=True,
             force_per_token_t_mod=True,
-            num_clean_prefix_frames=int(num_clean_latents),
+            num_clean_prefix_frames=int(layout.num_hist_latents),
             zero_clean_prefix_t_mod=True,
             has_first_frame_latents=True,
         )
@@ -532,30 +451,20 @@ class WanBackbone(VideoBackbone):
             extras=extras,
         )
 
-    def run_block(self, block_id: int, state: BlockLoopState) -> BlockLoopState:
+    def run_block(self, block_id: int, state: BlockLoopState, attn_mask: Tensor) -> BlockLoopState:
+        """One Wan DiT block on the video stream alone.
+
+        Args:
+            block_id: int. state: BlockLoopState. attn_mask: (S, S) bool self-attention mask of this layer.
+
+        Returns:
+            ``state`` with ``hidden_states`` updated.
+        """
         dit = state.extras["dit"]
         block = dit.blocks[block_id]
-        attn_mask = state.extras.get("shared_attention_mask")
-        context_mask = state.context_mask
-
-        block_context_mask = (
-            context_mask.unsqueeze(1).expand(-1, state.hidden_states.shape[1], -1) if context_mask is not None else None
-        )
-        if attn_mask is not None:
-            if block_context_mask is None:
-                block_context_mask = (
-                    torch.ones(
-                        (state.context.shape[0], state.context.shape[1]),
-                        dtype=torch.bool,
-                        device=state.context.device,
-                    )
-                    .unsqueeze(1)
-                    .expand(-1, state.hidden_states.shape[1], -1)
-                )
-            state.hidden_states = self._run_wan_block(block_id, block, state, block_context_mask, attn_mask)
-            return state
-
-        state.hidden_states = self._run_wan_block(block_id, block, state, block_context_mask, None)
+        # Text cross-attention mask: each video query row reads the same context keys.
+        block_context_mask = state.context_mask.unsqueeze(1).expand(-1, state.hidden_states.shape[1], -1)
+        state.hidden_states = self._run_wan_block(block_id, block, state, block_context_mask, attn_mask)
         return state
 
     def pre_attn_at_layer(self, layer_id: int, state: BlockLoopState) -> Tuple[Tensor, Tensor, Tensor, dict]:
@@ -680,22 +589,19 @@ class WanBackbone(VideoBackbone):
         """latents: (N, 48, T_lat, h, w). Returns: (N, 3, 1 + 4 (T_lat-1), 16h, 16w) pixels (tiled VAE decode)."""
         return self.vae.decode(latents.to(self.device), device=self.device, tiled=True)
 
-    @torch.no_grad()
-    def decode_video(self, latents: Tensor) -> list:
-        """Decode one latent clip to PIL frames with Wan's own pixel -> uint8 conversion.
+    def _pixels_to_frames(self, pixels: Tensor) -> list:
+        """Decoded pixels -> PIL frames with Wan's own pixel -> uint8 conversion.
 
         Transitional override of the base ``tensor_to_pil_frames`` path, kept for bitwise-equal Wan rollouts
         (Task 12 drops it).
 
         Args:
-            latents: (1, 48, T_lat, h, w).
+            pixels: (1, 3, T, H, W) decoded pixels in [-1, 1].
 
         Returns:
-            list of 1 + 4 (T_lat - 1) PIL frames. Raises ValueError for a batch B != 1.
+            list of T PIL frames.
         """
-        if latents.shape[0] != 1:
-            raise ValueError(f"decode_video decodes one clip, got a batch of {latents.shape[0]}")
-        return vae_output_to_video(self.decode_latents(latents))
+        return vae_output_to_video(pixels)
 
     @torch.no_grad()
     def _t5_entries(self, prompts: list) -> list:

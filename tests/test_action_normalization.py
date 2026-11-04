@@ -9,15 +9,11 @@ dependency on any real checkpoint directory.
 
 import numpy as np
 import pytest
-import torch
 from omegaconf import OmegaConf
-from torch import nn
 
 from openwam.dataloader.transforms.normalize import Normalizer
 from openwam.dataloader.utils.unify_action import UNIFY_DIM, map_to_unify, parse_unify_spec
-from openwam.deploy.engine import JointInferenceEngine
 from openwam.deploy.model_loader import _build_normalizer, _infer_raw_dim, _UnifyAwareNormalizer
-from openwam.model.architectures.base import BaseWAMArchitecture
 
 # --- Helper: build a realistic stats dict for a 20D eef action ---
 
@@ -135,7 +131,7 @@ def test_build_normalizer_wrong_action_mode_raises(tmp_path):
 
 
 def test_deployment_action_range_sanity(tmp_path):
-    """Mirrors the action postprocessing in BaseWAMArchitecture.generate().
+    """Mirrors the deploy engine's action postprocessing (normalized model output -> physical units).
 
     Model output is in [-1, 1] (after flow-matching). After unnormalize, xyz
     dims must reach physical range (here: ±0.8 m). If unnormalize were missing,
@@ -161,132 +157,6 @@ def test_deployment_action_range_sanity(tmp_path):
     )
 
     assert float(np.abs(actions).max()) > 1.0
-
-
-class _TinyScheduler:
-    num_train_timesteps = 1000
-
-    def set_timesteps(self, n, shift=5.0):
-        del shift
-        self.timesteps = torch.linspace(1.0, 0.0, n)
-        self.sigmas = torch.linspace(1.0, 0.0, n)
-
-    def flow_step(self, noise_pred, sigma, sigma_next, sample):
-        del sigma, sigma_next
-        return sample + noise_pred
-
-
-class _CaptureDeployArchitecture:
-    def __init__(self, normalizer):
-        self.normalizer = normalizer
-        self.video_scheduler = _TinyScheduler()
-        self.action_scheduler = _TinyScheduler()
-        self.seen_proprio = None
-
-    def apply_compile_optimizations(self, compile_cfg):
-        del compile_cfg
-
-    def normalize_deploy_proprio(self, proprio):
-        arr = np.asarray(proprio, dtype=np.float32)
-        return torch.from_numpy(self.normalizer.normalize(arr))
-
-    def generate(self, **kwargs):
-        self.seen_proprio = kwargs["proprio"]
-        return {"video": None, "actions": np.zeros((1, 20), dtype=np.float32)}
-
-
-def test_joint_engine_normalizes_raw_deploy_state_before_generate():
-    """JointInferenceEngine must pass normalized state into architecture.generate()."""
-    stats = _eef_stats_min_max()
-    normalizer = Normalizer(mode="min_max", stats=stats)
-    arch = _CaptureDeployArchitecture(normalizer)
-    cfg = OmegaConf.create(
-        {
-            "inference": {"denoise_steps": 2, "denoise_mode": "sync", "shift": 5.0},
-            "optimization": {"decode_video": False},
-        }
-    )
-    engine = JointInferenceEngine(cfg=cfg, architecture=arch)
-
-    raw_state = stats["max"].astype(np.float32)
-    engine.generate({"observation": {"state": raw_state}, "num_frames": 2})
-
-    assert arch.seen_proprio is not None
-    np.testing.assert_allclose(arch.seen_proprio.numpy(), np.ones_like(raw_state), atol=1e-6)
-
-
-class _TinyVideoBackbone:
-    dim = 4
-
-    def __init__(self):
-        self.scheduler = _TinyScheduler()
-
-    @staticmethod
-    def num_future_latents(num_frames):
-        del num_frames
-        return 1
-
-    @staticmethod
-    def preprocess_condition(history, prompts, *, num_frames, num_latents):
-        del history, prompts, num_frames, num_latents
-        return torch.zeros(1, 1, 1, 1, 1), None
-
-    def decode_video(self, latents):
-        del latents
-        return None
-
-
-class _TinyGenerateArchitecture(BaseWAMArchitecture):
-    def __init__(self, normalizer):
-        nn.Module.__init__(self)
-        self.cfg = None
-        self.video_backbone = _TinyVideoBackbone()
-        self._device = torch.device("cpu")
-        self._dtype = torch.float32
-        self.normalizer = normalizer
-        self._use_proprioception_context = False
-
-        class _ActionBackbone:
-            action_dim = 20
-            scheduler = _TinyScheduler()
-            uses_proprioception = False
-
-        self.action_backbone = _ActionBackbone()
-
-    def forward(self, noisy_actions, action_timestep, **kwargs):
-        del action_timestep, kwargs
-        video_noise = torch.zeros(1, 1, 1, 1, 1)
-        action_noise = torch.zeros_like(noisy_actions)
-        return video_noise, action_noise
-
-
-def test_base_generate_unnormalizes_deploy_actions():
-    """BaseWAMArchitecture.generate() must return physical-unit actions when normalizer is attached."""
-    stats = _eef_stats_min_max()
-    normalizer = Normalizer(mode="min_max", stats=stats)
-    arch = _TinyGenerateArchitecture(normalizer)
-
-    result = arch.generate(
-        schedule=[(0.0, 1.0), (0.0, 0.0)],
-        prompt="",
-        first_frame_image=object(),
-        num_frames=2,
-        decode_video=False,
-        seed=123,
-    )
-
-    normalized = (
-        torch.randn(
-            1,
-            1,
-            20,
-            generator=torch.Generator(device="cpu").manual_seed(123),
-        )
-        .squeeze(0)
-        .numpy()
-    )
-    expected = normalizer.unnormalize(normalized)
-    np.testing.assert_allclose(result["actions"], expected, atol=1e-6)
 
 
 # --- _UnifyAwareNormalizer + unify dispatch (unify_action ckpts) ---

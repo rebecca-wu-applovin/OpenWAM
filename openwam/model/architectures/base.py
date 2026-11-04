@@ -20,12 +20,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
-import numpy as np
 import torch
 from torch import Tensor, nn
 
+from openwam.config.resolve import PROPRIO_INPUTS
 from openwam.model.compile_options import compile_enabled
-from openwam.model.video_backbone.registry import LoadMode
+from openwam.model.video_backbone.registry import LoadMode, build_video_backbone
 
 
 def _wrap_single_forward(module: nn.Module) -> None:
@@ -58,7 +58,7 @@ def _wrap_forward_in_no_grad(module: nn.Module) -> None:
     ``self.model = self``) are visited once.
 
     Safe to apply to any module: if the caller already wraps the call in a
-    ``no_grad`` context (e.g. ``prepare_inputs``), the inner ``no_grad`` is a
+    ``no_grad`` context (e.g. ``preprocess_train``), the inner ``no_grad`` is a
     no-op; if the caller is inside a grad-tracking forward, it short-circuits
     activation saving.
 
@@ -77,8 +77,32 @@ def _wrap_forward_in_no_grad(module: nn.Module) -> None:
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from openwam.dataloader.collate import Batch
     from openwam.model.action_backbone.base import ActionDiTBackbone
     from openwam.model.video_backbone.base import TextCondition, VideoBackbone
+
+
+@dataclass(frozen=True)
+class TrainOptions:
+    """Training knobs the trainer decides once (from ``cfg.training``) and passes to the architecture constructor.
+
+    Fields:
+        use_gradient_checkpointing: bool, recompute block activations in the training backward.
+        use_gradient_checkpointing_offload: bool, also offload the checkpointed activations to CPU.
+        lambda_video: float, weight of the video flow-matching loss.
+        lambda_action: float, weight of the action flow-matching loss.
+    """
+
+    use_gradient_checkpointing: bool
+    use_gradient_checkpointing_offload: bool
+    lambda_video: float
+    lambda_action: float
+
+
+# Deploy builds: no loss is ever computed, so no checkpointing and both loss weights unused.
+INFERENCE_ONLY = TrainOptions(
+    use_gradient_checkpointing=False, use_gradient_checkpointing_offload=False, lambda_video=0.0, lambda_action=0.0
+)
 
 
 @dataclass
@@ -111,38 +135,42 @@ class BaseWAMArchitecture(ABC, nn.Module):
     subclass in ``__init__`` and own the complete ``forward()`` control flow.
 
     Args:
-        cfg: Architecture-specific configuration (OmegaConf DictConfig or dict).
+        cfg: dict of architecture params (``resolve_architecture_config(...).params``): ``clean_attention`` and
+            ``attention_mask_mode`` pick the frame-level mask, ``proprio_input`` the proprio routing (all validated by
+            ``resolve_config``), ``video_backbone`` is the backbone's cfg slice.
+        layout: ``cfg.common.layout`` from the entry point's ``resolve_config`` (DictConfig): the latent layout
+            the preprocessing, the attention mask, the loss and deploy read. Never re-derived here.
         mode: LoadMode the entry point chose for the video backbone (PRETRAINED: upstream weights;
-            CHECKPOINT: an empty shell of ``ckpt_dir`` the caller fills). The entry points (trainer, deploy
-            loader, via ``build_architecture``) always pass it; the default only serves direct test builds.
+            CHECKPOINT: an empty shell of ``ckpt_dir`` the caller fills).
         ckpt_dir: str checkpoint dir for CHECKPOINT, None for PRETRAINED.
+        train_options: TrainOptions (gradient checkpointing, loss weights) the trainer decided; deploy passes
+            ``INFERENCE_ONLY``.
     """
 
     # --- Construction & config resolution ---
 
-    def __init__(self, cfg=None, *, mode: LoadMode = LoadMode.PRETRAINED, ckpt_dir: Optional[str] = None):
+    def __init__(self, cfg: dict, *, layout, mode: LoadMode, ckpt_dir: Optional[str], train_options: TrainOptions):
+        from openwam.model.architectures.utils.mask_modes import build_frame_mask
+
         super().__init__()
         self.cfg = cfg
-        self.video_backbone: Optional["VideoBackbone"] = None
+        self.layout = layout
+        self.train_options = train_options
+        # Frame-level [latents, action] visibility, built once; backbones expand it to tokens per forward.
+        self.frame_mask = build_frame_mask(layout, str(cfg["clean_attention"]), str(cfg["attention_mask_mode"]))
+        # How the video backbone gets the proprio (validated by resolve_config); build_contexts applies it.
+        self.proprio_input = str(cfg["proprio_input"])
+        if self.proprio_input not in PROPRIO_INPUTS:
+            raise ValueError(f"proprio_input must be one of {PROPRIO_INPUTS}, got {self.proprio_input!r}")
         self.action_backbone: Optional["ActionDiTBackbone"] = None
         self._device = torch.device("cuda")
         self._dtype = torch.bfloat16
 
-        # Forward-time training runtime flags. Trainer calls
-        # ``set_training_runtime`` once during construction so ``prepare_inputs``
-        # can read these without the trainer having to thread them through.
-        self._use_gradient_checkpointing = False
-        self._use_gradient_checkpointing_offload = False
-        self._max_timestep_boundary = 1.0
-        self._min_timestep_boundary = 0.0
-
-        # Optional action normalizer for deployment. ``generate`` uses it to
-        # return real-scale actions; deploy-side proprio preprocessing uses it
-        # to normalize raw robot state into the model's training space.
+        # Optional action normalizer for deployment: the deploy engine uses it to
+        # return real-scale actions and to normalize raw robot state into the model's training space.
         self.normalizer = None
 
-        if cfg is not None:
-            self._init_video_backbone(cfg, mode, ckpt_dir)
+        self.video_backbone: "VideoBackbone" = self._build_video_backbone(cfg["video_backbone"], mode, ckpt_dir)
 
     @staticmethod
     def _cfg_get(cfg, key, default=None):
@@ -152,57 +180,27 @@ class BaseWAMArchitecture(ABC, nn.Module):
             return cfg.get(key, default)
         return getattr(cfg, key, default)
 
-    def _init_video_backbone(self, cfg, mode: LoadMode, ckpt_dir: Optional[str]) -> None:
-        """Build ``self.video_backbone`` from ``cfg.video_backbone`` with the constructor ``mode`` selects.
+    @staticmethod
+    def _build_video_backbone(vb_cfg, mode: LoadMode, ckpt_dir: Optional[str]) -> "VideoBackbone":
+        """Build the video backbone with the load mode the entry point chose, and check the yaml's VAE contract.
 
         Args:
-            cfg: architecture params; ``cfg["video_backbone"]`` is the backbone's DictConfig slice (absent: no
-                backbone, e.g. tests that attach a mock).
+            vb_cfg: ``cfg.model.video_backbone`` (DictConfig slice; ``name`` picks the registered class).
             mode: LoadMode decided by the entry point. ckpt_dir: str for CHECKPOINT, None for PRETRAINED.
 
         Returns:
-            None. Raises ValueError when the yaml's temporal contract or required mask mode disagrees.
+            VideoBackbone. Raises ValueError when the yaml's temporal contract disagrees with the built backbone.
         """
-        from openwam.model.video_backbone import build_video_backbone
-
-        vb_cfg = cfg.get("video_backbone") if isinstance(cfg, dict) else getattr(cfg, "video_backbone", None)
-        if vb_cfg is None:
-            return
-
-        # A backbone yaml may pin the architecture's video mask (LongLive: the Long-WAM history mask).
-        # Checked before the build so a wrong launch fails before the weight load.
-        required_mask = self._cfg_get(vb_cfg, "required_video_attention_mask_mode", None)
-        actual_mask = self._cfg_get(cfg, "video_attention_mask_mode", None)
-        if required_mask is not None and actual_mask != required_mask:
+        video_backbone = build_video_backbone(vb_cfg, mode, ckpt_dir)
+        # The layout and the dataloader read the yaml's temporal_compression: it must be the VAE's.
+        declared = (int(vb_cfg["temporal_compression"]), bool(vb_cfg.get("causal_temporal", True)))
+        actual = (video_backbone.temporal_compression, video_backbone.causal_temporal)
+        if declared != actual:
             raise ValueError(
-                f"video_backbone {vb_cfg.name!r} requires model.architecture.video_attention_mask_mode="
-                f"{required_mask!r}, got {actual_mask!r}"
+                f"video_backbone.temporal_compression / causal_temporal yaml {declared} does not match native VAE "
+                f"{actual}. Update the yaml fields to match."
             )
-        self.video_backbone = build_video_backbone(vb_cfg, mode, ckpt_dir)
-
-        # Cross-check: yaml-declared temporal contract must match what the
-        # backbone actually exposes. Drift here would let the dataloader
-        # enforce the wrong divisibility rule and let the mask-downsampler
-        # produce a wrong-length tail, so we fail-fast at backbone init.
-        declared_tc = self._cfg_get(vb_cfg, "temporal_compression", 4)
-        declared_causal = self._cfg_get(vb_cfg, "causal_temporal", True)
-        actual_tc = self.video_backbone.temporal_compression
-        actual_causal = self.video_backbone.causal_temporal
-        if (declared_tc, declared_causal) != (actual_tc, actual_causal):
-            raise ValueError(
-                f"video_backbone.temporal_compression / causal_temporal yaml "
-                f"({declared_tc}, {declared_causal}) does not match native VAE "
-                f"({actual_tc}, {actual_causal}). Update the yaml fields to match."
-            )
-
-    def _resolve_video_dim(self, cfg) -> int:
-        """Resolve video_dim from config or video_backbone; raise if neither provides it."""
-        dim = int(cfg.get("video_dim", 0)) if isinstance(cfg, dict) else int(getattr(cfg, "video_dim", 0))
-        if dim == 0 and self.video_backbone is not None:
-            dim = self.video_backbone.dim
-        if not dim:
-            raise ValueError("video_dim must be specified in config or inferred from video_backbone")
-        return dim
+        return video_backbone
 
     # --- Backbone composition ---
 
@@ -216,9 +214,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         ``move_frozen_to_device``, and ``save_assets_for_deployment`` to iterate
         over all backbones generically.
         """
-        result = {}
-        if self.video_backbone is not None:
-            result["video_backbone"] = self.video_backbone
+        result = {"video_backbone": self.video_backbone}
         if self.action_backbone is not None:
             result["action_backbone"] = self.action_backbone
         return result
@@ -235,8 +231,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
     @property
     def video_scheduler(self):
         """Flow-matching scheduler for the video stream (owned by video_backbone)."""
-        if self.video_backbone is None:
-            raise RuntimeError("video_backbone is not initialized")
         return self.video_backbone.scheduler
 
     @property
@@ -249,7 +243,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
     @property
     def uses_proprioception(self) -> bool:
-        return bool(getattr(self, "_use_proprioception_context", False)) or (
+        return self._use_proprioception_context or (
             self.action_backbone is not None and self.action_backbone.uses_proprioception
         )
 
@@ -263,8 +257,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         self.proprio_slot_emb: Optional[nn.Embedding] = None
         self.proprio_dim = 0
         self.context_dim = int(text_dim)
-        # N > 1 proprio tokens (one per history frame, oldest first; sparse history).
-        self.num_proprio_tokens = int(self._cfg_get(cfg, "num_proprio_tokens", 1) or 1)
+        # One proprio token per history frame (oldest first), from the layout.
+        self.num_proprio_tokens = int(self.layout.num_proprio_tokens)
         if not enabled:
             return
         state_dim = int(self._cfg_get(cfg, "state_dim", 0) or 0)
@@ -280,95 +274,62 @@ class BaseWAMArchitecture(ABC, nn.Module):
             self.proprio_slot_emb = nn.Embedding(self.num_proprio_tokens, self.context_dim)
             nn.init.zeros_(self.proprio_slot_emb.weight)
 
-    def _append_proprio_context_token(
-        self, text: "TextCondition", proprio: Optional[Tensor], sample_mask: Optional[Tensor]
-    ) -> "TextCondition":
-        """Append the proprio token(s) to the text context and extend its mask.
+    def _proprio_tokens(self, proprio: Tensor, proprio_mask: Tensor) -> tuple[Tensor, Tensor]:
+        """Encode the proprio rows into context tokens (one per history frame).
 
         Args:
-            text: TextCondition, context (B, L, D_text) and context_mask (B, L).
-            proprio: (B, D), (B, 1, D) or (B, N, D) normalized proprio (N = num_proprio_tokens); unused when
-                proprio-as-context is off.
-            sample_mask: optional per-sample proprio mask, (B,), (B, 1) or (B, 1, D) bool (any dim True =
-                the sample has proprio). Masked samples get a zero token and a False mask entry, which also
-                isolates the proprio_encoder gradient on them (input * 0 -> weight grad = 0).
+            proprio: (B, N, D) normalized proprio, N = ``layout.num_proprio_tokens`` (oldest first), D = state_dim.
+            proprio_mask: (B, N, D) bool, True = real entry; a row with no real entry gets a zero token and a
+                False mask entry, which also isolates the proprio_encoder gradient on it (input * 0 -> grad 0).
 
         Returns:
-            TextCondition with context (B, L + N, D_text) and context_mask (B, L + N) (``extra`` shared);
-            ``text`` itself when proprio-as-context is off.
+            (tokens (B, N, context_dim) in the encoder dtype, token_mask (B, N) bool).
         """
-        if not bool(getattr(self, "_use_proprioception_context", False)):
-            return text
-        if self.proprio_encoder is None:
-            raise RuntimeError("proprio context is enabled but proprio_encoder is not initialized.")
-        if proprio is None:
-            raise ValueError("use_proprioception=True requires `proprio` from sample['proprio'] or obs['state'].")
-        n_tok = int(getattr(self, "num_proprio_tokens", 1) or 1)
-        if proprio.ndim == 1:
-            proprio = proprio.unsqueeze(0)
-        elif proprio.ndim == 3 and proprio.shape[1] == 1:
-            proprio = proprio[:, 0, :]
-        if proprio.ndim == 2:
-            proprio = proprio.unsqueeze(1)  # (B, 1, D)
-        if proprio.ndim != 3 or proprio.shape[1] != n_tok:
+        expect = (self.num_proprio_tokens, self.proprio_dim)
+        if proprio.ndim != 3 or tuple(proprio.shape[1:]) != expect or proprio_mask.shape != proprio.shape:
             raise ValueError(
-                f"proprio must be [B, D] / [B, 1, D] (1 token) or [B, {n_tok}, D] ({n_tok} tokens), "
-                f"got shape {tuple(proprio.shape)}"
+                f"proprio must be (B, {expect[0]}, {expect[1]}) with a mask of the same shape, got "
+                f"{tuple(proprio.shape)} / {tuple(proprio_mask.shape)}"
             )
-        if proprio.shape[-1] != self.proprio_dim:
-            raise ValueError(f"proprio last dim must be {self.proprio_dim}, got {proprio.shape[-1]}")
+        weight = self.proprio_encoder.weight
+        tokens = self.proprio_encoder(proprio.to(device=weight.device, dtype=weight.dtype))
+        if self.proprio_slot_emb is not None:
+            # Learned absolute slot PE (one per history frame).
+            tokens = tokens + self.proprio_slot_emb.weight.to(tokens.dtype)
+        # A row is real when any of its dims is; masked rows become zero tokens.
+        token_mask = proprio_mask.to(device=tokens.device, dtype=torch.bool).any(dim=-1)
+        return tokens * token_mask.to(tokens.dtype).unsqueeze(-1), token_mask
 
+    def build_contexts(
+        self, text: "TextCondition", proprio: Tensor, proprio_mask: Tensor
+    ) -> tuple["TextCondition", "TextCondition"]:
+        """The text context of each stream; the one place ``proprio_input`` is applied.
+
+        ActionDiT always reads text + the proprio tokens (when ``use_proprioception``). The video backbone reads
+        the same context under ``proprio_input=context_token`` and the text alone under ``backbone_stream`` (it
+        embeds ``proprio`` in its own stream, see ``VideoBackbone.prepare``).
+
+        Args:
+            text: TextCondition, context (B, L, D_text), context_mask (B, L).
+            proprio: (B, N, D) normalized proprio, N = ``layout.num_proprio_tokens``.
+            proprio_mask: (B, N, D) bool, True = real entry.
+
+        Returns:
+            (video_text, action_text): TextConditions; with proprio tokens their context is (B, L + N, D_text) and
+            context_mask (B, L + N) (``extra`` shared with ``text``).
+        """
+        if not self._use_proprioception_context:
+            return text, text
+        tokens, token_mask = self._proprio_tokens(proprio, proprio_mask)
         context = text.context
-        if context.shape[0] != proprio.shape[0]:
-            if proprio.shape[0] == 1 and context.shape[0] > 1:
-                proprio = proprio.expand(context.shape[0], -1, -1)
-            else:
-                raise ValueError(
-                    f"Batch mismatch between context and proprio: {context.shape[0]} vs {proprio.shape[0]}"
-                )
-
-        # Normalize sample_mask to (B, 1) bool on context's device. Accepted shapes (after stacking in
-        # prepare_inputs): (B,) enable-per-sample, (B, 1), or (B, 1, D) per-dim mask whose sample-level
-        # enable is ``mask.any(dim=-1)``.
-        if sample_mask is None:
-            sample_mask = torch.ones(
-                (proprio.shape[0], 1),
-                dtype=torch.bool,
-                device=context.device,
-            )
-        else:
-            sample_mask = sample_mask.to(device=context.device, dtype=torch.bool)
-            if sample_mask.ndim == 3:
-                # (B, 1, D) -> (B, 1): True if any per-dim slot is real
-                sample_mask = sample_mask.any(dim=-1)
-            elif sample_mask.ndim == 1:
-                sample_mask = sample_mask.unsqueeze(-1)
-            if sample_mask.shape != (proprio.shape[0], 1):
-                raise ValueError(
-                    f"_proprio_sample_mask shape {tuple(sample_mask.shape)} must be ({proprio.shape[0]}, 1)"
-                )
-
-        # (B, N, context_dim): one token per proprio frame.
-        proprio_token = self.proprio_encoder(
-            proprio.to(device=context.device, dtype=self.proprio_encoder.weight.dtype)
-        )
-        if getattr(self, "proprio_slot_emb", None) is not None:
-            proprio_token = proprio_token + self.proprio_slot_emb.weight.to(proprio_token.dtype)
-        proprio_token = proprio_token.to(dtype=context.dtype)
-        # Token * mask cuts the weight grad for mask=False samples
-        # (input goes to zero so the encoder weight gradient contribution is zero).
-        sample_mask_f = sample_mask.to(proprio_token.dtype).unsqueeze(-1)  # (B, 1, 1)
-        proprio_token = proprio_token * sample_mask_f
-        sample_mask = sample_mask.expand(-1, proprio_token.shape[1])  # (B, N)
-
-        # The proprio tokens sit after the (possibly padded) text, so the valid tokens are not a contiguous
-        # prefix any more: the mask is authoritative.
-        context_mask = text.context_mask.to(device=context.device, dtype=torch.bool)
-        return dataclasses.replace(
+        # The proprio tokens sit after the (possibly padded) text: the mask, not a prefix length, marks valid tokens.
+        action_text = dataclasses.replace(
             text,
-            context=torch.cat([context, proprio_token], dim=1),
-            context_mask=torch.cat([context_mask, sample_mask], dim=1),
+            context=torch.cat([context, tokens.to(dtype=context.dtype)], dim=1),
+            context_mask=torch.cat([text.context_mask.to(device=context.device, dtype=torch.bool), token_mask], dim=1),
         )
+        video_text = action_text if self.proprio_input == "context_token" else text
+        return video_text, action_text
 
     # --- Device / dtype (top-level authority) ---
 
@@ -396,12 +357,11 @@ class BaseWAMArchitecture(ABC, nn.Module):
     # --- Normalizer (deployment) ---
 
     def attach_normalizer(self, normalizer) -> None:
-        """Attach (or clear) an action normalizer used by ``generate``.
+        """Attach (or clear) the deploy action normalizer.
 
         Deployment paths build the same normalizer used by training from
-        ``normalization_stats.npy``. ``generate`` uses it to return real-scale actions,
-        while server-side proprio preprocessing uses it to normalize raw robot
-        state into the model's training space. Pass ``None`` to clear.
+        ``normalization_stats.npy``. The deploy engine uses it to return real-scale actions
+        and to normalize raw robot state into the model's training space. Pass ``None`` to clear.
         """
         self.normalizer = normalizer
 
@@ -506,7 +466,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
            inspect freeze status separately.
 
         For text_encoder / vae, which are already called under the
-        ``@torch.no_grad()`` ``prepare_inputs`` decorator, the wrapper is a
+        ``@torch.no_grad()`` ``preprocess_train`` / ``preprocess_condition``, the wrapper is a
         no-op (nested ``no_grad``). For modules called inside the training
         forward graph, the wrapper is what actually saves activation memory.
 
@@ -591,315 +551,83 @@ class BaseWAMArchitecture(ABC, nn.Module):
         for bb in self.backbones.values():
             bb.save_deploy_assets(output_dir)
 
-    # --- Training: preprocessing ---
-
-    def set_training_runtime(
-        self,
-        *,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
-        max_timestep_boundary: float = 1.0,
-        min_timestep_boundary: float = 0.0,
-    ) -> None:
-        """Set forward-time training flags consumed by ``prepare_inputs``.
-
-        Trainers call this once during construction. Keeping these on the
-        architecture keeps ``prepare_inputs(batch)`` self-contained — the
-        trainer no longer needs to thread these flags through every loss call.
-        """
-        self._use_gradient_checkpointing = bool(use_gradient_checkpointing)
-        self._use_gradient_checkpointing_offload = bool(use_gradient_checkpointing_offload)
-        self._max_timestep_boundary = float(max_timestep_boundary)
-        self._min_timestep_boundary = float(min_timestep_boundary)
-
-    @torch.no_grad()
-    def prepare_inputs(self, batch: list[dict]) -> dict:
-        """Aggregate a list of dataset samples into a batched inputs dict.
-
-        The returned dict is designed to be
-        unpacked directly into ``compute_loss`` via ``**inputs``.
-
-        Args:
-            batch: List of dataset samples (each a dict). A single dict is
-                accepted as well and treated as a one-sample batch.
-
-        Returns:
-            Dict ready for ``compute_loss``: ``clean_latents`` (B, z, N_clean, h, w) the clean prefix,
-            ``input_latents`` (B, z, T_lat, h, w) the full clean clip, ``text`` (TextCondition), the action /
-            proprio tensors and masks, and the forward-time flags.
-        """
-        from openwam.dataloader.transforms.pipeline import FirstFrameConditioningTransform
-        from openwam.model.architectures.utils.common import downsample_video_mask_to_latent
-
-        if isinstance(batch, dict):
-            batch = [batch]
-
-        if not hasattr(self, "_pipeline_transform_instance"):
-            self._pipeline_transform_instance = FirstFrameConditioningTransform()
-        samples = [self._pipeline_transform_instance.apply(s) for s in batch]
-
-        _dtype = self.dtype
-        _device = self.device
-
-        all_frames: list = []
-        all_prompts: list = []
-        all_actions: list = []
-        all_proprios: list = []
-        all_proprio_masks: list = []
-        all_action_masks: list = []
-        all_video_masks: list = []
-
-        for sample in samples:
-            all_frames.append(sample["video"])
-            all_prompts.append(sample["prompt"])
-
-            action = sample.get("action")
-            if action is not None:
-                if isinstance(action, np.ndarray):
-                    action = torch.from_numpy(action)
-                action = action.to(dtype=_dtype, device=_device).unsqueeze(0)
-            all_actions.append(action)
-
-            # Carry proprio whenever the sample provides it — the main-stream
-            # proprio-context path consumes it downstream, so the bridge into
-            # ``inputs`` is not gated on a single consumer's flag.
-            proprio = sample.get("proprio")
-            if proprio is not None:
-                if isinstance(proprio, np.ndarray):
-                    proprio = torch.from_numpy(proprio)
-                proprio = proprio.to(dtype=_dtype, device=_device)
-                if proprio.ndim == 1:
-                    pass
-                elif proprio.ndim == 2 and proprio.shape[0] == 1:
-                    proprio = proprio[0]
-                elif proprio.ndim == 2:
-                    pass  # (N, D): one proprio per history frame (sparse history)
-                else:
-                    raise ValueError(
-                        f"sample['proprio'] must be [D], [1, D] or [N, D], got shape {tuple(proprio.shape)}"
-                    )
-            all_proprios.append(proprio)
-
-            # Collect per-sample proprio_mask. Two accepted shapes:
-            #   * 1D ``(1,) bool`` — legacy "is the proprio token enabled".
-            #   * 2D ``(1, D) bool`` — per-dim mask; sample-level enable is
-            #     ``pmask.any(dim=-1)``. Used by RoboCOIN/EgoDex/RoboTwin/OXE
-            #     after the 2D mask migration.
-            # Default for readers that don't emit the field: all True (1,).
-            # (Mixed 1-D / 2-D ranks across a batch are reconciled just before
-            # the stack below, so the bare (1,) default is safe.)
-            pmask = sample.get("proprio_mask")
-            if pmask is None:
-                pmask = torch.ones(1, dtype=torch.bool)
-            else:
-                if isinstance(pmask, np.ndarray):
-                    pmask = torch.from_numpy(pmask)
-                pmask = pmask.to(dtype=torch.bool)
-                if pmask.ndim == 0:
-                    pmask = pmask.unsqueeze(0)
-            all_proprio_masks.append(pmask)
-
-            amask = sample.get("action_mask", None)
-            vmask = sample.get("video_mask", None)
-            if isinstance(amask, np.ndarray):
-                amask = torch.from_numpy(amask)
-            if isinstance(vmask, np.ndarray):
-                vmask = torch.from_numpy(vmask)
-            all_action_masks.append(amask)
-            all_video_masks.append(vmask)
-
-        # Sparse history: the first H frames of every clip are single-frame history (0 = first-frame layout).
-        # Transitional: read from the samples until Task 8 puts the layout in cfg.
-        n_hist = {int(s.get("num_history_frames", 0) or 0) for s in samples}
-        if len(n_hist) != 1:
-            raise ValueError(f"Mixed num_history_frames in batch: {sorted(n_hist)}")
-        clean_latents, input_latents, text = self.video_backbone.preprocess_train(
-            all_frames, all_prompts, num_hist_frames=n_hist.pop()
-        )
-
-        action_data = torch.cat(all_actions, dim=0) if all_actions[0] is not None else None
-
-        inputs = {
-            "clean_latents": clean_latents,
-            "input_latents": input_latents,
-            "text": text,
-            "use_gradient_checkpointing": self._use_gradient_checkpointing,
-            "use_gradient_checkpointing_offload": self._use_gradient_checkpointing_offload,
-            "max_timestep_boundary": self._max_timestep_boundary,
-            "min_timestep_boundary": self._min_timestep_boundary,
-            "actions": action_data,
-        }
-
-        # Bridge proprio into inputs whenever the batch carries it (not gated on
-        # uses_proprioception): the main-stream proprio-context path reads
-        # inputs["proprio"]. Consumers that don't need it simply ignore it.
-        if all_proprios[0] is not None:
-            inputs["proprio"] = torch.stack(all_proprios, dim=0).contiguous()
-            # Reconcile mixed 1-D (1,) / 2-D (1, D) proprio_masks before stacking:
-            # promote any 1-D enable-flag to (1, D) (broadcasts the sample-level
-            # flag across all dims) so a batch mixing a 2-D reader mask with a
-            # 1-D default/external mask doesn't raise on rank mismatch. All-1-D
-            # and all-2-D batches are left untouched.
-            if len({m.ndim for m in all_proprio_masks}) > 1:
-                pdim = max((m.shape[-1] for m in all_proprio_masks if m.ndim == 2), default=1)
-                all_proprio_masks = [
-                    m if m.ndim == 2 else m.reshape(m.shape[0], 1).expand(m.shape[0], pdim) for m in all_proprio_masks
-                ]
-            inputs["proprio_mask"] = torch.stack(all_proprio_masks, dim=0).contiguous()
-
-        if all_action_masks[0] is not None:
-            inputs["action_is_pad"] = torch.stack([~m for m in all_action_masks], dim=0).to(device=_device)
-        if all_video_masks[0] is not None:
-            # ``latent[0]`` is always clean conditioning (every layout has clean_latents), so the mask skips it.
-            skip_first = True
-            # Pass the backbone's temporal_compression so the tail-grouping
-            # divisor matches the actual latent-T produced by the encoder.
-            # The default 4 in ``downsample_video_mask_to_latent`` is the Wan
-            # VAE legacy; for V-JEPA / other encoders it would silently emit
-            # a wrong-length mask. See VideoBackbone.temporal_compression for
-            # the source-of-truth contract.
-            temporal_factor = int(self.video_backbone.temporal_compression)
-            latent_masks = [
-                downsample_video_mask_to_latent(~m, temporal_factor=temporal_factor, skip_first=skip_first)
-                for m in all_video_masks
-            ]
-            inputs["video_is_pad"] = torch.stack(latent_masks, dim=0).to(device=_device)
-
-        return inputs
-
     # --- Training: loss computation ---
 
-    def compute_loss(
-        self,
-        *,
-        actions: Optional[torch.Tensor] = None,
-        lambda_video: float = 1.0,
-        lambda_action: float = 1.0,
-        **inputs,
-    ) -> dict:
-        """Compute joint video-action flow matching loss.
+    def compute_loss(self, batch: "Batch") -> dict:
+        """Joint video-action flow-matching loss of one batch (the single training entry point).
 
-        This is the single entry point for training loss computation.
-        Handles timestep sampling, noise injection, forward pass, and
-        loss calculation internally.
-
-        Callers should produce ``inputs`` via ``self.prepare_inputs(batch)``
-        (preferred) or assemble it manually with the same keys: ``clean_latents`` /
-        ``input_latents`` / ``text`` plus any of ``actions / proprio /
-        action_is_pad / video_is_pad / use_gradient_checkpointing[_offload] /
-        max_timestep_boundary / min_timestep_boundary``.
+        Encodes the clips and prompts with the frozen video backbone (``preprocess_train``, no grad), samples
+        the video / action timesteps and noise, runs the joint forward and weights the two losses with
+        ``train_options.lambda_video`` / ``lambda_action``.
 
         Args:
-            actions: (B, T_action, action_dim) ground truth actions. May also
-                be passed via ``inputs["actions"]``.
-            lambda_video: Weight for video loss term.
-            lambda_action: Weight for action loss term.
-            **inputs: Preprocessed video/text tensors plus forward-time flags.
+            batch: Batch on the model device / dtype (``Batch.to``): video, prompt, action (B, K, A),
+                action_is_pad (B, K, A), proprio (B, H, D), proprio_mask (B, H, D).
 
         Returns:
-            dict with keys: loss, loss_video, loss_action.
+            dict of 0-dim tensors: loss (weighted sum, carries the graph), loss_video, loss_action (weighted,
+            detached).
         """
-        vb = self.video_backbone
+        video_backbone = self.video_backbone
         action_scheduler = self.action_backbone.scheduler
+        lambda_video, lambda_action = self.train_options.lambda_video, self.train_options.lambda_action
         _dtype = self.dtype
         _device = self.device
 
-        if actions is None:
-            actions = inputs.pop("actions", None)
-        else:
-            inputs.pop("actions", None)
-
-        max_tb = int(inputs.pop("max_timestep_boundary", 1) * len(vb.scheduler.timesteps))
-        min_tb = int(inputs.pop("min_timestep_boundary", 0) * len(vb.scheduler.timesteps))
-        B = inputs["input_latents"].shape[0]
+        # Clean latent clip (B, z, num_latents, h, w); the first layout.num_hist_latents are the condition.
+        clean_latents, text = video_backbone.preprocess_train(batch.video, batch.prompt, self.layout)
+        B = clean_latents.shape[0]
 
         # --- Sample video timesteps ---
         # Backbones with a native training noise distribution (07: GE / flux)
         # expose ``sample_training_noise``; the rest use the shared scheduler grid.
-        native_sampler = getattr(vb, "sample_training_noise", None)
+        native_sampler = getattr(video_backbone, "sample_training_noise", None)
         video_loss_weights = None
         if native_sampler is not None:
             video_timesteps, video_sigmas, video_loss_weights = native_sampler(B, device=_device, dtype=_dtype)
             video_timestep_ids = None
         else:
-            video_timestep_ids = torch.randint(min_tb, max_tb, (B,))
-            video_timesteps = vb.scheduler.timesteps[video_timestep_ids].to(dtype=_dtype, device=_device)
-            video_sigmas = vb.scheduler.sigmas[video_timestep_ids].to(dtype=_dtype, device=_device)
+            video_timestep_ids = torch.randint(0, len(video_backbone.scheduler.timesteps), (B,))
+            video_timesteps = video_backbone.scheduler.timesteps[video_timestep_ids].to(dtype=_dtype, device=_device)
+            video_sigmas = video_backbone.scheduler.sigmas[video_timestep_ids].to(dtype=_dtype, device=_device)
 
         # --- Add video noise (flow-matching: linear interp + velocity target) ---
-        video_noise = torch.randn_like(inputs["input_latents"])
+        video_noise = torch.randn_like(clean_latents)
         sigma_bc = video_sigmas.view(B, 1, 1, 1, 1)
-        inputs["latents"] = (1 - sigma_bc) * inputs["input_latents"] + sigma_bc * video_noise
-        video_target = video_noise - inputs["input_latents"]
+        noisy_latents = (1 - sigma_bc) * clean_latents + sigma_bc * video_noise
+        video_target = video_noise - clean_latents
 
-        # The clean prefix (1 first-frame latent or H history latents) stays clean.
-        n_clean = inputs["clean_latents"].shape[2]
-        inputs["latents"][:, :, :n_clean] = inputs["clean_latents"]
+        # The clean prefix (the layout's history latents) stays clean.
+        n_clean = int(self.layout.num_hist_latents)
+        noisy_latents[:, :, :n_clean] = clean_latents[:, :, :n_clean]
 
         # --- Prepare action noise ---
-        noisy_actions, action_target, action_timesteps, action_timestep_ids, action_sigmas, a_sigma_bc = (
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        if lambda_action > 0 and actions is not None:
+        noisy_actions, action_target, action_timesteps, action_timestep_ids = None, None, None, None
+        if lambda_action > 0:
             action_timestep_ids = torch.randint(0, len(action_scheduler.timesteps), (B,))
-
             action_timesteps = action_scheduler.timesteps[action_timestep_ids].to(dtype=_dtype, device=_device)
             action_sigmas = action_scheduler.sigmas[action_timestep_ids].to(dtype=_dtype, device=_device)
-
-            actions = actions.to(dtype=_dtype, device=_device)
-            if actions.dim() == 2:
-                actions = actions.unsqueeze(0)
-
-            action_noise = torch.randn_like(actions)
-            if action_sigmas.dim() == 1:
-                a_sigma_bc = action_sigmas.view(B, 1, 1)
-            else:
-                a_sigma_bc = action_sigmas.unsqueeze(-1)
-            noisy_actions = action_scheduler.add_noise(actions, action_noise, a_sigma_bc)
-            action_target = action_scheduler.training_target(actions, action_noise)
+            action_noise = torch.randn_like(batch.action)
+            noisy_actions = action_scheduler.add_noise(batch.action, action_noise, action_sigmas.view(B, 1, 1))
+            action_target = action_scheduler.training_target(batch.action, action_noise)
 
         # --- Joint forward pass ---
-        forward_inputs = dict(inputs)
-        proprio = forward_inputs.pop("proprio", None)
-        proprio_mask = forward_inputs.pop("proprio_mask", None)
-        use_grad_ckpt = forward_inputs.pop("use_gradient_checkpointing", False)
-        use_grad_ckpt_offload = forward_inputs.pop("use_gradient_checkpointing_offload", False)
-        # Padding masks are kept in `inputs` for loss-side masking but dropped
-        # from `forward_inputs` so they don't leak into vb.prepare(). Per FastWAM
-        # MoT design, attention itself does not consume sample-level padding.
-        forward_inputs.pop("action_is_pad", None)
-        forward_inputs.pop("video_is_pad", None)
-
-        # Route per-sample proprio_mask through pipeline_inputs to
-        # ``_append_proprio_context_token``. Internal-only key; pop'd there.
-        if proprio_mask is not None:
-            forward_inputs["_proprio_sample_mask"] = proprio_mask
-
-        # Use ``self(...)`` (not ``self.forward(...)``) so ``nn.Module.__call__``
-        # is invoked and any architecture-level forward-pre-hooks fire.
+        # ``self(...)`` (not ``self.forward``) so nn.Module.__call__ fires architecture-level hooks.
         video_noise_pred, action_noise_pred = self(
-            noisy_actions if lambda_action > 0 else None,
-            action_timesteps if lambda_action > 0 else None,
-            proprio=proprio,
-            use_gradient_checkpointing=use_grad_ckpt,
-            use_gradient_checkpointing_offload=use_grad_ckpt_offload,
-            **forward_inputs,
+            noisy_actions,
+            action_timesteps,
+            latents=noisy_latents,
             timestep=video_timesteps,
+            text=text,
+            proprio=batch.proprio,
+            proprio_mask=batch.proprio_mask,
+            use_gradient_checkpointing=self.train_options.use_gradient_checkpointing,
+            use_gradient_checkpointing_offload=self.train_options.use_gradient_checkpointing_offload,
         )
 
         # --- Video loss ---
         loss_video = self._compute_video_loss(
-            video_noise_pred,
-            video_target,
-            video_timestep_ids,
-            inputs,
-            _device,
-            timestep_weights=video_loss_weights,
+            video_noise_pred, video_target, video_timestep_ids, _device, timestep_weights=video_loss_weights
         )
 
         if lambda_action == 0 or action_noise_pred is None:
@@ -911,12 +639,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         # --- Action loss ---
         loss_action = self._compute_action_loss(
-            action_noise_pred,
-            action_target,
-            action_timestep_ids,
-            action_scheduler,
-            inputs,
-            _device,
+            action_noise_pred, action_target, action_timestep_ids, action_scheduler, batch.action_is_pad, _device
         )
 
         if lambda_video == 0:
@@ -924,76 +647,54 @@ class BaseWAMArchitecture(ABC, nn.Module):
         else:
             loss = lambda_video * loss_video + lambda_action * loss_action
 
-        result = {
+        return {
             "loss": loss,
             "loss_video": lambda_video * loss_video.detach(),
             "loss_action": lambda_action * loss_action.detach(),
         }
 
-        return result
+    def _compute_video_loss(self, noise_pred, target, timestep_ids, device, timestep_weights=None):
+        """Per-sample weighted video MSE loss over the denoised (future) latents.
 
-    def _compute_video_loss(self, noise_pred, target, timestep_ids, inputs, device, timestep_weights=None):
-        """Per-sample weighted video MSE loss.
+        Args:
+            noise_pred / target: (B, z, num_latents, h, w); the first ``layout.num_hist_latents`` are skipped.
+            timestep_ids: (B,) indices into the scheduler grid (None with ``timestep_weights``).
+            device: torch.device of the loss.
+            timestep_weights: (B,) weights of a backbone's native noise sampler, overriding the scheduler's.
 
-        ``timestep_weights`` (B,) overrides the scheduler's per-timestep weights
-        (backbones with a native noise sampler, see ``compute_loss``).
+        Returns:
+            0-dim float32 loss.
         """
         import torch.nn.functional as F
 
-        video_is_pad = inputs.get("video_is_pad")
-
-        # The clean prefix is not a denoising target. Transitional: its length is read off clean_latents
-        # until Task 8 puts it in cfg (layout.num_hist_latents).
-        n_skip = int(inputs["clean_latents"].shape[2])
+        # The clean prefix is not a denoising target.
+        n_skip = int(self.layout.num_hist_latents)
         noise_pred = noise_pred[:, :, n_skip:]
         target = target[:, :, n_skip:]
 
-        vb = self.video_backbone
         if timestep_weights is not None:
             tw = timestep_weights.to(dtype=torch.float32, device=device)
         else:
-            tw = vb.scheduler.linear_timesteps_weights[timestep_ids].to(dtype=torch.float32, device=device)
+            tw = self.video_backbone.scheduler.linear_timesteps_weights[timestep_ids].to(
+                dtype=torch.float32, device=device
+            )
 
         per_element = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
-        per_frame = per_element.mean(dim=(1, 3, 4))
-
-        if video_is_pad is not None:
-            if video_is_pad.shape[-1] != noise_pred.shape[2]:
-                raise ValueError(
-                    f"video_is_pad length {video_is_pad.shape[-1]} does not match "
-                    f"trimmed noise_pred T={noise_pred.shape[2]} (n_skip={n_skip}). "
-                    "Expected mask sized to T_lat minus leading conditioning latents."
-                )
-            video_is_pad = video_is_pad.to(device=per_frame.device, dtype=torch.bool)
-            valid_mask = ~video_is_pad
-            per_frame = per_frame * valid_mask.float()
-            valid_count = valid_mask.float().sum(dim=1).clamp(min=1)
-            per_sample = per_frame.sum(dim=1) / valid_count
-        else:
-            per_sample = per_frame.mean(dim=1)
-
+        # Every frame is real (the dataset never pads): plain mean over frames.
+        per_sample = per_element.mean(dim=(1, 3, 4)).mean(dim=1)
         return (per_sample * tw).mean()
 
-    def _compute_action_loss(self, noise_pred, target, timestep_ids, scheduler, inputs, device):
-        """Per-sample weighted action MSE loss.
+    def _compute_action_loss(self, noise_pred, target, timestep_ids, scheduler, action_is_pad, device):
+        """Per-sample weighted action MSE loss over the supervised (step, dim) cells.
 
-        Supports two action_is_pad shapes:
-          * **(B, T) bool** — legacy per-timestep mask (pre-2D migration).
-            Each masked timestep contributes 0 to per-sample loss; per_sample =
-            sum_t(loss_t) / N_valid_t, where loss_t = mean over D dims.
-          * **(B, T, D) bool** — 2-D mask covering both time AND per-dim
-            validity (new default for RoboCOIN/EgoDex/RoboTwin/OXE). Each
-            (t, d) cell contributes only when mask[t, d] is True; per_sample =
-            sum_{t,d}(loss_{t,d}) / N_valid_cells.
+        Args:
+            noise_pred / target: (B, K, A) predicted / target velocity.
+            timestep_ids: (B,) indices into the action scheduler grid. scheduler: the action scheduler.
+            action_is_pad: (B, K, A) bool, True = no supervision for that cell.
+            device: torch.device of the loss.
 
-        The two paths are *mathematically equivalent* whenever the 2D mask
-        is a broadcast of the 1D time mask across all D dims (i.e. every
-        valid timestep has every dim valid): both reduce to
-        sum_{t,d}(loss_{t,d}) / (N_valid_t * D). This equivalence is covered by
-        the 2-D action-mask regression tests.
-
-        A (T, 2) per-hand mask is handled by the legacy 2D path
-        (rank-3 mask, per-element broadcasting), unchanged by this migration.
+        Returns:
+            0-dim float32 loss: per sample sum over valid cells / number of valid cells, weighted, batch mean.
         """
         import torch.nn.functional as F
 
@@ -1001,38 +702,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
         if tw.ndim != 1:
             raise ValueError(f"action loss weights must be per-sample [B], got shape {tuple(tw.shape)}")
         per_element = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
-
-        action_is_pad = inputs.get("action_is_pad")
-
-        if action_is_pad is None:
-            per_sample = per_element.mean(dim=(1, 2))
-            return (per_sample * tw).mean()
-
-        action_is_pad = action_is_pad.to(device=per_element.device, dtype=torch.bool)
-        valid_mask_f = (~action_is_pad).float()
-
-        # New default path: (B, T, D) per-element mask that exactly matches
-        # per_element's shape. Used by RoboCOIN/EgoDex/RoboTwin/OXE after the
-        # 2D mask migration.
-        if valid_mask_f.shape == per_element.shape:
-            weighted = per_element * valid_mask_f
-            per_sample = weighted.sum(dim=(1, 2)) / valid_mask_f.sum(dim=(1, 2)).clamp(min=1)
-            return (per_sample * tw).mean()
-
-        # Legacy fallback path. Handles:
-        #   (a) 1D ``(B, T)`` per-timestep mask (pre-migration contract; still
-        #       valid for any reader that didn't migrate).
-        #   (b) ``(B, T, K)`` mask whose K dim does NOT match per_element's D
-        #       (e.g. predictor stub used in tests where pred ∈ R^{T×2} but
-        #       reader emits 14-dim mask; OR a per-hand mask). Collapse
-        #       to per-step via ``any(dim=-1)`` so "any dim valid → timestep
-        #       contributes" — preserves legacy semantics.
-        if valid_mask_f.ndim == 3:
-            valid_mask_f = (valid_mask_f > 0).any(dim=-1).float()
-        per_step = per_element.mean(dim=2)
-        per_step = per_step * valid_mask_f
-        valid_count = valid_mask_f.sum(dim=1).clamp(min=1)
-        per_sample = per_step.sum(dim=1) / valid_count
+        if action_is_pad.shape != per_element.shape:
+            raise ValueError(f"action_is_pad {tuple(action_is_pad.shape)} must match the action {tuple(per_element.shape)}")
+        valid_mask_f = (~action_is_pad.to(device=per_element.device, dtype=torch.bool)).float()
+        per_sample = (per_element * valid_mask_f).sum(dim=(1, 2)) / valid_mask_f.sum(dim=(1, 2)).clamp(min=1)
         return (per_sample * tw).mean()
 
     # --- Inference: generation ---
@@ -1080,193 +753,33 @@ class BaseWAMArchitecture(ABC, nn.Module):
             return None
         return inactive_action_dims
 
-    @torch.no_grad()
-    def generate(
-        self,
-        schedule,
-        prompt: str,
-        *,
-        first_frame_image=None,
-        num_frames: int = 49,
-        action_num_frames: Optional[int] = None,
-        height: int = 384,
-        width: int = 320,
-        seed: int = 42,
-        tiled: bool = True,
-        input_video_latents: Optional[Tensor] = None,
-        num_inference_steps: int = 50,
-        shift: float = 5.0,
-        tile_size: tuple = None,
-        tile_stride: tuple = None,
-        dit_cache=None,
-        decode_video: bool = True,
-        profile: bool = False,
-        prompt_embed_cache: Optional[dict] = None,
-        proprio: Optional[Tensor] = None,
-        cfg_scale: float = 1.0,
-        cfg_merge: bool = False,
-        active_action_mask: Optional[Tensor] = None,
-        **extra_pipeline_inputs: Any,
-    ) -> dict:
-        """Execute joint video-action denoising driven by a schedule.
-
-        This is the single entry point for inference. External code
-        (engine) should call this instead of touching video_backbone directly.
-
-        The condition is the backbone's deploy encode (``preprocess_condition``) of the first frame alone, the
-        same encode the sparse layout uses for its history; the video noise is built here.
-
-        Args:
-            first_frame_image: the clean first frame, one PIL image (or a list holding exactly one).
-            num_frames: Video frame count T (1 + temporal_compression * k) of the denoised clip.
-            height / width / tiled / tile_size / tile_stride / prompt_embed_cache: ignored (the grid comes from
-                the encoded first frame; decode is the backbone's; the text goes through the backbone's
-                ``text_lookup``). Kept until Task 8 deletes ``generate``.
-            action_num_frames: Raw state/action window length. Generated
-                action chunk length is ``action_num_frames - 1``. Defaults to
-                ``num_frames`` for datasets whose video/action rates match.
-            active_action_mask: Optional ``(action_dim,)`` boolean mask for the
-                benchmark being generated. Inactive unified-action dimensions
-                stay on their analytic zero-padding noise path. When omitted,
-                the mask is inferred from the attached unified normalizer.
-
-        Returns:
-            dict with ``video`` (list of PIL images or None) and
-            ``actions`` ((T, action_dim) numpy array).
-        """
-        import time
-
-        # Defensive: deploy/model_loader.py:161 already flips eval at load,
-        # but ad-hoc callers (notebooks, mid-training eval callbacks) might
-        # invoke `generate()` without going through that path. Idempotent
-        # — guards CFG dropout and any other
-        # training-only behavior from firing during inference.
-        self.eval()
-
-        vb = self.video_backbone
-        device = self.device
-        dtype = self.dtype
-
-        t0 = time.time()
-
-        # §15 — validate CFG up front. CFG vs dit_cache (§15.D6): cond/uncond
-        # use the same cache key, so re-running uncond off a cond-tagged hit
-        # would silently corrupt the velocity prediction. MVP keeps it simple
-        # — disable the cache whenever CFG is on; future work can add a
-        # (cond, uncond) slot. CFG is applied by the denoising loop below, not
-        # forwarded to the backbone preprocess (Wan does no CFG at inference).
-        cfg_scale_f = float(cfg_scale)
-        if cfg_scale_f < 1.0:
-            raise ValueError(f"cfg_scale must be >= 1.0; got {cfg_scale!r}.")
-        if cfg_scale_f > 1.0:
-            dit_cache = None
-
-        action_num_frames = int(action_num_frames if action_num_frames is not None else num_frames)
-
-        # Condition: the first frame encoded alone + the text of the T-frame clip.
-        images = first_frame_image if isinstance(first_frame_image, list) else [first_frame_image]
-        if len(images) != 1 or images[0] is None:
-            raise ValueError("generate is first-frame conditioned: pass exactly one first_frame_image.")
-        num_latents = vb.num_future_latents(num_frames)  # 1 + (T-1)/tc, validates T
-        clean_latents, text = vb.preprocess_condition(
-            [images], [prompt], num_frames=int(num_frames), num_latents=num_latents
-        )
-        vb.scheduler.set_timesteps(num_inference_steps, shift=shift)
-
-        if profile:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            logger.info("[WAM_PROFILE] pipeline_prep: %.3fs", time.time() - t0)
-
-        # Video noise: seeded CPU generator, float32, then the model dtype / device.
-        _, z, _, h_lat, w_lat = clean_latents.shape
-        generator = torch.Generator("cpu").manual_seed(int(seed))
-        noise = torch.randn((1, z, num_latents, h_lat, w_lat), generator=generator, device="cpu", dtype=torch.float32)
-        inputs_shared = {"latents": noise.to(dtype=dtype, device=device), "clean_latents": clean_latents, "text": text}
-        if input_video_latents is not None:
-            inputs_shared["latents"] = input_video_latents
-        # Architecture-specific pipeline inputs are forwarded as-is. Subclasses
-        # extract what they recognize in their forward(); unrelated architectures
-        # never see these keys because callers only pass them via super().generate.
-        for key, value in extra_pipeline_inputs.items():
-            if value is not None:
-                inputs_shared[key] = value
-        latents = inputs_shared["latents"].clone()
-        latents[:, :, : clean_latents.shape[2]] = clean_latents
-        inputs_shared["latents"] = latents
-        if self.uses_proprioception:
-            if proprio is None:
-                raise ValueError("use_proprioception=True requires `proprio` during generation.")
-            inputs_shared["proprio"] = proprio.to(device=device, dtype=dtype)
-
-        action_latents = torch.randn(
-            1,
-            action_num_frames - 1,
-            self.action_dim,
-            device=device,
-            dtype=dtype,
-            generator=torch.Generator(device=device).manual_seed(seed),
-        )
-
-        # Unified-action checkpoints scatter raw actions into a larger zero-padded
-        # space.  The inactive dimensions may be excluded from the training loss,
-        # so their predicted flow is unconstrained.  Keep those dimensions on the
-        # analytic forward-noise path instead of feeding unconstrained updates back
-        # into the next denoising step.
-        inactive_action_dims = self._resolve_inactive_action_dims(active_action_mask, device)
-
-        t_loop = time.time()
-        action_latents = self._denoise_loop(
-            schedule,
-            inputs_shared,
-            action_latents,
-            inactive_action_dims=inactive_action_dims,
-            dit_cache=dit_cache,
-            cfg_scale=cfg_scale_f,
-            cfg_merge=bool(cfg_merge),
-        )
-
-        if profile:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            logger.info("[WAM_PROFILE] denoising_loop: %.3fs", time.time() - t_loop)
-
-        # VAE decode (only when pixels were requested).
-        if decode_video:
-            video_frames = vb.decode_video(inputs_shared["latents"])
-        else:
-            video_frames = None
-
-        actions = action_latents.squeeze(0).float().cpu().numpy()
-        normalizer = getattr(self, "normalizer", None)
-        if normalizer is not None:
-            actions = normalizer.unnormalize(actions)
-
-        return {"video": video_frames, "actions": actions}
-
     def _denoise_loop(
         self,
         schedule,
-        inputs_shared: dict,
+        latents: Tensor,
         action_latents: Tensor,
         *,
+        hist_latents: Tensor,
+        text: "TextCondition",
+        proprio: Tensor,
+        proprio_mask: Tensor,
         inactive_action_dims: Optional[Tensor] = None,
         dit_cache=None,
         cfg_scale: float = 1.0,
         cfg_merge: bool = False,
-    ) -> Tensor:
-        """Joint video-action Euler loop over a ``(t_video, t_action)`` schedule (shared by deploy and vis).
+    ) -> Tuple[Tensor, Tensor]:
+        """Joint video-action Euler loop over a ``(t_video, t_action)`` schedule (``sample``: deploy and vis).
 
         Args:
             schedule: list of (t_video, t_action) pairs ending with the (0, 0) sentinel (``make_schedule``).
-            inputs_shared: forward kwargs; ``latents`` (B, C, T, h, w) start noisy and are updated in place
-                in the dict, the ``clean_latents`` prefix (B, C, H, h, w) is re-imposed each step.
+            latents: (B, C, T, h, w) initial latents (noise, clean prefix written in).
             action_latents: (B, K, A) initial action noise.
+            hist_latents: (B, C, num_hist_latents, h, w) clean prefix, re-imposed after every video step.
+            text: TextCondition. proprio: (B, H, D) normalized proprio. proprio_mask: (B, H, D) bool.
             inactive_action_dims: (A,) index of unified-action dims kept on the analytic noise path, or None.
-            dit_cache / cfg_scale / cfg_merge: as in :meth:`generate`.
+            dit_cache: optional DiT velocity cache. cfg_scale / cfg_merge: classifier-free guidance (scale 1 = off).
 
-        Returns: (B, K, A) denoised actions (normalized space); the final video latents are in
-            ``inputs_shared["latents"]``.
+        Returns: (latents (B, C, T, h, w) denoised video latents, actions (B, K, A) in normalized space).
         """
         from tqdm import tqdm
 
@@ -1316,28 +829,33 @@ class BaseWAMArchitecture(ABC, nn.Module):
                     noise_pred, action_noise_pred = self._forward_with_cfg(
                         action_latents=action_latents,
                         a_timestep=a_timestep,
-                        inputs_shared=inputs_shared,
+                        inputs_shared={"latents": latents, "text": text, "proprio": proprio},
                         v_timestep=v_timestep,
                         cfg_scale=cfg_scale_f,
                         cfg_merge=bool(cfg_merge),
                     )
                 else:
                     torch.compiler.cudagraph_mark_step_begin()
+                    # Inference never checkpoints (it would also bypass the compiled loops).
                     noise_pred, action_noise_pred = self.forward(
                         action_latents,
                         a_timestep,
-                        **inputs_shared,
+                        latents=latents,
                         timestep=v_timestep,
+                        text=text,
+                        proprio=proprio,
+                        proprio_mask=proprio_mask,
+                        use_gradient_checkpointing=False,
+                        use_gradient_checkpointing_offload=False,
                     )
                 if dit_cache is not None and video_stepping:
                     dit_cache.update(noise_pred, sigma_v, action_noise_pred)
 
             if video_stepping:
-                new_latents = inputs_shared["latents"] + noise_pred * (sigma_v_next - sigma_v)
-                clean = inputs_shared["clean_latents"]
+                new_latents = latents + noise_pred * (sigma_v_next - sigma_v)
                 new_latents = new_latents.clone()
-                new_latents[:, :, : clean.shape[2]] = clean
-                inputs_shared["latents"] = new_latents
+                new_latents[:, :, : hist_latents.shape[2]] = hist_latents
+                latents = new_latents
 
             if action_stepping and action_noise_pred is not None:
                 if inactive_action_dims is not None and inactive_action_noise is None:
@@ -1351,76 +869,50 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 if inactive_action_dims is not None:
                     action_latents[..., inactive_action_dims] = inactive_action_noise * float(sigma_a_next)
 
-        return action_latents
-
-    @torch.no_grad()
-    def prepare_sparse_condition(self, history_frames, prompts, proprio, *, num_future_frames: int) -> dict:
-        """Forward conditioning of the sparse-history layout from raw observations (deploy).
-
-        The video backbone encodes the history + text exactly as its training path does
-        (``preprocess_condition`` is the history half of ``preprocess_train``).
-
-        Args:
-            history_frames: list of B clips, each H PIL canvases (oldest first, frame t last), training layout.
-            prompts: list of B str.
-            proprio: (B, H, D) normalized proprio, one row per history frame (oldest first).
-            num_future_frames: int F, future frames the denoised latents cover.
-
-        Returns: forward kwargs ``clean_latents`` (B, z, H, h, w), ``text`` (TextCondition for the H + T_fut
-            latent grid) and ``proprio`` (B, H, D) on the model device / dtype.
-        """
-        vb = self.video_backbone
-        num_latents = len(history_frames[0]) + vb.num_future_latents(num_future_frames)
-        clean_latents, text = vb.preprocess_condition(
-            history_frames,
-            list(prompts),
-            # The text describes the equivalent contiguous clip of these latents.
-            num_frames=1 + int(vb.temporal_compression) * (num_latents - 1),
-            num_latents=num_latents,
-        )
-        proprio = torch.as_tensor(proprio).to(device=self.device, dtype=self.dtype)
-        return {"clean_latents": clean_latents, "text": text, "proprio": proprio}
+        return latents, action_latents
 
     @torch.no_grad()
     def sample(
         self,
-        cond_inputs: dict,
+        hist_latents: Tensor,
+        text: "TextCondition",
+        proprio: Tensor,
         schedule,
         *,
-        latent_shape,
-        action_shape,
         seed: int,
         active_action_mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
-        """Denoise video latents + an action chunk from seeded noise, given forward conditioning.
+        """Denoise the future video latents + an action chunk from seeded noise, given the condition.
 
         Args:
-            cond_inputs: forward kwargs without ``latents`` (``prepare_sparse_condition``, or ``prepare_inputs``
-                with the GT / training-only entries removed); the ``clean_latents`` (B, z, N, h, w) prefix is
-                written over the first N latent frames and re-imposed every step.
+            hist_latents: (B, z, num_hist_latents, h, w) clean history latents (``preprocess_condition``), written
+                over the first latents and re-imposed every step.
+            text: TextCondition for the (num_latents, h, w) grid (``preprocess_condition``).
+            proprio: (B, H, D) normalized proprio on the model device / dtype, one row per history frame (all real).
             schedule: (t_video, t_action) list from ``make_schedule``.
-            latent_shape: (B, z, T, h, w) of the full latent clip (clean prefix + denoised part).
-            action_shape: (B, K, A) of the action chunk.
             seed: int, seeds one generator that draws the video noise, then the action noise.
-            active_action_mask: optional (A,) bool, see :meth:`generate`.
+            active_action_mask: optional (A,) bool of the active unified-action dims (None: from the normalizer).
 
-        Returns: (latents (B, z, T, h, w), actions (B, K, A) in normalized space).
+        Returns: (latents (B, z, layout.num_latents, h, w), actions (B, layout.action_horizon, A) in normalized
+            space). The shapes come from the layout; h, w are the history latents' grid.
         """
         device, dtype = self.device, self.dtype
-        inputs = dict(cond_inputs)
+        b, z, _, h, w = hist_latents.shape
         gen = torch.Generator(device=device).manual_seed(int(seed))
-        latents = torch.randn(tuple(latent_shape), generator=gen, device=device, dtype=dtype)
-        clean = inputs["clean_latents"]
-        latents[:, :, : clean.shape[2]] = clean
-        inputs["latents"] = latents
-        action_latents = torch.randn(tuple(action_shape), generator=gen, device=device, dtype=dtype)
-        action_latents = self._denoise_loop(
+        latents = torch.randn((b, z, int(self.layout.num_latents), h, w), generator=gen, device=device, dtype=dtype)
+        latents[:, :, : hist_latents.shape[2]] = hist_latents
+        action_shape = (b, int(self.layout.action_horizon), self.action_dim)
+        action_latents = torch.randn(action_shape, generator=gen, device=device, dtype=dtype)
+        return self._denoise_loop(
             schedule,
-            inputs,
+            latents,
             action_latents,
+            hist_latents=hist_latents,
+            text=text,
+            proprio=proprio,
+            proprio_mask=torch.ones(proprio.shape, dtype=torch.bool, device=proprio.device),
             inactive_action_dims=self._resolve_inactive_action_dims(active_action_mask, device),
         )
-        return inputs["latents"], action_latents
 
     # --- §15: Classifier-Free Guidance helpers (inference-time) ---
 
@@ -1514,11 +1006,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
         latents: Tensor,
         timestep: Tensor,
         text: "TextCondition",
-        clean_latents: Tensor,
-        proprio: Optional[Tensor] = None,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
-        **pipeline_inputs,
+        proprio: Tensor,
+        proprio_mask: Tensor,
+        use_gradient_checkpointing: bool,
+        use_gradient_checkpointing_offload: bool,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the joint video + action forward.
 
@@ -1526,18 +1017,18 @@ class BaseWAMArchitecture(ABC, nn.Module):
         runs the video DiT block loop, captures or interleaves with the
         action stream as appropriate, and returns
         ``(video_noise_pred, action_noise_pred)``. When ``noisy_actions`` is
-        None (CFG nega pass / video-only generation) the action term is
-        None.
+        None (video-only training, ``lambda_action = 0``) the action term is None.
 
         Args:
             noisy_actions: (B, K, A) or None. action_timestep: (B,) or None.
-            latents: (B, z, T_lat, h, w) noisy video latents (clean prefix already written in).
+            latents: (B, z, num_latents, h, w) noisy video latents (clean prefix already written in; its length is
+                ``layout.num_hist_latents``).
             timestep: (B,) video timestep. text: TextCondition from the video backbone.
-            clean_latents: (B, z, N_clean, h, w) clean prefix; only its length N_clean is read here.
-            proprio: normalized proprio for the proprio-as-context token(s).
-            use_gradient_checkpointing / use_gradient_checkpointing_offload: bool.
-            pipeline_inputs: ``_proprio_sample_mask`` (per-sample proprio mask) and training-only entries
-                (``input_latents``) that the forward ignores.
+            proprio: (B, H, D) normalized proprio (``build_contexts`` turns it into context tokens; a
+                ``backbone_stream`` family also embeds it in its own stream).
+            proprio_mask: (B, H, D) bool, True = real entry.
+            use_gradient_checkpointing / use_gradient_checkpointing_offload: bool (training: ``train_options``;
+                inference: False).
         """
         ...
 
@@ -1561,9 +1052,7 @@ def _combine_cfg(uncond: Tensor, cond: Tensor, scale: float) -> Tensor:
 # need duplication when stacking ``[uncond, cond]`` for cfg_merge=True.
 _CFG_BATCH_AXIS_KEYS: tuple = (
     "latents",
-    "input_latents",
     "proprio",
-    "clean_latents",
 )
 
 
@@ -1590,19 +1079,6 @@ def _expand_inputs_for_cfg(
     expanded = dict(inputs_shared)
     expanded["context"] = torch.cat([uncond_context, cond_context], dim=0)
     expanded["uncond_context"] = None
-
-    # proprio can come in raw 1D ``(D,)`` shape (the architecture's
-    # ``_compute_proprio`` normalises inside forward); cfg_merge
-    # stacks BEFORE forward so we must normalise to ``(B, D)`` first,
-    # otherwise ``cat([(D,), (D,)], dim=0)`` lands on ``(2·D,)`` and the
-    # last-dim check downstream raises. Mirrors the (B, 1, D) → (B, D)
-    # squeeze the architecture itself does.
-    proprio = expanded.get("proprio")
-    if isinstance(proprio, Tensor):
-        if proprio.ndim == 1:
-            expanded["proprio"] = proprio.unsqueeze(0)
-        elif proprio.ndim == 3 and proprio.shape[1] == 1:
-            expanded["proprio"] = proprio[:, 0, :]
 
     for key in _CFG_BATCH_AXIS_KEYS:
         v = expanded.get(key)

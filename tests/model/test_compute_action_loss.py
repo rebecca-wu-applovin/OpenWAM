@@ -1,15 +1,13 @@
-"""End-to-end tests of LeRobot3VideoActionModel._compute_action_loss.
+"""``BaseWAMArchitecture._compute_action_loss`` on the per-element (B, K, A) ``action_is_pad`` of a Batch.
 
-Verifies that the actual method implementation (not a re-implementation)
-behaves identically to the legacy formula when handed an equivalent 1-D
-vs 2-D action_is_pad. Uses a thin stub that supplies just the scheduler
-+ device arguments the method needs; no diffusion model is constructed.
+Uses a thin stub that supplies just the scheduler + device arguments the method needs; no diffusion model is
+constructed.
 """
 
 from __future__ import annotations
 
+import pytest
 import torch
-import torch.nn.functional as F
 
 
 class _SchedulerStub:
@@ -18,8 +16,7 @@ class _SchedulerStub:
 
 
 class _ModelStub:
-    """Subset of LeRobot3VideoActionModel just sufficient to call
-    ``_compute_action_loss``."""
+    """Just enough of BaseWAMArchitecture to call ``_compute_action_loss``."""
 
     # Pull in the actual implementation under test.
     from openwam.model.architectures.base import BaseWAMArchitecture
@@ -27,144 +24,48 @@ class _ModelStub:
     _compute_action_loss = BaseWAMArchitecture._compute_action_loss
 
 
-def _make_inputs(B, T, D, mask_1d_or_2d=None):
-    """Build minimal kwargs for _compute_action_loss."""
-    return {
-        "noise_pred": torch.randn(B, T, D),
-        "target": torch.randn(B, T, D),
-        "timestep_ids": torch.randint(0, 1000, (B,)),
-        "scheduler": _SchedulerStub(),
-        "inputs": {"action_is_pad": mask_1d_or_2d} if mask_1d_or_2d is not None else {},
-        "device": "cpu",
-    }
+def _loss(pred, target, action_is_pad):
+    """pred / target: (B, K, A). action_is_pad: (B, K, A) bool. Returns: 0-dim loss (unit timestep weights)."""
+    timestep_ids = torch.zeros(pred.shape[0], dtype=torch.long)
+    return _ModelStub()._compute_action_loss(pred, target, timestep_ids, _SchedulerStub(), action_is_pad, "cpu")
 
 
 class TestComputeActionLoss:
-    def _legacy_oracle(self, pred, target, pad_1d, tw):
-        """Replica of the pre-migration legacy formula for comparison."""
-        per_element = F.mse_loss(pred.float(), target.float(), reduction="none")
-        per_step = per_element.mean(dim=2)
-        valid = (~pad_1d).float()
-        per_step = per_step * valid
-        valid_count = valid.sum(dim=1).clamp(min=1)
-        per_sample = per_step.sum(dim=1) / valid_count
-        return (per_sample * tw).mean()
-
-    def test_no_mask_equivalent_to_legacy(self):
+    def test_all_valid_is_plain_mse(self):
         torch.manual_seed(0)
-        B, T, D = 3, 8, 20
-        kw = _make_inputs(B, T, D)
-        m = _ModelStub()
-        l = m._compute_action_loss(**kw)
-        oracle = kw["noise_pred"].float().sub(kw["target"].float()).pow(2).mean(dim=(1, 2)).mean()
-        assert torch.allclose(l, oracle, atol=1e-7)
+        pred, target = torch.randn(3, 8, 20), torch.randn(3, 8, 20)
+        loss = _loss(pred, target, torch.zeros(3, 8, 20, dtype=torch.bool))
+        oracle = pred.sub(target).pow(2).mean(dim=(1, 2)).mean()
+        assert torch.allclose(loss, oracle, atol=1e-7)
 
-    def test_2d_full_true_equivalent_to_legacy_full_true(self):
-        torch.manual_seed(1)
-        B, T, D = 3, 8, 20
-        # Use same pred/target for both paths
-        torch.manual_seed(1)
-        pred = torch.randn(B, T, D)
-        target = torch.randn(B, T, D)
-        ts = torch.randint(0, 1000, (B,))
-
-        pad_1d = torch.zeros(B, T, dtype=torch.bool)
-        pad_2d = torch.zeros(B, T, D, dtype=torch.bool)
-
-        m = _ModelStub()
-        # Path with 1D mask
-        kw_1d = {
-            "noise_pred": pred,
-            "target": target,
-            "timestep_ids": ts,
-            "scheduler": _SchedulerStub(),
-            "inputs": {"action_is_pad": pad_1d},
-            "device": "cpu",
-        }
-        l_1d = m._compute_action_loss(**kw_1d)
-        # Path with 2D mask
-        kw_2d = dict(kw_1d, inputs={"action_is_pad": pad_2d})
-        l_2d = m._compute_action_loss(**kw_2d)
-
-        assert torch.allclose(l_1d, l_2d, atol=1e-7), f"1D vs 2D loss diverged: {float(abs(l_1d - l_2d))}"
-
-    def test_2d_broadcast_time_equivalent_to_1d_time(self):
+    def test_time_padding_averages_valid_steps_only(self):
+        """A per-step padding (broadcast over dims) averages each sample over its valid steps."""
         torch.manual_seed(2)
-        B, T, D = 4, 10, 20
-        pred = torch.randn(B, T, D)
-        target = torch.randn(B, T, D)
-        ts = torch.randint(0, 1000, (B,))
+        B, K, A = 4, 10, 20
+        pred, target = torch.randn(B, K, A), torch.randn(B, K, A)
+        pad_steps = torch.tensor([[False] * 7 + [True] * 3, [False] * 5 + [True] * 5, [False] * 10, [False] + [True] * 9])
+        loss = _loss(pred, target, pad_steps.unsqueeze(-1).expand(-1, -1, A))
+        per_step = pred.sub(target).pow(2).mean(dim=2)
+        valid = (~pad_steps).float()
+        oracle = ((per_step * valid).sum(dim=1) / valid.sum(dim=1)).mean()
+        assert torch.allclose(loss, oracle, atol=1e-6)
 
-        # Mixed time-only pad
-        pad_1d = torch.tensor(
-            [
-                [False] * 7 + [True] * 3,
-                [False] * 5 + [True] * 5,
-                [False] * 10,
-                [False] * 1 + [True] * 9,
-            ]
-        )
-        pad_2d = pad_1d.unsqueeze(-1).expand(-1, -1, D).contiguous()
-
-        m = _ModelStub()
-        kw = {
-            "noise_pred": pred,
-            "target": target,
-            "timestep_ids": ts,
-            "scheduler": _SchedulerStub(),
-            "inputs": {"action_is_pad": pad_1d},
-            "device": "cpu",
-        }
-        l_1d = m._compute_action_loss(**kw)
-        kw_2d = dict(kw, inputs={"action_is_pad": pad_2d})
-        l_2d = m._compute_action_loss(**kw_2d)
-        assert torch.allclose(l_1d, l_2d, atol=1e-6), (
-            f"1D-time vs 2D-broadcast loss diverged: {float(abs(l_1d - l_2d))}"
-        )
-
-    def test_2d_per_dim_mask_changes_loss(self):
-        """Single-arm (front-10-True / back-10-False) mask gives different
-        loss vs all-True; this is the OXE training contract."""
+    def test_per_dim_mask_changes_loss(self):
+        """Padded dims (e.g. a single arm's unused half) are left out of the loss."""
         torch.manual_seed(3)
-        B, T, D = 4, 8, 20
-        pred = torch.randn(B, T, D)
-        target = torch.randn(B, T, D)
-        ts = torch.randint(0, 1000, (B,))
-
+        B, K, A = 4, 8, 20
+        pred, target = torch.randn(B, K, A), torch.randn(B, K, A)
         dim_pad = torch.cat([torch.zeros(10, dtype=torch.bool), torch.ones(10, dtype=torch.bool)])
-        pad_2d = dim_pad.unsqueeze(0).unsqueeze(0).expand(B, T, -1).contiguous()
+        partial = _loss(pred, target, dim_pad.expand(B, K, -1))
+        full = _loss(pred, target, torch.zeros(B, K, A, dtype=torch.bool))
+        assert torch.isfinite(partial) and not torch.allclose(partial, full, atol=1e-5)
+        oracle = pred[..., :10].sub(target[..., :10]).pow(2).mean(dim=(1, 2)).mean()
+        assert torch.allclose(partial, oracle, atol=1e-6)
 
-        m = _ModelStub()
-        l_partial = m._compute_action_loss(
-            noise_pred=pred,
-            target=target,
-            timestep_ids=ts,
-            scheduler=_SchedulerStub(),
-            inputs={"action_is_pad": pad_2d},
-            device="cpu",
-        )
-        l_full = m._compute_action_loss(
-            noise_pred=pred,
-            target=target,
-            timestep_ids=ts,
-            scheduler=_SchedulerStub(),
-            inputs={"action_is_pad": torch.zeros(B, T, D, dtype=torch.bool)},
-            device="cpu",
-        )
-        assert torch.isfinite(l_partial)
-        # Different distribution over dims → different loss
-        assert not torch.allclose(l_partial, l_full, atol=1e-5)
+    def test_all_padded_returns_zero(self):
+        loss = _loss(torch.randn(2, 4, 20), torch.randn(2, 4, 20), torch.ones(2, 4, 20, dtype=torch.bool))
+        assert torch.allclose(loss, torch.tensor(0.0), atol=1e-7)
 
-    def test_2d_all_false_mask_returns_zero(self):
-        torch.manual_seed(4)
-        B, T, D = 2, 4, 20
-        m = _ModelStub()
-        l = m._compute_action_loss(
-            noise_pred=torch.randn(B, T, D),
-            target=torch.randn(B, T, D),
-            timestep_ids=torch.randint(0, 1000, (B,)),
-            scheduler=_SchedulerStub(),
-            inputs={"action_is_pad": torch.ones(B, T, D, dtype=torch.bool)},
-            device="cpu",
-        )
-        assert torch.allclose(l, torch.tensor(0.0), atol=1e-7)
+    def test_mask_shape_must_match_the_action(self):
+        with pytest.raises(ValueError, match="action_is_pad"):
+            _loss(torch.randn(2, 4, 20), torch.randn(2, 4, 20), torch.zeros(2, 4, dtype=torch.bool))

@@ -50,6 +50,9 @@ def main() -> None:
         # A finished run drops its accel_state dirs; keep them so a second run can resume from step N.
         openwam_trainer.finalize_keep_weights_only = lambda *a, **k: None
     train._inject_project_seed(cfg)
+    from openwam.config import resolve_config
+
+    resolve_config(cfg)  # what scripts/train.py's entry does: cfg.common.layout
     seed_everything(int(OmegaConf.select(cfg, "project.seed")), rank=0)
     trainer = openwam_trainer.OpenWAMTrainer(
         cfg, accelerator=train._build_accelerator(cfg), dataset=build_dataset(cfg.dataloader, split="train")

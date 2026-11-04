@@ -10,8 +10,9 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from openwam.model.architectures.dual_system import DualSystemCrossAttnArchitecture
+from openwam.dataloader.collate import Batch
 from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
+from tests._arch import TEST_TRAIN_OPTIONS, build_test_arch
 
 # ---------------------------------------------------------------------------
 # Mock pipeline: replaces WanVideoPipeline to avoid loading ~20GB of weights
@@ -169,24 +170,6 @@ class _MockVideoBackbone(VideoBackbone):
     def submodule_names(self) -> list:
         return ["dit", "vae", "text_encoder"]
 
-    @property
-    def video_attention_mask_mode(self) -> str:
-        return getattr(self, "_video_attention_mask_mode", "bidirectional")
-
-    @video_attention_mask_mode.setter
-    def video_attention_mask_mode(self, mode: str) -> None:
-        self._video_attention_mask_mode = mode
-
-    def build_video_to_video_mask(self, video_seq_len: int, video_tokens_per_frame: int, device: torch.device):
-        if self.video_attention_mask_mode == "bidirectional":
-            return torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
-        if self.video_attention_mask_mode == "first_frame_causal":
-            mask = torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
-            first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
-            mask[:first_frame_tokens, first_frame_tokens:] = False
-            return mask
-        raise ValueError(f"Unsupported mock video_attention_mask_mode '{self.video_attention_mask_mode}'")
-
     def prepare(self, **inputs) -> BlockLoopState:
         latents = inputs["latents"]
         B = latents.shape[0]
@@ -214,7 +197,7 @@ class _MockVideoBackbone(VideoBackbone):
             extras={},
         )
 
-    def run_block(self, block_id: int, state: BlockLoopState) -> BlockLoopState:
+    def run_block(self, block_id: int, state: BlockLoopState, attn_mask) -> BlockLoopState:
         return state
 
     def pre_attn_at_layer(self, layer_id: int, state: BlockLoopState):
@@ -255,24 +238,24 @@ class _MockVideoBackbone(VideoBackbone):
         raise NotImplementedError("mock: preprocess_train is stubbed")
 
     def decode_latents(self, latents):
-        raise NotImplementedError("mock: decode_video is stubbed")
+        raise NotImplementedError("mock: decode_future is stubbed")
 
     def encode_text(self, prompts, *, grid, num_frames):
         raise NotImplementedError("mock: preprocess_train is stubbed")
 
-    def preprocess_train(self, clips, prompts, *, num_hist_frames):
-        # One clean first-frame latent (latent[0] = conditioning, loss + mask both skip it).
-        text = TextCondition(context=torch.randn(1, 4, self._dim), context_mask=torch.ones(1, 4, dtype=torch.bool))
-        return torch.zeros(1, 16, 1, 8, 8), torch.randn(1, 16, 3, 8, 8), text
+    def preprocess_train(self, clips, prompts, layout):
+        # One latent clip per sample; latent 0 (first-frame layout) is the clean condition the loss skips.
+        b = len(clips)
+        # Text width: the action stream's (set by a test as ``context_width``), else the mock's dim.
+        width = getattr(self, "context_width", self._dim)
+        text = TextCondition(context=torch.randn(b, 4, width), context_mask=torch.ones(b, 4, dtype=torch.bool))
+        return torch.randn(b, 16, int(layout.num_latents), 8, 8), text
 
     def get_submodule(self, name):
         return getattr(self, f"_{name}", None)
 
     def set_submodule(self, name, module):
         setattr(self, f"_{name}", module)
-
-    def decode_video(self, latents):
-        return []
 
     def set_dtype_device(self, dtype, device):
         pass
@@ -312,6 +295,8 @@ class _MockScheduler:
 
 _TINY_ARCH_CFG = {
     "framework": "dual_system",
+    "clean_attention": "bidirectional",
+    "attention_mask_mode": "mutual",
     "variant": "joint_cross_attn",
     "detach_bridge": False,
     "action_dim": 7,
@@ -325,26 +310,27 @@ _TINY_ARCH_CFG = {
 }
 
 
-def _make_tiny_arch():
-    arch = DualSystemCrossAttnArchitecture(cfg=_TINY_ARCH_CFG)
-    arch.video_backbone = _MockVideoBackbone(dim=64, num_layers=2)
+def _make_tiny_arch(train_options=TEST_TRAIN_OPTIONS):
+    """Tiny joint_cross_attn architecture on a mock video backbone (CPU, fp32)."""
+    arch = build_test_arch(
+        "dual_system_cross_attn", _TINY_ARCH_CFG, _MockVideoBackbone(dim=64, num_layers=2), train_options=train_options
+    )
     arch._device = torch.device("cpu")
     arch._dtype = torch.float32
     return arch
 
 
-def _make_fake_loss_inputs(B=1, action_dim=7, T_action=5, video_dim=64):
-    """Build the minimal dict that architecture.compute_loss expects."""
-    C, T, H, W = 16, 3, 8, 8
-    return {
-        "input_latents": torch.randn(B, C, T, H, W),
-        "clean_latents": torch.zeros(B, C, 1, H, W),
-        "text": TextCondition(context=torch.randn(B, 4, video_dim), context_mask=torch.ones(B, 4, dtype=torch.bool)),
-        "use_gradient_checkpointing": False,
-        "use_gradient_checkpointing_offload": False,
-        "max_timestep_boundary": 1.0,
-        "min_timestep_boundary": 0.0,
-    }
+def _make_batch(B=1, action_dim=7, T_action=5):
+    """A collated Batch for compute_loss (the mock backbone ignores the clips and prompts)."""
+    return Batch(
+        video=[[] for _ in range(B)],
+        prompt=["pick cup"] * B,
+        action=torch.randn(B, T_action, action_dim),
+        action_is_pad=torch.zeros(B, T_action, action_dim, dtype=torch.bool),
+        proprio=torch.randn(B, 1, action_dim),
+        proprio_mask=torch.ones(B, 1, action_dim, dtype=torch.bool),
+        source=["test"] * B,
+    )
 
 
 def test_resolve_architecture_config_merges_action_backbone_fields():
@@ -355,6 +341,8 @@ def test_resolve_architecture_config_merges_action_backbone_fields():
     model_cfg = SimpleNamespace(
         architecture={
             "framework": "dual_system",
+            "clean_attention": "bidirectional",
+            "attention_mask_mode": "mutual",
             "variant": "joint_cross_attn",
             "detach_bridge": False,
             "action_dim": 7,
@@ -435,14 +423,7 @@ def test_single_batch_loss():
     arch = _make_tiny_arch()
     arch.action_backbone.scheduler = _MockScheduler()
 
-    B, T_action, action_dim = 1, 5, 7
-    action_data = torch.randn(B, T_action, action_dim)
-    inputs = _make_fake_loss_inputs(B=B, action_dim=action_dim, T_action=T_action)
-
-    result = arch.compute_loss(
-        **inputs,
-        actions=action_data,
-    )
+    result = arch.compute_loss(_make_batch(B=1))
 
     assert "loss" in result
     assert "loss_video" in result
@@ -458,14 +439,7 @@ def test_multi_batch_loss():
     arch = _make_tiny_arch()
     arch.action_backbone.scheduler = _MockScheduler()
 
-    B, T_action, action_dim = 2, 5, 7
-    action_data = torch.randn(B, T_action, action_dim)
-    inputs = _make_fake_loss_inputs(B=B, action_dim=action_dim, T_action=T_action)
-
-    result = arch.compute_loss(
-        **inputs,
-        actions=action_data,
-    )
+    result = arch.compute_loss(_make_batch(B=2))
 
     assert result["loss"].shape == ()
     assert result["loss"].item() > 0
@@ -473,18 +447,12 @@ def test_multi_batch_loss():
 
 def test_video_only_loss():
     """lambda_action=0: only video loss is computed."""
-    arch = _make_tiny_arch()
+    from dataclasses import replace
+
+    arch = _make_tiny_arch(replace(TEST_TRAIN_OPTIONS, lambda_action=0.0))
     arch.action_backbone.scheduler = _MockScheduler()
 
-    B = 1
-    inputs = _make_fake_loss_inputs(B=B)
-
-    result = arch.compute_loss(
-        **inputs,
-        actions=None,
-        lambda_video=1.0,
-        lambda_action=0.0,
-    )
+    result = arch.compute_loss(_make_batch(B=1))
 
     assert result["loss"].item() > 0
     assert result["loss_action"].item() == 0.0
@@ -496,14 +464,7 @@ def test_loss_backward():
     arch.train()
     arch.action_backbone.scheduler = _MockScheduler()
 
-    B, T_action, action_dim = 1, 5, 7
-    action_data = torch.randn(B, T_action, action_dim)
-    inputs = _make_fake_loss_inputs(B=B)
-
-    result = arch.compute_loss(
-        **inputs,
-        actions=action_data,
-    )
+    result = arch.compute_loss(_make_batch(B=1))
 
     result["loss"].backward()
 
@@ -526,14 +487,7 @@ def test_training_step():
 
     losses = []
     for step in range(3):
-        B, T_action, action_dim = 1, 5, 7
-        action_data = torch.randn(B, T_action, action_dim)
-        inputs = _make_fake_loss_inputs(B=B)
-
-        result = arch.compute_loss(
-            **inputs,
-            actions=action_data,
-        )
+        result = arch.compute_loss(_make_batch(B=1))
 
         optimizer.zero_grad()
         result["loss"].backward()
@@ -589,32 +543,6 @@ def test_manage_checkpoints():
         names = [r.name for r in remaining]
         assert "checkpoint_step_400.safetensors" in names
         assert "checkpoint_step_500.safetensors" in names
-
-
-# ---------------------------------------------------------------------------
-# Tests: Mask downsampling utility
-# ---------------------------------------------------------------------------
-
-
-def test_downsample_video_mask():
-    """Verify the frame → latent mask downsampling logic."""
-    from openwam.model.architectures.utils.common import (
-        downsample_video_mask_to_latent as _downsample_video_mask_to_latent,
-    )
-
-    # 9 frames: frame 0 excluded, frames 1-8 grouped by 4
-    # All valid (is_pad=False) → all latent steps valid
-    video_is_pad = torch.zeros(9, dtype=torch.bool)
-    latent_mask = _downsample_video_mask_to_latent(video_is_pad)
-    assert latent_mask.shape[0] == 2  # (9-1)/4 = 2
-    assert not latent_mask.any()
-
-    # Last 4 frames padded → second latent step padded
-    video_is_pad = torch.tensor([False, False, False, False, False, True, True, True, True])
-    latent_mask = _downsample_video_mask_to_latent(video_is_pad)
-    assert latent_mask.shape[0] == 2
-    assert not latent_mask[0]  # frames 1-4 valid
-    assert latent_mask[1]  # frames 5-8 all padded
 
 
 def test_architecture_variant_strings_for_sampler_guard():

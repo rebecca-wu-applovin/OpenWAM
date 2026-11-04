@@ -15,7 +15,9 @@ def test_import_data_base():
 
 
 def test_import_data_transforms():
-    from openwam.dataloader.transforms import RotationTransform, build_transforms  # noqa: F401
+    from openwam.dataloader.collate import Batch, collate  # noqa: F401
+    from openwam.dataloader.transforms import Normalizer, VideoColorJitter  # noqa: F401
+    from openwam.dataloader.utils.rotation import matrix_to_rotation_6d, rotation_6d_to_matrix  # noqa: F401
 
 
 def test_import_data_normalization_stats():
@@ -44,14 +46,13 @@ def test_import_inference_schedule():
     )
 
 
-def test_import_inference_joint_engine():
-    from openwam.deploy.engine import JointInferenceEngine  # noqa: F401
+def test_import_inference_sparse_engine():
+    from openwam.deploy.sparse_engine import SparseHistoryInferenceEngine  # noqa: F401
 
 
 def test_import_inference_init():
     from openwam.deploy import (  # noqa: F401
         BaseInferenceEngine,
-        JointInferenceEngine,
         Schedule,
         make_schedule,
     )
@@ -93,16 +94,17 @@ def test_import_video_backbone():
 
 
 def test_import_architecture_registry():
-    from openwam.model import build_architecture, list_supported_architectures
-    from openwam.model.video_backbone import LoadMode
+    from openwam.model import ARCHITECTURE_REGISTRY
+    from tests._arch import build_test_arch, stub_backbone
 
-    supported = list_supported_architectures()
-    assert "dual_system_cross_attn" in supported
-    assert "dual_system_self_attn" in supported
+    assert "dual_system_cross_attn" in ARCHITECTURE_REGISTRY
+    assert "dual_system_self_attn" in ARCHITECTURE_REGISTRY
 
     configs = {
         "dual_system_cross_attn": {
             "framework": "dual_system",
+            "clean_attention": "bidirectional",
+            "attention_mask_mode": "mutual",
             "variant": "joint_cross_attn",
             "detach_bridge": True,
             "bridge_layers": (0, 1),
@@ -114,6 +116,8 @@ def test_import_architecture_registry():
         },
         "dual_system_self_attn": {
             "framework": "dual_system",
+            "clean_attention": "bidirectional",
+            "attention_mask_mode": "mutual",
             "variant": "joint_self_attn",
             "bridge_layers": (0, 1),
             "action_dim": 7,
@@ -127,7 +131,7 @@ def test_import_architecture_registry():
     }
 
     for arch_name in configs:
-        arch = build_architecture(arch_name, configs[arch_name], mode=LoadMode.PRETRAINED, ckpt_dir=None)
+        arch = build_test_arch(arch_name, configs[arch_name], stub_backbone(configs[arch_name]))
         assert arch is not None
 
 

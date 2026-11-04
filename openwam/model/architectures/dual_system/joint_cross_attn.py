@@ -15,7 +15,7 @@ import torch
 from torch import Tensor
 
 from openwam.model.action_backbone.separate_action_dit import ActionDiT
-from openwam.model.architectures.base import BaseWAMArchitecture
+from openwam.model.architectures.base import BaseWAMArchitecture, TrainOptions
 from openwam.model.architectures.registry import _cfg_get, register_architecture
 from openwam.model.architectures.utils.common import resolve_bridge_layers
 from openwam.model.compile_options import (
@@ -36,8 +36,6 @@ def _cross_attn_options(cfg) -> dict:
 
 @register_architecture(
     "dual_system_cross_attn",
-    status="supported",
-    note="DualSystem joint cross-attention: bridge-collection plan with separate ActionDiT.",
     framework="dual_system",
     variant="joint_cross_attn",
     options_from_cfg=_cross_attn_options,
@@ -50,29 +48,22 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
     layers. The video DiT is not aware of the action stream.
     """
 
-    def __init__(self, cfg=None, *, mode: LoadMode = LoadMode.PRETRAINED, ckpt_dir: Optional[str] = None):
-        """cfg: architecture params (see BaseWAMArchitecture). mode / ckpt_dir: how the video backbone is built
-        (LoadMode chosen by the entry point; ckpt_dir for CHECKPOINT, else None)."""
-        super().__init__(cfg, mode=mode, ckpt_dir=ckpt_dir)
-        self._detach_bridge: bool = False
+    def __init__(self, cfg: dict, *, layout, mode: LoadMode, ckpt_dir: Optional[str], train_options: TrainOptions):
+        """Arguments as in :class:`BaseWAMArchitecture`; ``cfg`` also carries the ActionDiT geometry."""
+        super().__init__(cfg, layout=layout, mode=mode, ckpt_dir=ckpt_dir, train_options=train_options)
         self._compiled_action_forward: Optional[Callable[..., Tensor]] = None
-        if cfg is None:
-            return
-        if self.video_backbone is not None:
-            # Auto-fill action-side geometry from the loaded video backbone,
-            # mirroring ``joint_self_attn``. cross_attn does NOT require
-            # num_heads / head_dim parity with the video backbone, but
-            # defaulting to vb geometry keeps the two variants
-            # apples-to-apples and removes the YAML coupling where every
-            # backbone change had to be echoed in ``action_backbone``.
-            # YAML/CLI overrides still win for ablations.
-            cfg = dict(cfg) if isinstance(cfg, dict) else {k: v for k, v in cfg.items()}
-            cfg.setdefault("num_dit_layers", self.video_backbone.num_layers)
-            cfg.setdefault("video_dim", self.video_backbone.dim)
-            cfg.setdefault("num_heads", self.video_backbone.num_heads)
-            cfg.setdefault("attn_head_dim", self.video_backbone.head_dim)
+        # Action-side geometry defaults to the video backbone's, mirroring ``joint_self_attn`` (cross_attn does
+        # not need num_heads / head_dim parity, but the defaults keep the two variants apples-to-apples);
+        # explicit cfg values win for ablations.
+        cfg = {
+            "num_dit_layers": self.video_backbone.num_layers,
+            "video_dim": self.video_backbone.dim,
+            "num_heads": self.video_backbone.num_heads,
+            "attn_head_dim": self.video_backbone.head_dim,
+            **cfg,
+        }
         bl = resolve_bridge_layers(cfg)
-        video_dim = self._resolve_video_dim(cfg)
+        video_dim = int(cfg["video_dim"])
         # Default the action-side raw context width to the loaded backbone's
         # text_dim (Wan T5-XXL=4096); explicit cfg/CLI
         # still wins. Falls back to 4096 when the backbone doesn't expose it.
@@ -87,12 +78,7 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
         # — Q/K/V project across the gap. Falls back to ``dim // num_heads``
         # for back-compat with older same-width cross_attn configs.
         action_dim_hidden = int(cfg.get("dim", 768))
-        # Hard-coded fallback (num_heads=12) is only hit when video_backbone is
-        # None at __init__ AND cfg has no ``num_heads``. The setdefault block
-        # above fills cfg from vb when vb is attached, and current mock-backbone
-        # tests all pass num_heads explicitly, so this fallback is effectively
-        # unreachable today; it stays as a last-resort default.
-        num_heads = int(cfg.get("num_heads", 12))
+        num_heads = int(cfg["num_heads"])
         attn_head_dim = cfg.get("attn_head_dim")
         if attn_head_dim is not None:
             attn_head_dim = int(attn_head_dim)
@@ -156,7 +142,7 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
         ab = self.action_backbone
         if ab is None:
             raise RuntimeError("action_backbone is None — cannot predict cross-attn actions.")
-        compiled_forward = getattr(self, "_compiled_action_forward", None)
+        compiled_forward = self._compiled_action_forward
         if compiled_forward is not None and not use_gradient_checkpointing and not use_gradient_checkpointing_offload:
             bridge_tuple = ab.bridge_tuple_from_dict(bridges)
             try:
@@ -192,50 +178,45 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
         latents: Tensor,
         timestep: Tensor,
         text: TextCondition,
-        clean_latents: Tensor,
-        proprio: Optional[Tensor] = None,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
-        **pipeline_inputs,
+        proprio: Tensor,
+        proprio_mask: Tensor,
+        use_gradient_checkpointing: bool,
+        use_gradient_checkpointing_offload: bool,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Joint forward; arguments as in :meth:`BaseWAMArchitecture.forward`. Returns (video pred, action pred)."""
-        vb = self.video_backbone
-        ab = self.action_backbone
-        if vb is None:
-            raise RuntimeError(
-                "video_backbone is None — pass pipe= to build_architecture or "
-                "architecture.__init__ to enable forward()."
-            )
+        video_backbone = self.video_backbone
+        action_backbone = self.action_backbone
 
-        # Text (+ proprio tokens) is the context of both streams.
-        text = self._append_proprio_context_token(text, proprio, pipeline_inputs.get("_proprio_sample_mask"))
-        raw_proprio = None
-        vstate = vb.prepare(
+        # Each stream's context (proprio tokens per cfg proprio_input).
+        video_text, action_text = self.build_contexts(text, proprio, proprio_mask)
+        vstate = video_backbone.prepare(
             latents=latents,
             timestep=timestep,
-            text=text,
-            num_clean_latents=int(clean_latents.shape[2]),
-            raw_proprio=raw_proprio,
+            text=video_text,
+            layout=self.layout,
+            proprio=proprio,
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         )
 
-        if noisy_actions is None or ab is None:
-            for block_id in range(vb.num_layers):
-                vstate = vb.run_block(block_id, vstate)
-            return vb.finalize(vstate), None
+        # The video's own self-attention reads the frame mask's video block (no action tokens in this stream).
+        masks = video_backbone.build_joint_attention_masks(self.frame_mask, vstate, 0)
+        if noisy_actions is None:
+            for block_id in range(video_backbone.num_layers):
+                vstate = video_backbone.run_block(block_id, vstate, masks[block_id])
+            return video_backbone.finalize(vstate), None
 
-        bridge_set = frozenset(ab.bridge_layers)
+        bridge_set = frozenset(action_backbone.bridge_layers)
         bridges: dict[int, Tensor] = {}
         detach_bridge = self._detach_bridge
 
-        for block_id in range(vb.num_layers):
-            vstate = vb.run_block(block_id, vstate)
+        for block_id in range(video_backbone.num_layers):
+            vstate = video_backbone.run_block(block_id, vstate, masks[block_id])
             if block_id in bridge_set:
                 bridge = vstate.hidden_states
                 bridges[block_id] = bridge.detach() if detach_bridge else bridge
 
-        video_pred = vb.finalize(vstate)
+        video_pred = video_backbone.finalize(vstate)
         if not bridges:
             return video_pred, None
 
@@ -243,8 +224,8 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
             noisy_actions,
             bridges,
             action_timestep,
-            context=text.context,
-            context_mask=text.context_mask,
+            context=action_text.context,
+            context_mask=action_text.context_mask,
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         )

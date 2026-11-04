@@ -1,7 +1,7 @@
 # LongLive2.0-Robot-S video backbone (cfg.model.video_backbone.*): the Wan2.2-TI2V-5B backbone
 # (same geometry, VAE, umT5 and tokenizer from model_path) whose DiT weights come from the LongLive
-# robot-video generator model.pt instead. Follows Long-WAM: 128-token prompts and a per-frame causal
-# history mask (required_video_attention_mask_mode below).
+# robot-video generator model.pt instead. Follows Long-WAM: 128-token prompts and per-frame causal
+# attention among the clean history latents (required_clean_attention below).
 
 defaults:
   - wan22_ti2v_5b         # geometry, model_path, weights, shift_video
@@ -13,6 +13,6 @@ dit_weights_prefix: "model."
 
 shift_video: 5.0       # LongLive2.0 timestep_shift (configs/inference.yaml) = Wan2.2's
 text_max_length: 128   # Long-WAM tokenizer_max_len
-# Long-WAM history mask (history row i sees history 0..i). The architecture raises unless
-# model.architecture.video_attention_mask_mode equals this, so a wrong launch fails fast.
-required_video_attention_mask_mode: history_per_frame_causal
+# Long-WAM history mask (clean latent i sees clean latents 0..i). resolve_config raises unless
+# model.architecture.clean_attention equals this, so a wrong launch fails fast (the backbone never reads it).
+required_clean_attention: causal

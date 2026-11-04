@@ -69,12 +69,15 @@ def test_preprocess_and_block_loop_shapes(variant):
 
     rng = np.random.default_rng(0)
     clip = [Image.fromarray(rng.integers(0, 255, (96, 160, 3), dtype=np.uint8)) for _ in range(9)]
+    from openwam.model.architectures.utils.mask_modes import build_frame_mask
+    from tests._layout import make_layout
+
+    layout = make_layout(h=1, f=8)  # the first-frame layout: 9 frames -> 1 + 2 latents
     with torch.no_grad():
-        clean, lat, text = vb.preprocess_train([clip], ["pick up the bottle"], num_hist_frames=0)
+        lat, text = vb.preprocess_train([clip], ["pick up the bottle"], layout)
         assert lat.shape[0] == 1 and lat.shape[1] == 48
         assert lat.shape[2] == 1 + (9 - 1) // 4  # 3 latent frames
         assert lat.shape[3] == 96 // 16 and lat.shape[4] == 160 // 16
-        assert clean.shape[2] == 1
         assert text.context.shape[-1] == text_dim
         assert len(text.extra["und_kv"]) == layers
 
@@ -82,11 +85,15 @@ def test_preprocess_and_block_loop_shapes(variant):
             latents=lat.to(vb.dtype),
             timestep=torch.tensor([500.0], device=lat.device),
             text=text,
-            num_clean_latents=1,
+            layout=layout,
+            proprio=torch.zeros(1, int(layout.num_proprio_tokens), 48, device=lat.device),  # unused by cosmos3
+            use_gradient_checkpointing=False,
+            use_gradient_checkpointing_offload=False,
         )
         assert state.prefix_kv_len == text.context.shape[1]
+        masks = vb.build_joint_attention_masks(build_frame_mask(layout, "bidirectional", "mutual"), state, 0)
         for i in range(vb.num_layers):
-            state = vb.run_block(i, state)
+            state = vb.run_block(i, state, masks[i])
         out = vb.finalize(state)
     assert out.shape == lat.shape
     assert torch.isfinite(out.float()).all()
@@ -98,9 +105,12 @@ def test_vae_roundtrip(variant):
     from PIL import Image
 
     rng = np.random.default_rng(1)
+    from tests._layout import make_layout
+
     clip = [Image.fromarray(rng.integers(0, 255, (96, 160, 3), dtype=np.uint8)) for _ in range(5)]
+    layout = make_layout(h=1, f=4)  # frame t + 4 future frames -> 1 + 1 latents
     with torch.no_grad():
-        _, lat, _ = vb.preprocess_train([clip], ["x"], num_hist_frames=0)
-        frames = vb.decode_video(lat.to(vb.dtype))
-    assert len(frames) == 5
+        lat, _ = vb.preprocess_train([clip], ["x"], layout)
+        frames = vb.decode_future(lat.to(vb.dtype), layout)
+    assert len(frames) == 4  # the 4 future frames (the decoded current frame is dropped)
     assert frames[0].size == (160, 96)

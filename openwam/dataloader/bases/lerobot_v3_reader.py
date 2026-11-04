@@ -9,18 +9,9 @@ shared building blocks (single-arm EEF assembly, stats materialization,
 prompt resolution, multi-bucket construction) live as stateless helpers in
 ``openwam.dataloader.utils``.
 
-The canonical sample dict every subclass emits::
-
-    {
-      "video": [PIL.Image x num_video_frames],
-      "first_frame_image": [video[0]],
-      "action": (T-1, action_dim) float32,
-      "action_mask": (T-1, action_dim) bool,
-      "video_mask": (num_video_frames,) bool,
-      "proprio": (1, action_dim) float32,
-      "proprio_mask": (1, action_dim) bool,
-      "prompt": str,
-    }
+The base owns the episode index, prompts, stats and the action / proprio
+finalization; the sample itself (which rows, which frames) is the subclass's
+:meth:`_getitem_impl` (yam_sharpa: H history frames + F future frames).
 
 Subclass surface
 ----------------
@@ -44,7 +35,8 @@ Hooks (override as needed; defaults cover the common case):
   * ``_load_prompts()``            — populate the prompt lookup.
   * ``_resolve_prompt(row, win)``  — per-sample prompt text.
   * ``_load_stats(info)``          — return in-reader normalization stats / None.
-  * ``_action_20d(win)`` / ``_proprio_20d(win)`` — normalized (..., 20) payload,
+  * ``_getitem_impl(idx, rng)``    — build one sample (required); ``rng`` is the caller's per-sample generator.
+  * ``_action_20d(win)``           — normalized (..., 20) action payload,
     or ``None`` to emit zeros (video-only / disabled supervision).
   * ``_post_init(info)``           — one-time per-dataset setup.
   * ``_multibucket_wrapper()``     — root-mode aggregate wrapper class or None.
@@ -52,11 +44,9 @@ Hooks (override as needed; defaults cover the common case):
 
 from __future__ import annotations
 
-import functools
 import logging
 import os
 import pickle
-import random
 import socket
 import uuid
 from pathlib import Path
@@ -66,10 +56,8 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-import torch
 
 from openwam.dataloader.bases.dataset import BaseDataset
-from openwam.dataloader.transforms.multiview import assemble_multiview_layout
 from openwam.dataloader.transforms.video import VideoColorJitter, color_jitter_enabled
 from openwam.dataloader.utils.eef import (
     EEF_DIM,
@@ -89,13 +77,9 @@ from openwam.dataloader.utils.lerobotv3 import (
 )
 from openwam.dataloader.utils.normalization import materialize_eef_stats
 from openwam.dataloader.utils.unify_action import UNIFY_DIM, map_to_unify, parse_unify_spec
-from openwam.dataloader.utils.video_io import decode_video_frames as _decode_video_frames
 
 logger = logging.getLogger(__name__)
 
-# Multiview L-shape slot sizes (must match assemble_multiview_layout defaults).
-_HEAD_SLOT_H, _HEAD_SLOT_W = 256, 320
-_WRIST_SLOT_H, _WRIST_SLOT_W = 128, 160
 _GETITEM_MAX_RETRIES = 64
 
 # Sentinel so an explicit ``normalize_mode=None`` (disable normalization) is
@@ -107,23 +91,26 @@ _NORMALIZE_MODE_UNSET = object()
 _CONFIG_MISSING = object()
 
 
-# Process-global LRU for decoded parquet shards, shared across all bucket
-# instances. A per-instance cache (the previous maxsize=32 design) is a memory
-# risk under shuffled training: bucket count, shard count, and DataLoader
-# workers multiply the number of retained tables while random access provides
-# little reuse. A small global cache keeps sequential scans fast with bounded
-# per-worker memory.
-@functools.lru_cache(maxsize=4)
-def _read_data_table_cached(path: str, columns: Tuple[str, ...]):
+def _read_data_table(path: str, columns: Tuple[str, ...]):
+    """Read one LeRobot v3 data parquet shard into process memory (not memory-mapped).
+
+    The buffers live in anonymous memory, so DataLoader workers forked after the read share them copy-on-write.
+
+    Args:
+        path: str, the shard's parquet file.
+        columns: tuple[str], column names to read.
+
+    Returns:
+        pyarrow.Table with ``columns`` (all columns on the dotted-name fallback below).
+    """
     try:
-        return pq.read_table(path, memory_map=True, columns=list(columns))
+        return pq.read_table(path, columns=list(columns))
     except pa.ArrowInvalid as exc:
         # Some pyarrow versions interpret flat LeRobot feature names containing
-        # dots as nested-field paths. Keep the compatibility fallback inside
-        # the process-global cache so affected shards are still read only once.
+        # dots as nested-field paths; read every column then.
         if "Dot path" not in str(exc):
             raise
-        return pq.read_table(path, memory_map=True)
+        return pq.read_table(path)
 
 
 class LeRobotV3Reader(BaseDataset):
@@ -166,17 +153,12 @@ class LeRobotV3Reader(BaseDataset):
     # override to "quantile" (their historical default); RoboCOIN/EgoDex keep
     # None (no in-reader normalization unless a config opts in).
     DEFAULT_NORMALIZE_MODE: ClassVar[Optional[str]] = None
-    # Exception types a wrist (auxiliary-camera) decode failure is tolerated for
-    # (missing / corrupt mp4 → black slot rather than a fatal sample). OXE used
-    # the specific triple; RoboCOIN tolerated all. Subclasses override as needed.
-    WRIST_DECODE_TOLERATED: ClassVar[tuple] = (FileNotFoundError, OSError, RuntimeError)
 
     def __init__(
         self,
         dataset_dir: str,
         *,
         num_frames: int = 33,
-        video_stride: int = 4,
         window_stride: int = 1,
         height: int = 384,
         width: int = 320,
@@ -213,7 +195,6 @@ class LeRobotV3Reader(BaseDataset):
         self._dataset_dir = Path(dataset_dir)
         self._dataset_id = dataset_id or self._dataset_dir.name
         self._num_frames = int(num_frames)
-        self._video_stride = max(1, int(video_stride))
         self._window_stride = max(1, int(window_stride))
         self._height = int(height)
         self._width = int(width)
@@ -242,7 +223,7 @@ class LeRobotV3Reader(BaseDataset):
             )
 
         # ── unified action space ──────────────────────────────────────────
-        # _raw_action_dim is what this reader's _action_20d/_proprio_20d emit
+        # _raw_action_dim is what this reader's action / proprio payloads emit
         # (the class ACTION_DIM). When unify is on, the public ACTION_DIM (and
         # thus the finalized action/proprio width + downstream model action_dim)
         # becomes unify_dim, and _finalize_* scatters raw -> unified via
@@ -287,9 +268,8 @@ class LeRobotV3Reader(BaseDataset):
         # when a reader emits meta/normalization_stats.npy; None otherwise).
         self.normalization_stats_path: Optional[str] = None
 
-        # Rate-limited failure counters for _safe_get / wrist decode.
+        # Rate-limited failure counter for sample().
         self._fail_count = 0
-        self._wrist_fail_count = 0
         self._fail_log_every = 100
 
         # ── info.json ─────────────────────────────────────────────────────
@@ -327,14 +307,6 @@ class LeRobotV3Reader(BaseDataset):
             ]
         else:
             self._camera_layout = [self._head_camera]
-
-        # ── video sub-sampling ────────────────────────────────────────────
-        # video_stride takes every Nth frame within the window. num_video_frames
-        # is whatever that yields; for clean encoder temporal downsampling it
-        # should match the encoder's contract (Wan VAE: (num_video_frames - 1) % 4
-        # == 0) — NOT enforced here, a mismatch surfaces downstream at encode time.
-        self._video_sample_indices = np.arange(0, self._num_frames, self._video_stride, dtype=np.int64)
-        self._num_video_frames = int(self._video_sample_indices.size)
 
         # ── episodes + offsets + split (hook) ─────────────────────────────
         # _build_episode_index is overridable so non-v3 on-disk layouts (e.g.
@@ -381,10 +353,12 @@ class LeRobotV3Reader(BaseDataset):
             self._select_episodes_by_hours(float(self._max_hours), self._subsample_seed)
 
         self._rebuild_episode_arrays()
+        # Data shards are read once here (the parent, before DataLoader workers fork); samples never re-read.
+        self._data_tables = self._read_all_data_tables()
         if self._head_camera_choices:
             # Fail fast on a mistyped choice: a camera without video index
             # columns would otherwise surface as an opaque empty-head-decode
-            # retry storm in _safe_get.
+            # retry storm in sample().
             missing = [c for c in self._head_camera_choices if c not in self._ep_video_frame_offsets]
             if missing:
                 raise ValueError(
@@ -802,10 +776,6 @@ class LeRobotV3Reader(BaseDataset):
         """Return normalized ``(actual_raw_len, ACTION_DIM)`` action, or None (disabled)."""
         return None
 
-    def _proprio_20d(self, win: pd.DataFrame) -> Optional[np.ndarray]:
-        """Return normalized ``(1, ACTION_DIM)`` proprio, or None (disabled)."""
-        return None
-
     def _post_init(self, info: dict) -> None:
         """Optional one-time per-dataset setup (e.g. Fractal quat sanity check)."""
 
@@ -835,9 +805,33 @@ class LeRobotV3Reader(BaseDataset):
     def _video_offset_col(camera: str) -> str:
         return f"_video_frame_offset/{camera}"
 
+    def _read_all_data_tables(self) -> Dict[Tuple[int, int], Any]:
+        """Read every data shard the kept episodes reference (``NEEDED_COLS`` only) into memory.
+
+        The process-global LRU this replaced re-decoded a whole shard on most shuffled samples (Modal step stalls).
+
+        Returns:
+            dict ``(chunk_idx, file_idx) -> pyarrow.Table``; yam_sharpa: ~2.7 GB per rank for the two default sources.
+        """
+        keys = sorted(
+            set(zip(self._eps_df["data/chunk_index"].astype(int), self._eps_df["data/file_index"].astype(int)))
+        )
+        tables = {}
+        for chunk_idx, file_idx in keys:
+            path = self._dataset_dir / self._data_path_template.format(chunk_index=chunk_idx, file_index=file_idx)
+            tables[(chunk_idx, file_idx)] = _read_data_table(str(path), tuple(self.NEEDED_COLS))
+        logger.info(
+            "%s(%s): preloaded %d data shards (%.2f GB)",
+            self.DATASET_NAME,
+            self._dataset_id,
+            len(keys),
+            sum(t.nbytes for t in tables.values()) / 1e9,
+        )
+        return tables
+
     def _load_data_table(self, chunk_idx: int, file_idx: int):
-        path = self._dataset_dir / self._data_path_template.format(chunk_index=chunk_idx, file_index=file_idx)
-        return _read_data_table_cached(str(path), tuple(self.NEEDED_COLS))
+        """chunk_idx, file_idx: int data shard indices. Returns: pyarrow.Table of ``NEEDED_COLS`` for that shard."""
+        return self._data_tables[(chunk_idx, file_idx)]
 
     # ----- Dataset ----------------------------------------------------------
 
@@ -845,12 +839,25 @@ class LeRobotV3Reader(BaseDataset):
         return self._n_total
 
     def __getitem__(self, idx: int) -> dict:
-        return self._safe_get(idx)
+        """Not supported: a source reader samples with its caller's per-sample RNG, see :meth:`sample`."""
+        raise TypeError(
+            f"{type(self).__name__} is read through sample(idx, rng) (MultiYamSharpaDataset passes the rng)"
+        )
 
-    def _safe_get(self, idx: int) -> dict:
+    def sample(self, idx: int, rng: np.random.Generator) -> dict:
+        """One sample; on a read failure retries the next window (up to ``_GETITEM_MAX_RETRIES`` times).
+
+        Args:
+            idx: int in [0, len).
+            rng: numpy Generator of this sample (the mixture's ``(seed, epoch, idx)`` RNG); every random choice
+                of the sample draws from it.
+
+        Returns:
+            dict, the subclass's sample (see :meth:`_getitem_impl`).
+        """
         for attempt in range(_GETITEM_MAX_RETRIES):
             try:
-                return self._getitem_impl(idx)
+                return self._getitem_impl(idx, rng)
             except Exception as e:
                 if attempt == _GETITEM_MAX_RETRIES - 1:
                     raise
@@ -868,56 +875,17 @@ class LeRobotV3Reader(BaseDataset):
                 idx = (idx + 1) % max(1, len(self))
         raise RuntimeError("unreachable")
 
-    def _getitem_impl(self, idx: int) -> dict:
-        ep_local = int(np.searchsorted(self._cum_n_starts, idx, side="right") - 1)
-        valid_start = int(self._ep_valid_start[ep_local])
-        valid_end = int(self._ep_valid_end[ep_local])
-        offset = valid_start + (idx - int(self._cum_n_starts[ep_local])) * self._window_stride
-        row = self._eps_df.iloc[ep_local]
-        actual_raw_len = min(self._num_frames, valid_end - offset)
+    def _getitem_impl(self, idx: int, rng: np.random.Generator) -> dict:
+        """Build sample ``idx`` (subclass hook; :meth:`sample` retries it on a failure).
 
-        # 1) parquet window rows
-        local_start = int(self._ep_data_row_offset[ep_local]) + offset
-        table = self._load_data_table(int(row["data/chunk_index"]), int(row["data/file_index"]))
-        win = table.slice(local_start, actual_raw_len).to_pandas()
+        Args:
+            idx: int in [0, len).
+            rng: numpy Generator of this sample; the only random source a subclass may use.
 
-        # 2) prompt (hook)
-        prompt = self._resolve_prompt(row, win)
-
-        # 3) action + 4) proprio (hooks → normalized 20-D payload or None)
-        action, action_mask = self._finalize_action(self._action_20d(win), actual_raw_len)
-        proprio, proprio_mask = self._finalize_proprio(self._proprio_20d(win))
-
-        # 5) video — decode head (+ optional wrist) frames into the canvas
-        real_local_indices = self._video_sample_indices[self._video_sample_indices < actual_raw_len]
-        if self._color_jitter is not None:
-            # Same jitter factors across the whole clip (temporal consistency).
-            video, exclusion_masks = self._decode_window_video(
-                row,
-                ep_local,
-                offset,
-                real_local_indices,
-                idx,
-                return_missing_masks=True,
-            )
-            jitter_input = {"video": video}
-            if exclusion_masks is not None:
-                jitter_input["video_jitter_exclusion_masks"] = exclusion_masks
-            video = self._color_jitter.apply(jitter_input)["video"]
-        else:
-            video = self._decode_window_video(row, ep_local, offset, real_local_indices, idx)
-        video_mask = torch.from_numpy(self._video_sample_indices < actual_raw_len)
-
-        return {
-            "video": video,
-            "first_frame_image": [video[0]] if video else [],
-            "action": torch.from_numpy(action),
-            "action_mask": torch.from_numpy(action_mask),
-            "video_mask": video_mask,
-            "proprio": torch.from_numpy(proprio).float(),
-            "proprio_mask": torch.from_numpy(proprio_mask),
-            "prompt": prompt,
-        }
+        Returns:
+            dict, the subclass's sample.
+        """
+        raise NotImplementedError(f"{type(self).__name__} must implement _getitem_impl")
 
     # ----- action / proprio finalization -----------------------------------
 
@@ -974,19 +942,18 @@ class LeRobotV3Reader(BaseDataset):
         """
         return actual_raw_len
 
-    def _finalize_proprio(self, proprio_20d: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
-        """Build ``(1, ACTION_DIM)`` proprio + its 2-D mask.
+    def _finalize_proprio(self, proprio_rows: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Scatter the normalized proprio rows into the model width and build their per-dim mask.
 
-        ``proprio_20d is None`` → all-zero proprio + all-False mask. When unify
-        is on, the raw proprio is scattered into ``unify_dim`` slots (same map
-        as the action), after normalization.
+        Args:
+            proprio_rows: (H, raw_dim) normalized proprio, one row per history frame.
+
+        Returns:
+            proprio (H, ACTION_DIM) float32 and mask (H, ACTION_DIM) bool (the same per-dim validity on every
+            row). When unify is on, the raw proprio is scattered into ``unify_dim`` slots (same map as the
+            action), after normalization.
         """
-        if proprio_20d is None:
-            proprio = np.zeros((1, self.ACTION_DIM), dtype=np.float32)
-            mask = build_proprio_mask_2d(action_dim=self.ACTION_DIM, enabled=False)
-            return proprio, mask
-
-        proprio = np.asarray(proprio_20d, dtype=np.float32)
+        proprio = np.asarray(proprio_rows, dtype=np.float32)
         if self._unify:
             # Same scatter as action, but honor the proprio-specific mask when
             # the source's action/state field availability differs.
@@ -1002,139 +969,8 @@ class LeRobotV3Reader(BaseDataset):
             enabled=True,
             dim_mask=dim_mask,
         )
-        return proprio, mask
-
-    # ----- video ------------------------------------------------------------
-
-    def _decode_window_video(
-        self,
-        row,
-        ep_local: int,
-        offset: int,
-        real_local_indices: np.ndarray,
-        idx: int,
-        *,
-        return_missing_masks: bool = False,
-    ):
-        """Decode the window's frames into a list of PIL images (single-view) or
-        L-shape multiview canvases, with last-real-frame padding. Optionally
-        return per-frame masks for structurally missing multiview slots.
-
-        Head decode failure is fatal (raises → ``_safe_get`` retries). Wrist
-        (auxiliary) decode failure is tolerated (black slot)."""
-        head_camera = self._head_camera
-        if self._head_camera_choices is not None:
-            # Head-view sampling (train only): decode the head slot from one
-            # uniformly sampled choice. The frames still land under the
-            # _head_camera layout key below — slot names are fixed, only the
-            # decoded content varies.
-            head_camera = self._head_camera_choices[random.randrange(len(self._head_camera_choices))]
-        head_frames = self._decode_one_camera(head_camera, row, ep_local, offset, real_local_indices, kind="head")
-        if not head_frames:
-            raise RuntimeError(f"empty head-video decode for {self.DATASET_NAME}({self._dataset_id}) at idx={idx}")
-
-        if self._multiview:
-            left_frames = (
-                self._decode_one_camera(
-                    self._left_wrist_camera, row, ep_local, offset, real_local_indices, kind="wrist"
-                )
-                if self._left_wrist_camera
-                else []
-            )
-            right_frames = (
-                self._decode_one_camera(
-                    self._right_wrist_camera, row, ep_local, offset, real_local_indices, kind="wrist"
-                )
-                if self._right_wrist_camera
-                else []
-            )
-        else:
-            left_frames = []
-            right_frames = []
-
-        # Pad to num_video_frames using the last real head frame.
-        n_real = len(head_frames)
-        if n_real < self._num_video_frames:
-            pad = self._num_video_frames - n_real
-            head_frames = head_frames + [head_frames[-1]] * pad
-            if left_frames:
-                left_frames = left_frames + [left_frames[-1]] * pad
-            if right_frames:
-                right_frames = right_frames + [right_frames[-1]] * pad
-
-        if not self._multiview:
-            if return_missing_masks:
-                return head_frames, None
-            return head_frames
-
-        video = []
-        missing_masks = [] if return_missing_masks else None
-        for fi in range(self._num_video_frames):
-            frames_dict: Dict[str, Any] = {self._head_camera: head_frames[fi]}
-            if left_frames and self._left_wrist_camera:
-                frames_dict[self._left_wrist_camera] = left_frames[fi]
-            if right_frames and self._right_wrist_camera:
-                frames_dict[self._right_wrist_camera] = right_frames[fi]
-            assembled = assemble_multiview_layout(
-                frames_dict,
-                self._camera_layout,
-                out_h=self._height,
-                out_w=self._width,
-                return_missing_mask=return_missing_masks,
-            )
-            if return_missing_masks:
-                frame, missing_mask = assembled
-                video.append(frame)
-                missing_masks.append(missing_mask)
-            else:
-                video.append(assembled)
-        if return_missing_masks:
-            return video, missing_masks
-        return video
-
-    def _decode_one_camera(self, camera, row, ep_local, offset, real_local_indices, *, kind: str) -> List:
-        """Decode one camera's frames. ``kind='head'`` is fatal-on-error; ``kind='wrist'``
-        tolerates a missing / corrupt clip by returning ``[]`` (black slot)."""
-        if camera is None:
-            return []
-        chunk_col = f"videos/{camera}/chunk_index"
-        file_col = f"videos/{camera}/file_index"
-        if chunk_col not in row.index:
-            return []
-        if camera not in self._ep_video_frame_offsets:
-            return []
-
-        if kind == "head":
-            path = self._dataset_dir / self._video_path_template.format(
-                video_key=camera, chunk_index=int(row[chunk_col]), file_index=int(row[file_col])
-            )
-            v_base = int(self._ep_video_frame_offsets[camera][ep_local]) + offset
-            frame_indices = (real_local_indices + v_base).tolist()
-            h, w = (_HEAD_SLOT_H, _HEAD_SLOT_W) if self._multiview else (self._height, self._width)
-            return _decode_video_frames(str(path), frame_indices, h, w)
-
-        # wrist: tolerated decode — path/offset computation lives INSIDE the try so a
-        # corrupt chunk/file index or offset lookup degrades to a black slot rather
-        # than failing the whole sample (matches the pre-refactor robocoin behavior).
-        try:
-            path = self._dataset_dir / self._video_path_template.format(
-                video_key=camera, chunk_index=int(row[chunk_col]), file_index=int(row[file_col])
-            )
-            v_base = int(self._ep_video_frame_offsets[camera][ep_local]) + offset
-            frame_indices = (real_local_indices + v_base).tolist()
-            return _decode_video_frames(str(path), frame_indices, _WRIST_SLOT_H, _WRIST_SLOT_W)
-        except self.WRIST_DECODE_TOLERATED as e:
-            self._wrist_fail_count += 1
-            if self._wrist_fail_count == 1 or self._wrist_fail_count % self._fail_log_every == 0:
-                logger.warning(
-                    "%s(%s): %d cumulative wrist decode failures (latest: %s, camera=%s)",
-                    self.DATASET_NAME,
-                    self._dataset_id,
-                    self._wrist_fail_count,
-                    type(e).__name__,
-                    camera,
-                )
-            return []
+        # (1, D) dim mask -> one copy per proprio row.
+        return proprio, np.repeat(mask, len(proprio), axis=0)
 
     # ----- BaseDataset ------------------------------------------------------
 
@@ -1151,7 +987,6 @@ class LeRobotV3Reader(BaseDataset):
 
     CONFIG_KEYS: ClassVar[Tuple[str, ...]] = (
         "num_frames",
-        "video_stride",
         "window_stride",
         "height",
         "width",

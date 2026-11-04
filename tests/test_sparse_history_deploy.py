@@ -83,12 +83,11 @@ def test_policy_without_history_sends_no_history():
     assert "history" not in eng.calls[0] and action.shape == (2,)
 
 
-def test_server_picks_engine_from_checkpoint_layout(monkeypatch):
-    """build_server_from_config: dataloader.history_offsets in the ckpt config -> sparse engine + buffered policy."""
+def test_server_serves_every_checkpoint_with_the_sparse_engine(monkeypatch):
+    """build_server_from_config: every ckpt (first-frame = history_offsets [0]) -> sparse engine + buffered policy."""
     import openwam.deploy.model_loader as model_loader
     import openwam.deploy.server as server
     import openwam.deploy.sparse_engine as sparse_engine
-    from openwam.deploy import engine as engine_mod
 
     made = {}
 
@@ -96,20 +95,14 @@ def test_server_picks_engine_from_checkpoint_layout(monkeypatch):
         def __init__(self, cfg, architecture, *, history_offsets):
             made["sparse"] = history_offsets
 
-    class _Joint:
-        def __init__(self, cfg, architecture):
-            made["joint"] = True
-
     monkeypatch.setattr(sparse_engine, "SparseHistoryInferenceEngine", _Sparse)
-    monkeypatch.setattr(engine_mod, "JointInferenceEngine", _Joint)
-    monkeypatch.setattr("openwam.deploy.JointInferenceEngine", _Joint)
-    for ckpt_dl, want in (({"history_offsets": OFFSETS, "num_frames": 33}, "sparse"), ({"num_frames": 33}, "joint")):
+    for offsets in (OFFSETS, [0]):
         made.clear()
-        ckpt_cfg = OmegaConf.create({"dataloader": ckpt_dl})
+        ckpt_cfg = OmegaConf.create({"dataloader": {"history_offsets": offsets, "num_frames": 33}})
         monkeypatch.setattr(model_loader, "load_from_checkpoint_dir", lambda *a, _c=ckpt_cfg, **k: (_c, object()))
         srv = server.build_server_from_config(OmegaConf.create({"inference": {"denoise_steps": 10}}), "/ckpt")
-        assert list(made) == [want]
-        assert srv.history_offsets == (OFFSETS if want == "sparse" else None)
+        assert made == {"sparse": offsets}
+        assert srv.history_offsets == offsets
 
 
 def test_server_sparse_requires_k_and_fps():

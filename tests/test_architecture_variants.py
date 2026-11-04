@@ -26,12 +26,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from openwam.model.video_backbone import LoadMode
-from openwam.model.video_backbone.base import TextCondition
-from tests.test_openwam_trainer import (
-    _make_fake_loss_inputs,
-    _MockVideoBackbone,
-)
+from openwam.dataloader.collate import Batch
+from tests._arch import build_test_arch
+from tests.test_openwam_trainer import _MockVideoBackbone
 
 # Wan2.2-TI2V-5B has 30 DiT blocks; mirror that so bridge_interval math is real.
 WAN_NUM_LAYERS = 30
@@ -43,28 +40,15 @@ T_ACTION = 5
 def _build_arch(registry_name: str, cfg: dict, *, num_layers: int = WAN_NUM_LAYERS):
     """Build an architecture under a Wan-shaped mock video backbone.
 
-    The production path constructs the real Wan2.2 video backbone in
-    ``BaseWAMArchitecture.__init__`` and then resolves ``video_dim`` /
-    ``num_dit_layers`` from it. Tests can't load that real backbone on CPU,
-    so we inject those fields directly into the cfg and attach a mock
-    backbone afterwards. This exercises exactly the same architecture
-    init code path as production for everything that matters here
-    (bridge/expert layer resolution, action_backbone instantiation).
+    The production path constructs the real Wan2.2 video backbone in ``BaseWAMArchitecture.__init__`` and
+    resolves ``video_dim`` / ``num_dit_layers`` from it; here the factory returns a mock with the Wan layer count,
+    so the same init code path runs (bridge layer resolution, action_backbone instantiation).
     """
-    from openwam.model import build_architecture
-
-    cfg = dict(cfg)
-    cfg.setdefault("video_dim", WAN_VIDEO_DIM)
-    cfg.setdefault("num_dit_layers", num_layers)
-    arch = build_architecture(registry_name, cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
     num_heads = int(cfg.get("num_heads", 4))
-    arch.video_backbone = _MockVideoBackbone(dim=WAN_VIDEO_DIM, num_layers=num_layers, num_heads=num_heads)
+    backbone = _MockVideoBackbone(dim=WAN_VIDEO_DIM, num_layers=num_layers, num_heads=num_heads)
+    arch = build_test_arch(registry_name, cfg, backbone)
     arch._device = torch.device("cpu")
     arch._dtype = torch.float32
-    # joint_self_attn builds the driver lazily when the video backbone was None
-    # at __init__ time — wire it now that the mock backbone is attached.
-    if hasattr(arch, "build_mot_driver"):
-        arch.build_mot_driver()
     return arch
 
 
@@ -74,15 +58,18 @@ def _count_params(module) -> int:
 
 def _run_compute_loss(arch):
     arch.init_training_schedulers(1000)
-    actions = torch.randn(1, T_ACTION, ACTION_DIM)
-    inputs = _make_fake_loss_inputs(B=1, action_dim=ACTION_DIM, T_action=T_ACTION, video_dim=WAN_VIDEO_DIM)
-    if arch.uses_proprioception:
-        inputs["proprio"] = torch.randn(1, int(arch.action_backbone.state_dim))
     # Text context at the action backbone's text width (both streams read it).
-    text_dim = arch.action_backbone.text_dim
-    inputs["text"] = TextCondition(context=torch.randn(1, 4, text_dim), context_mask=torch.ones(1, 4, dtype=torch.bool))
-    out = arch.compute_loss(**inputs, actions=actions)
-    return out
+    arch.video_backbone.context_width = arch.action_backbone.text_dim
+    batch = Batch(
+        video=[[]],
+        prompt=["pick cup"],
+        action=torch.randn(1, T_ACTION, ACTION_DIM),
+        action_is_pad=torch.zeros(1, T_ACTION, ACTION_DIM, dtype=torch.bool),
+        proprio=torch.randn(1, 1, ACTION_DIM),
+        proprio_mask=torch.ones(1, 1, ACTION_DIM, dtype=torch.bool),
+        source=["test"],
+    )
+    return arch.compute_loss(batch)
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +81,8 @@ def test_dual_system_cross_attn_bridge_interval_1():
     """bridge_interval=1: every video DiT layer feeds the bridge → 30 ActionDiT layers."""
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "detach_bridge": True,
         "action_dim": ACTION_DIM,
@@ -123,6 +112,8 @@ def test_dual_system_cross_attn_bridge_interval_2():
     """bridge_interval=2: every other video DiT layer → 15 ActionDiT layers."""
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "detach_bridge": False,
         "action_dim": ACTION_DIM,
@@ -152,6 +143,8 @@ def test_dual_system_cross_attn_explicit_bridge_layers():
     explicit = (0, 5, 10, 15, 20, 25, 29)
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "detach_bridge": True,
         "action_dim": ACTION_DIM,
@@ -181,6 +174,8 @@ def test_dual_system_cross_attn_heterogeneous_dim():
     """
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "detach_bridge": False,
         "action_dim": ACTION_DIM,
@@ -219,23 +214,14 @@ def test_dual_system_cross_attn_heterogeneous_dim():
 def test_dual_system_cross_attn_inherits_geometry_from_video_backbone():
     """cross_attn must auto-resolve num_heads / attn_head_dim from the loaded
     video backbone when cfg omits them (mirrors joint_self_attn). Regression
-    guard for the vb-derived ``setdefault`` block in
-    ``DualSystemCrossAttnArchitecture.__init__`` — the default ``_build_arch``
-    attaches the mock backbone after init and so does not exercise this path.
+    guard for the video-backbone defaults in ``DualSystemCrossAttnArchitecture.__init__``.
     """
-    from openwam.model.architectures.dual_system.joint_cross_attn import (
-        DualSystemCrossAttnArchitecture,
-    )
-
-    class _CrossAttnWithMockBackbone(DualSystemCrossAttnArchitecture):
-        def _init_video_backbone(self, _cfg, _mode, _dir):
-            # Attach mock BEFORE __init__'s vb-derived setdefault block runs.
-            self.video_backbone = _MockVideoBackbone(dim=WAN_VIDEO_DIM, num_layers=WAN_NUM_LAYERS, num_heads=4)
-
     # Deliberately omit num_heads + attn_head_dim — must come from vb, not from
     # the hard-coded fallback (num_heads=12 / attn_head_dim=dim//num_heads).
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "action_dim": ACTION_DIM,
         "bridge_layers": None,
@@ -243,7 +229,8 @@ def test_dual_system_cross_attn_inherits_geometry_from_video_backbone():
         "dim": WAN_VIDEO_DIM,
         "ffn_dim": 4 * WAN_VIDEO_DIM,
     }
-    arch = _CrossAttnWithMockBackbone(cfg=cfg)
+    backbone = _MockVideoBackbone(dim=WAN_VIDEO_DIM, num_layers=WAN_NUM_LAYERS, num_heads=4)
+    arch = build_test_arch("dual_system_cross_attn", cfg, backbone)
 
     vb = arch.video_backbone
     ab = arch.action_backbone
@@ -260,17 +247,10 @@ class _TextDim1024Backbone(_MockVideoBackbone):
 
 
 def _build_self_attn_with_backbone(backbone_cls, cfg_extra=None):
-    from openwam.model.architectures.dual_system.joint_self_attn import (
-        DualSystemSelfAttnArchitecture,
-    )
-
-    class _SelfAttnWithBackbone(DualSystemSelfAttnArchitecture):
-        def _init_video_backbone(self, _cfg, _mode, _dir):
-            # Attach BEFORE __init__'s vb-derived setdefault/derive block runs.
-            self.video_backbone = backbone_cls(dim=WAN_VIDEO_DIM, num_layers=WAN_NUM_LAYERS, num_heads=4)
-
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_self_attn",
         "action_dim": ACTION_DIM,
         "bridge_interval": 1,
@@ -278,7 +258,8 @@ def _build_self_attn_with_backbone(backbone_cls, cfg_extra=None):
         "ffn_dim": 4 * WAN_VIDEO_DIM,
     }
     cfg.update(cfg_extra or {})
-    return _SelfAttnWithBackbone(cfg=cfg)
+    backbone = backbone_cls(dim=WAN_VIDEO_DIM, num_layers=WAN_NUM_LAYERS, num_heads=4)
+    return build_test_arch("dual_system_self_attn", cfg, backbone)
 
 
 def test_text_dim_auto_derives_from_backbone():
@@ -314,6 +295,8 @@ def test_dual_system_self_attn_bridge_interval_1():
     # equal the video dim (no inter-modality projection inside attention).
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_self_attn",
         "action_dim": ACTION_DIM,
         "bridge_layers": None,
@@ -346,6 +329,8 @@ def test_dual_system_self_attn_rejects_interval_gt_1():
     """joint_self_attn rejects bridge_interval>1 — every video layer must have a MoT step."""
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_self_attn",
         "action_dim": ACTION_DIM,
         "bridge_layers": None,
@@ -372,6 +357,8 @@ def test_dual_system_self_attn_rejects_interval_gt_1():
             "dual_system_cross_attn",
             {
                 "framework": "dual_system",
+                "clean_attention": "bidirectional",
+                "attention_mask_mode": "mutual",
                 "variant": "joint_cross_attn",
                 "detach_bridge": True,
                 "action_dim": ACTION_DIM,
@@ -387,6 +374,8 @@ def test_dual_system_self_attn_rejects_interval_gt_1():
             "dual_system_self_attn",
             {
                 "framework": "dual_system",
+                "clean_attention": "bidirectional",
+                "attention_mask_mode": "mutual",
                 "variant": "joint_self_attn",
                 "action_dim": ACTION_DIM,
                 "bridge_layers": None,

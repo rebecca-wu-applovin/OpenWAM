@@ -1,4 +1,4 @@
-"""Action normalization transforms with multiple strategies.
+"""Action / proprio normalizer (deploy) with multiple strategies.
 
 Supported modes:
   - q99:      2 * (x - q01) / (q99 - q01) - 1   → [-1, 1]
@@ -14,9 +14,7 @@ from enum import Enum
 from typing import Dict, Optional
 
 import numpy as np
-import torch
 
-from openwam.dataloader.transforms.base import InvertibleModalityTransform
 from openwam.dataloader.utils.normalization import NORM_EPS, apply_normalization
 
 _NORMALIZE_STATS_KEY = "_normalize_stats"
@@ -30,7 +28,7 @@ class NormMode(str, Enum):
     SCALE = "scale"
 
 
-class Normalizer(InvertibleModalityTransform):
+class Normalizer:
     """Multi-strategy normalizer for continuous data.
 
     Args:
@@ -55,7 +53,6 @@ class Normalizer(InvertibleModalityTransform):
         binary_threshold: float = 0.5,
         eps: float = NORM_EPS,
     ):
-        super().__init__(apply_to=["action"])
         self.mode = NormMode(mode)
         raw_stats = stats or {}
         self.stats = {key: value for key, value in raw_stats.items() if key != _NORMALIZE_STATS_KEY}
@@ -63,7 +60,7 @@ class Normalizer(InvertibleModalityTransform):
         self.binary_threshold = binary_threshold
         self.eps = eps
 
-        # Precompute scale/offset for fast apply/unapply; _mode_stats feeds the
+        # Precompute scale/offset for fast normalize/unnormalize; _mode_stats feeds the
         # min_max/q99 normalize delegation to the training-side formula.
         self._scale = None
         self._offset = None
@@ -162,26 +159,6 @@ class Normalizer(InvertibleModalityTransform):
             return x
 
         return (x / self._scale) + self._offset
-
-    def apply(self, data: dict) -> dict:
-        for key in self.apply_to:
-            if key in data and data[key] is not None:
-                val = data[key]
-                if isinstance(val, torch.Tensor):
-                    data[key] = torch.from_numpy(self.normalize(val.numpy()))
-                elif isinstance(val, np.ndarray):
-                    data[key] = self.normalize(val)
-        return data
-
-    def unapply(self, data: dict) -> dict:
-        for key in self.apply_to:
-            if key in data and data[key] is not None:
-                val = data[key]
-                if isinstance(val, torch.Tensor):
-                    data[key] = torch.from_numpy(self.unnormalize(val.numpy()))
-                elif isinstance(val, np.ndarray):
-                    data[key] = self.unnormalize(val)
-        return data
 
 
 # ---------------------------------------------------------------------------

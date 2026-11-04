@@ -109,7 +109,11 @@ def _inject_project_seed(cfg: DictConfig) -> None:
 
 def _train(cfg: DictConfig) -> None:
     """Package-native training path."""
+    from openwam.config import resolve_config
+
     _inject_project_seed(cfg)
+    # The one place the run config's derived values (cfg.common.layout) are computed and checked.
+    resolve_config(cfg)
     _train_openwam(cfg)
 
 

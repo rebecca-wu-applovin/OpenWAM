@@ -140,20 +140,6 @@ def load_excluded_episodes_snapshot(dataset_dir: Path) -> ExcludedEpisodesSnapsh
     return ExcludedEpisodesSnapshot(path=str(path), episode_indices=tuple(sorted(set(values))))
 
 
-def assert_excluded_episodes_snapshot_current(
-    snapshot: ExcludedEpisodesSnapshot,
-    *,
-    context: str,
-) -> None:
-    """Fail if a bucket's effective exclusion population changed after loading."""
-    actual = load_excluded_episodes_snapshot(Path(snapshot.path).parent.parent)
-    if actual.episode_indices != snapshot.episode_indices:
-        raise DataContractError(
-            f"RoboCOIN episode exclusions {snapshot.path} changed while {context}; "
-            f"expected {list(snapshot.episode_indices)}, got {list(actual.episode_indices)}"
-        )
-
-
 @dataclass(frozen=True)
 class LeRobotV3DataRange:
     """One episode range addressed inside a LeRobot v3 data shard."""
@@ -395,11 +381,11 @@ def read_lerobot_v3_population_shard(
     read_columns = list(dict.fromkeys(["episode_index", *requested]))
     path = Path(dataset_dir) / shard.relative_path
     try:
-        table = pq.read_table(path, memory_map=True, columns=read_columns)
+        table = pq.read_table(path, columns=read_columns)
     except pa.ArrowInvalid as exc:
         if "Dot path" not in str(exc):
             raise
-        table = pq.read_table(path, memory_map=True).select(read_columns)
+        table = pq.read_table(path).select(read_columns)
 
     slices = []
     for episode_range in shard.ranges:

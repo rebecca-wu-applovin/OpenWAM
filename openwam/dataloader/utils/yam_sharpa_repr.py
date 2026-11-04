@@ -35,7 +35,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from openwam.dataloader.transforms.rotation import _matrix_to_rotation_6d, _rotation_6d_to_matrix
+from openwam.dataloader.utils.rotation import matrix_to_rotation_6d, rotation_6d_to_matrix
 
 ACTION_REPRS: Tuple[str, ...] = ("fingertips_abs", "fingertips_rel", "unify_abs", "unify_rel")
 
@@ -147,7 +147,7 @@ def _wrist_in_anchor_cam(pose48: np.ndarray, rel: np.ndarray, o: int) -> Tuple[n
         R_a: (N, 3, 3) wrist rotation in the frame-t camera.
     """
     p = pose48[:, o : o + 3]
-    R = _rotation_6d_to_matrix(pose48[:, o + 3 : o + 9])
+    R = rotation_6d_to_matrix(pose48[:, o + 3 : o + 9])
     # Rigid transform: rotate + translate the position, rotate the orientation.
     p_a = np.einsum("nij,nj->ni", rel[:, :3, :3], p) + rel[:, :3, 3]
     R_a = rel[:, :3, :3] @ R
@@ -170,8 +170,8 @@ def _wrist_block(p_t, R_t, p_k, R_k, relative: bool) -> np.ndarray:
     if relative:
         dp = p_k - p_t
         dR = R_k @ np.swapaxes(R_t, -1, -2)  # rotation that takes R_t to R_k
-        return np.concatenate([dp, _matrix_to_rotation_6d(dR)], axis=-1)
-    return np.concatenate([p_k, _matrix_to_rotation_6d(R_k)], axis=-1)
+        return np.concatenate([dp, matrix_to_rotation_6d(dR)], axis=-1)
+    return np.concatenate([p_k, matrix_to_rotation_6d(R_k)], axis=-1)
 
 
 # ── encode ──────────────────────────────────────────────────────────────────
@@ -230,7 +230,7 @@ def encode_proprio_in_anchor_cam(
         # Overwrite this hand's wrist [pos 3, rot6d 6] with its frame-t-camera version.
         p_a, R_a = _wrist_in_anchor_cam(s, rel, o)
         s[:, o : o + 3] = p_a
-        s[:, o + 3 : o + _WRIST_DIM] = _matrix_to_rotation_6d(R_a)
+        s[:, o + 3 : o + _WRIST_DIM] = matrix_to_rotation_6d(R_a)
     return encode_proprio(action_repr, s, joint_angles56)
 
 
@@ -269,7 +269,7 @@ def encode_action_pairs(
     for o, jo in zip(_POSE_OFFSETS, _HAND_JOINT_OFFSETS):
         # Wrist: measured pose at t vs target pose at t+k, both in the frame-t camera.
         p_t = s_t[:, o : o + 3]
-        R_t = _rotation_6d_to_matrix(s_t[:, o + 3 : o + 9])
+        R_t = rotation_6d_to_matrix(s_t[:, o + 3 : o + 9])
         p_k, R_k = _wrist_in_anchor_cam(a_k, rel, o)
         parts.append(_wrist_block(p_t, R_t, p_k, R_k, rel_on))
         if is_unify(rep):
@@ -319,9 +319,9 @@ def decode_action(action_repr: str, action_raw: np.ndarray, proprio_raw: np.ndar
     for o in _wrist_offsets(rep):
         out[:, o : o + 3] = prop[o : o + 3] + act[:, o : o + 3]
         # Inverse of dR = R_k R_t^T.
-        R_t = _rotation_6d_to_matrix(prop[None, o + 3 : o + 9])
-        dR = _rotation_6d_to_matrix(act[:, o + 3 : o + 9])
-        out[:, o + 3 : o + 9] = _matrix_to_rotation_6d(dR @ R_t)
+        R_t = rotation_6d_to_matrix(prop[None, o + 3 : o + 9])
+        dR = rotation_6d_to_matrix(act[:, o + 3 : o + 9])
+        out[:, o + 3 : o + 9] = matrix_to_rotation_6d(dR @ R_t)
         # Hand part (fingertips or joints) is a plain additive delta.
         out[:, o + _WRIST_DIM : o + hand_w] = prop[o + _WRIST_DIM : o + hand_w] + act[:, o + _WRIST_DIM : o + hand_w]
     return out.reshape(*lead, D).astype(np.float32)

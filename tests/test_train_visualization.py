@@ -5,6 +5,7 @@ import torch
 from PIL import Image
 
 from openwam.train.utils.visualization import TrainVisualizer
+from tests._layout import make_layout
 
 
 class _Sched:
@@ -18,45 +19,43 @@ class _Sched:
 
 
 class _StubBackbone(torch.nn.Module):
-    """decode_video stub: one (w x h) frame of value 10 per latent frame."""
+    """preprocess_condition / decode_future stubs: one latent per frame; decodes frames of value 10."""
 
     def __init__(self):
         super().__init__()
-        self.size = None  # (w, h) of the frames to return, set by the arch stub
+        self.size = None  # (w, h) of the frames to return, taken from the history
+        self.prompts = None
 
-    def decode_video(self, latents):
-        return [Image.new("RGB", self.size, (10, 10, 10)) for _ in range(latents.shape[2])]
+    def preprocess_condition(self, history, prompts, layout):
+        torch.rand(3)  # consumes the global RNG like an encoder may
+        assert len(history) == 1 and len(history[0]) == layout.num_hist_frames  # the history frames only
+        self.size, self.prompts = history[0][0].size, list(prompts)
+        return torch.zeros(1, 2, layout.num_hist_latents, 1, 1), "text"
+
+    def decode_future(self, latents, layout):
+        assert latents.shape[2] == layout.num_latents
+        return [Image.new("RGB", self.size, (10, 10, 10)) for _ in range(layout.num_future_frames)]
 
 
 class _StubArch(torch.nn.Module):
-    """prepare_inputs / sample stubs (one latent frame per video frame); records sample() calls.
+    """sample stub (one latent per video frame: tc = 1); records sample() calls."""
 
-    prepare_inputs also draws from the global torch RNG, which the hook must restore.
-    """
-
-    def __init__(self):
+    def __init__(self, layout=None):
         super().__init__()
+        self.layout = layout if layout is not None else make_layout(h=1, f=8, tc=1, num_frames=9)
+        self.device, self.dtype = torch.device("cpu"), torch.float32
         self.dit = torch.nn.Linear(2, 2)  # trainable part (train mode)
         self.vae = torch.nn.Linear(2, 2).eval()  # frozen part (eval mode)
         self.video_backbone = _StubBackbone()
         self.video_scheduler, self.action_scheduler = _Sched(), _Sched()
         self.calls = []
 
-    def prepare_inputs(self, batch):
-        torch.rand(3)  # consumes global RNG like prepare_inputs may
-        s = batch[0]
-        self.video_backbone.size = s["video"][0].size
-        return {
-            "input_latents": torch.zeros(1, 2, len(s["video"]), 1, 1),
-            "actions": torch.zeros(1, len(s["action"]), 4),
-            "action_is_pad": torch.zeros(1, len(s["action"]), dtype=torch.bool),
-            "prompt_seen": s["prompt"],
-        }
-
-    def sample(self, inputs, schedule, *, latent_shape, action_shape, seed):
-        assert "input_latents" not in inputs and "actions" not in inputs and "action_is_pad" not in inputs
-        self.calls.append({"prompt": inputs["prompt_seen"], "schedule": schedule, "seed": seed})
-        return torch.zeros(latent_shape), torch.zeros(action_shape)
+    def sample(self, hist_latents, text, proprio, schedule, *, seed):
+        assert hist_latents.shape[2] == self.layout.num_hist_latents and text == "text"
+        assert proprio.shape == (1, self.layout.num_hist_frames, 4)
+        self.calls.append({"prompt": self.video_backbone.prompts[0], "schedule": schedule, "seed": seed})
+        latents = torch.zeros(1, 2, self.layout.num_latents, 1, 1)
+        return latents, torch.zeros(1, self.layout.action_horizon, 4)
 
 
 class _Acc:
@@ -76,14 +75,16 @@ class _Run:
         self.logged.append((step, d))
 
 
-def _dataset(n=100, t=9, h=48, w=32):
-    """List-backed dataset of OpenWAM-shaped samples: video t frames (w x h), proprio (1, 4), action (8, 4)."""
+def _dataset(n=100, t=9, h=48, w=32, n_hist=1):
+    """List-backed dataset of OpenWAM-shaped samples: video t frames (w x h), proprio (n_hist, 4), action (8, 4)."""
     sample = {
         "video": [Image.new("RGB", (w, h), (0, 0, 0)) for _ in range(t)],
         "prompt": "pick the cube",
-        "proprio": torch.zeros(1, 4),
+        "proprio": torch.zeros(n_hist, 4),
+        "proprio_mask": torch.ones(n_hist, 4, dtype=torch.bool),
         "action": torch.ones(8, 4),
-        "_dataset_name": "stub",
+        "action_mask": torch.ones(8, 4, dtype=torch.bool),
+        "source": "stub",
     }
     return [sample] * n
 
@@ -112,9 +113,9 @@ def test_rollout_logs_video_and_restores_modes(tmp_path):
 
 def test_rollout_sparse_history_layout():
     """H history frames: GT on both sides, prediction only on the F future frames, error over all F."""
-    sample = dict(_dataset(n=1, t=5)[0], num_history_frames=2)
+    sample = _dataset(n=1, t=5, n_hist=2)[0]
     vis = TrainVisualizer([sample] * 100, rank=0, num_samples=1, denoise_steps=3, fps=5)
-    r = vis._rollout(_StubArch())
+    r = vis._rollout(_StubArch(make_layout(h=2, f=3, tc=1, num_frames=9)))
     assert r["video"].shape == (5, 48, 64, 3)
     left, right = r["video"][..., :32, :], r["video"][..., 32:, :]
     assert np.array_equal(left[:2], right[:2])  # history copied from GT

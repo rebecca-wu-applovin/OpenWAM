@@ -18,6 +18,7 @@ import pytest
 from omegaconf import OmegaConf, open_dict
 
 from openwam.train.utils import ckpt_model_loader as cml
+from tests._arch import TEST_TRAIN_OPTIONS
 
 # Minimal stand-in for a saved run's config.yaml: the backbone geometry block plus one overridable
 # value per section (video_backbone / action_backbone / architecture).
@@ -26,6 +27,7 @@ CKPT_CFG = {
         "video_backbone": {
             "name": "wan22_ti2v_5b",
             "model_path": "/ckpt-host/Wan2.2-TI2V-5B",
+            "temporal_compression": 4,
             "shift_video": 5.0,
             "text_cache": True,
             "dit": {"dim": 3072, "num_layers": 30, "num_heads": 24},
@@ -42,8 +44,18 @@ CKPT_CFG = {
             "bridge_interval": 1,
             "mot_checkpoint_mixed_attn": True,
             "attention_mask_mode": "mutual",
-            "video_attention_mask_mode": "first_frame_causal",
+            "clean_attention": "bidirectional",
+            "history_encoding": "per_frame",
+            "proprio_input": "context_token",
         },
+    },
+    # The keys resolve_config derives the latent layout from (first-frame layout: 1 + 2 latents).
+    "dataloader": {
+        "history_offsets": [0],
+        "future_offsets": [4, 8, 12, 16, 20, 24, 28, 32],
+        "num_frames": 33,
+        "history_sampling": "fixed",
+        "history_window": 100,
     },
     "training": {"batch_size": 24},
 }
@@ -64,7 +76,9 @@ def _live_cfg(**model_patch):
     model = OmegaConf.to_container(OmegaConf.create(CKPT_CFG["model"]), resolve=True)
     del model["video_backbone"]["dit"]
     model["video_backbone"]["model_path"] = "/live-host/Wan2.2-TI2V-5B"
-    cfg = OmegaConf.create({"model": model, "training": {"batch_size": 4}, "project": {"seed": 42}})
+    cfg = OmegaConf.create(
+        {"model": model, "dataloader": CKPT_CFG["dataloader"], "training": {"batch_size": 4}, "project": {"seed": 42}}
+    )
     for dotted, val in model_patch.items():
         OmegaConf.update(cfg, f"model.{dotted.replace('__', '.')}", val)
     OmegaConf.set_struct(cfg, True)
@@ -80,9 +94,11 @@ def capture(monkeypatch):
         def load_checkpoint(self, weights):
             captured["loaded"] = weights
 
-    def _build(ckpt_dir, model_cfg):
+    def _build(ckpt_dir, model_cfg, layout, train_options):
         captured["ckpt_dir"] = ckpt_dir
         captured["model_cfg"] = model_cfg
+        captured["layout"] = layout
+        captured["train_options"] = train_options
         return _Built()
 
     monkeypatch.setattr("openwam.model.build_architecture_from_ckpt_dir", _build, raising=True)
@@ -99,19 +115,19 @@ def test_live_model_cfg_overrides_the_ckpt_config(tmp_path, capture):
     """Every live ``model.*`` value must reach the built architecture."""
     ckpt_dir = _write_ckpt_cfg(tmp_path)
     cfg = _live_cfg(
-        architecture__attention_mask_mode="isolated",
+        architecture__clean_attention="causal",
         architecture__mot_checkpoint_mixed_attn=False,
-        architecture__video_attention_mask_mode="bidirectional",
         action_backbone__shift_action=9.0,
         video_backbone__shift_video=1.5,
     )
 
-    cml.build_for_finetune(ckpt_dir, cfg)
+    cml.build_for_finetune(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
 
     model = capture["model_cfg"]
-    assert model.architecture.attention_mask_mode == "isolated"
+    assert model.architecture.clean_attention == "causal"
     assert model.architecture.mot_checkpoint_mixed_attn is False
-    assert model.architecture.video_attention_mask_mode == "bidirectional"
+    # The layout handed to the build is the resolved one of this config.
+    assert capture["layout"] is cfg.common.layout and capture["layout"].num_latents == 3
     assert model.action_backbone.shift_action == 9.0
     # One config builds both the architecture and its backbone, so an override cannot reach only one.
     assert model.video_backbone.shift_video == 1.5
@@ -126,7 +142,7 @@ def test_explicit_weights_file_is_loaded(tmp_path, capture):
     weights = tmp_path / "checkpoint_step_7.safetensors"
     weights.write_bytes(b"")
 
-    cml.build_for_finetune(str(weights), _live_cfg())
+    cml.build_for_finetune(str(weights), _live_cfg(), TEST_TRAIN_OPTIONS)
 
     assert capture["ckpt_dir"] == ckpt_dir
     assert capture["loaded"] == str(weights)
@@ -136,9 +152,9 @@ def test_ckpt_only_keys_survive_the_merge(tmp_path, capture):
     """Keys only the ckpt config has (here the DiT geometry) survive the merge and land in cfg, which
     is what save_config() writes — otherwise the NEW run's checkpoints could not be rebuilt."""
     ckpt_dir = _write_ckpt_cfg(tmp_path)
-    cfg = _live_cfg(architecture__attention_mask_mode="isolated")
+    cfg = _live_cfg(architecture__clean_attention="causal")
 
-    cml.build_for_finetune(ckpt_dir, cfg)
+    cml.build_for_finetune(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
 
     assert capture["model_cfg"].video_backbone.dit.num_layers == 30
     assert cfg.model.video_backbone.dit.num_layers == 30
@@ -151,12 +167,12 @@ def test_cfg_model_is_rewritten_to_exactly_what_was_built(tmp_path, capture):
     never built with, and the deploy loader rebuilds a different model.
     """
     ckpt_dir = _write_ckpt_cfg(tmp_path)
-    cfg = _live_cfg(architecture__attention_mask_mode="isolated", video_backbone__shift_video=1.5)
+    cfg = _live_cfg(architecture__clean_attention="causal", video_backbone__shift_video=1.5)
 
-    cml.build_for_finetune(ckpt_dir, cfg)
+    cml.build_for_finetune(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
 
     assert capture["model_cfg"] is cfg.model
-    assert cfg.model.architecture.attention_mask_mode == "isolated"
+    assert cfg.model.architecture.clean_attention == "causal"
     assert cfg.model.video_backbone.shift_video == 1.5
     # Struct mode survives the node swap: a typo'd model key must still raise.
     with pytest.raises(Exception):
@@ -172,7 +188,7 @@ def test_explicit_null_in_live_cfg_clears_a_ckpt_value(tmp_path, capture):
     ckpt_dir = _write_ckpt_cfg(tmp_path)
     cfg = _live_cfg(architecture__bridge_layers=None, architecture__bridge_interval=2)
 
-    cml.build_for_finetune(ckpt_dir, cfg)
+    cml.build_for_finetune(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
 
     assert capture["model_cfg"].architecture.bridge_layers is None
     assert capture["model_cfg"].architecture.bridge_interval == 2
@@ -184,7 +200,7 @@ def test_video_backbone_name_mismatch_raises(tmp_path, capture):
     cfg = _live_cfg(video_backbone__name="cosmos3_edge")
 
     with pytest.raises(ValueError, match="model.video_backbone.name"):
-        cml.build_for_finetune(ckpt_dir, cfg)
+        cml.build_for_finetune(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
 
 
 def test_architecture_framework_mismatch_raises(tmp_path, capture):
@@ -193,7 +209,7 @@ def test_architecture_framework_mismatch_raises(tmp_path, capture):
     cfg = _live_cfg(architecture__framework="other_system")
 
     with pytest.raises(ValueError, match="model.architecture.framework"):
-        cml.build_for_finetune(ckpt_dir, cfg)
+        cml.build_for_finetune(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
 
 
 def test_resume_keeps_the_ckpt_config(tmp_path, capture):
@@ -202,14 +218,15 @@ def test_resume_keeps_the_ckpt_config(tmp_path, capture):
     file lie about the model being trained. Its shell gets storage instead of a
     safetensors load (accelerate's load_state fills it after prepare)."""
     ckpt_dir = _write_ckpt_cfg(tmp_path)
-    cfg = _live_cfg(architecture__attention_mask_mode="isolated")
+    cfg = _live_cfg(architecture__clean_attention="causal")
 
-    cml.build_for_resume(ckpt_dir, cfg)
+    _, ckpt_cfg = cml.build_for_resume(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
 
     model = capture["model_cfg"]
-    assert model.architecture.attention_mask_mode == "mutual"
+    assert model is ckpt_cfg.model and capture["layout"] is ckpt_cfg.common.layout
+    assert model.architecture.clean_attention == "bidirectional"
     assert model.video_backbone.shift_video == 5.0
-    assert cfg.model.architecture.attention_mask_mode == "isolated", "resume must not rewrite the live cfg"
+    assert cfg.model.architecture.clean_attention == "causal", "resume must not rewrite the live cfg"
     assert capture["materialized"] == "cpu"
     assert "loaded" not in capture, "resume must not load safetensors"
 
@@ -233,7 +250,7 @@ def test_ckpt_config_without_a_model_section_raises(tmp_path, capture, build):
     OmegaConf.save(OmegaConf.create({"training": {"batch_size": 4}}), tmp_path / "config.yaml")
 
     with pytest.raises(ValueError, match="no `model:` section"):
-        build(str(tmp_path), _live_cfg())
+        build(str(tmp_path), _live_cfg(), TEST_TRAIN_OPTIONS)
 
 
 def test_build_architecture_from_ckpt_dir_uses_checkpoint_mode(tmp_path, monkeypatch):
@@ -243,8 +260,16 @@ def test_build_architecture_from_ckpt_dir_uses_checkpoint_mode(tmp_path, monkeyp
 
     seen = {}
     monkeypatch.setattr(registry, "build_architecture", lambda name, params, **kw: seen.update(kw, name=name))
-    registry.build_architecture_from_ckpt_dir(str(tmp_path), OmegaConf.create(CKPT_CFG["model"]))
-    assert seen == {"name": "dual_system_self_attn", "mode": LoadMode.CHECKPOINT, "ckpt_dir": str(tmp_path)}
+    registry.build_architecture_from_ckpt_dir(
+        str(tmp_path), OmegaConf.create(CKPT_CFG["model"]), "LAYOUT", TEST_TRAIN_OPTIONS
+    )
+    assert seen == {
+        "name": "dual_system_self_attn",
+        "layout": "LAYOUT",
+        "mode": LoadMode.CHECKPOINT,
+        "ckpt_dir": str(tmp_path),
+        "train_options": TEST_TRAIN_OPTIONS,
+    }
 
 
 def test_trainer_reads_freeze_from_the_merged_cfg(tmp_path, monkeypatch):
@@ -268,8 +293,6 @@ def test_trainer_reads_freeze_from_the_merged_cfg(tmp_path, monkeypatch):
             "lambda_action": 1.0,
             "use_gradient_checkpointing": False,
             "use_gradient_checkpointing_offload": False,
-            "max_timestep_boundary": 1.0,
-            "min_timestep_boundary": 0.0,
         }
         cfg.project = {"seed": None}
 
@@ -290,21 +313,80 @@ def test_trainer_reads_freeze_from_the_merged_cfg(tmp_path, monkeypatch):
         def init_training_schedulers(self, n):
             pass
 
-        def set_training_runtime(self, **kw):
-            pass
-
         def load_checkpoint(self, weights):
             pass
 
-    monkeypatch.setattr("openwam.model.build_architecture_from_ckpt_dir", lambda d, m: _Arch(), raising=True)
+    built: dict = {}
+
+    def _build(d, m, layout, train_options):
+        built["train_options"] = train_options
+        return _Arch()
+
+    monkeypatch.setattr("openwam.model.build_architecture_from_ckpt_dir", _build, raising=True)
     monkeypatch.setattr(cml, "find_latest_weights", lambda d: "w.safetensors", raising=True)
 
+    from openwam.model.architectures.base import TrainOptions
     from openwam.train.openwam_trainer import OpenWAMTrainer
 
     OpenWAMTrainer(cfg, accelerator=None, dataset=None)
+    # The training knobs reach the constructor once, from cfg.training.
+    assert built["train_options"] == TrainOptions(
+        use_gradient_checkpointing=False, use_gradient_checkpointing_offload=False, lambda_video=1.0, lambda_action=1.0
+    )
 
     assert frozen["names"] == ["video_backbone.vae"], "freeze must come from the merged (ckpt+live) cfg.model"
     assert list(cfg.model.freeze) == ["video_backbone.vae"], "save_config() must record the same list"
+
+
+def test_trainer_resume_reads_model_decisions_from_the_ckpt_cfg(tmp_path, monkeypatch):
+    """Resume builds the architecture from the ckpt config, so every model-side decision of the trainer (freeze
+    list, text cache) must come from that same config, never from the live one."""
+    import torch.nn as nn
+
+    ckpt_dir = _write_ckpt_cfg(tmp_path)
+    cfg = _live_cfg(video_backbone__text_cache=False)
+    with open_dict(cfg):
+        del cfg.model["freeze"]
+        cfg.training = {
+            "finetune_ckpt_path": None,
+            "resume_ckpt_path": ckpt_dir,
+            "initialize_model_on_cpu": False,
+            "lambda_video": 1.0,
+            "lambda_action": 1.0,
+            "use_gradient_checkpointing": False,
+            "use_gradient_checkpointing_offload": False,
+        }
+        cfg.project = {"seed": None}
+
+    frozen: dict = {}
+
+    class _Arch(nn.Module):
+        backbones: dict = {}
+        dtype = None
+        device = None
+
+        def set_dtype_device(self, *a):
+            pass
+
+        def freeze_modules(self, names):
+            frozen["names"] = list(names)
+            return []
+
+        def init_training_schedulers(self, n):
+            pass
+
+    monkeypatch.setattr(
+        "openwam.model.build_architecture_from_ckpt_dir", lambda d, m, layout, train_options: _Arch(), raising=True
+    )
+    monkeypatch.setattr("openwam.model.video_backbone.common.weights.materialize_meta", lambda module, device: None)
+
+    from openwam.train.openwam_trainer import OpenWAMTrainer
+
+    trainer = OpenWAMTrainer(cfg, accelerator=None, dataset=None)
+
+    assert frozen["names"] == ["video_backbone.vae"], "freeze must come from the ckpt cfg on resume"
+    assert trainer.model_cfg.video_backbone.text_cache is True, "text_cache must come from the ckpt cfg on resume"
+    assert cfg.model.video_backbone.text_cache is False  # the live cfg is untouched
 
 
 def test_diff_model_cfgs_buckets_keys():

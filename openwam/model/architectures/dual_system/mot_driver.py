@@ -20,15 +20,6 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
 
-from openwam.model.architectures.utils.common import compute_video_tokens_per_frame
-from openwam.model.architectures.utils.mask_modes import (
-    ACTION_SEES_VIDEO,
-    build_cross_modal_attention_mask,
-    set_video_attention_mask_mode,
-    validate_attention_mask_mode,
-    widen_mask_for_prefix_kv,
-)
-
 if TYPE_CHECKING:
     from openwam.model.action_backbone.base import ActionDiTBackbone
     from openwam.model.architectures.base import ActionState
@@ -49,12 +40,9 @@ class DualSystemMoTDriver:
     backbone owns its own Q/K/V projections that map their residual streams
     into the shared ``num_heads * head_dim`` attention space.
 
-    The cross-modal ``[Sv+Sa, Sv+Sa]`` mask is built once per
-    :meth:`run_joint_loop` and reused across layers. ``v↔v`` follows
-    ``vb.video_attention_mask_mode``; ``a↔a`` is fully connected; the v↔a
-    coupling follows ``attention_mask_mode`` — see :mod:`utils.mask_modes`
-    for the four modes (default ``action_sees_video``, the FastWAM-Joint
-    layout where video does not see action so video-KV prefill stays correct).
+    The per-layer token masks come from the frame-level ``frame_mask`` the
+    architecture built once (``utils.mask_modes.build_frame_mask``), expanded by
+    ``vb.build_joint_attention_masks`` once per :meth:`run_joint_loop`.
     """
 
     def __init__(
@@ -62,11 +50,15 @@ class DualSystemMoTDriver:
         vb: "VideoBackbone",
         ab: "ActionDiTBackbone",
         *,
+        frame_mask: Tensor,
         mot_checkpoint_mixed_attn: bool = True,
-        attention_mask_mode: str = ACTION_SEES_VIDEO,
-        video_attention_mask_mode: Optional[str] = None,
-        num_history_frames: int = 0,
     ) -> None:
+        """
+        Args:
+            vb / ab: the video and action backbones.
+            frame_mask: (T + 1, T + 1) bool frame-level mask of ``[latents, action block]`` (``build_frame_mask``).
+            mot_checkpoint_mixed_attn: bool, grad-checkpoint the mixed attention in training.
+        """
         if vb.num_layers != ab.num_layers:
             raise ValueError(
                 f"DualSystemMoTDriver: video num_layers ({vb.num_layers}) must equal "
@@ -82,7 +74,6 @@ class DualSystemMoTDriver:
             raise ValueError(
                 f"DualSystemMoTDriver: video head_dim ({vb.head_dim}) must equal action head_dim ({ab.head_dim})."
             )
-        validate_attention_mask_mode(attention_mask_mode)
 
         self.vb = vb
         self.ab = ab
@@ -90,41 +81,11 @@ class DualSystemMoTDriver:
         self.num_heads = vb.num_heads
         self.head_dim = vb.head_dim
         self.mot_checkpoint_mixed_attn = bool(mot_checkpoint_mixed_attn)
-        self.attention_mask_mode = attention_mask_mode
-        # H > 1 leading clean latent frames (sparse history); 0/1 = legacy single first frame.
-        self.num_history_frames = int(num_history_frames or 0)
-
-        # Allow the architecture / config to override the video v↔v sub-mode.
-        # When None we defer to whatever ``vb.video_attention_mask_mode`` reports.
-        set_video_attention_mask_mode(vb, video_attention_mask_mode)
+        self.frame_mask = frame_mask
 
     # ------------------------------------------------------------------
     # Mixed attention
     # ------------------------------------------------------------------
-
-    def _build_attention_mask(
-        self,
-        s_video: int,
-        s_action: int,
-        video_tokens_per_frame: int,
-        *,
-        device: torch.device,
-    ) -> Tensor:
-        """Build the ``[Sv+Sa, Sv+Sa]`` cross-modal bool mask for the configured mode.
-
-        Delegates to :func:`build_cross_modal_attention_mask`. ``v↔v`` follows
-        ``vb.video_attention_mask_mode``; ``a↔a`` is fully connected; ``v↔a``
-        follows ``attention_mask_mode`` (see :mod:`utils.mask_modes`).
-        """
-        return build_cross_modal_attention_mask(
-            self.vb,
-            s_video=s_video,
-            s_action=s_action,
-            video_tokens_per_frame=video_tokens_per_frame,
-            mode=self.attention_mask_mode,
-            device=device,
-            num_clean_frames=max(self.num_history_frames, 1),
-        )
 
     def _mixed_attention(
         self,
@@ -150,14 +111,6 @@ class DualSystemMoTDriver:
     # Per-layer step
     # ------------------------------------------------------------------
 
-    def _video_tokens_per_frame(self, vstate: "BlockLoopState") -> int:
-        """Tokens per video frame, derived from the spatial dims in vstate.
-
-        Delegates to :func:`compute_video_tokens_per_frame`, which returns
-        ``h * w`` from the spatial dims populated on ``vstate``.
-        """
-        return compute_video_tokens_per_frame(vstate, "DualSystemMoTDriver")
-
     def step(
         self,
         layer_id: int,
@@ -174,9 +127,8 @@ class DualSystemMoTDriver:
         runs mixed attention (optionally checkpointed), splits the
         result, and feeds each slice through its post-attention suffix.
 
-        ``attn_mask`` is the joint ``[Sv+Sa, Sv+Sa]`` mask built once at
-        :meth:`run_joint_loop`. When ``None``, the driver falls back to
-        per-step construction (used by direct ``step()`` callers in tests).
+        ``attn_mask`` is this layer's joint ``[Sv+Sa, Sv+Sa]`` mask built once at
+        :meth:`run_joint_loop`.
 
         When ``use_gradient_checkpointing`` is enabled (and the action
         backbone is in training mode), the entire pre→mixed→post triplet
@@ -317,52 +269,23 @@ class DualSystemMoTDriver:
     ) -> Tuple["BlockLoopState", "ActionState"]:
         """Run the full per-layer loop over both modalities.
 
-        Builds the joint attention mask once from the initial shapes and
-        reuses it across all layers (token counts and tokens-per-frame are
-        layer-invariant during one forward). The two ``use_gradient_*``
-        flags are forwarded to :meth:`step` so each layer may opt into
-        step-level activation checkpointing — see the class docstring of
-        :meth:`step` for memory/compute trade-offs.
+        Expands the frame mask to per-layer token masks once (token counts are
+        layer-invariant during one forward) and reuses them across layers. The
+        two ``use_gradient_*`` flags are forwarded to :meth:`step` so each layer
+        may opt into step-level activation checkpointing.
         """
-        # Resolve sequence shapes from the backbone-populated f/h/w fields.
-        # Going through f and the shared ``compute_video_tokens_per_frame`` helper
-        # avoids depending on the layout of ``vstate.hidden_states``.
-        s_video = int(vstate.grid_frames) * self._video_tokens_per_frame(vstate)
         payload = astate.payload
         if payload is None or not hasattr(payload, "x_action"):
             raise RuntimeError(
                 "DualSystemMoTDriver: astate.payload must expose `x_action` (populated by ActionDiT.prepare_state)."
             )
         s_action = payload.x_action.shape[1]
-
-        # Backbones whose attention pattern changes per layer (GE per-view vs
-        # cross-view blocks, flux mode vs single blocks) or whose video stream
-        # carries extra tokens build the per-layer masks themselves.
-        custom = getattr(self.vb, "build_joint_attention_masks", None)
-        layer_masks = None
-        if custom is not None:
-            layer_masks = custom(
-                vstate,
-                s_action=s_action,
-                attention_mask_mode=self.attention_mask_mode,
-                num_clean_frames=max(self.num_history_frames, 1),
-            )
-        if layer_masks is None:
-            attn_mask = self._build_attention_mask(
-                s_video=s_video,
-                s_action=s_action,
-                video_tokens_per_frame=self._video_tokens_per_frame(vstate),
-                device=vstate.hidden_states.device,
-            )
-
-            # Backbones may prepend prefix K/V tokens (keys without matching query
-            # rows — e.g. Cosmos3's cached und text stream). ``_step_impl`` needs no
-            # change: it splits the attention output by query lengths, and SDPA
-            # handles the resulting rectangular mask.
-            attn_mask = widen_mask_for_prefix_kv(attn_mask, vstate)
-            layer_masks = [attn_mask] * self.num_layers
+        # The backbone owns its token order (views, text / proprio tokens, prefix keys); the rules are the frame mask's.
+        layer_masks = self.vb.build_joint_attention_masks(self.frame_mask, vstate, s_action)
         if len(layer_masks) != self.num_layers:
-            raise ValueError(f"build_joint_attention_masks returned {len(layer_masks)} masks for {self.num_layers} layers")
+            raise ValueError(
+                f"build_joint_attention_masks returned {len(layer_masks)} masks for {self.num_layers} layers"
+            )
 
         for layer_id in range(self.num_layers):
             vstate, astate = self.step(

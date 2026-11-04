@@ -9,7 +9,7 @@ model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/
 weights_file: GE_base_fast_v0.1.safetensors
 ltx_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/LTX-Video        # [Required] vae/ text_encoder/ tokenizer/
 
-temporal_compression: 8   # LTX VAE (yaml contract checked against the backbone at build)
+temporal_compression: 8   # LTX VAE (yaml contract checked against the backbone at build; the latent layout reads it)
 causal_temporal: true
 shift_video: 1.0          # deploy-grid shift; GE trains on the shift-1 FlowMatchEuler grid
 n_view: 2                 # cameras stacked top-to-bottom in the dataloader canvas

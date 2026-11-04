@@ -5,7 +5,6 @@ import pytest
 import torch
 
 from openwam.model.action_backbone.separate_action_dit import ActionDiT
-from openwam.model.architectures.dual_system import DualSystemCrossAttnArchitecture
 
 # ---------------------------------------------------------------------------
 # Step 3: sigma uses scheduler.num_train_timesteps, not hardcoded 1000
@@ -13,7 +12,7 @@ from openwam.model.architectures.dual_system import DualSystemCrossAttnArchitect
 
 
 def test_generate_sigma_uses_scheduler_num_train_timesteps():
-    """The denoising loop behind generate() should use the schedulers' num_train_timesteps, not 1000.0."""
+    """The denoising loop (``_denoise_loop``, behind ``sample``) should use the schedulers' num_train_timesteps, not 1000.0."""
     from tests.test_openwam_trainer import _make_tiny_arch
 
     arch = _make_tiny_arch()
@@ -21,10 +20,10 @@ def test_generate_sigma_uses_scheduler_num_train_timesteps():
     assert hasattr(arch.action_scheduler, "num_train_timesteps")
     assert arch.action_scheduler.num_train_timesteps == 1000
 
-    # The sigma math lives in _denoise_loop (shared by generate and the training vis rollout).
+    # The sigma math lives in _denoise_loop (shared by deploy and the training vis rollout).
     import inspect
 
-    source = inspect.getsource(arch.generate) + inspect.getsource(arch._denoise_loop)
+    source = inspect.getsource(arch.sample) + inspect.getsource(arch._denoise_loop)
     assert "/ 1000.0" not in source
     assert "/ 1000" not in source
     assert "num_train_ts" in inspect.getsource(arch._denoise_loop)
@@ -55,31 +54,6 @@ def test_action_dit_requires_all_params():
     )
     assert dit.action_dim == 7
     assert dit.dim == 64
-
-
-# ---------------------------------------------------------------------------
-# Step 5: vanilla.py video_dim raises without config or backbone
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Step 5 (extended): all architectures raise without video_dim
-# ---------------------------------------------------------------------------
-
-
-def test_dual_system_cross_attn_no_video_dim_raises():
-    """DualSystemCrossAttn should raise when video_dim is not specified."""
-    cfg = {
-        "framework": "dual_system",
-        "variant": "joint_cross_attn",
-        "action_dim": 20,
-        "dim": 64,
-        "ffn_dim": 256,
-        "num_heads": 4,
-        "bridge_layers": (0, 1),
-    }
-    with pytest.raises(ValueError, match="video_dim must be specified"):
-        DualSystemCrossAttnArchitecture(cfg=cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -174,19 +148,3 @@ def test_action_decode_neither():
 
     expected = np.full((5, 7), 3.0)
     np.testing.assert_allclose(actions, expected)
-
-
-# ---------------------------------------------------------------------------
-# Step 7: tile_size/tile_stride default to None
-# ---------------------------------------------------------------------------
-
-
-def test_generate_tile_defaults_are_none():
-    """generate() signature should default tile_size and tile_stride to None."""
-    import inspect
-
-    from openwam.model.architectures.base import BaseWAMArchitecture
-
-    sig = inspect.signature(BaseWAMArchitecture.generate)
-    assert sig.parameters["tile_size"].default is None
-    assert sig.parameters["tile_stride"].default is None

@@ -257,7 +257,6 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         self._dit_patch_size = _COSMOS3_DIT_PATCH_SIZE
         self._temporal_compression = _COSMOS3_TEMPORAL_COMPRESSION
         self._causal_temporal = _COSMOS3_CAUSAL_TEMPORAL
-        self._video_attention_mask_mode = "bidirectional"
 
         self._use_system_prompt = bool(use_system_prompt)
         self._prompt_templates = bool(prompt_templates)
@@ -338,44 +337,6 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
     def text_dim(self) -> Optional[int]:
         """Context width for the action stream = und hidden size (2048)."""
         return self._context_dim
-
-    @property
-    def video_attention_mask_mode(self) -> str:
-        return self._video_attention_mask_mode
-
-    @video_attention_mask_mode.setter
-    def video_attention_mask_mode(self, mode: str) -> None:
-        self._video_attention_mask_mode = str(mode)
-
-    def build_video_to_video_mask(
-        self, video_seq_len: int, video_tokens_per_frame: int, device: torch.device
-    ) -> Tensor:
-        """v↔v joint-mask block; three modes."""
-        mode = self._video_attention_mask_mode
-        if video_seq_len <= 0 or video_tokens_per_frame <= 0:
-            raise ValueError(
-                f"build_video_to_video_mask needs positive sizes; got seq={video_seq_len}, "
-                f"tokens_per_frame={video_tokens_per_frame}."
-            )
-        if mode == "bidirectional":
-            return torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
-        if mode == "per_frame_causal":
-            if video_seq_len % video_tokens_per_frame != 0:
-                raise ValueError(
-                    f"per_frame_causal needs seq divisible by tokens_per_frame; got {video_seq_len} "
-                    f"% {video_tokens_per_frame}."
-                )
-            frames = video_seq_len // video_tokens_per_frame
-            frame_mask = torch.tril(torch.ones((frames, frames), dtype=torch.bool, device=device))
-            return frame_mask.repeat_interleave(video_tokens_per_frame, dim=0).repeat_interleave(
-                video_tokens_per_frame, dim=1
-            )
-        if mode == "first_frame_causal":
-            mask = torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
-            ff = min(video_tokens_per_frame, video_seq_len)
-            mask[:ff, ff:] = False
-            return mask
-        raise NotImplementedError(f"{type(self).__name__} does not implement v-v mask mode '{mode}'.")
 
     # ================================================================
     # Construction
@@ -679,17 +640,18 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         latents: Tensor,
         timestep: Tensor,
         text: TextCondition,
-        num_clean_latents: int,
-        raw_proprio: Optional[Tensor] = None,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
+        layout,
+        proprio: Tensor,
+        use_gradient_checkpointing: bool,
+        use_gradient_checkpointing_offload: bool,
     ) -> BlockLoopState:
         """Pack the gen stream (``cosmos3_dit.prepare_block_loop``) with the und bundle from ``text.extra``.
 
         Args:
-            latents: (B, 48, T_lat, h, w); the first ``num_clean_latents`` get no timestep embedding.
+            latents: (B, 48, T_lat, h, w); the first ``layout.num_hist_latents`` get no timestep embedding.
             timestep: (B,). text: TextCondition from :meth:`encode_text` (context may carry proprio tokens).
-            num_clean_latents: int. raw_proprio: unused. use_gradient_checkpointing(_offload): bool loop flags.
+            layout: ``cfg.common.layout`` (clean prefix length). proprio: (B, H, D); unused (context tokens).
+            use_gradient_checkpointing(_offload): bool loop flags.
 
         Returns:
             BlockLoopState.
@@ -703,7 +665,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             und_mask=text.extra["und_mask"],
             und_kv=text.extra["und_kv"],
             vision_positions=text.extra["vision_positions"],
-            num_clean_prefix_frames=int(num_clean_latents),
+            num_clean_prefix_frames=int(layout.num_hist_latents),
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         )
@@ -722,7 +684,18 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         self._gen_block_compile_enabled = True
         logger.info("Enabled lazy Cosmos3 gen-block compile with kwargs=%s", self._gen_block_compile_kwargs)
 
-    def run_block(self, block_id: int, state: BlockLoopState) -> BlockLoopState:
+    def run_block(self, block_id: int, state: BlockLoopState, attn_mask: Tensor) -> BlockLoopState:
+        """One gen block on the video stream alone.
+
+        Args:
+            block_id: int. state: BlockLoopState.
+            attn_mask: this layer's mask from :meth:`build_joint_attention_masks` (und prefix columns first); the
+                gen block reads its und columns from ``und_mask`` itself, so only the gen columns are passed on.
+
+        Returns:
+            ``state`` with ``hidden_states`` updated.
+        """
+        gen_mask = attn_mask[..., int(state.prefix_kv_len) :]
         compile_allowed = (
             self._gen_block_compile_enabled
             and not self.training
@@ -737,12 +710,30 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
                     self._compiled_gen_block = torch.compile(
                         cosmos3_dit._gen_block_forward, **(self._gen_block_compile_kwargs or {})
                     )
-                return cosmos3_dit.run_block(self.dit, block_id, state, block_forward=self._compiled_gen_block)
+                return cosmos3_dit.run_block(
+                    self.dit, block_id, state, gen_mask=gen_mask, block_forward=self._compiled_gen_block
+                )
             except Exception as exc:
                 self._compiled_gen_block = None
                 self._gen_block_compile_enabled = False
                 logger.warning("Cosmos3 gen-block compile failed at block %s; falling back to eager: %s", block_id, exc)
-        return cosmos3_dit.run_block(self.dit, block_id, state)
+        return cosmos3_dit.run_block(self.dit, block_id, state, gen_mask=gen_mask)
+
+    def build_joint_attention_masks(self, frame_mask: Tensor, state: BlockLoopState, s_action: int) -> list:
+        """The shared frame-major expansion with the cached und keys prepended (every row may read them).
+
+        Args:
+            frame_mask: (T + 1, T + 1) bool frame mask. state: BlockLoopState (``prefix_kv_len`` / ``prefix_kv_mask``).
+            s_action: int, action tokens.
+
+        Returns:
+            list of ``num_layers`` masks (S, P + S), or (B, 1, S, P + S) when the und text is padded per sample.
+        """
+        from openwam.model.video_backbone.cosmos3.masks import widen_mask_for_prefix_kv
+
+        mask = super().build_joint_attention_masks(frame_mask, state, s_action)[0]
+        mask = widen_mask_for_prefix_kv(mask, int(state.prefix_kv_len), state.prefix_kv_mask)
+        return [mask] * self.num_layers
 
     def finalize(self, state: BlockLoopState) -> Tensor:
         return cosmos3_dit.finalize_block_loop(self.dit, state)

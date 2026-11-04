@@ -309,8 +309,7 @@ def _gen_block_forward(
     ``[und K/V ; gen K/V]`` (GQA) + gen MLP. Mirrors the upstream layer body.
 
     ``gen_mask`` is an optional ``(S, S)`` (or ``(B, 1, S, S)``) bool mask over
-    the gen block of the key axis, read from ``extras["shared_attention_mask"]``
-    by :func:`run_block`. ``None`` keeps the gen block fully visible (the plain
+    the gen block of the key axis, passed by :func:`run_block`. ``None`` keeps the gen block fully visible (the plain
     video path).
     """
     b, s, _ = gen_seq.shape
@@ -358,8 +357,19 @@ def run_block(
     block_id: int,
     state: BlockLoopState,
     *,
+    gen_mask: Optional[Tensor] = None,
     block_forward: Callable[..., Tensor] = _gen_block_forward,
 ) -> BlockLoopState:
+    """One gen block over the packed gen stream.
+
+    Args:
+        net: the Cosmos3 transformer. block_id: int. state: BlockLoopState of :func:`prepare_block_loop`.
+        gen_mask: optional (S, S) / (B, 1, S, S) bool mask over the gen keys (None = fully visible).
+        block_forward: the block body (eager or compiled ``_gen_block_forward``).
+
+    Returns:
+        ``state`` with ``hidden_states`` updated.
+    """
     layer = net.layers[block_id]
     k_und, v_und = state.extras["und_kv"][block_id]
     state.hidden_states = gradient_checkpoint_forward(
@@ -373,7 +383,7 @@ def run_block(
         state.extras["und_mask"],
         state.extras["cos_gen"],
         state.extras["sin_gen"],
-        state.extras.get("shared_attention_mask"),
+        gen_mask,
     )
     return state
 

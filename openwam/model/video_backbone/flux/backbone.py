@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -83,9 +83,6 @@ def _rational_time_shift(t: Tensor, shift: float) -> Tensor:
 class FluxActionVideoBackbone(VideoBackbone):
     """flux-3-action-base trunk + ViTNorm video VAE + Qwen3-VL-4B behind the VideoBackbone ABC."""
 
-    # The P stream needs the raw proprio frames (joint_self_attn passes them as ``raw_proprio``).
-    consumes_raw_proprio = True
-
     def __init__(
         self,
         *,
@@ -105,7 +102,8 @@ class FluxActionVideoBackbone(VideoBackbone):
             vae: ViTNormInference (frozen).
             text_encoder: Qwen3VLEmbedder (frozen).
             text_encoder_dir: str, the dir its config / processor files were read from (save_deploy_assets copies it).
-            action_cond_dim: int, proprio width fed to the P stream (must equal the architecture's state_dim).
+            action_cond_dim: int, proprio width fed to the P stream (``resolve_config`` checks it equals
+                ``model.architecture.state_dim``).
             shift_video: float, inference shift of the OpenWAM scheduler (flux DROID inference: 5).
             text_dropout_p: float, training caption dropout to "" (flux PolicyConfig.caption_dropout).
             train_timestep_width / train_timestep_shift: native training timestep law (logit-logistic + rational shift).
@@ -126,7 +124,6 @@ class FluxActionVideoBackbone(VideoBackbone):
         self._dit_patch_size = (1, 1, 1)
         self._temporal_compression = _TEMPORAL_COMPRESSION
         self._causal_temporal = True
-        self._video_attention_mask_mode = "first_frame_causal"
         # Text slot read by encode_text: the online Qwen3-VL here, a PromptCache after build_text_cache.
         self.text_lookup = self._qwen_entries
         # Test-only switch of build_flux_layer_masks (see verify_layout.py); never set in training.
@@ -156,19 +153,6 @@ class FluxActionVideoBackbone(VideoBackbone):
     @property
     def text_dim(self) -> int:
         return self.dit.params.context_in_dim
-
-    @property
-    def action_cond_dim(self) -> int:
-        """Input width of the P (proprio) stream; the architecture checks it equals its ``state_dim``."""
-        return self.state_dim
-
-    @property
-    def video_attention_mask_mode(self) -> str:
-        return self._video_attention_mask_mode
-
-    @video_attention_mask_mode.setter
-    def video_attention_mask_mode(self, mode: str) -> None:
-        self._video_attention_mask_mode = str(mode)
 
     # ---------------------------------------------------------------- construction
     @classmethod
@@ -377,8 +361,7 @@ class FluxActionVideoBackbone(VideoBackbone):
 
         Returns:
             TextCondition: context (B, L_max, 20480) zero-padded to the longest bucket, context_mask (B, L_max)
-            = position < the caption's bucket length, extra ``text_len`` = L_max (int; ``prepare`` slices the
-            text tokens off the context the architecture extended with proprio).
+            = position < the caption's bucket length.
         """
         ctxs = self.text_lookup(self._caption_dropout(list(prompts)))
         lens = torch.tensor([c.shape[1] for c in ctxs], device=self.device)
@@ -386,9 +369,7 @@ class FluxActionVideoBackbone(VideoBackbone):
         for i, c in enumerate(ctxs):
             ctx[i, : c.shape[1]] = c[0].to(device=self.device, dtype=self.dtype)
         positions = torch.arange(ctx.shape[1], device=ctx.device).unsqueeze(0)
-        return TextCondition(
-            context=ctx, context_mask=positions < lens.unsqueeze(1), extra={"text_len": int(ctx.shape[1])}
-        )
+        return TextCondition(context=ctx, context_mask=positions < lens.unsqueeze(1))
 
     # ---------------------------------------------------------------- block loop
     def prepare(
@@ -397,20 +378,20 @@ class FluxActionVideoBackbone(VideoBackbone):
         latents: Tensor,
         timestep: Tensor,
         text: TextCondition,
-        num_clean_latents: int,
-        raw_proprio: Optional[Tensor] = None,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
+        layout,
+        proprio: Tensor,
+        use_gradient_checkpointing: bool,
+        use_gradient_checkpointing_offload: bool,
     ) -> BlockLoopState:
         """Embed T / F / H / P, build per-token modulations and RoPE, stash per-segment metadata.
 
         Args:
-            latents: (B, 96, T, h, w); the first ``num_clean_latents`` = H are the history (H stream).
+            latents: (B, 96, T, h, w); the first ``layout.num_hist_latents`` are the clean history (H stream).
             timestep: (B,) = 1000 t.
-            text: TextCondition; the first ``extra["text_len"]`` context tokens are text (the architecture may
-                have appended proprio tokens after them), context_mask gives each caption's bucket length.
-            num_clean_latents: int H.
-            raw_proprio: (B, N_p, state_dim) proprio frames for the P stream (zeros when None).
+            text: TextCondition of the text alone (flux runs with ``proprio_input=backbone_stream``, so the
+                architecture appends no proprio token); context_mask gives each caption's bucket length.
+            layout: ``cfg.common.layout`` (clean prefix length = the H stream).
+            proprio: (B, H, state_dim) normalized proprio frames, embedded as the P stream.
             use_gradient_checkpointing(_offload): bool loop flags.
 
         Returns:
@@ -418,15 +399,17 @@ class FluxActionVideoBackbone(VideoBackbone):
         """
         dit = self.dit
         b, _, t_lat, h, w = latents.shape
-        n_hist = int(num_clean_latents)
-        text_len = int(text.extra["text_len"])
-        ctx = text.context[:, :text_len]
-        # Each caption's own bucket length (the text part of the mask is a prefix of True).
-        seq_lens = text.context_mask[:, :text_len].sum(dim=1)
-        prop = raw_proprio
-        if prop is None:
-            prop = torch.zeros(b, n_hist, self.state_dim, device=latents.device, dtype=latents.dtype)
-        prop = prop.reshape(b, -1, self.state_dim)
+        n_hist = int(layout.num_hist_latents)
+        ctx = text.context
+        text_len = int(ctx.shape[1])
+        # Each caption's own bucket length (the mask is a prefix of True).
+        seq_lens = text.context_mask.sum(dim=1)
+        # One P token per history frame.
+        if tuple(proprio.shape) != (b, int(layout.num_proprio_tokens), self.state_dim):
+            raise ValueError(
+                f"flux proprio must be (B, {layout.num_proprio_tokens}, {self.state_dim}), got {tuple(proprio.shape)}"
+            )
+        prop = proprio
         n_prop = prop.shape[1]
         dtype = latents.dtype
         dev = latents.device
@@ -555,31 +538,46 @@ class FluxActionVideoBackbone(VideoBackbone):
         state.hidden_states = x + ex["single_mod"][2] * out
         return state
 
-    def build_joint_attention_masks(self, vstate: BlockLoopState, *, s_action: int, attention_mask_mode: str,
-                                    num_clean_frames: int) -> list[Tensor]:
-        """Per-layer masks for the MoT driver (see module docstring); only ``mutual`` is defined here."""
-        if s_action and attention_mask_mode != "mutual":
-            raise NotImplementedError(f"flux3_action_base defines only the mutual v<->a mask, got {attention_mask_mode}")
+    def build_joint_attention_masks(self, frame_mask: Tensor, state: BlockLoopState, s_action: int) -> list[Tensor]:
+        """Per-layer masks over ``[T | F | H | P | A]`` (see module docstring and ``build_flux_layer_masks``).
+
+        Args:
+            frame_mask: (T + 1, T + 1) bool frame mask. state: BlockLoopState (segment lengths, text lengths).
+            s_action: int, action tokens.
+
+        Returns:
+            list of ``num_layers`` masks.
+        """
+        n_hist = int(state.extras["n_hist"])
+        if int(state.grid_frames) != int(frame_mask.shape[0]) - 1:
+            raise ValueError(
+                f"the video stream has {state.grid_frames} latent frames, layout says {frame_mask.shape[0] - 1}"
+            )
         return build_flux_layer_masks(
-            vstate.extras["seg_lens"],
-            s_action,
-            vstate.extras["text_valid"],
+            frame_mask,
+            state.extras["seg_lens"],
+            int(s_action),
+            state.extras["text_valid"],
+            n_hist=n_hist,
             num_mode_layers=_N_MODE,
             num_layers=self.num_layers,
-            device=vstate.hidden_states.device,
+            device=state.hidden_states.device,
             strict_clean_rows=self.strict_clean_rows,
         )
 
-    def run_block(self, block_id: int, state: BlockLoopState) -> BlockLoopState:
-        """Video-only layer (no action tokens): same masks with ``s_action = 0``."""
-        masks = state.extras.get("_masks")
-        if masks is None:
-            masks = self.build_joint_attention_masks(state, s_action=0, attention_mask_mode="mutual", num_clean_frames=1)
-            state.extras = {**state.extras, "_masks": masks}
+    def run_block(self, block_id: int, state: BlockLoopState, attn_mask: Tensor) -> BlockLoopState:
+        """Video-only layer (no action tokens).
+
+        Args:
+            block_id: int. state: BlockLoopState. attn_mask: this layer's mask (``s_action = 0``).
+
+        Returns:
+            ``state`` with ``hidden_states`` updated.
+        """
         q, k, v, post = self.pre_attn_at_layer(block_id, state)
         heads = self.num_heads
         split = lambda t: rearrange(t, "b s (n d) -> b n s d", n=heads)  # noqa: E731
-        out = F.scaled_dot_product_attention(split(q), split(k), split(v), attn_mask=masks[block_id])
+        out = F.scaled_dot_product_attention(split(q), split(k), split(v), attn_mask=attn_mask)
         return self.post_attn_at_layer(block_id, state, rearrange(out, "b n s d -> b s (n d)"), post)
 
     def finalize(self, state: BlockLoopState) -> Tensor:

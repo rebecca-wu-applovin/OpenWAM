@@ -55,7 +55,7 @@ class BlockLoopState:
 class TextCondition:
     """Text conditioning of one batch, as :meth:`VideoBackbone.encode_text` returns it.
 
-    ``extra`` is family-private (cosmos3: ``und_kv`` / ``und_mask`` / ``vision_positions``; flux: ``text_len``):
+    ``extra`` is family-private (cosmos3: ``und_kv`` / ``und_mask`` / ``vision_positions``):
     only that family's ``prepare`` reads it; the architecture, joint and mask code never do.
     """
 
@@ -193,25 +193,36 @@ class VideoBackbone(ABC, nn.Module):
         latents: Tensor,
         timestep: Tensor,
         text: TextCondition,
-        num_clean_latents: int,
-        raw_proprio: Optional[Tensor] = None,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
+        layout,
+        proprio: Tensor,
+        use_gradient_checkpointing: bool,
+        use_gradient_checkpointing_offload: bool,
     ) -> BlockLoopState:
         """Pre-loop: patchify / freqs / time_mod / text. Returns a BlockLoopState.
 
         Args:
-            latents: (B, z, T_lat, h, w) latents; the first ``num_clean_latents`` are clean (t = 0).
+            latents: (B, z, T_lat, h, w) latents, T_lat = ``layout.num_latents``; the first
+                ``layout.num_hist_latents`` are clean (t = 0).
             timestep: (B,) video timestep.
             text: TextCondition (the architecture may have appended proprio tokens to context / context_mask).
-            num_clean_latents: int, clean prefix latents.
-            raw_proprio: (B, N, state_dim) raw proprio for a family that embeds it in its own stream (flux), else None.
+            layout: ``cfg.common.layout`` (DictConfig); read for the clean prefix length.
+            proprio: (B, H, D) normalized proprio, always passed; only a ``proprio_input=backbone_stream`` family
+                (flux) embeds it in its own stream, the others ignore it (they read the context's proprio tokens).
             use_gradient_checkpointing / use_gradient_checkpointing_offload: bool loop flags.
         """
 
     @abstractmethod
-    def run_block(self, block_id: int, state: BlockLoopState) -> BlockLoopState:
-        """Run a single DiT block. Gradient checkpointing is transparent to the architecture."""
+    def run_block(self, block_id: int, state: BlockLoopState, attn_mask: Tensor) -> BlockLoopState:
+        """Run a single DiT block on the video stream alone (no action tokens).
+
+        Args:
+            block_id: int, layer index.
+            state: BlockLoopState from :meth:`prepare`.
+            attn_mask: bool token mask of this layer, ``build_joint_attention_masks(frame_mask, state, 0)[block_id]``.
+
+        Returns:
+            BlockLoopState with the layer applied. Gradient checkpointing is transparent to the architecture.
+        """
 
     @abstractmethod
     def finalize(self, state: BlockLoopState) -> Tensor:
@@ -245,28 +256,11 @@ class VideoBackbone(ABC, nn.Module):
         """Whether the first frame is encoded into its own standalone latent token."""
         return getattr(self, "_causal_temporal", True)
 
-    @property
-    def video_attention_mask_mode(self) -> str:
-        """v↔v mask mode for joint MoT. Default bidirectional; causal backbones override."""
-        return "bidirectional"
-
-    def build_video_to_video_mask(
-        self, video_seq_len: int, video_tokens_per_frame: int, device: torch.device
-    ) -> Tensor:
-        """Build the v↔v attention-mask block; mode from :attr:`video_attention_mask_mode`."""
-        if self.video_attention_mask_mode != "bidirectional":
-            raise NotImplementedError(
-                f"{type(self).__name__} does not implement build_video_to_video_mask "
-                f"for mode '{self.video_attention_mask_mode}'."
-            )
-        return torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
-
     # ================================================================
     # Shared preprocessing flow (implemented once here; families only encode)
     # ================================================================
-    # Two transitional layouts until the latent layout comes from cfg (Task 8): sparse history (H > 0 frames each
-    # encoded alone + the future as one clip) and first frame (H = 0: the whole clip as one causal clip, its
-    # latent 0 is the clean condition).
+    # One latent layout (cfg.common.layout): past frames (per_frame | clip) + the current frame t alone, both
+    # clean, then the future: the clip [t, future] encoded as one with its latent 0 (= t) dropped.
 
     def to_pixels(self, clips: list) -> Tensor:
         """PIL clips -> pixels.
@@ -302,9 +296,11 @@ class VideoBackbone(ABC, nn.Module):
             pixels: (B, 3, T, H, W) in [-1, 1], T = 1 + temporal_compression * k.
 
         Returns:
-            (B, z, 1 + (T-1) / temporal_compression, h, w) latents. Raises ValueError unless T = 1 (mod tc).
+            (B, z, 1 + (T-1) / temporal_compression, h, w) latents. Raises ValueError for any other T.
         """
-        self.num_future_latents(pixels.shape[2])  # validates T = 1 + tc * k
+        tc, t = int(self.temporal_compression), int(pixels.shape[2])
+        if t < 1 or (t - 1) % tc:
+            raise ValueError(f"{type(self).__name__}: a causal clip must be 1 + {tc}k frames, got {t}")
         return self.encode_pixels(pixels)
 
     @staticmethod
@@ -315,87 +311,140 @@ class VideoBackbone(ABC, nn.Module):
             raise ValueError(f"got {len(prompts)} prompts for a batch of {batch_size} clips")
         return prompts
 
-    @torch.no_grad()
-    def preprocess_condition(
-        self, history: list, prompts, *, num_frames: int, num_latents: int
-    ) -> Tuple[Tensor, TextCondition]:
-        """Deploy condition: H history frames, each encoded alone, and the text.
+    def _encode_history(self, pixels: Tensor, layout) -> Tensor:
+        """The clean latents of the H history frames: the past frames, then the current frame alone.
 
         Args:
-            history: list of B clips, each H PIL frames (oldest first, frame t last).
-            prompts: one str or B str.
-            num_frames: int, pixel frames of the equivalent contiguous clip the text describes.
-            num_latents: int T_lat, latents of the whole clip that will be denoised (H clean + the future).
+            pixels: (B, 3, H, Hp, Wp) history pixels in [-1, 1], oldest first, the current frame t last.
+            layout: ``cfg.common.layout``; ``history_encoding`` picks how the H - 1 past frames are encoded.
 
         Returns:
-            (hist_latents (B, z, H, h, w) in the backbone dtype, TextCondition for the (T_lat, h, w) grid).
+            (B, z, num_hist_latents, h, w) in the backbone dtype. Raises ValueError when the frame or latent
+            count disagrees with the layout.
+        """
+        h = int(layout.num_hist_frames)
+        if pixels.shape[2] != h:
+            raise ValueError(f"layout has {h} history frames, got {pixels.shape[2]}")
+        parts = []
+        if int(layout.num_past_latents) > 0:
+            # Contiguous slices: the VAE sees the same memory layout as a separately built clip.
+            past = pixels[:, :, : h - 1].contiguous()
+            # The only place the past-frame encoding is chosen.
+            parts.append(self.encode_frames(past) if layout.history_encoding == "per_frame" else self.encode_clip(past))
+        parts.append(self.encode_frames(pixels[:, :, h - 1 :].contiguous()))
+        hist = torch.cat(parts, dim=2).to(device=self.device, dtype=self.dtype)
+        if hist.shape[2] != int(layout.num_hist_latents):
+            raise ValueError(f"history encoded to {hist.shape[2]} latents, layout says {layout.num_hist_latents}")
+        return hist
+
+    def _encode_layout_text(self, prompts: list, layout, latent_hw) -> TextCondition:
+        """Text of the whole latent clip.
+
+        Args:
+            prompts: list of B str. layout: ``cfg.common.layout``. latent_hw: (h, w) latent grid.
+
+        Returns:
+            TextCondition for the (num_latents, h, w) grid and the equivalent contiguous clip of
+            1 + tc * (num_latents - 1) frames.
+        """
+        t_lat = int(layout.num_latents)
+        return self.encode_text(
+            prompts, grid=(t_lat, *latent_hw), num_frames=1 + int(self.temporal_compression) * (t_lat - 1)
+        )
+
+    @torch.no_grad()
+    def preprocess_condition(self, history: list, prompts, layout) -> Tuple[Tensor, TextCondition]:
+        """Deploy condition: the H history frames as clean latents, and the text.
+
+        Args:
+            history: list of B clips, each H PIL frames (oldest first, the current frame t last).
+            prompts: one str or B str.
+            layout: ``cfg.common.layout``.
+
+        Returns:
+            (hist_latents (B, z, num_hist_latents, h, w) in the backbone dtype, TextCondition for the
+            (num_latents, h, w) grid).
         """
         prompts = self._batch_prompts(prompts, len(history))
-        hist = self.encode_frames(self.to_pixels(history)).to(device=self.device, dtype=self.dtype)
-        text = self.encode_text(prompts, grid=(int(num_latents), *hist.shape[3:]), num_frames=int(num_frames))
-        return hist, text
+        hist = self._encode_history(self.to_pixels(history), layout)
+        return hist, self._encode_layout_text(prompts, layout, hist.shape[3:])
 
     @torch.no_grad()
-    def preprocess_train(self, clips: list, prompts, *, num_hist_frames: int) -> Tuple[Tensor, Tensor, TextCondition]:
-        """Training inputs: clean prefix latents, the full latent clip and the text.
+    def preprocess_train(self, clips: list, prompts, layout) -> Tuple[Tensor, TextCondition]:
+        """Training inputs: the full latent clip and the text.
 
         Args:
-            clips: list of B clips, each T PIL frames (sparse history: H history frames first, then F future).
+            clips: list of B clips, each H + F PIL frames (H history frames, the current frame t last, then F
+                future frames).
             prompts: one str or B str.
-            num_hist_frames: int H; > 0: sparse history (each history frame alone + the future as one clip);
-                0: first frame (the whole clip as one causal clip).
+            layout: ``cfg.common.layout``.
 
         Returns:
-            clean_latents (B, z, N_clean, h, w): the clean prefix (sparse: the H history latents; first frame:
-                latent 0 of the clip); latents (B, z, T_lat, h, w) with ``latents[:, :, :N_clean] == clean_latents``;
-                TextCondition for the (T_lat, h, w) grid.
+            latents (B, z, num_latents, h, w): ``cat(hist_latents, future)``, the first ``num_hist_latents`` the
+            clean condition (the same code as :meth:`preprocess_condition`), the future = the clip [t, future]
+            encoded as one with its latent 0 dropped; TextCondition for the (num_latents, h, w) grid.
         """
         prompts = self._batch_prompts(prompts, len(clips))
         pixels = self.to_pixels(clips)
-        h = int(num_hist_frames)
-        if h > 0:
-            # Contiguous slices: the VAE sees the same memory layout as a separately built clip.
-            clean = self.encode_frames(pixels[:, :, :h].contiguous()).to(device=self.device, dtype=self.dtype)
-            future = self.encode_clip(pixels[:, :, h:].contiguous()).to(device=self.device, dtype=self.dtype)
-            latents = torch.cat([clean, future], dim=2)
-        else:
-            latents = self.encode_clip(pixels).to(device=self.device, dtype=self.dtype)
-            clean = latents[:, :, :1].clone()
-        t_lat = int(latents.shape[2])
-        text = self.encode_text(
-            prompts, grid=(t_lat, *latents.shape[3:]), num_frames=1 + int(self.temporal_compression) * (t_lat - 1)
-        )
-        return clean, latents, text
+        h, f = int(layout.num_hist_frames), int(layout.num_future_frames)
+        if pixels.shape[2] != h + f:
+            raise ValueError(f"layout has {h} + {f} frames, got clips of {pixels.shape[2]}")
+        hist = self._encode_history(pixels[:, :, :h], layout)
+        # The future latents see t while being encoded (Wan TI2V pretraining / contiguous-video encode).
+        future = self.encode_clip(pixels[:, :, h - 1 :].contiguous())[:, :, 1:]
+        latents = torch.cat([hist, future.to(device=self.device, dtype=self.dtype)], dim=2)
+        if latents.shape[2] != int(layout.num_latents):
+            raise ValueError(f"clip encoded to {latents.shape[2]} latents, layout says {layout.num_latents}")
+        return latents, self._encode_layout_text(prompts, layout, latents.shape[3:])
 
-    def num_future_latents(self, num_future_frames: int) -> int:
-        """Latent frames of a causally encoded F-frame clip.
-
-        Args:
-            num_future_frames: int F.
-
-        Returns: int 1 + (F - 1) / temporal_compression. Raises ValueError unless F = 1 (mod temporal_compression).
-        """
-        tc = int(self.temporal_compression)
-        f = int(num_future_frames)
-        if f < 1 or (f - 1) % tc:
-            raise ValueError(f"{type(self).__name__}: future frames must be 1 + {tc}k, got {f}")
-        return 1 + (f - 1) // tc
-
-    @torch.no_grad()
-    def decode_video(self, latents: Tensor) -> list:
-        """Decode one latent clip to PIL frames.
-
-        Args:
-            latents: (1, z, T_lat, h, w) normalized latents.
-
-        Returns:
-            list of T PIL frames. Raises ValueError for a batch B != 1.
-        """
+    def _pixels_to_frames(self, pixels: Tensor) -> list:
+        """(1, 3, T, H, W) decoded pixels in [-1, 1] -> list of T PIL frames (transitional hook, see Wan)."""
         from openwam.model.video_backbone.common.pixels import tensor_to_pil_frames
 
+        return tensor_to_pil_frames(pixels.float().clamp(-1, 1))
+
+    @torch.no_grad()
+    def decode_future(self, latents: Tensor, layout) -> list:
+        """Decode the future of one latent clip.
+
+        Args:
+            latents: (1, z, num_latents, h, w) normalized latents of the whole clip.
+            layout: ``cfg.common.layout``.
+
+        Returns:
+            list of F PIL frames: the segment [current frame, future] decoded as one clip, frame 0 (t) dropped.
+            Raises ValueError for a batch B != 1 or a latent count other than ``layout.num_latents``.
+        """
         if latents.shape[0] != 1:
-            raise ValueError(f"decode_video decodes one clip, got a batch of {latents.shape[0]}")
-        return tensor_to_pil_frames(self.decode_latents(latents).float().clamp(-1, 1))
+            raise ValueError(f"decode_future decodes one clip, got a batch of {latents.shape[0]}")
+        if latents.shape[2] != int(layout.num_latents):
+            raise ValueError(f"got {latents.shape[2]} latents, layout says {layout.num_latents}")
+        segment = latents[:, :, int(layout.num_hist_latents) - 1 :]
+        return self._pixels_to_frames(self.decode_latents(segment))[1:]
+
+    # ================================================================
+    # Joint attention masks
+    # ================================================================
+
+    def build_joint_attention_masks(self, frame_mask: Tensor, state: BlockLoopState, s_action: int) -> list:
+        """Token-level masks of the joint ``[video tokens, action tokens]`` sequence, one per layer.
+
+        Default: every latent frame is ``tokens_per_frame`` consecutive tokens (frame-major), the action block
+        ``s_action`` tokens after them; all layers share one mask. GE (views), flux (text / proprio tokens in the
+        sequence) and cosmos3 (und prefix keys) override.
+
+        Args:
+            frame_mask: (T + 1, T + 1) bool from ``build_frame_mask`` (last row / column = action block).
+            state: BlockLoopState of the video stream (its token count and ``grid_frames``).
+            s_action: int, action tokens (0 for the video-only loop).
+
+        Returns:
+            list of ``num_layers`` (S_v + s_action, S_v + s_action) bool masks, True = attend.
+        """
+        s_video = int(state.hidden_states.shape[1])
+        tpf = frame_tokens(frame_mask, state, s_video)
+        mask = expand_frame_mask(frame_mask, [tpf] * (frame_mask.shape[0] - 1), s_action, state.hidden_states.device)
+        return [mask] * self.num_layers
 
     # ================================================================
     # Optional: deploy compile
@@ -466,8 +515,46 @@ class VideoBackbone(ABC, nn.Module):
         raise NotImplementedError(f"{type(self).__name__} has no text cache; set model.video_backbone.text_cache=false")
 
 
+def frame_tokens(frame_mask: Tensor, state: BlockLoopState, s_video: int) -> int:
+    """Tokens per latent frame of a frame-major video stream.
+
+    Args:
+        frame_mask: (T + 1, T + 1) frame mask. state: BlockLoopState (``grid_frames``). s_video: int, video tokens.
+
+    Returns:
+        int S_v / T. Raises ValueError when the stream does not hold T = layout.num_latents latent frames.
+    """
+    t = int(frame_mask.shape[0]) - 1
+    if int(state.grid_frames) != t or s_video % t:
+        raise ValueError(f"the video stream has {state.grid_frames} latent frames ({s_video} tokens), layout says {t}")
+    return s_video // t
+
+
+def expand_frame_mask(frame_mask: Tensor, frame_of_tokens, s_action: int, device) -> Tensor:
+    """Expand a frame mask to tokens.
+
+    Args:
+        frame_mask: (T + 1, T + 1) bool, last row / column = action block.
+        frame_of_tokens: list of T ints, tokens of each latent frame in sequence order (frame-major).
+        s_action: int, action tokens after the video tokens.
+        device: torch device of the result.
+
+    Returns:
+        (sum(frame_of_tokens) + s_action, same) bool: token i inherits the row / column of its frame.
+    """
+    counts = [int(n) for n in frame_of_tokens] + [int(s_action)]
+    # output_size from python ints: no data-dependent shape inside a compiled MoT loop.
+    index = torch.repeat_interleave(
+        torch.arange(len(counts), device=device), torch.tensor(counts, device=device), output_size=sum(counts)
+    )
+    fm = frame_mask.to(device=device, dtype=torch.bool)
+    return fm[index][:, index]
+
+
 __all__ = [
     "BlockLoopState",
     "TextCondition",
     "VideoBackbone",
+    "expand_frame_mask",
+    "frame_tokens",
 ]

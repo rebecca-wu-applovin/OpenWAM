@@ -22,25 +22,19 @@ class BaseDataset(ABC, torch.utils.data.Dataset):
 
     @abstractmethod
     def __getitem__(self, idx: int) -> dict:
-        """Return a single training sample.
+        """Return a single training sample: the data only (no marker for a model branch).
 
-        Conventional keys when the sample carries action supervision (used
-        by every reader currently in this package, but not required by
-        the base contract):
+        Keys (``openwam.dataloader.collate.collate`` stacks them into a ``Batch``):
 
-            video:           List[PIL.Image]
-            action:          Tensor (T, action_dim)
-            action_mask:     Tensor (T,) bool
-            video_mask:      Tensor (num_video_frames,) bool
-            proprio:         Tensor (1, state_dim)
-            proprio_mask:    Tensor (1,) bool
-            prompt:          str
-            first_frame_image: List[PIL.Image]
+            video:        list of H + F PIL.Image (H history frames, the current frame t last, then F future)
+            prompt:       str
+            action:       Tensor (K, action_dim), normalized action chunk
+            action_mask:  Tensor (K, action_dim) bool, True = supervised
+            proprio:      Tensor (H, state_dim), one normalized proprio row per history frame
+            proprio_mask: Tensor (H, state_dim) bool, True = real entry
+            source:       str, the sub-dataset the sample came from (added by the mixture dataset)
 
-        ``video`` is returned as PIL Images because the legacy
-        WanVideoPipeline.preprocess_video handles cropping, resizing, and
-        VAE encoding internally — converting to Tensor prematurely would
-        bypass that step.
+        ``video`` stays PIL: the video backbone turns it into pixels (``VideoBackbone.to_pixels``).
         """
         ...
 

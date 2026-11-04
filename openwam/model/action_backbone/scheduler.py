@@ -142,7 +142,7 @@ class ActionScheduler:
 
         ``sigma`` / ``sigma_next`` are taken directly (no internal lookup
         in ``self.timesteps``), because the joint inference loop in
-        ``BaseWAMArchitecture.generate`` drives its own (t_v, t_a)
+        ``BaseWAMArchitecture.sample`` drives its own (t_v, t_a)
         schedule whose timesteps are not necessarily indices into this
         scheduler's series.
         """

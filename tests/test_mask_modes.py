@@ -1,94 +1,44 @@
-"""Unit tests for the unified cross-modal attention-mask builder.
+"""Unit tests of the frame-level joint attention mask (``build_frame_mask``).
 
-Validates the four modes' v<->a layout, the first-frame-row exclusion, and the
-read-only tail (tri's understanding / shared's state) block.
+Rows / columns are the T latents of the layout plus one action block. Clean latents never see noisy latents or
+the action; noisy latents and the action see everything (``mutual``, the only implemented v<->a mode).
 """
 
 from __future__ import annotations
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
-from openwam.model.architectures.utils.mask_modes import (
-    ACTION_SEES_VIDEO,
-    ISOLATED,
-    MUTUAL,
-    VIDEO_SEES_ACTION,
-    build_cross_modal_attention_mask,
-    validate_attention_mask_mode,
-)
+from openwam.config import latent_layout
+from openwam.model.architectures.utils.mask_modes import build_frame_mask
 
-
-class _VBFirstFrameCausal:
-    """Minimal video backbone exposing first_frame_causal v<->v sub-mask."""
-
-    video_attention_mask_mode = "first_frame_causal"
-
-    def build_video_to_video_mask(self, *, video_seq_len, video_tokens_per_frame, device):
-        mask = torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
-        ff = min(video_tokens_per_frame, video_seq_len)
-        mask[:ff, ff:] = False  # first frame only sees itself
-        return mask
+# 3 history frames per frame (3 clean latents) + 8 future frames at 4x (2 noisy latents): T = 5, action = row 5.
+LAYOUT = OmegaConf.create(latent_layout([-2, -1, 0], list(range(1, 9)), 33, "per_frame", 4))
+N_CLEAN, T = 3, 5
 
 
-SV, SA, TPF = 6, 3, 2  # 3 video frames x 2 tokens, 3 action tokens
-FF = min(TPF, SV)  # first-frame token count = 2
+def test_mutual_bidirectional():
+    mask = build_frame_mask(LAYOUT, "bidirectional", "mutual")
+    assert mask.shape == (T + 1, T + 1) and mask.dtype == torch.bool
+    assert mask[:N_CLEAN, :N_CLEAN].all()  # clean <-> clean
+    assert not mask[:N_CLEAN, N_CLEAN:].any()  # clean -> noisy / action blocked
+    assert mask[N_CLEAN:].all()  # noisy latents and the action see everything
 
 
-def _build(mode):
-    return build_cross_modal_attention_mask(
-        _VBFirstFrameCausal(),
-        s_video=SV,
-        s_action=SA,
-        video_tokens_per_frame=TPF,
-        mode=mode,
-        device=torch.device("cpu"),
-    )
+def test_causal_clean_rows():
+    mask = build_frame_mask(LAYOUT, "causal", "mutual")
+    # Clean latent i sees clean latents 0..i only; the rest of the mask is the bidirectional one.
+    assert torch.equal(mask[:N_CLEAN, :N_CLEAN], torch.tril(torch.ones(N_CLEAN, N_CLEAN, dtype=torch.bool)))
+    assert torch.equal(mask[N_CLEAN:], build_frame_mask(LAYOUT, "bidirectional", "mutual")[N_CLEAN:])
 
 
-def test_validate_rejects_unknown_mode():
-    with pytest.raises(ValueError, match="attention_mask_mode"):
-        validate_attention_mask_mode("joint")  # old name no longer valid
+def test_unknown_clean_attention_raises():
+    with pytest.raises(ValueError):
+        build_frame_mask(LAYOUT, "first_frame_causal", "mutual")
 
 
-@pytest.mark.parametrize("mode", [MUTUAL, ACTION_SEES_VIDEO, VIDEO_SEES_ACTION, ISOLATED])
-def test_shared_invariants(mode):
-    """v<->v sub-mask and a<->a hold for all modes."""
-    mask = _build(mode)
-    assert mask.shape == (SV + SA, SV + SA)
-    assert mask.dtype == torch.bool
-    # a<->a fully connected
-    assert mask[SV:, SV:].all()
-    # v<->v first_frame_causal: first frame rows don't see later video
-    assert not mask[:FF, FF:SV].any()
-    assert mask[:FF, :FF].all()
-    assert mask[FF:SV, :SV].all()
-
-
-def test_action_sees_video():
-    mask = _build(ACTION_SEES_VIDEO)
-    assert mask[SV:, :SV].all()  # a -> all video
-    assert not mask[:SV, SV:].any()  # v -> a blocked
-
-
-def test_isolated():
-    mask = _build(ISOLATED)
-    assert mask[SV:, :FF].all()  # a -> first frame only
-    assert not mask[SV:, FF:SV].any()  # a -> later video blocked
-    assert not mask[:SV, SV:].any()  # v -> a blocked
-
-
-def test_mutual():
-    mask = _build(MUTUAL)
-    assert mask[SV:, :SV].all()  # a -> all video
-    # v -> a: all video rows EXCEPT first-frame rows
-    assert not mask[:FF, SV:].any()  # first-frame rows do NOT see action
-    assert mask[FF:SV, SV:].all()  # later video rows see action
-
-
-def test_video_sees_action():
-    mask = _build(VIDEO_SEES_ACTION)
-    assert mask[SV:, :FF].all()  # a -> first frame only
-    assert not mask[SV:, FF:SV].any()  # a -> later video blocked
-    assert not mask[:FF, SV:].any()  # v -> a: first-frame rows excluded
-    assert mask[FF:SV, SV:].all()  # later video rows see action
+@pytest.mark.parametrize("mode", ["action_sees_video", "video_sees_action", "isolated"])
+def test_unverified_modes_raise(mode):
+    with pytest.raises(NotImplementedError):
+        build_frame_mask(LAYOUT, "bidirectional", mode)

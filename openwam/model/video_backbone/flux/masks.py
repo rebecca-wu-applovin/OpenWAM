@@ -67,10 +67,12 @@ def build_stream_ids(n_hist: int, n_fut: int, h: int, w: int, text_len: int, n_p
 
 
 def build_flux_layer_masks(
+    frame_mask: Tensor,
     seg_lens: dict[str, int],
     s_action: int,
     text_valid: Optional[Tensor],
     *,
+    n_hist: int,
     num_mode_layers: int,
     num_layers: int,
     device,
@@ -78,38 +80,54 @@ def build_flux_layer_masks(
 ) -> list[Tensor]:
     """Per-layer joint masks over ``[T | F | H | P | A]`` (True = attend).
 
+    The video / action tokens take their rows and columns from the frame mask (F = latents n_hist .. T-1,
+    H = latents 0 .. n_hist-1, A = the action block). The text T and proprio P tokens are not latent frames:
+    natively every row reads them and they read everything.
+
     Args:
+        frame_mask: (T + 1, T + 1) bool frame mask (``build_frame_mask``), last row / column = action block.
         seg_lens: token count per segment ``txt / video / video_cond / action_cond``.
         s_action: int, OpenWAM action tokens appended after the video-side sequence (0 = none).
         text_valid: optional (B,) int, each sample's own text bucket length (<= seg_lens['txt']).
+        n_hist: int, clean latents (the H stream; ``layout.num_hist_latents``).
         num_mode_layers: int, leading mode-block layers (5).
         num_layers: int, total layers (33).
         device: torch device.
-        strict_clean_rows: bool, test-only: also hide F / A from the T and P rows (native flux lets them
-            read everything, so H reads noisy content one layer later through T / P).
+        strict_clean_rows: bool, test-only: also hide the noisy latents / action from the T and P rows (native
+            flux lets them read everything, so H reads noisy content one layer later through T / P).
 
     Returns:
         list of ``num_layers`` masks, each (S, S) or (B, 1, S, S) when text lengths differ per sample;
         the mode-layer entries share one tensor, as do the single-layer ones.
     """
+    t = int(frame_mask.shape[0]) - 1
+    hw = seg_lens["video_cond"] // n_hist  # n_hist >= 1: the current frame is always clean
     names = list(_SEGMENTS) + ["action"]
     lens = [seg_lens[n] for n in _SEGMENTS] + [s_action]
     starts = torch.tensor([0] + lens[:-1]).cumsum(0).tolist()
     s = sum(lens)
     sl = {n: slice(a, a + n_) for n, a, n_ in zip(names, starts, lens)}
 
-    # Mode blocks: block-diagonal, every stream attends only to itself.
-    mode = torch.zeros((s, s), dtype=torch.bool, device=device)
-    for n in names:
-        mode[sl[n], sl[n]] = True
-    # Single blocks: native full attention; clean history never reads the noisy future / action.
-    single = torch.ones((s, s), dtype=torch.bool, device=device)
-    single[sl["video_cond"], sl["video"]] = False
-    single[sl["video_cond"], sl["action"]] = False
+    # Extended frame mask: index T + 1 = the text / proprio tokens, visible to and seeing every token.
+    ext = torch.ones((t + 2, t + 2), dtype=torch.bool)
+    ext[: t + 1, : t + 1] = frame_mask.cpu()
     if strict_clean_rows:
-        for clean in ("txt", _P_STREAM):
-            single[sl[clean], sl["video"]] = False
-            single[sl[clean], sl["action"]] = False
+        ext[t + 1, n_hist:] = False  # T / P rows: no noisy latent, no action
+        ext[t + 1, t + 1] = True
+    # Frame index of every token, in sequence order.
+    frame_of = torch.cat([
+        torch.full((seg_lens["txt"],), t + 1),
+        torch.arange(n_hist, t).repeat_interleave(hw),
+        torch.arange(0, n_hist).repeat_interleave(hw),
+        torch.full((seg_lens[_P_STREAM],), t + 1),
+        torch.full((s_action,), t),
+    ]).to(device)
+    single = ext.to(device)[frame_of][:, frame_of]
+    # Mode blocks: additionally block-diagonal, every stream attends only to itself.
+    stream = torch.zeros((s, s), dtype=torch.bool, device=device)
+    for n in names:
+        stream[sl[n], sl[n]] = True
+    mode = single & stream
 
     def with_text_padding(m: Tensor) -> Tensor:
         # Per sample: text keys past the sample's own bucket are invisible (rows keep their diagonal).

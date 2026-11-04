@@ -7,6 +7,8 @@ import pytest
 import torch
 
 from openwam.model.video_backbone import LoadMode
+from tests._arch import TEST_TRAIN_OPTIONS, arch_params, backbone_double, build_test_arch, init_test_base, stub_backbone
+from tests._layout import make_layout
 
 
 def _action_context(ab, batch_size: int, seq_len: int = 4):
@@ -14,11 +16,12 @@ def _action_context(ab, batch_size: int, seq_len: int = 4):
 
 
 def _make_dual_system_self_attn_mot_fixture():
-    from openwam.model import build_architecture
     from tests.test_openwam_trainer import _MockVideoBackbone
 
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_self_attn",
         "action_dim": 7,
         "dim": 32,
@@ -27,18 +30,20 @@ def _make_dual_system_self_attn_mot_fixture():
         "video_dim": 32,
         "bridge_layers": (0, 1),
     }
-    arch = build_architecture("dual_system_self_attn", cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
-    arch.video_backbone = _MockVideoBackbone(dim=32, num_layers=2, num_heads=4)
-    driver = arch.build_mot_driver()
+    # 2 history + 2 future latents = the 4 one-token frames of _dual_system_self_attn_mot_states.
+    backbone = _MockVideoBackbone(dim=32, num_layers=2, num_heads=4)
+    arch = build_test_arch("dual_system_self_attn", cfg, backbone, layout=make_layout(h=2))
+    driver = arch.mot_driver
     arch.eval()
     return arch, driver
 
 
 def _make_dual_system_cross_attn_fixture():
-    from openwam.model import build_architecture
 
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "detach_bridge": False,
         "action_dim": 7,
@@ -49,7 +54,7 @@ def _make_dual_system_cross_attn_fixture():
         "bridge_layers": (0, 1),
         "text_dim": 16,
     }
-    arch = build_architecture("dual_system_cross_attn", cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
+    arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     arch.eval()
     return arch
 
@@ -105,19 +110,6 @@ def test_architecture_state_types_import():
     from openwam.model.action_backbone.separate_action_dit import ActionDiTState
 
     assert ActionDiTState is not None
-
-
-def test_architecture_support_lists():
-    from openwam.model import (
-        get_architecture_support,
-        list_supported_architectures,
-    )
-
-    supported = list_supported_architectures()
-    assert "dual_system_cross_attn" in supported
-    assert "dual_system_self_attn" in supported
-    assert get_architecture_support("dual_system_self_attn").status == "supported"
-    assert get_architecture_support("dual_system_cross_attn").status == "supported"
 
 
 def _make_tiny_wan_backbone_for_compile_test():
@@ -186,8 +178,9 @@ def test_wan_backbone_compile_auto_lazily_compiles_run_block():
         assert calls["compile"] == 0
 
         state = _tiny_wan_block_state(vb)
-        state = vb.run_block(0, state)
-        state = vb.run_block(0, state)
+        mask = torch.ones(2, 2, dtype=torch.bool)
+        state = vb.run_block(0, state, mask)
+        state = vb.run_block(0, state, mask)
 
     assert calls == {"compile": 1, "wrapped": 2}
     assert torch.equal(state.hidden_states, torch.full((1, 2, 8), 2.0))
@@ -200,7 +193,9 @@ def test_wan_backbone_compile_skips_gradient_checkpointed_run_block():
     vb.apply_compile_optimizations(OmegaConf.create({"mode": "auto", "wan_blocks": {}}))
 
     with patch("torch.compile") as mock_compile:
-        state = vb.run_block(0, _tiny_wan_block_state(vb, use_gradient_checkpointing=True))
+        state = vb.run_block(
+            0, _tiny_wan_block_state(vb, use_gradient_checkpointing=True), torch.ones(2, 2, dtype=torch.bool)
+        )
 
     mock_compile.assert_not_called()
     assert torch.equal(state.hidden_states, torch.ones(1, 2, 8))
@@ -209,16 +204,25 @@ def test_wan_backbone_compile_skips_gradient_checkpointed_run_block():
 def test_freeze_modules_supports_dotted_path():
     from openwam.model.architectures.base import BaseWAMArchitecture
 
+    backbone = stub_backbone({})
+
     class TestArch(BaseWAMArchitecture):
         def __init__(self):
-            super().__init__(cfg=None)
+            super().__init__(
+                arch_params({}, backbone),
+                layout=make_layout(),
+                mode=LoadMode.PRETRAINED,
+                ckpt_dir=None,
+                train_options=TEST_TRAIN_OPTIONS,
+            )
             self.aux_backbone = torch.nn.Module()
             self.aux_backbone.inner = torch.nn.Linear(2, 2)
 
         def forward(self, noisy_actions, action_timestep, **_kw):
             return None, noisy_actions
 
-    arch = TestArch()
+    with backbone_double(backbone):
+        arch = TestArch()
     frozen = arch.freeze_modules(["aux_backbone.inner"])
 
     assert frozen == ["aux_backbone.inner"]
@@ -260,9 +264,6 @@ def test_openwam_trainer_uses_strategy_freeze_list(monkeypatch):
         def init_training_schedulers(self, num_timesteps=1000):  # noqa: ARG002
             return None
 
-        def set_training_runtime(self, **kwargs):  # noqa: ARG002
-            return None
-
     holder = {}
 
     def _fake_resolve(model_cfg):  # noqa: ARG001
@@ -276,7 +277,7 @@ def test_openwam_trainer_uses_strategy_freeze_list(monkeypatch):
             },
         )()
 
-    def _fake_build(name, params, *, mode, ckpt_dir):  # noqa: ARG001
+    def _fake_build(name, params, *, layout, mode, ckpt_dir, train_options):  # noqa: ARG001
         arch = _Arch()
         holder["arch"] = arch
         return arch
@@ -290,8 +291,6 @@ def test_openwam_trainer_uses_strategy_freeze_list(monkeypatch):
                 "initialize_model_on_cpu": False,
                 "use_gradient_checkpointing": False,
                 "use_gradient_checkpointing_offload": False,
-                "max_timestep_boundary": 1.0,
-                "min_timestep_boundary": 0.0,
                 "lambda_video": 1.0,
                 "lambda_action": 1.0,
             },
@@ -299,6 +298,7 @@ def test_openwam_trainer_uses_strategy_freeze_list(monkeypatch):
                 "architecture": {"framework": "dual_system", "variant": "joint_self_attn"},
                 "freeze": ["aux_backbone.inner"],
             },
+            "common": {"layout": make_layout()},
         }
     )
 
@@ -311,10 +311,11 @@ def test_openwam_trainer_uses_strategy_freeze_list(monkeypatch):
 
 
 def test_build_architecture_dual_system():
-    from openwam.model import build_architecture
 
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "detach_bridge": True,
         "action_dim": 7,
@@ -325,7 +326,7 @@ def test_build_architecture_dual_system():
         "video_dim": 256,
         "bridge_layers": (0, 1),
     }
-    arch = build_architecture("dual_system_cross_attn", cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
+    arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     assert arch.action_dim == 7
     assert arch.bridge_layers == (0, 1)
     assert arch.action_backbone is not None
@@ -334,18 +335,21 @@ def test_build_architecture_dual_system():
 def test_build_architecture_unknown():
     import pytest
 
-    from openwam.model import build_architecture
+    from openwam.model import build_architecture as _build
 
     with pytest.raises(KeyError, match="Unknown architecture"):
-        build_architecture("nonexistent", {}, mode=LoadMode.PRETRAINED, ckpt_dir=None)
+        _build(
+            "nonexistent", {}, layout=make_layout(), mode=LoadMode.PRETRAINED, ckpt_dir=None, train_options=TEST_TRAIN_OPTIONS
+        )
 
 
 def test_dual_system_prepare_and_extract():
     """Smoke test: cross_attn ActionDiT.forward(action, bridges, timestep, context)."""
-    from openwam.model import build_architecture
 
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "detach_bridge": False,
         "action_dim": 7,
@@ -356,7 +360,7 @@ def test_dual_system_prepare_and_extract():
         "video_dim": 128,
         "bridge_layers": (0, 1),
     }
-    arch = build_architecture("dual_system_cross_attn", cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
+    arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     arch.eval()
 
     B, T_action = 1, 10
@@ -379,10 +383,11 @@ def test_dual_system_prepare_and_extract():
 
 def test_dual_system_bridge_interval_resolves():
     """bridge_layers: null + bridge_interval resolves from injected num_dit_layers."""
-    from openwam.model import build_architecture
 
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "detach_bridge": True,
         "action_dim": 7,
@@ -394,21 +399,22 @@ def test_dual_system_bridge_interval_resolves():
         "bridge_interval": 2,
         "num_dit_layers": 30,
     }
-    arch = build_architecture("dual_system_cross_attn", cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
+    arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     assert arch.bridge_layers == tuple(range(0, 30, 2))
     assert len(arch.bridge_layers) == 15
 
     cfg["bridge_interval"] = 1
-    arch_full = build_architecture("dual_system_cross_attn", cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
+    arch_full = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     assert arch_full.bridge_layers == tuple(range(30))
 
 
 def test_dual_system_bridge_interval_missing_raises():
     """bridge_layers: null without bridge_interval should fail explicitly."""
-    from openwam.model import build_architecture
 
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "detach_bridge": True,
         "action_dim": 7,
@@ -419,7 +425,7 @@ def test_dual_system_bridge_interval_missing_raises():
         "bridge_layers": None,
     }
     with pytest.raises(ValueError, match="bridge_layers is null but bridge_interval is not set"):
-        build_architecture("dual_system_cross_attn", cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
+        build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
 
 
 def test_action_self_attention_rope_breaks_permutation_equivariance():
@@ -593,10 +599,11 @@ def test_action_dit_joint_self_attn_uses_only_rope():
 
 def test_dual_system_joint_self_attn_pre_post_attn_round_trip():
     """joint_self_attn pre/post_attn_at_layer round trip applies RoPE on Q/K."""
-    from openwam.model import build_architecture
 
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_self_attn",
         "action_dim": 7,
         "dim": 32,
@@ -605,7 +612,7 @@ def test_dual_system_joint_self_attn_pre_post_attn_round_trip():
         "video_dim": 32,
         "bridge_layers": (0,),
     }
-    arch = build_architecture("dual_system_self_attn", cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
+    arch = build_test_arch("dual_system_self_attn", cfg, stub_backbone(cfg), layout=make_layout())
     arch.eval()
 
     noisy_actions = torch.randn(2, 5, 7)
@@ -631,10 +638,11 @@ def test_dual_system_joint_self_attn_pre_post_attn_round_trip():
 
 def test_dual_system_joint_cross_attn_no_per_layer_state():
     """joint_cross_attn skips prepare_state and runs ActionDiT.forward directly."""
-    from openwam.model import build_architecture
 
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "detach_bridge": False,
         "action_dim": 7,
@@ -644,7 +652,7 @@ def test_dual_system_joint_cross_attn_no_per_layer_state():
         "video_dim": 128,
         "bridge_layers": (0, 2),
     }
-    arch = build_architecture("dual_system_cross_attn", cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
+    arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
 
     # cross_attn calls ab.forward(actions, bridges, timestep) directly —
     # no per-layer state machinery on the action backbone.
@@ -663,12 +671,13 @@ def test_dual_system_joint_cross_attn_no_per_layer_state():
 
 def test_dual_system_joint_cross_attn_passes_appended_proprio_context_to_action():
     """cross_attn architecture should pass raw text+proprio context to ActionDiT."""
-    from openwam.model import build_architecture
     from openwam.model.video_backbone.base import TextCondition
     from tests.test_openwam_trainer import _MockVideoBackbone
 
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "detach_bridge": False,
         "action_dim": 7,
@@ -681,8 +690,7 @@ def test_dual_system_joint_cross_attn_passes_appended_proprio_context_to_action(
         "state_dim": 7,
         "text_dim": 16,
     }
-    arch = build_architecture("dual_system_cross_attn", cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
-    arch.video_backbone = _MockVideoBackbone(dim=32, num_layers=1, num_heads=4)
+    arch = build_test_arch("dual_system_cross_attn", cfg, _MockVideoBackbone(dim=32, num_layers=1, num_heads=4))
     arch.eval()
 
     seen = {}
@@ -700,11 +708,13 @@ def test_dual_system_joint_cross_attn_passes_appended_proprio_context_to_action(
         video_pred, action_pred = arch(
             torch.randn(B, 5, 7),
             torch.tensor([0.5]),
-            proprio=torch.randn(B, 7),
-            latents=torch.randn(B, 16, 1, 2, 2),
+            proprio=torch.randn(B, 1, 7),
+            proprio_mask=torch.ones(B, 1, 7, dtype=torch.bool),
+            latents=torch.randn(B, 16, 3, 2, 2),
             timestep=torch.tensor([0.5]),
             text=TextCondition(context=torch.randn(B, 3, 16), context_mask=torch.tensor([[True, True, False]])),
-            clean_latents=torch.zeros(B, 16, 1, 2, 2),
+            use_gradient_checkpointing=False,
+            use_gradient_checkpointing_offload=False,
         )
 
     assert video_pred.shape[0] == B
@@ -716,10 +726,11 @@ def test_dual_system_joint_cross_attn_passes_appended_proprio_context_to_action(
 
 def test_dual_system_detached_joint_cross_attn_blocks_grad_to_video():
     """detach_bridge=True: action loss must not produce grad on the bridge tensors."""
-    from openwam.model import build_architecture
 
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "detach_bridge": True,
         "action_dim": 7,
@@ -729,7 +740,7 @@ def test_dual_system_detached_joint_cross_attn_blocks_grad_to_video():
         "video_dim": 128,
         "bridge_layers": (0,),
     }
-    arch = build_architecture("dual_system_cross_attn", cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
+    arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     # detach is owned by the architecture; the action backbone has no such flag.
     assert arch.detach_bridge is True
     assert not hasattr(arch.action_backbone, "detach_bridge")
@@ -863,10 +874,11 @@ def test_dual_system_joint_cross_attn_compile_skips_checkpointed_path():
 
 def test_dual_system_joint_self_attn_creates_dit_state():
     """joint_self_attn populates ActionDiTState payload via prepare_state."""
-    from openwam.model import build_architecture
 
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_self_attn",
         "action_dim": 7,
         "dim": 32,
@@ -875,7 +887,7 @@ def test_dual_system_joint_self_attn_creates_dit_state():
         "video_dim": 32,
         "bridge_layers": (0, 1),
     }
-    arch = build_architecture("dual_system_self_attn", cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
+    arch = build_test_arch("dual_system_self_attn", cfg, stub_backbone(cfg), layout=make_layout())
 
     context, context_mask = _action_context(arch.action_backbone, 1)
     state = arch.action_backbone.prepare_state(
@@ -890,11 +902,12 @@ def test_dual_system_joint_self_attn_creates_dit_state():
 def test_dual_system_joint_self_attn_compile_auto_sets_mot_loop():
     from omegaconf import OmegaConf
 
-    from openwam.model import build_architecture
     from tests.test_openwam_trainer import _MockVideoBackbone
 
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_self_attn",
         "action_dim": 7,
         "dim": 32,
@@ -904,7 +917,7 @@ def test_dual_system_joint_self_attn_compile_auto_sets_mot_loop():
         "bridge_layers": (0, 1),
         "text_dim": 16,
     }
-    arch = build_architecture("dual_system_self_attn", cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
+    arch = build_test_arch("dual_system_self_attn", cfg, stub_backbone(cfg), layout=make_layout())
     arch.video_backbone = _MockVideoBackbone(dim=32, num_layers=2, num_heads=4)
     arch.build_mot_driver()
 
@@ -954,6 +967,8 @@ def test_resolve_architecture_config_from_canonical_dual_system_fields():
     model_cfg = SimpleNamespace(
         architecture={
             "framework": "dual_system",
+            "clean_attention": "bidirectional",
+            "attention_mask_mode": "mutual",
             "variant": "joint_cross_attn",
             "detach_bridge": True,
             "action_dim": 20,
@@ -978,6 +993,8 @@ def test_resolve_architecture_config_from_canonical_fields():
     model_cfg = SimpleNamespace(
         architecture={
             "framework": "dual_system",
+            "clean_attention": "bidirectional",
+            "attention_mask_mode": "mutual",
             "variant": "joint_cross_attn",
             "action_dim": 20,
             "detach_bridge": True,
@@ -995,10 +1012,11 @@ def test_resolve_architecture_config_from_canonical_fields():
 
 
 def test_build_architecture_injects_framework_variant_and_detach_option():
-    from openwam.model import build_architecture
 
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "detach_bridge": True,
         "action_dim": 7,
@@ -1008,7 +1026,7 @@ def test_build_architecture_injects_framework_variant_and_detach_option():
         "video_dim": 128,
         "bridge_layers": (0, 1),
     }
-    arch = build_architecture("dual_system_cross_attn", cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
+    arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     assert arch.cfg["framework"] == "dual_system"
     assert arch.cfg["variant"] == "joint_cross_attn"
     assert arch.cfg["detach_bridge"] is True
@@ -1016,11 +1034,12 @@ def test_build_architecture_injects_framework_variant_and_detach_option():
 
 def test_dual_system_self_attn_payload_is_action_dit_state():
     """joint_self_attn populates a flat payload of type ActionDiTState."""
-    from openwam.model import build_architecture
     from openwam.model.action_backbone.separate_action_dit import ActionDiTState
 
     cfg = {
         "framework": "dual_system",
+        "clean_attention": "bidirectional",
+        "attention_mask_mode": "mutual",
         "variant": "joint_self_attn",
         "action_dim": 7,
         "dim": 32,
@@ -1029,7 +1048,7 @@ def test_dual_system_self_attn_payload_is_action_dit_state():
         "video_dim": 32,
         "bridge_layers": (0, 1),
     }
-    arch = build_architecture("dual_system_self_attn", cfg, mode=LoadMode.PRETRAINED, ckpt_dir=None)
+    arch = build_test_arch("dual_system_self_attn", cfg, stub_backbone(cfg), layout=make_layout())
     context, context_mask = _action_context(arch.action_backbone, 1)
     state = arch.action_backbone.prepare_state(
         torch.randn(1, 5, 7), torch.tensor([0.5]), context=context, context_mask=context_mask
@@ -1045,7 +1064,7 @@ def test_register_custom_architecture():
     @register_architecture("test_custom", framework="test", variant="custom")
     class TestArch(BaseWAMArchitecture):
         def __init__(self, cfg=None):
-            super().__init__(cfg)
+            super().__init__(cfg, layout=make_layout())
 
         def forward(self, noisy_actions, action_timestep, **_kw):
             return None, noisy_actions
@@ -1080,7 +1099,7 @@ def test_freeze_modules_disables_grad_and_wraps_forward_in_no_grad():
 
     class _Arch(BaseWAMArchitecture):
         def __init__(self):
-            super().__init__(cfg=None)
+            init_test_base(self)
             self.frozen_mod = nn.Linear(3, 4)
             self.trainable_mod = nn.Linear(3, 4)
 
@@ -1120,7 +1139,7 @@ def test_freeze_modules_skips_unknown_paths():
 
     class _Arch(BaseWAMArchitecture):
         def __init__(self):
-            super().__init__(cfg=None)
+            init_test_base(self)
             self.real = nn.Linear(2, 2)
 
         def forward(self, *args, **kwargs):  # pragma: no cover - unused stub
@@ -1162,7 +1181,7 @@ def test_freeze_modules_wraps_all_descendants_in_no_grad():
 
     class _Arch(BaseWAMArchitecture):
         def __init__(self):
-            super().__init__(cfg=None)
+            init_test_base(self)
             self.outer = _Outer()
 
         def forward(self, *args, **kwargs):  # pragma: no cover - unused stub
@@ -1191,7 +1210,7 @@ def test_freeze_parent_blocks_trainable_child_grad():
 
     class _Arch(BaseWAMArchitecture):
         def __init__(self):
-            super().__init__(cfg=None)
+            init_test_base(self)
             self.trunk = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.Linear(8, 8))
             # Register a trainable adapter UNDER the trunk
             self.trunk.adapter = torch.nn.Linear(8, 4)
@@ -1213,96 +1232,10 @@ def test_freeze_parent_blocks_trainable_child_grad():
     )
 
 
-def test_base_generate_signature_takes_extra_pipeline_inputs():
-    """``BaseWAMArchitecture.generate`` accepts arbitrary keyword args via
-    ``**extra_pipeline_inputs`` and forwards non-None values to
-    ``architecture.forward`` via ``inputs_shared``. This test guards the
-    signature itself so future refactors don't accidentally revert to explicit
-    per-arch params.
-    """
-    import inspect
-
-    from openwam.model.architectures.base import BaseWAMArchitecture
-
-    sig = inspect.signature(BaseWAMArchitecture.generate)
-    has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-    assert has_var_keyword, "BaseWAMArchitecture.generate must accept **extra_pipeline_inputs"
-
-
-def test_base_generate_dit_cache_reuses_joint_action_prediction(monkeypatch):
-    """A joint cache hit must skip the whole video/action forward."""
-
-    from openwam.deploy.optimizations.dit_cache import DiTVelocityCache
-    from openwam.model.architectures.base import BaseWAMArchitecture
-
-    monkeypatch.setattr(torch.compiler, "cudagraph_mark_step_begin", lambda: None)
-
-    class _Scheduler:
-        num_train_timesteps = 1000
-
-        @staticmethod
-        def set_timesteps(*_args, **_kwargs):
-            pass
-
-        @staticmethod
-        def flow_step(model_output, sigma, sigma_next, sample):
-            return sample + model_output * (sigma_next - sigma)
-
-    class _VideoBackbone(torch.nn.Module):
-        scheduler = _Scheduler()
-
-        @staticmethod
-        def num_future_latents(num_frames):  # noqa: ARG004
-            return 1
-
-        @staticmethod
-        def preprocess_condition(history, prompts, *, num_frames, num_latents):  # noqa: ARG004
-            return torch.zeros(1, 1, 1, 1, 1), None
-
-    class _ActionBackbone(torch.nn.Module):
-        scheduler = _Scheduler()
-        action_dim = 3
-        bridge_layers = ()
-        uses_proprioception = False
-
-    class _Arch(BaseWAMArchitecture):
-        def __init__(self):
-            super().__init__(cfg=None)
-            self._device = torch.device("cpu")
-            self._dtype = torch.float32
-            self.video_backbone = _VideoBackbone()
-            self.action_backbone = _ActionBackbone()
-            self.forward_calls = 0
-
-        def forward(self, noisy_actions, action_timestep, **kwargs):  # noqa: ARG002
-            self.forward_calls += 1
-            return torch.ones_like(kwargs["latents"]), torch.ones_like(noisy_actions) * 2
-
-    arch = _Arch()
-    cache = DiTVelocityCache(cosine_threshold=0.0)
-    schedule = [(1000, 1000), (800, 800), (600, 600), (400, 400)]
-
-    result = arch.generate(
-        schedule=schedule,
-        prompt="",
-        first_frame_image=object(),
-        num_frames=4,
-        action_num_frames=4,
-        seed=0,
-        dit_cache=cache,
-        decode_video=False,
-    )
-
-    assert arch.forward_calls == 2
-    assert cache.stats["total_steps"] == 3
-    assert cache.stats["total_skips"] == 1
-    assert result["actions"].shape == (3, 3)
-
-
-def test_base_generate_frozen_lag_stream_stays_in_forward_context(monkeypatch):
+def test_sample_frozen_lag_stream_stays_in_forward_context(monkeypatch):
     """A sigma plateau (linear_offset delay) freezes a stream's *update* only: its
     tokens/timestep must stay in every forward, because v→a-visible attention
-    masks (mutual / video_sees_action) read them."""
+    masks (mutual) read them."""
 
     from openwam.model.architectures.base import BaseWAMArchitecture
 
@@ -1315,24 +1248,12 @@ def test_base_generate_frozen_lag_stream_stays_in_forward_context(monkeypatch):
         num_train_timesteps = 1000
 
         @staticmethod
-        def set_timesteps(*_args, **_kwargs):
-            pass
-
-        @staticmethod
         def flow_step(model_output, sigma, sigma_next, sample):
             flow_steps.append((sigma, sigma_next))
             return sample + model_output * (sigma_next - sigma)
 
     class _VideoBackbone(torch.nn.Module):
         scheduler = _Scheduler()
-
-        @staticmethod
-        def num_future_latents(num_frames):  # noqa: ARG004
-            return 1
-
-        @staticmethod
-        def preprocess_condition(history, prompts, *, num_frames, num_latents):  # noqa: ARG004
-            return torch.zeros(1, 1, 1, 1, 1), None
 
     class _ActionBackbone(torch.nn.Module):
         scheduler = _Scheduler()
@@ -1342,7 +1263,8 @@ def test_base_generate_frozen_lag_stream_stays_in_forward_context(monkeypatch):
 
     class _Arch(BaseWAMArchitecture):
         def __init__(self):
-            super().__init__(cfg=None)
+            # First-frame layout: 1 clean + 2 noisy latents, a 3-step action chunk.
+            init_test_base(self, layout=make_layout(num_frames=4))
             self._device = torch.device("cpu")
             self._dtype = torch.float32
             self.video_backbone = _VideoBackbone()
@@ -1352,40 +1274,17 @@ def test_base_generate_frozen_lag_stream_stays_in_forward_context(monkeypatch):
             forward_inputs.append((noisy_actions is not None, float(action_timestep.item())))
             return torch.zeros_like(kwargs["latents"]), torch.zeros_like(noisy_actions)
 
-    class _RecordingCache:
-        def __init__(self):
-            self.action_updates = []
-
-        def should_recompute(self, sigma, *, require_action=False):  # noqa: ARG002
-            return True
-
-        def update(self, velocity, sigma, action_velocity=None):  # noqa: ARG002
-            self.action_updates.append(action_velocity is not None)
-
     # linear_offset=0.5 shape: sigma_a plateaus at 1.0 for the first
     # two transitions, then catches up.
     schedule = [(1000.0, 1000.0), (750.0, 1000.0), (500.0, 1000.0), (250.0, 500.0), (0.0, 0.0)]
-    cache = _RecordingCache()
-
-    result = _Arch().generate(
-        schedule=schedule,
-        prompt="",
-        first_frame_image=object(),
-        num_frames=4,
-        action_num_frames=4,
-        seed=0,
-        dit_cache=cache,
-        decode_video=False,
-    )
+    _, actions = _Arch().sample(torch.zeros(1, 1, 1, 1, 1), _text(), torch.zeros(1, 1, 3), schedule, seed=0)
 
     # Every step is a joint forward with action tokens present; the frozen
     # head rides t_a=1000 (the training grid's sigma=1 endpoint).
     assert forward_inputs == [(True, 1000.0), (True, 1000.0), (True, 1000.0), (True, 500.0)]
     # The plateau gates only the update: action flow_steps once it moves.
     assert flow_steps == [(1.0, 0.5), (0.5, 0.0)]
-    # Plateau-step predictions are cached with the action branch present.
-    assert cache.action_updates == [True, True, True, True]
-    assert result["actions"].shape == (3, 3)
+    assert actions.shape == (1, 3, 3)
 
 
 _PIN_ACTION_DIM = 8
@@ -1403,23 +1302,11 @@ def _make_inactive_dim_probe_arch():
         num_train_timesteps = 1000
 
         @staticmethod
-        def set_timesteps(*_args, **_kwargs):
-            pass
-
-        @staticmethod
         def flow_step(model_output, sigma, sigma_next, sample):
             return sample + model_output * (sigma_next - sigma)
 
     class _VideoBackbone(torch.nn.Module):
         scheduler = _Scheduler()
-
-        @staticmethod
-        def num_future_latents(num_frames):  # noqa: ARG004
-            return 1
-
-        @staticmethod
-        def preprocess_condition(history, prompts, *, num_frames, num_latents):  # noqa: ARG004
-            return torch.zeros(1, 1, 1, 1, 1), None
 
     class _ActionBackbone(torch.nn.Module):
         scheduler = _Scheduler()
@@ -1429,7 +1316,8 @@ def _make_inactive_dim_probe_arch():
 
     class _Arch(BaseWAMArchitecture):
         def __init__(self):
-            super().__init__(cfg=None)
+            # First-frame layout: 1 clean + 2 noisy one-pixel latents, a 4-step action chunk.
+            init_test_base(self, layout=make_layout(num_frames=5))
             self._device = torch.device("cpu")
             self._dtype = torch.float32
             self.video_backbone = _VideoBackbone()
@@ -1446,7 +1334,26 @@ def _make_inactive_dim_probe_arch():
     return _Arch()
 
 
-def test_base_generate_pins_inactive_action_dims_on_noise_path(monkeypatch):
+# Shapes sample() draws for the pin tests (from the probe arch's layout): 1 clean + 2 noisy one-pixel latents,
+# a 4-step chunk.
+_PIN_LATENT_SHAPE = (1, 1, 3, 1, 1)
+_PIN_ACTION_SHAPE = (1, 4, _PIN_ACTION_DIM)
+
+
+def _text():
+    """A one-token TextCondition (the probe forwards ignore it). Returns: TextCondition (1, 1, 1)."""
+    from openwam.model.video_backbone.base import TextCondition
+
+    return TextCondition(context=torch.zeros(1, 1, 1), context_mask=torch.ones(1, 1, dtype=torch.bool))
+
+
+def _probe_actions(arch, schedule, **kw):
+    """Run ``arch.sample`` on the pin-test shapes (seed 7). Returns: (4, A) numpy actions (normalized space)."""
+    _, actions = arch.sample(torch.zeros(1, 1, 1, 1, 1), _text(), torch.zeros(1, 1, 3), schedule, seed=7, **kw)
+    return actions[0].numpy()
+
+
+def test_sample_pins_inactive_action_dims_on_noise_path(monkeypatch):
     """Unsupervised (non-scattered) unified-action dims must ride the analytic
     sigma * eps0 noise path through the denoising loop instead of integrating
     unconstrained flow back into the next forward."""
@@ -1456,25 +1363,19 @@ def test_base_generate_pins_inactive_action_dims_on_noise_path(monkeypatch):
 
     schedule = [(1000.0, 1000.0), (750.0, 750.0), (500.0, 500.0), (250.0, 250.0), (0.0, 0.0)]
     sigmas = [t_a / 1000.0 for _, t_a in schedule]
-    gen_kwargs = dict(
-        schedule=schedule,
-        prompt="",
-        first_frame_image=object(),
-        num_frames=5,
-        action_num_frames=5,
-        seed=7,
-        decode_video=False,
-    )
-    eps0 = torch.randn(1, 4, _PIN_ACTION_DIM, generator=torch.Generator(device="cpu").manual_seed(7))
+    # sample() draws the video noise, then the action noise, from one seeded generator.
+    gen = torch.Generator(device="cpu").manual_seed(7)
+    torch.randn(_PIN_LATENT_SHAPE, generator=gen)
+    eps0 = torch.randn(_PIN_ACTION_SHAPE, generator=gen)
 
-    baseline = _make_inactive_dim_probe_arch().generate(**gen_kwargs)["actions"]
+    baseline = _probe_actions(_make_inactive_dim_probe_arch(), schedule)
     # Unpinned, the garbage flow drags inactive dims far off the noise path.
     assert np.abs(baseline[:, _PIN_INACTIVE_IDX]).max() > 100
 
     mask = torch.zeros(_PIN_ACTION_DIM, dtype=torch.bool)
     mask[_PIN_ACTIVE_IDX] = True
     pinned_arch = _make_inactive_dim_probe_arch()
-    pinned = pinned_arch.generate(**gen_kwargs, active_action_mask=mask)["actions"]
+    pinned = _probe_actions(pinned_arch, schedule, active_action_mask=mask)
 
     # Every forward saw inactive dims exactly on sigma_k * eps0 ...
     for k, seen in enumerate(pinned_arch.seen_action_inputs):
@@ -1487,7 +1388,7 @@ def test_base_generate_pins_inactive_action_dims_on_noise_path(monkeypatch):
     np.testing.assert_array_equal(pinned[:, _PIN_ACTIVE_IDX], baseline[:, _PIN_ACTIVE_IDX])
 
 
-def test_base_generate_infers_inactive_dims_from_unify_normalizer(monkeypatch):
+def test_sample_infers_inactive_dims_from_unify_normalizer(monkeypatch):
     """The pin auto-enables from the attached unify normalizer's scatter map and
     stays off for plain (non-unify) normalizers or width mismatches."""
     import numpy as np
@@ -1495,15 +1396,6 @@ def test_base_generate_infers_inactive_dims_from_unify_normalizer(monkeypatch):
     monkeypatch.setattr(torch.compiler, "cudagraph_mark_step_begin", lambda: None)
 
     schedule = [(1000.0, 1000.0), (500.0, 500.0), (0.0, 0.0)]
-    gen_kwargs = dict(
-        schedule=schedule,
-        prompt="",
-        first_frame_image=object(),
-        num_frames=5,
-        action_num_frames=5,
-        seed=7,
-        decode_video=False,
-    )
 
     class _UnifyNormalizer:  # duck-types _UnifyAwareNormalizer's private surface
         _dst_index = np.asarray(_PIN_ACTIVE_IDX, dtype=np.int64)
@@ -1511,17 +1403,17 @@ def test_base_generate_infers_inactive_dims_from_unify_normalizer(monkeypatch):
 
         @staticmethod
         def unnormalize(x):
-            return x  # keep the unified width so inactive dims stay observable
+            return x
 
-    baseline = _make_inactive_dim_probe_arch().generate(**gen_kwargs)["actions"]
+    baseline = _probe_actions(_make_inactive_dim_probe_arch(), schedule)
 
     mask = torch.zeros(_PIN_ACTION_DIM, dtype=torch.bool)
     mask[_PIN_ACTIVE_IDX] = True
-    explicit = _make_inactive_dim_probe_arch().generate(**gen_kwargs, active_action_mask=mask)["actions"]
+    explicit = _probe_actions(_make_inactive_dim_probe_arch(), schedule, active_action_mask=mask)
 
     auto_arch = _make_inactive_dim_probe_arch()
     auto_arch.attach_normalizer(_UnifyNormalizer())
-    np.testing.assert_array_equal(auto_arch.generate(**gen_kwargs)["actions"], explicit)
+    np.testing.assert_array_equal(_probe_actions(auto_arch, schedule), explicit)
 
     class _PlainNormalizer:
         @staticmethod
@@ -1530,11 +1422,11 @@ def test_base_generate_infers_inactive_dims_from_unify_normalizer(monkeypatch):
 
     plain_arch = _make_inactive_dim_probe_arch()
     plain_arch.attach_normalizer(_PlainNormalizer())
-    np.testing.assert_array_equal(plain_arch.generate(**gen_kwargs)["actions"], baseline)
+    np.testing.assert_array_equal(_probe_actions(plain_arch, schedule), baseline)
 
     class _MismatchNormalizer(_UnifyNormalizer):
         _unify_dim = _PIN_ACTION_DIM + 1
 
     mismatch_arch = _make_inactive_dim_probe_arch()
     mismatch_arch.attach_normalizer(_MismatchNormalizer())
-    np.testing.assert_array_equal(mismatch_arch.generate(**gen_kwargs)["actions"], baseline)
+    np.testing.assert_array_equal(_probe_actions(mismatch_arch, schedule), baseline)

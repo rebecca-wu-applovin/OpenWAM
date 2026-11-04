@@ -43,10 +43,6 @@ training:
   lambda_video: 1.0               # Video flow-matching loss weight
   lambda_action: 1.0              # Action flow-matching loss weight
 
-  # --- Flow matching timestep range ---
-  max_timestep_boundary: 1.0      # Upper bound (fraction of total timesteps)
-  min_timestep_boundary: 0.0      # Lower bound (fraction of total timesteps)
-
   # --- Checkpoint ---
   output_path: outputs/openwam_checkpoints            # Base directory for checkpoint output (relative to the launch cwd)
   run_dir_name: null              # Run dir under output_path (null = launch timestamp); must not already hold a run
@@ -59,7 +55,7 @@ training:
   vis_steps: 5000                 # Render every N steps (+ once at step 1); 0 or null = off
   vis_num_samples: 4              # Rollouts logged per vis step (one fixed training sample per rank)
   vis_denoise_steps: 10           # Euler steps per rollout (deploy default)
-  vis_fps: 5                      # Clip playback fps (dataset fps / video_stride: 20 / 4)
+  vis_fps: 5                      # Clip playback fps (dataset fps / future frame spacing: 20 / 4)
 
   # --- Finetune / Resume (mutually exclusive; both point to a training output dir, latest step auto-selected) ---
   finetune_ckpt_path: null   # non-null: warm-start from latest weights in this dir (step from 0, new output dir)

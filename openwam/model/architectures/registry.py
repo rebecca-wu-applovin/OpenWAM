@@ -19,18 +19,16 @@ Usage:
     class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
         ...
 
-    arch = build_architecture("dual_system_cross_attn", cfg)
+    arch = build_architecture("dual_system_cross_attn", params, layout=..., mode=..., ckpt_dir=..., train_options=...)
 """
 
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Type
 
-from openwam.model.architectures.base import BaseWAMArchitecture
+from openwam.model.architectures.base import BaseWAMArchitecture, TrainOptions
 from openwam.model.video_backbone.registry import LoadMode
 
 ARCHITECTURE_REGISTRY: Dict[str, Type[BaseWAMArchitecture]] = {}
-ARCHITECTURE_SUPPORT: Dict[str, "ArchitectureSupport"] = {}
 ARCHITECTURE_METADATA: Dict[str, "ArchitectureMetadataEntry"] = {}
 
 _FRAMEWORK_VARIANT_INDEX: Dict[tuple, str] = {}
@@ -154,23 +152,9 @@ def resolve_architecture_config(
     )
 
 
-@dataclass(frozen=True)
-class ArchitectureSupport:
-    """Support metadata for a registered architecture."""
-
-    status: str
-    note: str = ""
-
-    @property
-    def supported(self) -> bool:
-        return self.status == "supported"
-
-
 def register_architecture(
     name: str,
     *,
-    status: str = "supported",
-    note: str = "",
     framework: str = "",
     variant: str = "",
     options_from_cfg: Optional[Callable] = None,
@@ -179,8 +163,6 @@ def register_architecture(
 
     Args:
         name: Canonical registry key (e.g. ``"dual_system_cross_attn"``).
-        status: ``"supported"`` or ``"experimental"``.
-        note: Human-readable note.
         framework: Architecture family (e.g. ``"dual_system"``).
         variant: Variant within the family (e.g. ``"joint_cross_attn"``).
         options_from_cfg: Optional callable ``(cfg) -> dict`` that extracts
@@ -190,10 +172,7 @@ def register_architecture(
     def decorator(cls: Type[BaseWAMArchitecture]):
         if name in ARCHITECTURE_REGISTRY:
             raise ValueError(f"Architecture '{name}' already registered")
-        if status not in {"supported", "experimental"}:
-            raise ValueError(f"Unsupported architecture status '{status}'")
         ARCHITECTURE_REGISTRY[name] = cls
-        ARCHITECTURE_SUPPORT[name] = ArchitectureSupport(status=status, note=note)
         ARCHITECTURE_METADATA[name] = ArchitectureMetadataEntry(
             framework=framework,
             variant=variant,
@@ -207,70 +186,57 @@ def register_architecture(
     return decorator
 
 
-def get_architecture_support(name: str) -> ArchitectureSupport:
-    """Return support metadata for a registered architecture."""
-    if name not in ARCHITECTURE_SUPPORT:
-        available = ", ".join(sorted(ARCHITECTURE_SUPPORT.keys()))
-        raise KeyError(f"Unknown architecture '{name}'. Available: {available}")
-    return ARCHITECTURE_SUPPORT[name]
-
-
-def list_supported_architectures() -> tuple[str, ...]:
-    """List architecture names that are part of the supported matrix."""
-    return tuple(name for name in sorted(ARCHITECTURE_REGISTRY.keys()) if ARCHITECTURE_SUPPORT[name].supported)
-
-
 def build_architecture(
-    name: str, cfg=None, *, mode: LoadMode, ckpt_dir: Optional[str], allow_experimental: bool = False
+    name: str, cfg: dict, *, layout, mode: LoadMode, ckpt_dir: Optional[str], train_options: TrainOptions
 ) -> BaseWAMArchitecture:
-    """
-    Instantiate a registered WAM architecture by registry key.
+    """Instantiate a registered WAM architecture by registry key.
 
-    Parameters:
-        name (str): Registry key of the architecture (e.g., "dual_system_cross_attn").
-        cfg: Configuration object passed to the architecture constructor.
-            The architecture creates its own ``video_backbone`` internally
-            from ``cfg.video_backbone`` via the video backbone registry.
-        mode (LoadMode): how that backbone is built (PRETRAINED: upstream weights; CHECKPOINT: an empty
+    Args:
+        name: str registry key of the architecture (e.g. ``"dual_system_cross_attn"``).
+        cfg: dict of architecture params (``resolve_architecture_config(...).params``); the architecture builds
+            its own ``video_backbone`` from ``cfg["video_backbone"]`` via the video backbone registry.
+        layout: ``cfg.common.layout`` (DictConfig) from the entry point's ``resolve_config``.
+        mode: LoadMode, how that backbone is built (PRETRAINED: upstream weights; CHECKPOINT: an empty
             shell of ``ckpt_dir`` the caller fills). Decided by the entry point, never inferred here.
-        ckpt_dir (str | None): checkpoint dir for CHECKPOINT, None for PRETRAINED.
-        allow_experimental (bool): If False, prevent instantiation of architectures marked as experimental.
+        ckpt_dir: str checkpoint dir for CHECKPOINT, None for PRETRAINED.
+        train_options: TrainOptions the trainer decided (deploy: ``INFERENCE_ONLY``).
 
     Returns:
-        BaseWAMArchitecture: An instance of the registered architecture class.
+        BaseWAMArchitecture: an instance of the registered architecture class.
     """
-    canonical_name = name
-    if canonical_name not in ARCHITECTURE_REGISTRY:
+    if name not in ARCHITECTURE_REGISTRY:
         available = ", ".join(sorted(ARCHITECTURE_REGISTRY.keys()))
         raise KeyError(f"Unknown architecture '{name}'. Available: {available}")
-    support = ARCHITECTURE_SUPPORT[canonical_name]
-    if not support.supported and not allow_experimental:
-        detail = f" {support.note}" if support.note else ""
-        raise NotImplementedError(
-            f"Architecture '{canonical_name}' is experimental and not part of the supported OpenWAM matrix.{detail}"
-        )
-
     normalized = normalize_architecture_spec(name, cfg)
-    cfg_out = deepcopy(cfg) if isinstance(cfg, dict) else cfg
-    if isinstance(cfg_out, dict):
-        cfg_out.setdefault("framework", normalized.framework)
-        cfg_out.setdefault("variant", normalized.variant)
-        for key, value in normalized.options.items():
-            cfg_out.setdefault(key, value)
-    return ARCHITECTURE_REGISTRY[canonical_name](cfg=cfg_out, mode=mode, ckpt_dir=ckpt_dir)
+    # Registry-declared framework / variant / options fill keys the params leave out; explicit params win.
+    params = {"framework": normalized.framework, "variant": normalized.variant, **normalized.options, **cfg}
+    return ARCHITECTURE_REGISTRY[name](
+        cfg=params, layout=layout, mode=mode, ckpt_dir=ckpt_dir, train_options=train_options
+    )
 
 
-def build_architecture_from_ckpt_dir(ckpt_dir: str, model_cfg) -> BaseWAMArchitecture:
+def build_architecture_from_ckpt_dir(
+    ckpt_dir: str, model_cfg, layout, train_options: TrainOptions
+) -> BaseWAMArchitecture:
     """Build the empty architecture of one of our checkpoints (deploy, finetune and resume share it).
 
     Args:
         ckpt_dir: str, the checkpoint (run) dir; the backbones read their non-weight assets from it.
         model_cfg: the ``model`` config to build (the ckpt's ``config.yaml`` model section, or for finetune
             that section with the live overrides merged in).
+        layout: ``cfg.common.layout`` of the config ``model_cfg`` belongs to (``resolve_config``).
+        train_options: TrainOptions (finetune / resume: the trainer's; deploy: ``INFERENCE_ONLY``).
 
     Returns:
         BaseWAMArchitecture whose video backbone is a meta shell (LoadMode.CHECKPOINT). The caller fills it:
         ``load_checkpoint`` (deploy / finetune) or ``materialize_meta`` + accelerate ``load_state`` (resume).
     """
     resolved = resolve_architecture_config(model_cfg)
-    return build_architecture(resolved.registry_name, resolved.params, mode=LoadMode.CHECKPOINT, ckpt_dir=ckpt_dir)
+    return build_architecture(
+        resolved.registry_name,
+        resolved.params,
+        layout=layout,
+        mode=LoadMode.CHECKPOINT,
+        ckpt_dir=ckpt_dir,
+        train_options=train_options,
+    )

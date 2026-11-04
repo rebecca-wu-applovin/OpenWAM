@@ -6,20 +6,19 @@ every source. The action / proprio representation is selected by
 ``action_mode`` (see :mod:`openwam.dataloader.utils.yam_sharpa_repr`):
 ``fingertips_abs | fingertips_rel | unify_abs | unify_rel``.
 
-Per sample (anchor = first window frame t, OpenWAM temporal contract):
+Per sample (anchor = the current frame t):
 
-* video: ``num_frames`` raw rows sub-sampled by ``video_stride``; each frame is
-  the cameras in ``camera_layout`` stacked top-to-bottom (ego over chest,
-  2 x 240x320 → 480x320).
-* proprio: representation of ``state[t]`` (1, D).
+* video: the history rows ``t + history_offsets`` (clamped to the episode start,
+  i.e. the first frame repeats) followed by the future rows ``t + future_offsets``;
+  each frame is the cameras in ``camera_layout`` stacked top-to-bottom (ego over
+  chest, 2 x 240x320 → 480x320). ``history_offsets: [0]`` is the first-frame layout.
+* proprio: the history rows (H, D), each wrist re-expressed in the frame-t ego
+  camera (the action's frame).
 * action: representation of targets ``t .. t+num_frames-2`` w.r.t. frame t.
 
-Sparse-history layout (``history_offsets`` + ``future_offsets`` set; used by
-07_sparse_history_backbones): video = the history rows ``t + history_offsets``
-(clamped to the episode start, i.e. the first frame repeats) followed by the
-future rows ``t + future_offsets``; proprio = the history rows (H, D), each
-wrist re-expressed in the frame-t ego camera (the action's frame); action is unchanged.
-A window is only drawn where every future / action row exists.
+A window is only drawn where every future / action row exists. ``history_sampling: random`` (train split
+only) replaces the fixed history offsets per sample by H-1 random rows of the past ``history_window`` rows plus
+frame t, drawn from the sample's ``(seed, epoch, idx)`` RNG; val keeps ``history_offsets`` (the layout deploy serves).
 
 Width D is 48 for ``fingertips_*`` (``unify_action`` off) and 80 for
 ``unify_*`` (raw 62 scattered by ``UNIFY_ACTION_MAP``). The unify switch is
@@ -37,18 +36,18 @@ from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from openwam.config.resolve import HISTORY_SAMPLINGS
 from openwam.dataloader.bases import BaseDataset, LeRobotV3Reader
 from openwam.dataloader.transforms.multiview import assemble_vstack_layout
 from openwam.dataloader.utils import get_cfg
 from openwam.dataloader.utils.normalization import apply_normalization, load_stats_file
-from openwam.dataloader.utils.sparse_history import history_rows
+from openwam.dataloader.utils.sparse_history import history_rows, sample_history_offsets
 from openwam.dataloader.utils.video_io import decode_video_frames as _decode_video_frames
 from openwam.dataloader.utils.yam_sharpa_repr import (
     CAM_POSE_DIM,
     JOINT56_DIM,
     POSE48_DIM,
     encode_action_pairs,
-    encode_proprio,
     encode_proprio_in_anchor_cam,
     is_unify,
     raw_dim,
@@ -105,21 +104,19 @@ def _read_stats_meta(path: Path) -> Optional[dict]:
 
 
 def _validate_sparse_offsets(
-    history_offsets: Optional[Sequence[int]], future_offsets: Optional[Sequence[int]]
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """Check the sparse-history row offsets.
+    history_offsets: Sequence[int], future_offsets: Sequence[int]
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Check the history / future row offsets.
 
     Args:
-        history_offsets: H ints, increasing, <= 0, last one 0 (frame t); or None.
-        future_offsets: F ints, increasing, > 0; or None.
+        history_offsets: H ints, increasing, <= 0, last one 0 (frame t).
+        future_offsets: F ints, increasing, > 0.
 
     Returns:
-        ``(history (H,), future (F,))`` int64 arrays, or ``(None, None)`` when the layout is off.
+        ``(history (H,), future (F,))`` int64 arrays.
     """
-    if history_offsets is None and future_offsets is None:
-        return None, None
     if history_offsets is None or future_offsets is None:
-        raise ValueError("yam_sharpa: history_offsets and future_offsets must be set together")
+        raise ValueError("yam_sharpa: history_offsets and future_offsets are required")
     h = np.asarray(list(history_offsets), dtype=np.int64)
     f = np.asarray(list(future_offsets), dtype=np.int64)
     if h.size == 0 or h[-1] != 0 or (np.diff(h) <= 0).any():
@@ -132,9 +129,8 @@ def _validate_sparse_offsets(
 class YamSharpaDataset(LeRobotV3Reader):
     """Single-source reader; built by :class:`MultiYamSharpaDataset`.
 
-    Emits the base LeRobotV3Reader sample dict with ``action`` (num_frames-1, A),
-    ``proprio`` (1, A) and ``video`` (num_video_frames PIL images, height x width),
-    A = 48 (``fingertips_*``) or 80 (``unify_*``).
+    Emits ``action`` (num_frames-1, A), ``proprio`` (H, A) and ``video`` (H + F PIL images,
+    height x width), A = 48 (``fingertips_*``) or 80 (``unify_*``).
     """
 
     DATASET_NAME = "YamSharpa"
@@ -143,7 +139,14 @@ class YamSharpaDataset(LeRobotV3Reader):
     # unify_* keys are derived from action_mode, so they are not accepted from config.
     CONFIG_KEYS: ClassVar[Tuple[str, ...]] = tuple(
         k for k in LeRobotV3Reader.CONFIG_KEYS if k not in ("unify_action", "unify_action_map", "unify_state_map")
-    ) + ("action_mode", "normalization_stats_path", "history_offsets", "future_offsets", "min_rows_ahead")
+    ) + (
+        "action_mode",
+        "normalization_stats_path",
+        "history_offsets",
+        "future_offsets",
+        "history_sampling",
+        "history_window",
+    )
 
     def __init__(
         self,
@@ -152,9 +155,10 @@ class YamSharpaDataset(LeRobotV3Reader):
         action_mode: str,
         normalization_stats_path: Optional[str] = None,
         camera_layout: Optional[Sequence[str]] = None,
-        history_offsets: Optional[Sequence[int]] = None,
-        future_offsets: Optional[Sequence[int]] = None,
-        min_rows_ahead: int = 0,
+        history_offsets: Sequence[int],
+        future_offsets: Sequence[int],
+        history_sampling: str,
+        history_window: int,
         **kwargs: Any,
     ):
         """
@@ -163,12 +167,14 @@ class YamSharpaDataset(LeRobotV3Reader):
             action_mode: str, one of ``ACTION_REPRS``.
             normalization_stats_path: str, pooled stats file (required when normalization is on).
             camera_layout: list[str] of camera feature keys, top-to-bottom; default ego over chest.
-            history_offsets: list[int] of H row offsets <= 0 ending at 0 (e.g. [-80,-60,-40,-20,0]); enables the
-                sparse-history layout together with ``future_offsets``. None = legacy contiguous window.
-            future_offsets: list[int] of F increasing row offsets > 0 (e.g. [5,10,...,25]).
-            min_rows_ahead: int, sparse layout only: row t + min_rows_ahead must exist too, so backbones with
-                shorter futures can share one sampling range (07: 45 for every backbone).
-            **kwargs: forwarded to :class:`LeRobotV3Reader` (num_frames, video_stride, height, width, ...).
+            history_offsets: list[int] of H row offsets <= 0 ending at 0 (e.g. [-80,-60,-40,-20,0]; [0] = only
+                the current frame).
+            future_offsets: list[int] of F increasing row offsets > 0 (e.g. [4,8,...,32]).
+            history_sampling: str, ``fixed`` (always ``history_offsets``) or ``random`` (train split only: per
+                sample, H-1 distinct random rows of the past ``history_window`` rows + frame t; val stays fixed).
+                ``resolve_config`` checks that the window covers ``history_offsets``.
+            history_window: int, rows back the random history may reach (100 = 5 s at 20 Hz); unused when fixed.
+            **kwargs: forwarded to :class:`LeRobotV3Reader` (num_frames, height, width, split, ...).
         """
         for key in ("unify_action", "unify_action_map", "unify_state_map"):
             if kwargs.pop(key, None) is not None:
@@ -178,7 +184,11 @@ class YamSharpaDataset(LeRobotV3Reader):
         self._state_normalization_stats: Optional[dict] = None  # filled by _load_stats
         self._layout_cams = [str(c) for c in (camera_layout or DEFAULT_CAMERA_LAYOUT)]
         self._history_offsets, self._future_offsets = _validate_sparse_offsets(history_offsets, future_offsets)
-        self._min_rows_ahead = int(min_rows_ahead or 0)
+        if history_sampling not in HISTORY_SAMPLINGS:
+            raise ValueError(
+                f"yam_sharpa: history_sampling must be one of {HISTORY_SAMPLINGS}, got {history_sampling!r}"
+            )
+        self._history_window = int(history_window)
 
         # Raw (pre-unify) width; the base class scatters it to 80 when unify is on.
         self.ACTION_DIM = raw_dim(self.action_mode)
@@ -190,23 +200,32 @@ class YamSharpaDataset(LeRobotV3Reader):
             unify_action_map=unify_action_map(self.action_mode),
             **kwargs,
         )
-        if self.sparse_history:
-            # The sampled video is history + future frames, not the video_stride grid.
-            self._num_video_frames = len(self._history_offsets) + len(self._future_offsets)
+        # Resolved once from (history_sampling, split): random history is a train-split augmentation, val keeps
+        # the deploy layout. Every sample calls the one slot below with its RNG.
+        random_history = history_sampling == "random" and self._split == "train"
+        self._draw_history_offsets = self._random_history_offsets if random_history else self._fixed_history_offsets
+        if random_history:
+            logger.info(
+                "YamSharpa(%s): random history, %d frames from the past %d rows + frame t",
+                self._dataset_id,
+                len(self._history_offsets),
+                self._history_window,
+            )
 
-    @property
-    def sparse_history(self) -> bool:
-        """True when the sparse-history layout (history_offsets + future_offsets) is on."""
-        return self._history_offsets is not None
+    def _fixed_history_offsets(self, rng: np.random.Generator) -> np.ndarray:
+        """rng: the sample's Generator (unused). Returns: (H,) int64, the configured ``history_offsets``."""
+        return self._history_offsets
+
+    def _random_history_offsets(self, rng: np.random.Generator) -> np.ndarray:
+        """rng: the sample's Generator. Returns: (H,) int64, H-1 random past rows of the window + frame t."""
+        return sample_history_offsets(len(self._history_offsets), self._history_window, rng)
 
     # ----- hooks ------------------------------------------------------------
 
     def _min_window_len(self) -> int:
-        """Sparse layout: every future frame and every action row must exist (train and val alike)."""
-        if not self.sparse_history:
-            return super()._min_window_len()
+        """Every future frame and every action row must exist (train and val alike)."""
         # Rows t .. t + max_ahead must all lie inside the episode.
-        return max(int(self._future_offsets[-1]), self._num_frames - 1, self._min_rows_ahead) + 1
+        return max(int(self._future_offsets[-1]), self._num_frames - 1) + 1
 
     def _resolve_cameras(self, info: dict):
         """Map the layout onto the base (head, left, right) slots so every camera gets video offsets."""
@@ -289,33 +308,19 @@ class YamSharpaDataset(LeRobotV3Reader):
         )
         return apply_normalization(raw, self._normalization_stats, self._normalize_mode)
 
-    def _proprio_20d(self, win) -> np.ndarray:
-        """Normalized raw proprio of frame t.
+    # ----- sample ---------------------------------------------------------------
 
-        Args:
-            win: DataFrame, window rows; only row 0 is used.
-
-        Returns:
-            (1, D) float32, normalized with the ``_state`` stats block.
-        """
-        raw = encode_proprio(self.action_mode, win[STATE_COL].values[0], win[JOINT_COL].values[0])
-        return apply_normalization(raw, self._state_normalization_stats, self._normalize_mode)
-
-    # ----- sparse-history sample ----------------------------------------------
-
-    def _getitem_impl(self, idx: int) -> dict:
-        """Sparse layout sample; defers to the base contiguous window when the layout is off.
+    def _getitem_impl(self, idx: int, rng: np.random.Generator) -> dict:
+        """One sample: H history frames + F future frames, H proprio rows, the action chunk.
 
         Args:
             idx: int in [0, len).
+            rng: numpy Generator of this sample (draws the random history offsets).
 
         Returns:
-            dict with ``video`` (H+F PIL images: history then future), ``proprio`` (H, D),
-            ``action`` (num_frames-1, D) + masks, ``prompt``, ``num_history_frames`` = H and
-            ``video_mask`` = None (every frame is real by construction).
+            dict with ``video`` (H+F PIL images: history then future), ``proprio`` (H, D) + ``proprio_mask``
+            (H, D), ``action`` (num_frames-1, D) + ``action_mask`` (num_frames-1, D) and ``prompt``.
         """
-        if not self.sparse_history:
-            return super()._getitem_impl(idx)
         ep_local = int(np.searchsorted(self._cum_n_starts, idx, side="right") - 1)
         valid_start = int(self._ep_valid_start[ep_local])
         offset = valid_start + (idx - int(self._cum_n_starts[ep_local])) * self._window_stride
@@ -328,8 +333,9 @@ class YamSharpaDataset(LeRobotV3Reader):
         prompt = self._resolve_prompt(row, win)
         action, action_mask = self._finalize_action(self._action_20d(win), self._num_frames)
 
-        # History rows clamp to the episode start (repeat the first frame); deploy uses the same rule.
-        hist_rows = history_rows(offset, self._history_offsets, valid_start)
+        # This sample's offsets (fixed, or drawn first in random mode); rows then clamp to the episode start
+        # (repeat the first frame), the same rule deploy uses.
+        hist_rows = history_rows(offset, self._draw_history_offsets(rng), valid_start)
         lo = int(hist_rows.min())
         hist_tab = table.slice(ep_row0 + lo, offset - lo + 1).to_pandas()
         hist = hist_tab.iloc[hist_rows - lo]
@@ -338,23 +344,18 @@ class YamSharpaDataset(LeRobotV3Reader):
 
         # Video indices are relative to the window start ``offset`` (history ones are <= 0).
         rel = np.concatenate([hist_rows - offset, self._future_offsets]).astype(np.int64)
+        video = self._decode_window_video(row, ep_local, offset, rel, idx)
         if self._color_jitter is not None:
             # Same jitter factors across all H+F frames.
-            video, _ = self._decode_window_video(row, ep_local, offset, rel, idx, return_missing_masks=True)
-            video = self._color_jitter.apply({"video": video})["video"]
-        else:
-            video = self._decode_window_video(row, ep_local, offset, rel, idx)
+            video = self._color_jitter.apply(video)
 
         return {
             "video": video,
-            "first_frame_image": [video[0]] if video else [],
             "action": torch.from_numpy(action),
             "action_mask": torch.from_numpy(action_mask),
-            "video_mask": None,
             "proprio": torch.from_numpy(proprio).float(),
             "proprio_mask": torch.from_numpy(proprio_mask),
             "prompt": prompt,
-            "num_history_frames": int(len(self._history_offsets)),
         }
 
     def _proprio_history(self, hist, anchor_cam16) -> np.ndarray:
@@ -378,19 +379,18 @@ class YamSharpaDataset(LeRobotV3Reader):
 
     # ----- video: cameras stacked top-to-bottom ------------------------------
 
-    def _decode_window_video(self, row, ep_local, offset, real_local_indices, idx, *, return_missing_masks=False):
+    def _decode_window_video(self, row, ep_local, offset, real_local_indices, idx):
         """Decode every layout camera and stack them per frame.
 
         Args:
             row: episodes-table row (video chunk / file indices).
             ep_local: int, episode position in this reader.
             offset: int, window start inside the episode.
-            real_local_indices: (F,) int, sampled frame offsets inside the window (F <= num_video_frames).
+            real_local_indices: (N,) int, sampled frame offsets relative to the window start.
             idx: int, sample index (error messages only).
-            return_missing_masks: bool, base-class color-jitter contract; always None here (no black tiles).
 
         Returns:
-            list of num_video_frames PIL images (width x height), or ``(list, None)``.
+            list of N PIL images (width x height).
         """
         tile_h = self._height // len(self._layout_cams)
         per_cam: Dict[str, List] = {}
@@ -403,10 +403,12 @@ class YamSharpaDataset(LeRobotV3Reader):
             # Frame index inside the (multi-episode) mp4 = episode offset + window offset + sample offset.
             base = int(self._ep_video_frame_offsets[cam][ep_local]) + offset
             frames = _decode_video_frames(str(path), (real_local_indices + base).tolist(), tile_h, self._width)
-            if not frames:
-                raise RuntimeError(f"empty {cam} decode for {self.DATASET_NAME}({self._dataset_id}) at idx={idx}")
-            # Pad to num_video_frames with the last real frame (masked by video_mask).
-            per_cam[cam] = frames + [frames[-1]] * (self._num_video_frames - len(frames))
+            if len(frames) != len(real_local_indices):
+                raise RuntimeError(
+                    f"{cam} decoded {len(frames)} of {len(real_local_indices)} frames for "
+                    f"{self.DATASET_NAME}({self._dataset_id}) at idx={idx}"
+                )
+            per_cam[cam] = frames
         video = [
             assemble_vstack_layout(
                 {cam: per_cam[cam][fi] for cam in self._layout_cams},
@@ -414,9 +416,9 @@ class YamSharpaDataset(LeRobotV3Reader):
                 out_h=self._height,
                 out_w=self._width,
             )
-            for fi in range(self._num_video_frames)
+            for fi in range(len(real_local_indices))
         ]
-        return (video, None) if return_missing_masks else video
+        return video
 
 
 class MultiYamSharpaDataset(BaseDataset):
@@ -446,7 +448,7 @@ class MultiYamSharpaDataset(BaseDataset):
         """
         Args:
             datasets: list of S readers sharing one action_mode / stats file.
-            names: list of S source names (``sample['_dataset_name']``).
+            names: list of S source names (``sample['source']``).
             weights: list of S non-negative sampling weights (normalized to probabilities).
             seed: int, base RNG seed.
             normalization_stats_path: str, pooled stats file copied into checkpoints.
@@ -482,14 +484,14 @@ class MultiYamSharpaDataset(BaseDataset):
         return self._len
 
     def __getitem__(self, idx: int) -> dict:
-        """Args: idx: int in [0, len). Returns: one source sample dict + ``_dataset_index`` / ``_dataset_name``."""
+        """Args: idx: int in [0, len). Returns: one source sample dict + ``source`` (that source's name)."""
         # Per-(seed, epoch, idx) RNG: reproducible and identical in every worker.
         rng = np.random.default_rng([self._seed, self._epoch, int(idx)])
         di = int(rng.choice(len(self._datasets), p=self._probs))
         ds = self._datasets[di]
-        sample = ds[int(rng.integers(len(ds)))]
-        sample["_dataset_index"] = di
-        sample["_dataset_name"] = self._names[di]
+        # The same RNG goes on into the source's sample (random history offsets).
+        sample = ds.sample(int(rng.integers(len(ds))), rng)
+        sample["source"] = self._names[di]
         return sample
 
     def set_epoch(self, epoch: int) -> None:

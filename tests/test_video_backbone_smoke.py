@@ -198,9 +198,11 @@ def test_ti2v_branch_ignores_zero_clean_prefix_t_mod_kwarg():
     assert torch.allclose(a, b), "TI2V branch must be unaffected by the broadcast-path kwargs"
 
 
-def test_wan_prepare_takes_text_condition_and_clean_count():
+def test_wan_prepare_takes_text_condition_and_layout():
     """``WanBackbone.prepare`` reads context / context_mask from the TextCondition and gives the first
-    ``num_clean_latents`` latent frames t = 0 (TI2V per-token timestep)."""
+    ``layout.num_hist_latents`` latent frames t = 0 (TI2V per-token timestep)."""
+    from omegaconf import OmegaConf
+
     from openwam.model.video_backbone.base import TextCondition
 
     backbone, model = _build_tiny_wan_backbone(ti2v=True)
@@ -209,7 +211,11 @@ def test_wan_prepare_takes_text_condition_and_clean_count():
     mask = torch.tensor([[True, True, False]])
     text = TextCondition(context=torch.randn(1, 3, 32), context_mask=mask)
 
-    state = backbone.prepare(latents=latents, timestep=timestep, text=text, num_clean_latents=2)
+    layout = OmegaConf.create({"num_hist_latents": 2, "num_latents": 3})
+    state = backbone.prepare(
+        latents=latents, timestep=timestep, text=text, layout=layout, proprio=torch.zeros(1, 2, 3),
+        use_gradient_checkpointing=False, use_gradient_checkpointing_offload=False,
+    )
     assert torch.equal(state.context_mask, mask)
     # Frames 0-1 (4 tokens each) carry the t = 0 modulation, frame 2 the sampled one.
     expected = _time_mod(model, latents, timestep, fuse_vae_embedding_in_latents=True, num_clean_prefix_frames=2)

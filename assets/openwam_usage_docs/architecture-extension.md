@@ -58,13 +58,16 @@ class MyVideoBackbone(VideoBackbone):
     def encode_text(self, prompts, *, grid, num_frames) -> TextCondition: ...
 
     # Block loop
-    def prepare(self, *, latents, timestep, text, num_clean_latents, **kwargs) -> BlockLoopState: ...
-    def run_block(self, block_id, state): ...
+    # layout = cfg.common.layout; proprio (B, H, D) is always passed, only a proprio_input=backbone_stream family reads it
+    def prepare(self, *, latents, timestep, text, layout, proprio,
+                use_gradient_checkpointing, use_gradient_checkpointing_offload) -> BlockLoopState: ...
+    def run_block(self, block_id, state, attn_mask): ...  # video-only layer with this layer's token mask
     def finalize(self, state): ...
 ~~~
 
 The base class implements `to_pixels`, `encode_frames` / `encode_clip`, `preprocess_condition` (deploy),
-`preprocess_train` (training) and `decode_video` once on top of `encode_pixels` / `decode_latents` / `encode_text`.
+`preprocess_train` (training) and `decode_future` once on top of `encode_pixels` / `decode_latents` / `encode_text`;
+all of them take the latent layout (`cfg.common.layout`, derived by `openwam.config.resolve_config`).
 
 The execution order is `prepare → run_block → finalize`. `prepare` returns a `BlockLoopState` containing hidden tokens, timestep data, RoPE, context, and grid metadata. `finalize` returns video noise with shape `(B, C, T, H, W)`. Preserve gradient-checkpointing data in the state.
 
@@ -85,7 +88,7 @@ Implement only the capability hooks that the backbone supports:
 pre_attn_at_layer / post_attn_at_layer
 
 # Masks and deployment
-build_video_to_video_mask
+build_joint_attention_masks   # only when the token order is not frame-major (views, extra tokens, prefix keys)
 build_text_cache / save_deploy_assets
 ~~~
 
@@ -133,19 +136,22 @@ from openwam.model.architectures import BaseWAMArchitecture, register_architectu
     'my_architecture',
     framework='my_framework',
     variant='default',
-    status='experimental',
-    note='Describe current limitations.',
 )
 class MyArchitecture(BaseWAMArchitecture):
-    def __init__(self, cfg=None):
-        super().__init__(cfg)
+    def __init__(self, cfg, *, layout, mode, ckpt_dir, train_options):
+        super().__init__(cfg, layout=layout, mode=mode, ckpt_dir=ckpt_dir, train_options=train_options)
         self.action_backbone = ...
 
-    def forward(self, noisy_actions, action_timestep, *, timestep=None, **inputs):
+    def forward(self, noisy_actions, action_timestep, *, latents, timestep, text, proprio, proprio_mask,
+                use_gradient_checkpointing, use_gradient_checkpointing_offload):
+        video_text, action_text = self.build_contexts(text, proprio, proprio_mask)
         ...  # -> (video_noise, action_noise_or_none)
 ~~~
 
-The forward method returns `(video_noise_pred, action_noise_pred_or_none)`. Use public backbone methods, set architecture-owned trainable modules explicitly, and fail clearly when a required capability is absent. Import the implementation from the family `__init__.py` so the decorator runs.
+The base class owns the training step (`compute_loss(batch)` on the collated `Batch`) and inference
+(`sample(hist_latents, text, proprio, schedule, seed=...)`); the forward method returns
+`(video_noise_pred, action_noise_pred_or_none)`. `build_contexts` applies `proprio_input`: ActionDiT always reads
+text + proprio tokens, the video backbone the same context (`context_token`) or the text alone (`backbone_stream`). Use public backbone methods, set architecture-owned trainable modules explicitly, and fail clearly when a required capability is absent. Import the implementation from the family `__init__.py` so the decorator runs.
 
 Add a model YAML with `architecture.framework` and `architecture.variant`. [openwam/model/architectures/registry.py](../../openwam/model/architectures/registry.py) maps that pair to the canonical name. Keep mask rules in the architecture. A backbone should expose geometry and mask builders as methods and must not inspect architecture configuration or import an architecture module.
 

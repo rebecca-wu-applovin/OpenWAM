@@ -3,8 +3,7 @@
 Splits each step's wall time into phases so a slow s/step can be attributed:
 
     data     waiting on the DataLoader iterator (incl. accelerate's H2D copy)
-    encode   architecture.prepare_inputs (frozen VAE/T5 encode, no grad)
-    forward  architecture.compute_loss (trainable forward)
+    forward  architecture.compute_loss (frozen VAE / text encode + trainable forward)
     backward loss.backward (+ ZeRO grad reduce-scatter; waits for slower ranks)
     optim    clip + optimizer step + zero_grad (DeepSpeed engine.step)
     other    metric all-reduce, logging, checkpoint save, vis (previous step)
@@ -18,7 +17,7 @@ import time
 
 import torch
 
-PHASES = ("data", "encode", "forward", "backward", "optim", "other")
+PHASES = ("data", "forward", "backward", "optim", "other")
 
 
 class StepTimer:
@@ -56,9 +55,9 @@ class StepTimer:
     def snapshot(self, accelerator=None) -> dict:
         """This step's phase times, reduced across ranks.
 
-        accelerator: Accelerate handle; with >1 process the (world, 6) times are gathered.
+        accelerator: Accelerate handle; with >1 process the (world, len(PHASES)) times are gathered.
         Returns: dict ``timing/<phase>`` = rank-mean seconds and ``timing/<phase>_max`` =
-            slowest-rank seconds (6 phases each), plus ``timing/step`` = sum of the means.
+            slowest-rank seconds (one per phase), plus ``timing/step`` = sum of the means.
             ``other`` is the previous step's value. Empty dict if disabled.
         """
         if not self.enabled:
@@ -66,7 +65,7 @@ class StepTimer:
         vals = [self._cur[p] for p in PHASES[:-1]] + [self._prev_other]
         local = torch.tensor(vals, dtype=torch.float32)
         if accelerator is not None and accelerator.num_processes > 1:
-            g = accelerator.gather(local.to(accelerator.device).reshape(1, -1)).float().cpu()  # (world, 6)
+            g = accelerator.gather(local.to(accelerator.device).reshape(1, -1)).float().cpu()  # (world, len(PHASES))
             mean, mx = g.mean(dim=0), g.max(dim=0).values
         else:
             mean = mx = local

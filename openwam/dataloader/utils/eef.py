@@ -213,7 +213,8 @@ def eef14_to_eef20(eef12: np.ndarray, grip2: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Every reader that emits the 20-D EEF schema produces a 2-D
 # ``action_mask`` of shape ``(T_action, action_dim)`` and a 2-D
-# ``proprio_mask`` of shape ``(1, action_dim)``. ``mask[t, d] = True``
+# ``proprio_mask`` of shape ``(H, action_dim)`` (the ``(1, action_dim)`` dim
+# mask below, one copy per history row). ``mask[t, d] = True``
 # means "this (time, dim) element is real data and should contribute
 # to loss / encoder gradients".
 #

@@ -231,22 +231,27 @@ def _load_ckpt_cfg(ckpt_dir: str) -> DictConfig:
     return ckpt_cfg
 
 
-def build_for_finetune(source: str, cfg: DictConfig):
+def build_for_finetune(source: str, cfg: DictConfig, train_options):
     """Warm-start: the checkpoint's architecture with the live model config on top, weights loaded strictly.
 
     Args:
         source: str, ``training.finetune_ckpt_path`` (a run dir, or one ``checkpoint_step_*.safetensors`` in it).
-        cfg: the live run config; ``cfg.model`` is replaced by the merged model config (what save_config writes).
+        cfg: the live run config, already resolved (``resolve_config``); ``cfg.model`` is replaced by the merged
+            model config (what save_config writes) and the layout is re-checked against it.
+        train_options: TrainOptions the trainer decided (passed to the architecture constructor).
 
     Returns:
         BaseWAMArchitecture with every weight loaded from the requested / latest safetensors.
     """
+    from openwam.config import resolve_config
     from openwam.model import build_architecture_from_ckpt_dir
 
     ckpt_dir, explicit_weights = _resolve_ckpt_path(source)
     model_cfg = merge_ckpt_model_cfg(_load_ckpt_cfg(ckpt_dir), cfg, ckpt_dir)
+    # The merge may change model keys the layout derives from: re-resolve (checks cfg.common.layout still holds).
+    resolve_config(cfg)
     logger.info("[finetune] building architecture from ckpt dir: %s", ckpt_dir)
-    architecture = build_architecture_from_ckpt_dir(ckpt_dir, model_cfg)
+    architecture = build_architecture_from_ckpt_dir(ckpt_dir, model_cfg, cfg.common.layout, train_options)
     weights = explicit_weights or find_latest_weights(ckpt_dir)
     # Plain print so the warm-start is visible on the launch terminal even
     # when logger output is drowned out; non-main ranks have print disabled.
@@ -256,7 +261,7 @@ def build_for_finetune(source: str, cfg: DictConfig):
     return architecture
 
 
-def build_for_resume(source: str, cfg: DictConfig):
+def build_for_resume(source: str, cfg: DictConfig, train_options):
     """Resume: the checkpoint's own architecture, with zeroed storage for accelerate ``load_state`` to fill.
 
     The safetensors are not read: ``load_state`` restores a strict superset (module weights incl. frozen
@@ -266,18 +271,22 @@ def build_for_resume(source: str, cfg: DictConfig):
     Args:
         source: str, ``training.resume_ckpt_path`` (the run dir).
         cfg: the live run config; only compared with the ckpt's (the ckpt config wins, divergence is logged).
+        train_options: TrainOptions the trainer decided (passed to the architecture constructor).
 
     Returns:
-        BaseWAMArchitecture with real (zero) storage everywhere and the shell's real buffers kept.
+        (architecture, ckpt_cfg): the BaseWAMArchitecture with real (zero) storage everywhere and the shell's real
+        buffers kept, and the resolved checkpoint config it was built from (the run's effective config: every
+        model-side decision of the resumed run reads it, never the live one).
     """
+    from openwam.config import resolve_config
     from openwam.model import build_architecture_from_ckpt_dir
     from openwam.model.video_backbone.common.weights import materialize_meta
 
     ckpt_dir, _explicit_weights = _resolve_ckpt_path(source)
-    ckpt_cfg = _load_ckpt_cfg(ckpt_dir)
+    ckpt_cfg = resolve_config(_load_ckpt_cfg(ckpt_dir))
     warn_live_model_cfg_ignored(ckpt_cfg, cfg, ckpt_dir)
     logger.info("[resume] building architecture from ckpt dir: %s", ckpt_dir)
-    architecture = build_architecture_from_ckpt_dir(ckpt_dir, ckpt_cfg.model)
+    architecture = build_architecture_from_ckpt_dir(ckpt_dir, ckpt_cfg.model, ckpt_cfg.common.layout, train_options)
     # set_dtype_device runs before load_state and cannot copy out of meta tensors.
     materialize_meta(architecture, "cpu")
-    return architecture
+    return architecture, ckpt_cfg

@@ -19,11 +19,10 @@ import torch
 from torch import Tensor
 
 from openwam.model.action_backbone.separate_action_dit import ActionDiT
-from openwam.model.architectures.base import BaseWAMArchitecture
+from openwam.model.architectures.base import BaseWAMArchitecture, TrainOptions
 from openwam.model.architectures.dual_system.mot_driver import DualSystemMoTDriver
 from openwam.model.architectures.registry import register_architecture
 from openwam.model.architectures.utils.common import resolve_bridge_layers
-from openwam.model.architectures.utils.mask_modes import ACTION_SEES_VIDEO
 from openwam.model.compile_options import (
     compile_enabled,
     section_enabled,
@@ -38,42 +37,27 @@ logger = logging.getLogger(__name__)
 
 @register_architecture(
     "dual_system_self_attn",
-    status="supported",
-    note="DualSystem joint self-attention: MoT-style mixed attention at every layer.",
     framework="dual_system",
     variant="joint_self_attn",
 )
 class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
     """DualSystem with true joint self-attention (FastWAM MoT pattern)."""
 
-    def __init__(self, cfg=None, *, mode: LoadMode = LoadMode.PRETRAINED, ckpt_dir: Optional[str] = None):
-        """cfg: architecture params (see BaseWAMArchitecture). mode / ckpt_dir: how the video backbone is built
-        (LoadMode chosen by the entry point; ckpt_dir for CHECKPOINT, else None)."""
-        super().__init__(cfg, mode=mode, ckpt_dir=ckpt_dir)
-        vb = self.video_backbone
-        if (
-            vb is not None
-            and getattr(vb, "consumes_raw_proprio", False)
-            and vb.action_cond_dim != int(cfg.get("state_dim"))
-        ):
-            # flux feeds the raw proprio into its own P stream, whose input width is fixed in its yaml.
-            raise ValueError(
-                f"video_backbone.action_cond_dim={vb.action_cond_dim} must equal "
-                f"model.architecture.state_dim={cfg.get('state_dim')}"
-            )
+    def __init__(self, cfg: dict, *, layout, mode: LoadMode, ckpt_dir: Optional[str], train_options: TrainOptions):
+        """Arguments as in :class:`BaseWAMArchitecture`; ``cfg`` also carries the ActionDiT geometry."""
+        super().__init__(cfg, layout=layout, mode=mode, ckpt_dir=ckpt_dir, train_options=train_options)
         self._mot_driver: DualSystemMoTDriver | None = None
-        self._mot_driver_kwargs: dict = {}
         self._compiled_mot_run_joint_loop: Optional[Callable[..., Tuple[object, object]]] = None
-        if cfg is None:
-            return
-        if self.video_backbone is not None:
-            cfg = dict(cfg) if isinstance(cfg, dict) else {k: v for k, v in cfg.items()}
-            cfg.setdefault("num_dit_layers", self.video_backbone.num_layers)
-            cfg.setdefault("video_dim", self.video_backbone.dim)
-            cfg.setdefault("num_heads", self.video_backbone.num_heads)
-            cfg.setdefault("attn_head_dim", self.video_backbone.head_dim)
+        # ActionDiT geometry defaults to the video backbone's; explicit cfg values win.
+        cfg = {
+            "num_dit_layers": self.video_backbone.num_layers,
+            "video_dim": self.video_backbone.dim,
+            "num_heads": self.video_backbone.num_heads,
+            "attn_head_dim": self.video_backbone.head_dim,
+            **cfg,
+        }
         bl = resolve_bridge_layers(cfg)
-        video_dim = self._resolve_video_dim(cfg)
+        video_dim = int(cfg["video_dim"])
         # Default the action-side raw context width to the loaded backbone's
         # text_dim (Wan T5-XXL=4096); explicit cfg/CLI
         # still wins. Falls back to 4096 when the backbone doesn't expose it.
@@ -102,43 +86,21 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
             shift_action=cfg.get("shift_action"),
         )
 
-        # MoT driver is built once both backbones are available. The video
-        # backbone is normally constructed in ``BaseWAMArchitecture._init_video_backbone``
-        # (already done by ``super().__init__``), so we can build the driver
-        # right here. Tests that swap in a mock video backbone after init call
-        # :meth:`build_mot_driver` directly.
-        self._mot_driver_kwargs = {
-            "mot_checkpoint_mixed_attn": bool(cfg.get("mot_checkpoint_mixed_attn", True)),
-            "attention_mask_mode": str(cfg.get("attention_mask_mode", ACTION_SEES_VIDEO)),
-            "video_attention_mask_mode": str(cfg.get("video_attention_mask_mode", "first_frame_causal")),
-            "num_history_frames": int(cfg.get("num_history_frames", 0) or 0),
-        }
-        if self.video_backbone is not None:
-            self.build_mot_driver()
+        # The MoT driver pairs the two backbones (both built by now).
+        self._mot_checkpoint_mixed_attn = bool(cfg.get("mot_checkpoint_mixed_attn", True))
+        self.build_mot_driver()
 
     def build_mot_driver(self) -> DualSystemMoTDriver:
-        """Construct the :class:`DualSystemMoTDriver` from the current backbones.
+        """Construct the :class:`DualSystemMoTDriver` from the current backbones (re-callable).
 
-        Re-callable; raises if either backbone is missing. Tests that swap in
-        a mock video backbone after ``__init__`` should call this method to
-        wire up the driver afterwards.
+        Returns:
+            DualSystemMoTDriver, also stored as ``self._mot_driver``.
         """
-        if self.video_backbone is None:
-            raise RuntimeError(
-                "DualSystemSelfAttnArchitecture.build_mot_driver: video_backbone is not "
-                "set. Construct the architecture with a video_backbone config or attach "
-                "one before calling this method."
-            )
-        if self.action_backbone is None:
-            raise RuntimeError(
-                "DualSystemSelfAttnArchitecture.build_mot_driver: action_backbone is not "
-                "set. Architecture must be built from a non-None cfg."
-            )
-
         self._mot_driver = DualSystemMoTDriver(
             self.video_backbone,
             self.action_backbone,
-            **self._mot_driver_kwargs,
+            frame_mask=self.frame_mask,
+            mot_checkpoint_mixed_attn=self._mot_checkpoint_mixed_attn,
         )
         return self._mot_driver
 
@@ -159,11 +121,7 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         if not section_enabled(section, default=True):
             logger.info("dual self-attn MoT compile disabled by config; running eager.")
             return
-        if self.video_backbone is None or self.action_backbone is None:
-            logger.warning("dual self-attn MoT compile requested before backbones are ready; running eager.")
-            return
-
-        driver = self._mot_driver or self.build_mot_driver()
+        driver = self._mot_driver
 
         def _run_joint_loop(vstate, astate):
             return driver.run_joint_loop(
@@ -190,53 +148,44 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         latents: Tensor,
         timestep: Tensor,
         text: TextCondition,
-        clean_latents: Tensor,
-        proprio: Optional[Tensor] = None,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
-        **pipeline_inputs,
+        proprio: Tensor,
+        proprio_mask: Tensor,
+        use_gradient_checkpointing: bool,
+        use_gradient_checkpointing_offload: bool,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Joint forward; arguments as in :meth:`BaseWAMArchitecture.forward`. Returns (video pred, action pred)."""
-        vb = self.video_backbone
-        ab = self.action_backbone
-        if vb is None:
-            raise RuntimeError(
-                "video_backbone is None — pass pipe= to build_architecture or "
-                "architecture.__init__ to enable forward()."
-            )
+        video_backbone = self.video_backbone
+        action_backbone = self.action_backbone
 
-        # Text (+ proprio tokens) is the context of both streams.
-        text = self._append_proprio_context_token(text, proprio, pipeline_inputs.get("_proprio_sample_mask"))
-        # Backbones that embed proprio in their own sequence (flux's x_action_cond stream).
-        raw_proprio = proprio if getattr(vb, "consumes_raw_proprio", False) else None
-        vstate = vb.prepare(
+        # Each stream's context (proprio tokens per cfg proprio_input).
+        video_text, action_text = self.build_contexts(text, proprio, proprio_mask)
+        vstate = video_backbone.prepare(
             latents=latents,
             timestep=timestep,
-            text=text,
-            num_clean_latents=int(clean_latents.shape[2]),
-            raw_proprio=raw_proprio,
+            text=video_text,
+            layout=self.layout,
+            proprio=proprio,
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         )
 
-        if noisy_actions is None or ab is None:
-            for block_id in range(vb.num_layers):
-                vstate = vb.run_block(block_id, vstate)
-            return vb.finalize(vstate), None
+        if noisy_actions is None:
+            # Video only: the same frame mask, expanded without action tokens.
+            masks = video_backbone.build_joint_attention_masks(self.frame_mask, vstate, 0)
+            for block_id in range(video_backbone.num_layers):
+                vstate = video_backbone.run_block(block_id, vstate, masks[block_id])
+            return video_backbone.finalize(vstate), None
 
         driver = self._mot_driver
-        if driver is None:
-            driver = self.build_mot_driver()
-
-        astate = ab.prepare_state(
+        astate = action_backbone.prepare_state(
             noisy_actions,
             action_timestep,
-            context=text.context,
-            context_mask=text.context_mask,
+            context=action_text.context,
+            context_mask=action_text.context_mask,
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         )
-        compiled_loop = getattr(self, "_compiled_mot_run_joint_loop", None)
+        compiled_loop = self._compiled_mot_run_joint_loop
         if compiled_loop is not None and not use_gradient_checkpointing and not use_gradient_checkpointing_offload:
             try:
                 vstate, astate = compiled_loop(vstate, astate)
@@ -256,7 +205,7 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             )
-        return vb.finalize(vstate), ab.extract_prediction(astate)
+        return video_backbone.finalize(vstate), action_backbone.extract_prediction(astate)
 
 
 __all__ = ["DualSystemSelfAttnArchitecture"]

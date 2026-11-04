@@ -133,9 +133,8 @@ class WAMPolicy:
     def _build_conditions(self, obs: dict) -> dict:
         """Assemble inference conditions from the current observation.
 
-        Populates the engine-facing fields (``first_frame_image``,
-        ``prompt``) from the server-preprocessed observation so the
-        pipeline receives images without any further client-side work.
+        Populates the engine-facing fields (``history``, ``prompt``) from the server-preprocessed
+        observation so the pipeline receives images without any further client-side work.
         """
         conditions = {
             "observation": obs,
@@ -144,10 +143,6 @@ class WAMPolicy:
             # Record this plan's observation, then pass the H history observations (oldest first).
             self._history.append(obs)
             conditions["history"] = self._history.window()
-        img = obs.get("image")
-        if img is not None:
-            # Single first frame — pipeline expects list[PIL.Image]
-            conditions["first_frame_image"] = [img]
         if obs.get("prompt"):
             conditions["prompt"] = obs["prompt"]
         if "state" in obs and obs["state"] is not None:

@@ -80,17 +80,6 @@ ERR_INTERNAL = "internal_error"
 MAX_MESSAGE_BYTES = 32 * 1024 * 1024
 
 
-def _infer_video_num_frames(dl) -> int:
-    """Return the video frame count seen by Wan after dataloader sub-sampling."""
-    from omegaconf import OmegaConf
-
-    raw_frames = int(OmegaConf.select(dl, "num_frames", default=33))
-    video_stride = int(OmegaConf.select(dl, "video_stride", default=1) or 1)
-    if video_stride <= 0:
-        video_stride = 1
-    return (raw_frames - 1) // video_stride + 1
-
-
 def _normalize_compile_enabled_in_cfg(cfg) -> None:
     """Keep package and script entrypoints aligned on compile-enabled validation."""
     from omegaconf import OmegaConf
@@ -390,8 +379,7 @@ def merge_deploy_cfg(training_cfg, deploy_cfg):
     then merge deploy overrides on top of the training config (deploy wins).
 
     ``inference.num_frames`` stays the raw action/state window (actions returned
-    = num_frames - 1); ``inference.video_num_frames`` is the Wan video length
-    after ``dataloader.video_stride`` sub-sampling.
+    = num_frames - 1).
     """
     from omegaconf import OmegaConf
 
@@ -401,8 +389,6 @@ def merge_deploy_cfg(training_cfg, deploy_cfg):
         inf = OmegaConf.select(deploy_cfg, "inference", default=OmegaConf.create({}))
         if OmegaConf.select(inf, "num_frames", default=None) is None:
             OmegaConf.update(inf, "num_frames", OmegaConf.select(dl, "num_frames", default=33), merge=False)
-        if OmegaConf.select(inf, "video_num_frames", default=None) is None:
-            OmegaConf.update(inf, "video_num_frames", _infer_video_num_frames(dl), merge=False)
         if OmegaConf.select(inf, "height", default=None) is None:
             OmegaConf.update(inf, "height", OmegaConf.select(dl, "height", default=384), merge=False)
         if OmegaConf.select(inf, "width", default=None) is None:
@@ -425,29 +411,21 @@ def build_server_from_config(
     ``checkpoint_step_*.safetensors``), merge deploy-side overrides on top via
     :func:`merge_deploy_cfg`, build the engine, and wrap it in a PolicyServer.
 
-    The engine is chosen here, once, from the CHECKPOINT's data layout: a ckpt trained on the
-    sparse-history layout (``dataloader.history_offsets`` set) gets the
-    :class:`SparseHistoryInferenceEngine` and a per-step observation buffer; every other ckpt the
-    first-frame :class:`JointInferenceEngine`.
+    Every checkpoint is served by :class:`SparseHistoryInferenceEngine` with a per-plan observation buffer over
+    the CHECKPOINT's ``dataloader.history_offsets`` (the first-frame layout is ``history_offsets: [0]``).
     """
     from omegaconf import OmegaConf
 
-    from openwam.deploy import JointInferenceEngine
     from openwam.deploy.model_loader import load_from_checkpoint_dir
+    from openwam.deploy.sparse_engine import SparseHistoryInferenceEngine
 
     deploy_cfg = cfg if cfg is not None else OmegaConf.create({})
     _validate_inference_config(deploy_cfg)
     _normalize_compile_enabled_in_cfg(deploy_cfg)
     training_cfg, architecture = load_from_checkpoint_dir(ckpt_dir, device=device, ckpt_name=ckpt_name)
     merged = merge_deploy_cfg(training_cfg, deploy_cfg)
-    history_offsets = OmegaConf.select(training_cfg, "dataloader.history_offsets", default=None)
-    if history_offsets is not None:
-        from openwam.deploy.sparse_engine import SparseHistoryInferenceEngine
-
-        history_offsets = [int(o) for o in history_offsets]
-        engine = SparseHistoryInferenceEngine(cfg=merged, architecture=architecture, history_offsets=history_offsets)
-    else:
-        engine = JointInferenceEngine(cfg=merged, architecture=architecture)
+    history_offsets = [int(o) for o in training_cfg.dataloader.history_offsets]
+    engine = SparseHistoryInferenceEngine(cfg=merged, architecture=architecture, history_offsets=history_offsets)
     return PolicyServer(engine=engine, cfg=merged, readiness_token=readiness_token, history_offsets=history_offsets,
                         ckpt=os.path.join(ckpt_dir, ckpt_name or "<latest>"))
 

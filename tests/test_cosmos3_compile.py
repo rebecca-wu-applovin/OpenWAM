@@ -62,10 +62,18 @@ def _state(*, batch=1, seq=6, padded=False, masked=False, mask_4d=False):
             "und_mask": und_mask,
             "cos_gen": angle.cos(),
             "sin_gen": angle.sin(),
-            "shared_attention_mask": gen_mask,
+            "test_gen_mask": gen_mask,  # what the tests pass as the layer mask (None = fully visible)
             "orig_hw": (1, seq),
         },
     )
+
+
+def _run(vb, block_id, state):
+    """``vb.run_block`` with the state's test gen mask (all-True when it has none). Returns: the new state."""
+    mask = state.extras["test_gen_mask"]
+    if mask is None:
+        mask = torch.ones(state.hidden_states.shape[1], state.hidden_states.shape[1], dtype=torch.bool)
+    return vb.run_block(block_id, state, mask)
 
 
 def test_default_options():
@@ -81,7 +89,7 @@ def test_custom_compile_options_are_forwarded(monkeypatch):
         {"enabled": True, "cosmos3_blocks": {"torch_mode": "max-autotune-no-cudagraphs", "dynamic": True}}
     )
     with torch.no_grad():
-        vb.run_block(0, _state())
+        _run(vb, 0, _state())
     compiler.assert_called_once_with(cosmos3_dit._gen_block_forward, dynamic=True, mode="max-autotune-no-cudagraphs")
 
 
@@ -105,7 +113,7 @@ def test_disabled_is_eager(monkeypatch, cfg):
     monkeypatch.setattr(torch, "compile", compiler)
     vb.apply_compile_optimizations(cfg)
     with torch.no_grad():
-        vb.run_block(0, _state())
+        _run(vb, 0, _state())
     compiler.assert_not_called()
 
 
@@ -121,7 +129,7 @@ def test_lazy_reuse_reset_and_checkpoint_keys(monkeypatch):
         for _ in range(2):
             state = _state()
             for i in range(2):
-                vb.run_block(i, state)
+                _run(vb, i, state)
     compiler.assert_called_once_with(cosmos3_dit._gen_block_forward, dynamic=False, mode="default")
     assert compiled.call_count == 4
     after = vb.state_dict()
@@ -131,7 +139,7 @@ def test_lazy_reuse_reset_and_checkpoint_keys(monkeypatch):
     assert vb._compiled_gen_block is None and not vb._gen_block_compile_enabled
     vb.apply_compile_optimizations({"enabled": True})
     with torch.no_grad():
-        vb.run_block(0, _state())
+        _run(vb, 0, _state())
     assert compiler.call_count == 2
 
 
@@ -151,7 +159,7 @@ def test_inference_only(monkeypatch, gate):
     elif gate == "outer_compile":
         monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     with torch.set_grad_enabled(gate == "grad"):
-        output = vb.run_block(0, state).hidden_states
+        output = _run(vb, 0, state).hidden_states
         if gate == "grad":
             output.sum().backward()
             assert vb.dit.layers[0].self_attn.add_q_proj.weight.grad is not None
@@ -162,21 +170,21 @@ def test_inference_only(monkeypatch, gate):
 def test_failure_retries_eager_once_and_can_reenable(monkeypatch, caplog, at_setup):
     vb = _backbone()
     with torch.no_grad():
-        expected = vb.run_block(0, _state()).hidden_states
+        expected = _run(vb, 0, _state()).hidden_states
     broken = Mock(side_effect=RuntimeError("compiler failed"))
     compiler = broken if at_setup else Mock(return_value=broken)
     monkeypatch.setattr(torch, "compile", compiler)
     vb.apply_compile_optimizations({"enabled": True})
     with torch.no_grad():
         for _ in range(2):
-            torch.testing.assert_close(vb.run_block(0, _state()).hidden_states, expected)
+            torch.testing.assert_close(_run(vb, 0, _state()).hidden_states, expected)
     assert compiler.call_count == 1
     assert vb._compiled_gen_block is None and not vb._gen_block_compile_enabled
     assert "falling back to eager" in caplog.text
     monkeypatch.setattr(torch, "compile", lambda fn, **kw: fn)
     vb.apply_compile_optimizations({"enabled": True})
     with torch.no_grad():
-        torch.testing.assert_close(vb.run_block(0, _state()).hidden_states, expected)
+        torch.testing.assert_close(_run(vb, 0, _state()).hidden_states, expected)
     assert vb._compiled_gen_block is not None
 
 
@@ -204,8 +212,8 @@ def test_fullgraph_block_loop_parity(monkeypatch, padded, masked, mask_4d):
             kwargs = dict(batch=2, seq=seq, padded=padded, masked=masked, mask_4d=mask_4d)
             eager, fast = _state(**kwargs), _state(**kwargs)
             for i in range(2):
-                cosmos3_dit.run_block(vb.dit, i, eager)
-                vb.run_block(i, fast)
+                cosmos3_dit.run_block(vb.dit, i, eager, gen_mask=eager.extras["test_gen_mask"])
+                _run(vb, i, fast)
                 assert vb._gen_block_compile_enabled  # Do not let fallback hide a capture failure.
                 torch.testing.assert_close(fast.hidden_states, eager.hidden_states, rtol=1e-5, atol=1e-5)
             torch.testing.assert_close(vb.finalize(fast), vb.finalize(eager), rtol=1e-5, atol=1e-5)
@@ -227,8 +235,8 @@ def test_late_failure_preserves_previous_layer_progress(monkeypatch, caplog):
     eager, fast = _state(), _state()
     with torch.no_grad():
         for i in range(2):
-            cosmos3_dit.run_block(vb.dit, i, eager)
-            vb.run_block(i, fast)
+            cosmos3_dit.run_block(vb.dit, i, eager, gen_mask=eager.extras["test_gen_mask"])
+            _run(vb, i, fast)
             torch.testing.assert_close(fast.hidden_states, eager.hidden_states)
     assert compiled.call_count == 2
     assert vb._compiled_gen_block is None and not vb._gen_block_compile_enabled
@@ -245,10 +253,10 @@ def test_actual_outer_compile_does_not_nest_inner_compile(monkeypatch, warm_inne
     vb.apply_compile_optimizations({"enabled": True})
     with torch.no_grad():
         if warm_inner:
-            vb.run_block(0, _state())
+            _run(vb, 0, _state())
         calls_before = compiler.call_count
-        expected = cosmos3_dit.run_block(vb.dit, 0, _state()).hidden_states
-        outer = real_compile(lambda state: vb.run_block(0, state).hidden_states, backend="eager", fullgraph=True)
+        expected = cosmos3_dit.run_block(vb.dit, 0, _state()).hidden_states  # no mask = fully visible
+        outer = real_compile(lambda state: _run(vb, 0, state).hidden_states, backend="eager", fullgraph=True)
         torch.testing.assert_close(outer(_state()), expected)
         assert compiler.call_count == calls_before
     torch._dynamo.reset()

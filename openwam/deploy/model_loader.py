@@ -76,14 +76,17 @@ def load_from_checkpoint_dir(
             (highest step number) checkpoint is used.
 
     Returns:
-        ``(cfg, architecture)`` — the resolved config and architecture
-        with all weights restored.
+        ``(cfg, architecture)`` — the resolved config (``resolve_config``: ``cfg.common.layout`` set) and
+        the architecture with all weights restored.
     """
     # 1. Load config
     config_path = os.path.join(ckpt_dir, "config.yaml")
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"config.yaml not found in {ckpt_dir}")
-    cfg = OmegaConf.load(config_path)
+    from openwam.config import resolve_config
+
+    # The deploy entry's resolve: a post-Task-8 ckpt already stores common.layout, so this only re-checks it.
+    cfg = resolve_config(OmegaConf.load(config_path))
 
     # 2. Resolve checkpoint file
     if ckpt_name is not None:
@@ -95,8 +98,10 @@ def load_from_checkpoint_dir(
     # 3. Build the empty architecture from the ckpt's own config + assets (LoadMode.CHECKPOINT, the same
     # shell the trainer builds for finetune / resume).
     from openwam.model import build_architecture_from_ckpt_dir
+    from openwam.model.architectures.base import INFERENCE_ONLY
 
-    architecture = build_architecture_from_ckpt_dir(ckpt_dir, cfg.model)
+    # Deploy never computes a loss: no training knobs.
+    architecture = build_architecture_from_ckpt_dir(ckpt_dir, cfg.model, cfg.common.layout, INFERENCE_ONLY)
     logger.info("Architecture: %s", type(architecture).__name__)
 
     # 4. Load all weights from checkpoint

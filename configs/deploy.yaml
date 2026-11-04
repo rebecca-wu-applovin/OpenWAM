@@ -41,7 +41,3 @@ optimization:
     cross_attn:
       torch_mode: default
       dynamic: false           # Action-side fast path for dual_system_cross_attn
-
-  prompt_embed_cache:
-    enabled: true             # false = skip prompt -> text embedding caching entirely
-    maxsize: 32               # LRU cap for prompt -> text embeddings cache

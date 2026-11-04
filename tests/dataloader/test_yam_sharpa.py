@@ -16,7 +16,7 @@ from omegaconf import OmegaConf
 from PIL import Image
 from scipy.spatial.transform import Rotation
 
-from openwam.dataloader.registry import build_dataset, list_registered_datasets
+from openwam.dataloader.registry import DATASET_REGISTRY, build_dataset
 from openwam.dataloader.utils import yam_sharpa_repr as R
 from openwam.dataloader.utils.normalization import load_stats_file
 from openwam.dataloader.utils.stats_computation.yam_sharpa_stats_computation import (
@@ -68,7 +68,16 @@ def _synthetic_episode(length: int, rng: np.random.Generator) -> dict:
     }
 
 
-def _write_source(root: Path, lengths, seed: int = 0) -> list:
+def _write_source(root: Path, lengths, seed: int = 0, splits: dict | None = None) -> list:
+    """Write a synthetic LeRobot v3 source (one data shard, empty mp4 files).
+
+    Args:
+        root: Path, dataset dir to create. lengths: list[int], rows per episode. seed: int, data RNG seed.
+        splits: optional ``info.json`` splits, e.g. ``{"val": "0:2"}`` (absent = every episode is train).
+
+    Returns:
+        list of per-episode dicts from :func:`_synthetic_episode`.
+    """
     rng = np.random.default_rng(seed)
     (root / "meta" / "episodes" / "chunk-000").mkdir(parents=True)
     (root / "data" / "chunk-000").mkdir(parents=True)
@@ -92,6 +101,7 @@ def _write_source(root: Path, lengths, seed: int = 0) -> list:
                 "features": features,
                 "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
                 "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+                **({"splits": splits} if splits else {}),
             }
         )
     )
@@ -149,10 +159,13 @@ def _cfg(sources: dict, **overrides):
         "action_mode": "fingertips_abs",
         "normalize_mode": None,
         "num_frames": 5,
-        "video_stride": 2,
+        "history_offsets": [0],  # the current frame + 2 future frames (rows t, t+2, t+4)
+        "future_offsets": [2, 4],
         "height": 480,
         "width": 320,
         "camera_layout": [EGO, CHEST],
+        "history_sampling": "fixed",
+        "history_window": 100,
         "seed": 0,
     }
     cfg.update(overrides)
@@ -167,7 +180,7 @@ def source(tmp_path):
 
 def _first_window(ds: MultiYamSharpaDataset) -> dict:
     with _mock_decoder():
-        return ds.datasets[0][0]  # episode 0, anchor t=0
+        return ds.datasets[0].sample(0, np.random.default_rng(0))  # episode 0, anchor t=0
 
 
 def _rot6d(Rm):
@@ -178,7 +191,7 @@ def _rot6d(Rm):
 
 
 def test_registry_includes_yam_sharpa():
-    assert "yam_sharpa" in list_registered_datasets()
+    assert "yam_sharpa" in DATASET_REGISTRY
 
 
 def test_fingertips_abs_moves_target_wrist_into_anchor_camera(source):
@@ -209,7 +222,7 @@ def test_fingertips_rel_is_delta_in_anchor_camera(source):
         for h, o in enumerate((0, 24)):
             W = cam0_inv @ ep["targets_world"][k][h]
             p_t = ep["state"][0, o : o + 3]
-            R_t = R._rotation_6d_to_matrix(ep["state"][0, o + 3 : o + 9][None])[0]
+            R_t = R.rotation_6d_to_matrix(ep["state"][0, o + 3 : o + 9][None])[0]
             np.testing.assert_allclose(s["action"][k, o : o + 3].numpy(), W[:3, 3] - p_t, atol=1e-4)
             np.testing.assert_allclose(s["action"][k, o + 3 : o + 9].numpy(), _rot6d(W[:3, :3] @ R_t.T), atol=1e-4)
             np.testing.assert_allclose(
@@ -271,17 +284,150 @@ def test_unknown_mode_and_unify_keys_rejected(source):
         build_dataset(_cfg({"a": (root, 1.0)}, unify_action=True), "train")
 
 
+def _all_samples(reader, seed: int = 0) -> list:
+    """Every window of one source reader, each drawn with its own ``(seed, k)`` RNG (fake video decoder).
+
+    Args:
+        reader: YamSharpaDataset. seed: int, RNG seed.
+
+    Returns:
+        list of sample dicts, one per window index.
+    """
+    with _mock_decoder():
+        return [reader.sample(k, np.random.default_rng([seed, k])) for k in range(len(reader))]
+
+
+def test_preload_never_rereads(source):
+    # The data shards are read once at construction; sampling afterwards never touches a parquet file.
+    root, _ = source
+    reader = build_dataset(_cfg({"a": (root, 1.0)}), "train").datasets[0]
+    with patch("pyarrow.parquet.read_table", side_effect=AssertionError("re-read a shard")) as read:
+        got = _all_samples(reader)
+    read.assert_not_called()
+    # Same samples, byte for byte, as reading the shard straight from parquet for every sample.
+    shard = root / "data" / "chunk-000" / "file-000.parquet"
+
+    def _direct(self, chunk_idx, file_idx):
+        return pq.read_table(shard, columns=list(self.NEEDED_COLS))
+
+    with patch.object(type(reader), "_load_data_table", _direct):
+        want = _all_samples(reader)
+    assert len(got) == len(want) > 0
+    for g, w in zip(got, want):
+        assert g["prompt"] == w["prompt"]
+        for k in ("action", "action_mask", "proprio", "proprio_mask"):
+            assert g[k].numpy().tobytes() == w[k].numpy().tobytes(), k
+
+
+# ── random history sampling (history_sampling=random) ───────────────────────
+
+RAND_HIST = [-8, -4, 0]  # fixed (val / deploy) offsets of the random-history sources below
+
+
+def _random_cfg(root: Path, **overrides):
+    """Config of one long-episode source with random history (window 40 rows) over ``RAND_HIST``."""
+    keys = {"history_offsets": RAND_HIST, "history_sampling": "random", "history_window": 40}
+    return _cfg({"a": (root, 1.0)}, **{**keys, **overrides})
+
+
+def test_random_history_offsets():
+    from openwam.dataloader.utils.sparse_history import sample_history_offsets
+
+    rng = np.random.default_rng(0)
+    seen = set()
+    for _ in range(2000):
+        o = sample_history_offsets(5, 100, rng)
+        # H offsets, strictly increasing, inside [-100, 0], ending at frame t.
+        assert o.shape == (5,) and o.dtype == np.int64
+        assert o[-1] == 0 and (np.diff(o) > 0).all() and o[0] >= -100
+        seen.update(o[:-1].tolist())
+    assert seen == set(range(-100, 0))  # every past row of the window gets drawn
+    np.testing.assert_array_equal(sample_history_offsets(1, 100, rng), [0])  # H=1: frame t only
+    # The draw is a function of the generator state alone.
+    a = sample_history_offsets(5, 100, np.random.default_rng([42, 3, 7]))
+    np.testing.assert_array_equal(a, sample_history_offsets(5, 100, np.random.default_rng([42, 3, 7])))
+
+
+def _offsets_by_index(ds, epoch: int, num_workers: int) -> list:
+    """History offsets each mixture index drew, read through a DataLoader.
+
+    Args:
+        ds: MultiYamSharpaDataset with random history. epoch: int, ``set_epoch`` value.
+        num_workers: int, DataLoader workers (forked, so the patches below reach them).
+
+    Returns:
+        list of (H,) offset lists, one per index in order.
+    """
+    import torch
+
+    import openwam.dataloader.yam_sharpa as ys
+
+    real_draw, real_sample, last = ys.sample_history_offsets, ys.YamSharpaDataset.sample, {}
+
+    def _draw(*args):
+        last["offsets"] = real_draw(*args)  # remember this process's latest draw
+        return last["offsets"]
+
+    def _sample(self, idx, rng):
+        out = real_sample(self, idx, rng)
+        out["_offsets"] = last.pop("offsets").tolist()  # the draw of this very sample
+        return out
+
+    ds.set_epoch(epoch)
+    with patch.object(ys, "sample_history_offsets", _draw), patch.object(ys.YamSharpaDataset, "sample", _sample):
+        with _mock_decoder():
+            loader = torch.utils.data.DataLoader(
+                ds, batch_size=None, num_workers=num_workers, multiprocessing_context="fork" if num_workers else None
+            )
+            return [s["_offsets"] for s in loader]
+
+
+def test_random_history_deterministic(tmp_path):
+    # Offsets come from the per-sample (seed, epoch, idx) RNG: worker count does not matter, the epoch does.
+    _write_source(tmp_path / "a", [60, 60])
+    ds = build_dataset(_random_cfg(tmp_path / "a"), "train")
+    serial = _offsets_by_index(ds, epoch=0, num_workers=0)
+    assert serial == _offsets_by_index(ds, epoch=0, num_workers=4)
+    assert all(len(o) == 3 and o[-1] == 0 and o[0] >= -40 for o in serial)
+    other = _offsets_by_index(ds, epoch=1, num_workers=0)
+    assert sum(a != b for a, b in zip(serial, other)) > len(serial) // 2
+
+
+def test_val_split_uses_fixed_offsets(tmp_path):
+    # Random history is a train-split augmentation; val always reads history_offsets (the deploy layout).
+    _write_source(tmp_path / "a", [60, 60], splits={"train": "0:2", "val": "0:2"})
+    rand_val = build_dataset(_random_cfg(tmp_path / "a"), "val").datasets[0]
+    fixed_val = build_dataset(_random_cfg(tmp_path / "a", history_sampling="fixed"), "val").datasets[0]
+    with patch("openwam.dataloader.yam_sharpa.sample_history_offsets", side_effect=AssertionError("drew")) as draw:
+        got = _all_samples(rand_val)
+    draw.assert_not_called()
+    want = _all_samples(fixed_val)
+    for g, w in zip(got, want):
+        assert g["proprio"].numpy().tobytes() == w["proprio"].numpy().tobytes()
+    # The same config on the train split does draw.
+    rand_train = build_dataset(_random_cfg(tmp_path / "a"), "train").datasets[0]
+    stub = lambda h, w, rng: np.array([-9, -1, 0])  # noqa: E731
+    with patch("openwam.dataloader.yam_sharpa.sample_history_offsets", wraps=stub) as draw:
+        _all_samples(rand_train)
+    assert draw.call_count == len(rand_train)
+
+
+def test_unknown_history_sampling_rejected(source):
+    root, _ = source
+    with pytest.raises(ValueError, match="history_sampling"):
+        build_dataset(_cfg({"a": (root, 1.0)}, history_sampling="uniform"), "train")
+
+
 # ── video layout ────────────────────────────────────────────────────────────
 
 
 def test_video_is_ego_over_chest(source):
     root, _ = source
     s = _first_window(build_dataset(_cfg({"a": (root, 1.0)}), "train"))
-    assert len(s["video"]) == 3  # num_frames=5, stride 2
+    assert len(s["video"]) == 3  # frame t + future rows t+2, t+4
     img = np.asarray(s["video"][0])
     assert img.shape == (480, 320, 3)
     assert (img[:240] == CAM_COLORS[EGO]).all() and (img[240:] == CAM_COLORS[CHEST]).all()
-    assert s["first_frame_image"][0] is s["video"][0]
 
 
 # ── probability sampling ────────────────────────────────────────────────────
@@ -298,22 +444,22 @@ def test_sampling_follows_weights_and_covers_every_window(tmp_path):
     counts = {"a": 0, "b": 0}
     n_b = len(ds.datasets[1])
 
-    def _record(self, j):
+    def _record(self, j, rng):
         picks[self._dataset_id].add(j)
         return {"_j": j}
 
-    with patch.object(type(ds.datasets[0]), "__getitem__", _record):
+    with patch.object(type(ds.datasets[0]), "sample", _record):
         for epoch in range(8):
             ds.set_epoch(epoch)
             for i in range(len(ds)):
-                counts[ds[i]["_dataset_name"]] += 1
+                counts[ds[i]["source"]] += 1
     frac_b = counts["b"] / (counts["a"] + counts["b"])
     assert abs(frac_b - 0.2) < 0.03
     # the down-weighted source is not stuck on its first windows
     assert len(picks["b"]) > 0.9 * n_b
 
     ds.set_epoch(0)
-    with patch.object(type(ds.datasets[0]), "__getitem__", _record):
+    with patch.object(type(ds.datasets[0]), "sample", _record):
         a0 = [ds[i]["_j"] for i in range(50)]
         b0 = [ds[i]["_j"] for i in range(50)]
     assert a0 == b0  # deterministic per (seed, epoch, idx)

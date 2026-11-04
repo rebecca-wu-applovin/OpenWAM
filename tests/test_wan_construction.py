@@ -265,18 +265,26 @@ def test_wan_registry_names_map_to_wan_backbone():
     assert _VIDEO_BACKBONE_REGISTRY["longlive2_robot_s"] is WanBackbone
 
 
-def test_required_mask_mode_checked_by_architecture(longlive_cfg):
-    """The yaml's required_video_attention_mask_mode is enforced at architecture build, before any weight load."""
-    from types import SimpleNamespace
+def test_required_clean_attention_checked_by_resolve_config(longlive_cfg):
+    """The yaml's required_clean_attention (LongLive: causal) is enforced by resolve_config, before any build."""
+    from omegaconf import OmegaConf
 
-    from openwam.model.architectures.base import BaseWAMArchitecture
-    from openwam.model.video_backbone import LoadMode
+    from openwam.config import resolve_config
 
-    # Only the check runs (it raises before build_video_backbone), so a stub self is enough.
-    arch = SimpleNamespace(_cfg_get=BaseWAMArchitecture._cfg_get)
-    params = {"video_backbone": longlive_cfg, "video_attention_mask_mode": "first_frame_causal"}
-    with pytest.raises(ValueError, match="history_per_frame_causal"):
-        BaseWAMArchitecture._init_video_backbone(arch, params, LoadMode.PRETRAINED, None)
+    def _cfg(clean):
+        return OmegaConf.create({
+            "dataloader": {"history_offsets": [-20, 0], "future_offsets": [4, 8, 12, 16], "num_frames": 33,
+                           "history_sampling": "fixed", "history_window": 100},
+            "model": {
+                "architecture": {"history_encoding": "per_frame", "clean_attention": clean,
+                                 "attention_mask_mode": "mutual", "proprio_input": "context_token"},
+                "video_backbone": OmegaConf.to_container(longlive_cfg, resolve=True),
+            },
+        })
+
+    with pytest.raises(ValueError, match="causal"):
+        resolve_config(_cfg("bidirectional"))
+    assert resolve_config(_cfg("causal")).common.layout.num_latents == 3
 
 
 # ----------------------------------------------------------------------------- real weights

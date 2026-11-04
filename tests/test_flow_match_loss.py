@@ -42,9 +42,8 @@ def test_video_loss_basic():
     target = torch.randn(2, 16, 5, 4, 4)
     timestep_ids = torch.tensor([10, 20])
 
-    # One clean prefix latent, skipped by the loss.
-    inputs = {"clean_latents": torch.zeros(2, 16, 1, 4, 4)}
-    loss = arch._compute_video_loss(noise_pred, target, timestep_ids, inputs, device="cpu")
+    # One clean prefix latent (the layout's num_hist_latents), skipped by the loss.
+    loss = arch._compute_video_loss(noise_pred, target, timestep_ids, device="cpu")
     assert loss.shape == ()
     assert loss.item() > 0
 
@@ -56,7 +55,8 @@ def test_action_loss_basic():
     target = torch.randn(2, 49, 14)
     timestep_ids = torch.tensor([5, 15])
 
-    loss = arch._compute_action_loss(noise_pred, target, timestep_ids, _MockScheduler(), inputs={}, device="cpu")
+    pad = torch.zeros(2, 49, 14, dtype=torch.bool)
+    loss = arch._compute_action_loss(noise_pred, target, timestep_ids, _MockScheduler(), pad, device="cpu")
     assert loss.shape == ()
     assert loss.item() > 0
 
@@ -68,7 +68,8 @@ def test_action_loss_single_sample():
     target = torch.randn(1, 49, 14)
     timestep_ids = torch.tensor([10])
 
-    loss = arch._compute_action_loss(noise_pred, target, timestep_ids, _MockScheduler(), inputs={}, device="cpu")
+    pad = torch.zeros(1, 49, 14, dtype=torch.bool)
+    loss = arch._compute_action_loss(noise_pred, target, timestep_ids, _MockScheduler(), pad, device="cpu")
     assert loss.shape == ()
 
 
@@ -79,9 +80,10 @@ def test_action_loss_per_token_timestep():
     noise_pred = torch.randn(B, T, action_dim)
     target = torch.randn(B, T, action_dim)
     timestep_ids = torch.randint(0, 1000, (B, T))
+    pad = torch.zeros(B, T, action_dim, dtype=torch.bool)
 
     with pytest.raises(ValueError, match="per-sample"):
-        arch._compute_action_loss(noise_pred, target, timestep_ids, _MockScheduler(), inputs={}, device="cpu")
+        arch._compute_action_loss(noise_pred, target, timestep_ids, _MockScheduler(), pad, device="cpu")
 
 
 def test_action_loss_per_token_timestep_with_pad():
@@ -91,10 +93,9 @@ def test_action_loss_per_token_timestep_with_pad():
     noise_pred = torch.randn(B, T, action_dim)
     target = torch.randn(B, T, action_dim)
     timestep_ids = torch.randint(0, 1000, (B, T))
-    action_is_pad = torch.zeros(B, T, dtype=torch.bool)
+    action_is_pad = torch.zeros(B, T, action_dim, dtype=torch.bool)
     action_is_pad[0, 7:] = True
     action_is_pad[1, 4:] = True
 
-    inputs = {"action_is_pad": action_is_pad}
     with pytest.raises(ValueError, match="per-sample"):
-        arch._compute_action_loss(noise_pred, target, timestep_ids, _MockScheduler(), inputs=inputs, device="cpu")
+        arch._compute_action_loss(noise_pred, target, timestep_ids, _MockScheduler(), action_is_pad, device="cpu")
