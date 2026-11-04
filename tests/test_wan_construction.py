@@ -298,7 +298,8 @@ def test_required_clean_attention_checked_by_resolve_config(longlive_cfg):
                            "history_sampling": "fixed", "history_window": 100,
                            "caption_dropout_p": 0.0},
             "model": {
-                "architecture": {"history_encoding": "per_frame", "clean_attention": clean,
+                "architecture": {"variant": "joint_self_attn", "bridge_interval": 1,
+                                 "history_encoding": "per_frame", "clean_attention": clean,
                                  "attention_mask_mode": "mutual", "proprio_input": "context_token"},
                 "video_backbone": OmegaConf.to_container(longlive_cfg, resolve=True),
             },

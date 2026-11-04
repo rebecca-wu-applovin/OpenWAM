@@ -21,8 +21,7 @@ from einops import rearrange
 from torch import Tensor
 
 if TYPE_CHECKING:
-    from openwam.model.action_backbone.base import ActionDiTBackbone
-    from openwam.model.architectures.base import ActionState
+    from openwam.model.action_backbone.separate_action_dit import ActionDiTState, MoTActionDiT
     from openwam.model.video_backbone.base import BlockLoopState, VideoBackbone
 
 
@@ -48,7 +47,7 @@ class DualSystemMoTDriver:
     def __init__(
         self,
         vb: "VideoBackbone",
-        ab: "ActionDiTBackbone",
+        ab: "MoTActionDiT",
         *,
         frame_mask: Tensor,
         mot_checkpoint_mixed_attn: bool,
@@ -79,7 +78,6 @@ class DualSystemMoTDriver:
         self.ab = ab
         self.num_layers = vb.num_layers
         self.num_heads = vb.num_heads
-        self.head_dim = vb.head_dim
         self.mot_checkpoint_mixed_attn = bool(mot_checkpoint_mixed_attn)
         self.frame_mask = frame_mask
 
@@ -115,12 +113,12 @@ class DualSystemMoTDriver:
         self,
         layer_id: int,
         vstate: "BlockLoopState",
-        astate: "ActionState",
+        astate: "ActionDiTState",
         attn_mask: Optional[Tensor] = None,
         *,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
-    ) -> Tuple["BlockLoopState", "ActionState"]:
+    ) -> Tuple["BlockLoopState", "ActionDiTState"]:
         """Run one mixed-attention layer.
 
         Pulls Q/K/V from each backbone, concatenates along sequence,
@@ -159,10 +157,10 @@ class DualSystemMoTDriver:
         self,
         layer_id: int,
         vstate: "BlockLoopState",
-        astate: "ActionState",
+        astate: "ActionDiTState",
         attn_mask: Optional[Tensor],
         mixed_attention: Callable[[Tensor, Tensor, Tensor, Optional[Tensor]], Tensor],
-    ) -> Tuple["BlockLoopState", "ActionState"]:
+    ) -> Tuple["BlockLoopState", "ActionDiTState"]:
         """Unwrapped per-layer body. See :meth:`step` for the public entry point.
 
         ``mixed_attention`` is :meth:`_mixed_attention` or :meth:`_checkpointed_mixed_attention`, chosen by
@@ -170,7 +168,7 @@ class DualSystemMoTDriver:
 
         INVARIANT (consumed by :meth:`_step_checkpointed`): this method must
         only reassign the two layer-varying tensor fields ``vstate.hidden_states`` and
-        ``astate.payload.x_action``. It MUST NOT mutate any layer-invariant
+        ``astate.x_action``. It MUST NOT mutate any layer-invariant
         field of ``vstate`` / ``astate`` in place — concretely, do not
         write into ``extras``, or mutate ``context`` /
         ``freqs`` / ``t_mod``. ``_step_checkpointed`` runs this body inside
@@ -217,14 +215,14 @@ class DualSystemMoTDriver:
         self,
         layer_id: int,
         vstate: "BlockLoopState",
-        astate: "ActionState",
+        astate: "ActionDiTState",
         *,
         attn_mask: Optional[Tensor],
         offload: bool,
-    ) -> Tuple["BlockLoopState", "ActionState"]:
+    ) -> Tuple["BlockLoopState", "ActionDiTState"]:
         """Run :meth:`_step_impl` under ``torch.utils.checkpoint``.
 
-        ``_step_impl`` mutates ``vstate.hidden_states`` and ``astate.payload.x_action``
+        ``_step_impl`` mutates ``vstate.hidden_states`` and ``astate.x_action``
         as it walks the block, which is fine on forward but lethal on
         backward: ``torch.utils.checkpoint`` re-runs the closure during
         recompute, and that second mutation would clobber the post-forward
@@ -232,7 +230,7 @@ class DualSystemMoTDriver:
         recomputed activation from an earlier layer once backward unwinds.
 
         We avoid that by giving the closure shallow copies of the state
-        containers (``copy.copy`` on the dataclass / payload — same field
+        containers (``copy.copy`` on both dataclasses — same field
         references, fresh wrappers). Layer-invariant fields like
         ``context`` / ``freqs`` / ``t_mod`` / ``extras``
         are still shared by reference (cheap), but the two tensor fields
@@ -242,20 +240,18 @@ class DualSystemMoTDriver:
         new tensor values onto the outer ``vstate`` / ``astate`` for the
         next layer's iteration in ``run_joint_loop``.
         """
-        outer_payload = astate.payload
 
         def _run(vx: Tensor, ax: Tensor) -> Tuple[Tensor, Tensor]:
+            # Fresh wrappers around the shared layer-invariant fields; only the two hidden states are local.
             local_vstate = copy.copy(vstate)
             local_astate = copy.copy(astate)
-            local_payload = copy.copy(outer_payload)
-            local_astate.payload = local_payload
             local_vstate.hidden_states = vx
-            local_payload.x_action = ax
+            local_astate.x_action = ax
             self._step_impl(layer_id, local_vstate, local_astate, attn_mask, self._mixed_attention)
-            return local_vstate.hidden_states, local_payload.x_action
+            return local_vstate.hidden_states, local_astate.x_action
 
         vx0 = vstate.hidden_states
-        ax0 = outer_payload.x_action
+        ax0 = astate.x_action
 
         if offload:
             with torch.autograd.graph.save_on_cpu():
@@ -264,17 +260,17 @@ class DualSystemMoTDriver:
             new_vx, new_ax = torch.utils.checkpoint.checkpoint(_run, vx0, ax0, use_reentrant=False)
 
         vstate.hidden_states = new_vx
-        outer_payload.x_action = new_ax
+        astate.x_action = new_ax
         return vstate, astate
 
     def run_joint_loop(
         self,
         vstate: "BlockLoopState",
-        astate: "ActionState",
+        astate: "ActionDiTState",
         *,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
-    ) -> Tuple["BlockLoopState", "ActionState"]:
+    ) -> Tuple["BlockLoopState", "ActionDiTState"]:
         """Run the full per-layer loop over both modalities.
 
         Expands the frame mask to per-layer token masks once (token counts are
@@ -282,8 +278,8 @@ class DualSystemMoTDriver:
         two ``use_gradient_*`` flags are forwarded to :meth:`step` so each layer
         may opt into step-level activation checkpointing.
         """
-        # Action tokens in the joint sequence: ``payload`` is the ActionDiTState from ActionDiT.prepare_state.
-        s_action = astate.payload.x_action.shape[1]
+        # Action tokens in the joint sequence.
+        s_action = astate.x_action.shape[1]
         # The backbone owns its token order (views, text / proprio tokens, prefix keys); the rules are the frame mask's.
         layer_masks = self.vb.build_joint_attention_masks(self.frame_mask, vstate, s_action)
         if len(layer_masks) != self.num_layers:

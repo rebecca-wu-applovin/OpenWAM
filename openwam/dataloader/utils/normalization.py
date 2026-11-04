@@ -1,7 +1,8 @@
 """In-reader normalization: the stats file, the forward map (training + deploy proprio) and its inverse (deploy actions).
 
 ``dataloader.normalize_mode`` is ``null`` (off) or one of :data:`NORMALIZE_MODES`; :func:`normalization_on` is the one
-place that reads it. A stats file holds one block per ``action_mode`` key, each with all six vectors of
+function that interprets it (the dataset's ``from_config`` decides normalization with it once; the trainer and deploy
+use it for their own on / off checks). A stats file holds one block per ``action_mode`` key, each with all six vectors of
 :data:`STAT_KEYS` (``yam_sharpa_stats_computation`` writes them); a missing block or field raises.
 """
 

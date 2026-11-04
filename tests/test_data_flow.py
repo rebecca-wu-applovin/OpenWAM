@@ -114,7 +114,7 @@ def fake_arch():
             "state_dim": 6,
         }
         backbone = _MockVideoBackbone(dim=64, num_layers=2, num_heads=4, text_dim=16)
-        return build_test_arch("dual_system_self_attn", cfg, backbone, layout=make_layout(h=5))
+        return build_test_arch("joint_self_attn", cfg, backbone, layout=make_layout(h=5))
 
     return _build
 

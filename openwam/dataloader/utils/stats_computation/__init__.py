@@ -1,8 +1,7 @@
 """Offline stats precompute tools for dataloaders.
 
-CLI modules that scan a dataset once and write the normalization stats the
-readers require at train time — one ``<dataset>_stats_computation`` module per
-dataset family.
+``yam_sharpa_stats_computation``: scans the yam_sharpa sources once and writes the pooled normalization stats the
+dataset requires at train time (also built on first use by ``MultiYamSharpaDataset.from_config``).
 
-Run any of them as ``python -m openwam.dataloader.utils.stats_computation.<module>``.
+Run it as ``python -m openwam.dataloader.utils.stats_computation.yam_sharpa_stats_computation``.
 """

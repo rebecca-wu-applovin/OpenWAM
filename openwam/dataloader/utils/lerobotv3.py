@@ -22,9 +22,6 @@ Functions
 - apply_info_splits(eps_df, split, info_splits, *, source_name=...)
     Honor ``info.json["splits"][split]`` when present; otherwise default train to the full eps_df and val to empty.
     Raises with a clear message on malformed split specs.
-
-- effective_episode_frames(eps_df, length_col="length")
-    Validate and return each row's post-trim sampleable span.
 """
 
 from __future__ import annotations
@@ -140,44 +137,9 @@ def apply_info_splits(
     return eps_df.reset_index(drop=True) if split == "train" else eps_df.iloc[0:0].reset_index(drop=True)
 
 
-def effective_episode_frames(eps_df: pd.DataFrame, length_col: str = "length") -> np.ndarray:
-    """Return validated post-trim frame counts for each episode row.
-
-    Readers that physically shift offsets during trimming also replace
-    ``length`` and therefore need no special handling. Segment-based readers
-    retain nominal ``length`` and provide the sampleable half-open range through
-    the paired ``_valid_start`` / ``_valid_end`` columns.
-    """
-    nominal = eps_df[length_col].to_numpy(dtype=np.int64)
-    if np.any(nominal < 0):
-        raise ValueError(f"episode {length_col!r} values must be non-negative")
-    if length_col != "length":
-        return nominal
-
-    has_start = "_valid_start" in eps_df.columns
-    has_end = "_valid_end" in eps_df.columns
-    if has_start != has_end:
-        missing = "_valid_end" if has_start else "_valid_start"
-        raise ValueError(f"episode table has only one valid-range column; missing {missing!r}")
-    if not has_start:
-        return nominal
-
-    valid_start = eps_df["_valid_start"].to_numpy(dtype=np.int64)
-    valid_end = eps_df["_valid_end"].to_numpy(dtype=np.int64)
-    invalid = (valid_start < 0) | (valid_end < valid_start) | (valid_end > nominal)
-    if np.any(invalid):
-        bad_pos = np.flatnonzero(invalid)[:5]
-        preview = ", ".join(
-            f"row {int(i)}: [{int(valid_start[i])}, {int(valid_end[i])}) / length {int(nominal[i])}" for i in bad_pos
-        )
-        raise ValueError(f"episode valid ranges must satisfy 0 <= start <= end <= length ({preview})")
-    return valid_end - valid_start
-
-
 __all__ = [
     "parse_info_json",
     "load_episodes_parquet",
     "compute_file_local_offsets",
     "apply_info_splits",
-    "effective_episode_frames",
 ]

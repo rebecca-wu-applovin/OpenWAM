@@ -232,6 +232,8 @@ def _cfg(h=5, f=8, encoding="per_frame", tc=4, clean="bidirectional", va="mutual
             },
             "model": {
                 "architecture": {
+                    "variant": "joint_self_attn",
+                    "bridge_interval": 1,
                     "history_encoding": encoding,
                     "clean_attention": clean,
                     "attention_mask_mode": va,
@@ -263,6 +265,14 @@ def test_resolve_config_rejects_bool_seed():
     cfg.project.seed = True
     with pytest.raises(ValueError, match="project.seed"):
         resolve_config(cfg)
+
+
+def test_bridge_interval_must_be_1_for_joint_self_attn():
+    # joint_self_attn runs one mixed attention per video layer: a stride is rejected by its key name.
+    with pytest.raises(ValueError, match=r"model\.architecture\.bridge_interval"):
+        resolve_config(_cfg(bridge_interval=2))
+    # joint_cross_attn: the stride selects the bridged video layers.
+    resolve_config(_cfg(variant="joint_cross_attn", bridge_interval=2))
 
 
 def test_resolve_config_layout():

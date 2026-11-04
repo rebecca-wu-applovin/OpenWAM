@@ -1,6 +1,7 @@
 """Abstract base class of every dataset the trainer reads (registered with ``register_dataset``)."""
 
 from abc import ABC, abstractmethod
+from typing import List, Optional
 
 import torch
 
@@ -8,11 +9,29 @@ import torch
 class BaseDataset(ABC, torch.utils.data.Dataset):
     """Abstract root of the trainer-facing datasets (``build_dataset`` returns one).
 
-    The contract: ``__getitem__`` / ``__len__`` and :meth:`eval_view`. Per-source metadata such as the action
-    dimensionality (``action_dim``) or normalization stats (``normalization_stats``) is NOT part of the base
-    contract; the dataset abstraction does not bake an action-conditioned model in. Source readers
-    (``LeRobotV3Reader``) are not BaseDatasets: a registered dataset (``MultiYamSharpaDataset``) wraps them.
+    The contract is what the trainer calls: :meth:`from_config` (``build_dataset``), ``__getitem__`` / ``__len__``,
+    :meth:`eval_view`, :meth:`set_epoch`, :meth:`all_prompts` and the ``normalization_stats_path`` attribute. Source
+    readers (``LeRobotV3Reader``) are not BaseDatasets: a registered dataset (``MultiYamSharpaDataset``) wraps them.
+
+    Attributes:
+        normalization_stats_path: str, the stats file the trainer copies into checkpoints (deploy denormalizes
+            with it), or None when normalization is off. Set by the subclass's ``__init__``.
     """
+
+    normalization_stats_path: Optional[str]
+
+    @classmethod
+    @abstractmethod
+    def from_config(cls, config, split: str) -> "BaseDataset":
+        """Build the dataset from its config slice.
+
+        Args:
+            config: ``merge(cfg.common, cfg.dataloader)``.
+            split: str, ``train`` / ``val``.
+
+        Returns:
+            the dataset.
+        """
 
     @abstractmethod
     def __getitem__(self, idx: int) -> dict:
@@ -35,6 +54,14 @@ class BaseDataset(ABC, torch.utils.data.Dataset):
 
     @abstractmethod
     def __len__(self) -> int: ...
+
+    @abstractmethod
+    def set_epoch(self, epoch: int) -> None:
+        """Args: epoch: int, the trainer's epoch (called once per epoch; it may change every index's draw)."""
+
+    @abstractmethod
+    def all_prompts(self) -> List[str]:
+        """Returns: sorted list[str] of every prompt a sample can carry (the trainer caches their text embeddings)."""
 
     @abstractmethod
     def eval_view(self) -> "BaseDataset":

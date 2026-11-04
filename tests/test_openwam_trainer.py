@@ -269,7 +269,7 @@ def _make_tiny_arch(train_options=TEST_TRAIN_OPTIONS):
     """Tiny joint_cross_attn architecture on a mock video backbone (CPU, fp32)."""
     # The ActionDiT geometry follows the backbone: 2 heads of 16, a 64-wide text context.
     backbone = _MockVideoBackbone(dim=64, num_layers=2, num_heads=2, head_dim=16, text_dim=64)
-    arch = build_test_arch("dual_system_cross_attn", _TINY_ARCH_CFG, backbone, train_options=train_options)
+    arch = build_test_arch("joint_cross_attn", _TINY_ARCH_CFG, backbone, train_options=train_options)
     arch._device = torch.device("cpu")
     arch._dtype = torch.float32
     return arch

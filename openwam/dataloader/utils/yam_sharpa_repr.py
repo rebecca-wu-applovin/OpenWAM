@@ -40,6 +40,14 @@ from openwam.dataloader.utils.unify_action import UNIFY_DIM
 
 ACTION_REPRS: Tuple[str, ...] = ("fingertips_abs", "fingertips_rel", "unify_abs", "unify_rel")
 
+# Parquet columns the representations read (shapes per frame: 48, 48, 56, 56, 16); the reader and the stats
+# computation both import them from here.
+STATE_COL = "observation.state"  # measured hand pose
+ACTION_COL = "action"  # setpoint FK: target wrist + fingertips
+JOINT_COL = "joint_angles"  # measured joints (arm 12 + hand 44)
+SETPOINT_COL = "joint_setpoints"  # target joints
+CAM_POSE_COL = "camera_pose.ego_view"  # base_from_camera, row-major 4x4
+
 POSE48_DIM = 48  # observation.state / action width
 JOINT56_DIM = 56  # joint_angles / joint_setpoints width
 CAM_POSE_DIM = 16  # camera_pose.<cam> (row-major 4x4)
@@ -371,8 +379,13 @@ def split_hand_targets(action_repr: str, actions: np.ndarray) -> dict:
 
 
 __all__ = [
+    "ACTION_COL",
     "ACTION_REPRS",
+    "CAM_POSE_COL",
     "CAM_POSE_DIM",
+    "JOINT_COL",
+    "SETPOINT_COL",
+    "STATE_COL",
     "JOINT56_DIM",
     "POSE48_DIM",
     "UNIFY_ACTION_MAP",

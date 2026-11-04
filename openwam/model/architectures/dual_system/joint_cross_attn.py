@@ -8,23 +8,31 @@ action gradients from flowing back into the video DiT.
 
 from __future__ import annotations
 
-import logging
 from typing import Optional, Tuple
 
 from omegaconf import DictConfig
 from torch import Tensor
 
-from openwam.model.action_backbone.separate_action_dit import ActionDiT
+from openwam.model.action_backbone.separate_action_dit import CrossAttnActionDiT
 from openwam.model.architectures.base import BaseWAMArchitecture, TrainOptions
 from openwam.model.architectures.registry import register_architecture
-from openwam.model.architectures.utils.common import bridge_layers
 from openwam.model.video_backbone.base import TextCondition
 from openwam.model.video_backbone.registry import LoadMode
 
-logger = logging.getLogger(__name__)
+
+def select_bridge_layers(num_video_layers: int, bridge_interval: int) -> tuple[int, ...]:
+    """Video DiT layers whose hidden state feeds an ActionDiT block (one block each, ascending).
+
+    Args:
+        num_video_layers: int, the video backbone's layer count (yaml ``geometry.num_layers``).
+        bridge_interval: int >= 1 (checked by resolve_config), stride over the video layers (1 = every layer).
+
+    Returns: tuple of ascending layer ids ``range(0, num_video_layers, bridge_interval)``.
+    """
+    return tuple(range(0, num_video_layers, bridge_interval))
 
 
-@register_architecture("dual_system_cross_attn", framework="dual_system", variant="joint_cross_attn")
+@register_architecture(framework="dual_system", variant="joint_cross_attn")
 class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
     """DualSystem with bridge cross-attention.
 
@@ -43,58 +51,16 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
         train_options: TrainOptions,
     ):
         """Arguments as in :class:`BaseWAMArchitecture`; ``cfg.action_backbone`` sizes the ActionDiT."""
-        super().__init__(cfg, mode=mode, assets=assets, ckpt_dir=ckpt_dir, train_options=train_options)
-        ab, geometry = cfg.action_backbone, cfg.video_backbone.geometry
-        # One ActionDiT block per bridged video layer; geometry is the yaml block _build_video_backbone checked,
+        # One ActionDiT block per bridged video layer; geometry is the yaml block _build_video_backbone checks,
         # so every id in range(0, num_layers, interval) is a layer the video forward runs.
-        bl = bridge_layers(int(geometry.num_layers), int(cfg.architecture.bridge_interval))
-        self._init_proprio_context(
-            enabled=bool(cfg.architecture.use_proprioception),
-            state_dim=int(cfg.state_dim),
-            text_dim=int(geometry.text_dim),
+        num_video_layers = int(cfg.video_backbone.geometry.num_layers)
+        bridge_ids = select_bridge_layers(num_video_layers, int(cfg.architecture.bridge_interval))
+        super().__init__(
+            cfg, mode=mode, assets=assets, ckpt_dir=ckpt_dir, train_options=train_options,
+            action_dit_cls=CrossAttnActionDiT, num_action_layers=len(bridge_ids),
         )
+        self.bridge_layers = bridge_ids
         self._detach_bridge = bool(cfg.architecture.detach_bridge)
-
-        # The action residual width (dim) may differ from num_heads * head_dim: Q/K/V project across the gap.
-        self.action_backbone = ActionDiT.from_cfg(
-            ab, action_dim=int(cfg.action_dim), bridge_layers=bl, variant="joint_cross_attn"
-        )
-
-    @property
-    def detach_bridge(self) -> bool:
-        return self._detach_bridge
-
-    def _predict_actions_from_bridges(
-        self,
-        noisy_actions: Tensor,
-        bridges: dict[int, Tensor],
-        action_timestep: Tensor,
-        *,
-        context: Optional[Tensor] = None,
-        context_mask: Optional[Tensor] = None,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
-    ) -> Tensor:
-        """Predict actions from collected bridge tensors.
-
-        Args:
-            noisy_actions: (B, T_a, A) noisy action latents.
-            bridges: {video layer id: (B, L_v, video_dim) bridge hidden state}.
-            action_timestep: (B,) action timestep.
-            context / context_mask: (B, L, text_dim) action-side context and its (B, L) mask, or None.
-            use_gradient_checkpointing / use_gradient_checkpointing_offload: bool training checkpoint switches.
-
-        Returns: (B, T_a, A) action prediction.
-        """
-        return self.action_backbone(
-            noisy_actions,
-            bridges,
-            action_timestep,
-            context=context,
-            context_mask=context_mask,
-            use_gradient_checkpointing=use_gradient_checkpointing,
-            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-        )
 
     def forward(
         self,
@@ -111,35 +77,24 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
     ) -> Tuple[Tensor, Tensor]:
         """Joint forward; arguments as in :meth:`BaseWAMArchitecture.forward`. Returns (video pred, action pred)."""
         video_backbone = self.video_backbone
-        action_backbone = self.action_backbone
-
-        # Each stream's context (proprio tokens per cfg proprio_input).
-        video_text, action_text = self.build_contexts(text, proprio, proprio_mask)
-        vstate = video_backbone.prepare(
-            latents=latents,
-            timestep=timestep,
-            text=video_text,
-            layout=self.layout,
-            proprio=proprio,
-            use_gradient_checkpointing=use_gradient_checkpointing,
-            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+        vstate, action_text = self._prepare_video(
+            latents, timestep, text, proprio, proprio_mask,
+            use_gradient_checkpointing, use_gradient_checkpointing_offload,
         )
 
         # The video's own self-attention reads the frame mask's video block (no action tokens in this stream).
         masks = video_backbone.build_joint_attention_masks(self.frame_mask, vstate, 0)
-        bridge_set = frozenset(action_backbone.bridge_layers)
-        bridges: dict[int, Tensor] = {}
-        detach_bridge = self._detach_bridge
-
+        bridge_set = frozenset(self.bridge_layers)
+        # Collected in ascending layer order = ActionDiT block order.
+        bridges: list[Tensor] = []
         for block_id in range(video_backbone.num_layers):
             vstate = video_backbone.run_block(block_id, vstate, masks[block_id])
             if block_id in bridge_set:
                 bridge = vstate.hidden_states
-                bridges[block_id] = bridge.detach() if detach_bridge else bridge
+                bridges.append(bridge.detach() if self._detach_bridge else bridge)
 
-        # Every bridge layer is a video layer (range over geometry.num_layers), so the bridge set is complete here.
         video_pred = video_backbone.finalize(vstate)
-        action_pred = self._predict_actions_from_bridges(
+        action_pred = self.action_backbone(
             noisy_actions,
             bridges,
             action_timestep,

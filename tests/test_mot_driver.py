@@ -15,8 +15,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from openwam.model.action_backbone.separate_action_dit import ActionDiT
-from openwam.model.architectures.base import ActionState
+from openwam.model.action_backbone.separate_action_dit import ActionDiTState, MoTActionDiT
 from openwam.model.architectures.dual_system.mot_driver import DualSystemMoTDriver
 from openwam.model.architectures.utils.mask_modes import build_frame_mask
 from openwam.model.video_backbone.base import BlockLoopState
@@ -27,8 +26,8 @@ from tests.test_openwam_trainer import _MockVideoBackbone
 # ---------------------------------------------------------------------------
 
 
-def _make_action_dit(*, dim: int = 32, num_heads: int = 4, num_layers: int = 2, action_dim: int = 7) -> ActionDiT:
-    return ActionDiT(
+def _make_action_dit(*, dim: int = 32, num_heads: int = 4, num_layers: int = 2, action_dim: int = 7) -> MoTActionDiT:
+    return MoTActionDiT(
         shift_action=5.0,
         train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=action_dim,
@@ -36,9 +35,6 @@ def _make_action_dit(*, dim: int = 32, num_heads: int = 4, num_layers: int = 2, 
         ffn_dim=dim * 2,
         num_heads=num_heads,
         num_layers=num_layers,
-        video_dim=dim,
-        bridge_layers=tuple(range(num_layers)),
-        variant="joint_self_attn",
         text_dim=dim,
         attn_head_dim=dim // num_heads,
         freq_dim=256,
@@ -47,7 +43,7 @@ def _make_action_dit(*, dim: int = 32, num_heads: int = 4, num_layers: int = 2, 
     )
 
 
-def _make_action_context(ab: ActionDiT, B: int, T_ctx: int = 4, *, generator: torch.Generator | None = None):
+def _make_action_context(ab: MoTActionDiT, B: int, T_ctx: int = 4, *, generator: torch.Generator | None = None):
     context = torch.randn(B, T_ctx, ab.text_dim, generator=generator)
     context_mask = torch.ones(B, T_ctx, dtype=torch.bool)
     return context, context_mask
@@ -60,12 +56,12 @@ def _fm(t: int, n_clean: int = 1):
 
 def _make_states(
     vb: _MockVideoBackbone,
-    ab: ActionDiT,
+    ab: MoTActionDiT,
     *,
     B: int = 2,
     s_video: int = 9,
     s_action: int = 5,
-) -> Tuple[BlockLoopState, ActionState]:
+) -> Tuple[BlockLoopState, ActionDiTState]:
     """Build minimal vstate/astate ready for driver.step."""
     dim = vb.dim
     vstate = BlockLoopState(
@@ -206,7 +202,7 @@ def test_driver_handles_heterogeneous_hidden_dim_end_to_end():
     torch.manual_seed(0)
     vb = _MockVideoBackbone(dim=64, num_layers=2, num_heads=4)
     # Action: hidden=32, attn_hidden = 4*16 = 64 (matches video's per-head layout).
-    ab = ActionDiT(
+    ab = MoTActionDiT(
         shift_action=5.0,
         train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=7,
@@ -214,9 +210,6 @@ def test_driver_handles_heterogeneous_hidden_dim_end_to_end():
         ffn_dim=64,
         num_heads=4,
         num_layers=2,
-        video_dim=64,
-        bridge_layers=(0, 1),
-        variant="joint_self_attn",
         attn_head_dim=16,
         text_dim=32,
         freq_dim=256,
@@ -325,7 +318,7 @@ def test_action_uses_own_projected_text_context():
         )
         with torch.no_grad():
             _, astate2 = driver.run_joint_loop(vstate, astate)
-        return astate2.payload.x_action
+        return astate2.x_action
 
     ctx_a = torch.randn(B, T_ctx, ab.text_dim, generator=torch.Generator().manual_seed(11))
     ctx_b = torch.randn(B, T_ctx, ab.text_dim, generator=torch.Generator().manual_seed(22))
@@ -380,7 +373,7 @@ def test_driver_step_checkpoint_matches_non_checkpoint_forward_and_backward():
         vstate1.hidden_states
     )  # leaf tensor with requires_grad=True; ``vstate.hidden_states`` is rebound during the loop
     vstate1, astate1 = driver.run_joint_loop(vstate1, astate1, use_gradient_checkpointing=False)
-    loss1 = vstate1.hidden_states.float().pow(2).sum() + astate1.payload.x_action.float().pow(2).sum()
+    loss1 = vstate1.hidden_states.float().pow(2).sum() + astate1.x_action.float().pow(2).sum()
     loss1.backward()
     grad_q1 = ab.blocks[0].self_attn.q.weight.grad.detach().clone()
     grad_ffn1 = ab.blocks[0].ffn[0].weight.grad.detach().clone()
@@ -391,7 +384,7 @@ def test_driver_step_checkpoint_matches_non_checkpoint_forward_and_backward():
     vstate2, astate2 = _build_run_inputs(vb, ab, B=B, s_video=s_video, s_action=s_action, seed=7)
     leaf_v2 = vstate2.hidden_states
     vstate2, astate2 = driver.run_joint_loop(vstate2, astate2, use_gradient_checkpointing=True)
-    loss2 = vstate2.hidden_states.float().pow(2).sum() + astate2.payload.x_action.float().pow(2).sum()
+    loss2 = vstate2.hidden_states.float().pow(2).sum() + astate2.x_action.float().pow(2).sum()
     loss2.backward()
     grad_q2 = ab.blocks[0].self_attn.q.weight.grad.detach().clone()
     grad_ffn2 = ab.blocks[0].ffn[0].weight.grad.detach().clone()
@@ -401,9 +394,9 @@ def test_driver_step_checkpoint_matches_non_checkpoint_forward_and_backward():
     assert torch.allclose(vstate1.hidden_states, vstate2.hidden_states, rtol=1e-5, atol=1e-6), (
         f"forward video mismatch; max diff = {(vstate1.hidden_states - vstate2.hidden_states).abs().max().item()}"
     )
-    assert torch.allclose(astate1.payload.x_action, astate2.payload.x_action, rtol=1e-5, atol=1e-6), (
+    assert torch.allclose(astate1.x_action, astate2.x_action, rtol=1e-5, atol=1e-6), (
         f"forward action mismatch; "
-        f"max diff = {(astate1.payload.x_action - astate2.payload.x_action).abs().max().item()}"
+        f"max diff = {(astate1.x_action - astate2.x_action).abs().max().item()}"
     )
     # Backward parity: gradients on ab params and vstate.hidden_states leaf must match.
     assert torch.allclose(grad_q1, grad_q2, rtol=1e-4, atol=1e-6), (
@@ -434,4 +427,4 @@ def test_driver_step_checkpoint_no_op_in_eval_mode():
         vstate2, astate2 = driver.run_joint_loop(vstate2, astate2, use_gradient_checkpointing=True)
 
     assert torch.allclose(vstate1.hidden_states, vstate2.hidden_states, atol=1e-6)
-    assert torch.allclose(astate1.payload.x_action, astate2.payload.x_action, atol=1e-6)
+    assert torch.allclose(astate1.x_action, astate2.x_action, atol=1e-6)

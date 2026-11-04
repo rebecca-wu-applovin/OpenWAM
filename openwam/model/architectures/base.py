@@ -8,8 +8,8 @@ Supported architecture families:
    / `joint_self_attn` (MMDiT-style mixed attention at every layer, driven
    by :class:`DualSystemMoTDriver`).
 
-Each architecture composes the backbones it owns and implements its own
-``forward()``.
+The base builds the video backbone, the proprio context encoder and the coupling's ActionDiT; each coupling
+subclass implements its own ``forward()`` block loop.
 """
 
 import dataclasses
@@ -18,7 +18,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 from omegaconf import DictConfig
@@ -75,8 +75,8 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from openwam.dataloader.collate import Batch
-    from openwam.model.action_backbone.base import ActionDiTBackbone
-    from openwam.model.video_backbone.base import TextCondition, VideoBackbone
+    from openwam.model.action_backbone.separate_action_dit import ActionDiT
+    from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
 
 
 @dataclass(frozen=True)
@@ -111,27 +111,12 @@ INFERENCE_ONLY = TrainOptions(
 )
 
 
-@dataclass
-class ActionState:
-    """Mutable action-stream state that ``DualSystemMoTDriver`` threads across layers (joint_self_attn only).
-
-    Fields:
-        action_latents: (B, T_action, action_dim) noisy actions (input to forward).
-        timestep: action diffusion timestep (raw shape preserved for the action backbone's internal use).
-        payload: backbone-specific per-forward state (typically ``ActionDiTState``).
-    """
-
-    action_latents: Optional[Tensor] = None
-    timestep: Optional[Tensor] = None
-    payload: Optional[Any] = None
-
-
 class BaseWAMArchitecture(ABC, nn.Module):
     """Base class for WAM architecture variants.
 
-    Composes a ``video_backbone`` and an ``action_backbone`` plus optional
-    extra backbones. Subclasses instantiate the appropriate action backbone
-    subclass in ``__init__`` and own the complete ``forward()`` control flow.
+    Builds, in this order (the parameter creation order, i.e. the init RNG draws, of the released checkpoints):
+    the ``video_backbone``, the proprio context encoder, and the ``action_backbone`` of the class the subclass
+    names. Subclasses add only their coupling (e.g. the MoT driver) and own the ``forward()`` block loop.
 
     Args:
         cfg: ``OmegaConf.merge(cfg.common, cfg.model)``: ``layout`` (the latent layout ``resolve_config`` derived;
@@ -145,21 +130,19 @@ class BaseWAMArchitecture(ABC, nn.Module):
         ckpt_dir: str checkpoint dir for CHECKPOINT, None for PRETRAINED.
         train_options: TrainOptions (gradient checkpointing, loss weights) the trainer decided; deploy passes
             ``INFERENCE_ONLY``.
+        action_dit_cls: the ActionDiT subclass of the coupling (set by the subclass, never by config).
+        num_action_layers: int, number of ActionDiT blocks (the subclass derives it from the coupling).
     """
-
-    # Built by the subclass ``__init__`` (every architecture has an action stream).
-    action_backbone: "ActionDiTBackbone"
 
     # --- Construction & config resolution ---
 
     def __init__(
         self, cfg: DictConfig, *, mode: LoadMode, assets: Optional[DictConfig], ckpt_dir: Optional[str],
-        train_options: TrainOptions,
+        train_options: TrainOptions, action_dit_cls: type["ActionDiT"], num_action_layers: int,
     ):
         from openwam.model.architectures.utils.mask_modes import build_frame_mask
 
         super().__init__()
-        self.cfg = cfg
         self.layout = cfg.layout
         self.train_options = train_options
         arch = cfg.architecture
@@ -172,6 +155,15 @@ class BaseWAMArchitecture(ABC, nn.Module):
         self._dtype: Optional[torch.dtype] = None
 
         self.video_backbone: "VideoBackbone" = self._build_video_backbone(cfg.video_backbone, mode, assets, ckpt_dir)
+        geometry = cfg.video_backbone.geometry
+        # Proprio tokens are appended to the text context, so they take its width.
+        self._init_proprio_context(
+            enabled=bool(arch.use_proprioception), state_dim=int(cfg.state_dim), text_dim=int(geometry.text_dim)
+        )
+        # The action residual width (dim) may differ from num_heads * head_dim: Q/K/V project across the gap.
+        self.action_backbone: "ActionDiT" = action_dit_cls.from_cfg(
+            cfg.action_backbone, action_dim=int(cfg.action_dim), num_layers=num_action_layers
+        )
 
     @staticmethod
     def _build_video_backbone(
@@ -218,13 +210,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
     @property
     def backbones(self) -> dict[str, nn.Module]:
-        """All backbone modules owned by this architecture.
+        """The two backbones (video, action) by attribute name.
 
-        Subclasses with additional backbones should override this to include
-        them. The returned dict
-        is used by ``set_dtype_device``,
-        ``move_frozen_to_device``, and ``save_assets_for_deployment`` to iterate
-        over all backbones generically.
+        ``set_dtype_device``, ``move_frozen_to_device`` and ``save_assets_for_deployment`` iterate over it.
         """
         return {"video_backbone": self.video_backbone, "action_backbone": self.action_backbone}
 
@@ -243,14 +231,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
     @property
     def action_dim(self) -> int:
         return self.action_backbone.action_dim
-
-    @property
-    def bridge_layers(self) -> tuple:
-        return self.action_backbone.bridge_layers
-
-    @property
-    def uses_proprioception(self) -> bool:
-        return self._use_proprioception_context or self.action_backbone.uses_proprioception
 
     # --- Proprio-as-context conditioning ---
 
@@ -342,6 +322,39 @@ class BaseWAMArchitecture(ABC, nn.Module):
         )
         video_text = action_text if self.proprio_input == "context_token" else text
         return video_text, action_text
+
+    def _prepare_video(
+        self,
+        latents: Tensor,
+        timestep: Tensor,
+        text: "TextCondition",
+        proprio: Tensor,
+        proprio_mask: Tensor,
+        use_gradient_checkpointing: bool,
+        use_gradient_checkpointing_offload: bool,
+    ) -> tuple["BlockLoopState", "TextCondition"]:
+        """The forward prologue both couplings share: build each stream's context, prepare the video block loop.
+
+        Args:
+            latents: (B, z, num_latents, h, w) noisy video latents. timestep: (B,) video timestep.
+            text: TextCondition. proprio: (B, N, D) normalized proprio. proprio_mask: (B, N, D) bool.
+            use_gradient_checkpointing / use_gradient_checkpointing_offload: bool, the video blocks' checkpointing.
+
+        Returns:
+            (vstate, action_text): the video BlockLoopState before block 0, and the action stream's TextCondition.
+        """
+        # Each stream's context (proprio tokens per cfg proprio_input).
+        video_text, action_text = self.build_contexts(text, proprio, proprio_mask)
+        vstate = self.video_backbone.prepare(
+            latents=latents,
+            timestep=timestep,
+            text=video_text,
+            layout=self.layout,
+            proprio=proprio,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+        )
+        return vstate, action_text
 
     # --- Device / dtype (top-level authority) ---
 

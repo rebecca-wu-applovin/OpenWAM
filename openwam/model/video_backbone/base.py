@@ -38,8 +38,8 @@ class BlockLoopState:
     grid_width: int = 0
 
     # Prefix K/V tokens the backbone prepends to its per-layer keys/values but
-    # NOT to its queries (e.g. Cosmos3's cached und text stream). The MoT driver
-    # widens the joint mask by this many leading key columns — visible to every
+    # NOT to its queries (e.g. Cosmos3's cached und text stream). The backbone's
+    # build_joint_attention_masks widens the joint mask by this many leading key columns — visible to every
     # query row, gated per-sample by ``prefix_kv_mask`` (True = attend). Zero
     # for backbones whose K and Q sequences coincide (Wan).
     prefix_kv_len: int = 0

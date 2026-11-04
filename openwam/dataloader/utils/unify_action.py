@@ -43,7 +43,7 @@ import numpy as np
 # Width of the unified action space. The *semantic* layout of these slots
 # (which slot is which robot's which joint/EEF dim) is defined separately by the
 # project; this module treats the width purely as a size and takes ``unify_dim``
-# as an explicit argument everywhere. This constant is just the default.
+# as an explicit argument everywhere (callers pass this constant, or another width).
 UNIFY_DIM = 80
 
 # A single spec token: "a-b" range, a bare int, or a (possibly nested) list of those.
@@ -95,7 +95,7 @@ def _is_paired(spec: Sequence) -> bool:
     return all(isinstance(el, (list, tuple)) for el in spec)
 
 
-def parse_unify_spec(spec: Sequence, unify_dim: int = UNIFY_DIM) -> np.ndarray:
+def parse_unify_spec(spec: Sequence, unify_dim: int) -> np.ndarray:
     """Parse a yaml unify spec into a ``dst_index`` array.
 
     Returns ``dst_index`` of shape ``(N,)`` int, where ``dst_index[i]`` is the
@@ -160,9 +160,7 @@ def parse_unify_spec(spec: Sequence, unify_dim: int = UNIFY_DIM) -> np.ndarray:
     return dst_index
 
 
-def map_to_unify(
-    action: np.ndarray, dst_index: np.ndarray, unify_dim: int = UNIFY_DIM
-) -> Tuple[np.ndarray, np.ndarray]:
+def map_to_unify(action: np.ndarray, dst_index: np.ndarray, unify_dim: int) -> Tuple[np.ndarray, np.ndarray]:
     """Scatter a raw action into the unified space and build its dim mask.
 
     Args:

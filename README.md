@@ -25,7 +25,7 @@ OpenWAM/
 │   ├── dataloader/    # Dataset adapters (yam_sharpa), transforms, processors, registry
 │   ├── model/
 │   │   ├── architectures/    # WAM family: dual_system
-│   │   ├── action_backbone/  # ActionDiTBackbone ABC, separate ActionDiT, scheduler
+│   │   ├── action_backbone/  # ActionDiT base + CrossAttnActionDiT / MoTActionDiT, components
 │   │   └── video_backbone/   # VideoBackbone ABC + one directory per family (wan / cosmos3 / ge / flux)
 │   ├── train/         # OpenWAMTrainer, flow-match loss, checkpointing, optimizer utils
 │   └── deploy/        # InferenceEngine / Session (one episode each), deploy config, model loader

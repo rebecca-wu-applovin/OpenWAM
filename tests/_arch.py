@@ -45,8 +45,6 @@ _ARCH_KEYS = (
     "history_encoding", "bridge_interval", "detach_bridge",
 )
 _ACTION_KEYS = ("dim", "ffn_dim", "shift_action", "train_timestep", "freq_dim", "max_action_len", "eps")
-# Registry name -> the architecture.variant that selects it.
-_VARIANT_OF = {"dual_system_self_attn": "joint_self_attn", "dual_system_cross_attn": "joint_cross_attn"}
 # The trainer's defaults (configs/train.yaml): no gradient checkpointing, both loss weights 1; no mixed-attention
 # recompute in the stub tests.
 # assets.video_backbone for PRETRAINED test builds; never read (build_video_backbone is patched by backbone_double).
@@ -132,11 +130,11 @@ def stub_backbone(cfg: dict):
     )
 
 
-def build_test_arch(name: str, cfg: dict, backbone, *, layout=None, train_options: TrainOptions = TEST_TRAIN_OPTIONS):
+def build_test_arch(variant: str, cfg: dict, backbone, *, layout=None, train_options: TrainOptions = TEST_TRAIN_OPTIONS):
     """Build a registered architecture whose video backbone is ``backbone``.
 
     Args:
-        name: registry name (``dual_system_self_attn`` | ``dual_system_cross_attn``); sets ``architecture.variant``.
+        variant: ``joint_self_attn`` | ``joint_cross_attn``, the ``architecture.variant`` (framework dual_system).
         cfg: flat test keys (see ``arch_params``).
         backbone: the VideoBackbone test double.
         layout: ``cfg.common.layout`` (default: ``make_layout()``, the first-frame layout).
@@ -147,8 +145,8 @@ def build_test_arch(name: str, cfg: dict, backbone, *, layout=None, train_option
     """
     from openwam.model import build_architecture
 
-    # The yaml's (framework, variant) pair picks the class; the test names it by registry name.
-    cfg = {**cfg, "variant": _VARIANT_OF[name]}
+    # The yaml's (framework, variant) pair picks the class.
+    cfg = {**cfg, "variant": variant}
     with backbone_double(backbone):
         return build_architecture(
             arch_params(cfg, backbone, layout=layout),
@@ -164,15 +162,18 @@ def init_test_base(arch, cfg: dict = None, *, layout=None) -> None:
 
     Args:
         arch: the BaseWAMArchitecture subclass instance being constructed (call from its ``__init__``).
-        cfg: test architecture params (default: only the required keys).
+        cfg: test architecture params (default: only the required keys, plus a small ActionDiT).
         layout: ``cfg.common.layout`` (default: ``make_layout()``).
 
     Returns:
-        None; ``arch.video_backbone`` is a ``stub_backbone``.
+        None; ``arch.video_backbone`` is a ``stub_backbone``, ``arch.action_backbone`` a small MoTActionDiT (one
+        block per stub layer) the test may replace.
     """
+    from openwam.model.action_backbone.separate_action_dit import MoTActionDiT
     from openwam.model.architectures.base import BaseWAMArchitecture
 
-    cfg = dict(cfg or {})
+    # The base always builds an ActionDiT; keep it small unless the test sizes it.
+    cfg = {"dim": 32, "ffn_dim": 64, "action_dim": 1, **(cfg or {})}
     backbone = stub_backbone(cfg)
     with backbone_double(backbone):
         BaseWAMArchitecture.__init__(
@@ -182,11 +183,13 @@ def init_test_base(arch, cfg: dict = None, *, layout=None) -> None:
             assets=TEST_ASSETS,
             ckpt_dir=None,
             train_options=TEST_TRAIN_OPTIONS,
+            action_dit_cls=MoTActionDiT,
+            num_action_layers=backbone.num_layers,
         )
 
 
 def proprio_context_arch(*, state_dim: int, text_dim: int, enabled: bool = True, h: int = 1, proprio_input: str = "context_token"):
-    """A BaseWAMArchitecture shell with only the proprio-context helpers set up (no action backbone).
+    """A BaseWAMArchitecture shell for the proprio-context helpers (the base builds them from the cfg).
 
     Args:
         state_dim: int proprio width D. text_dim: int context width. enabled: bool ``use_proprioception``.
@@ -201,11 +204,14 @@ def proprio_context_arch(*, state_dim: int, text_dim: int, enabled: bool = True,
 
     class _Shell(BaseWAMArchitecture):
         def __init__(self):
-            cfg = {"use_proprioception": enabled, "state_dim": state_dim, "proprio_input": proprio_input}
+            # The stub geometry's text_dim is the width the proprio tokens are appended to.
+            cfg = {
+                "use_proprioception": enabled, "state_dim": state_dim, "proprio_input": proprio_input,
+                "text_dim": text_dim,
+            }
             init_test_base(self, cfg, layout=make_layout(h=h))
             self._device = torch.device("cpu")
             self._dtype = torch.float32
-            self._init_proprio_context(enabled=enabled, state_dim=state_dim, text_dim=text_dim)
 
         def forward(self, *args, **kwargs):  # pragma: no cover - unused stub
             raise NotImplementedError

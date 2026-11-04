@@ -34,7 +34,7 @@ architecture:
   history_encoding: per_frame            # past history frames: per_frame | clip
 
   # Bridge and memory controls
-  bridge_interval: 1                     # bridge layers = range(0, video geometry.num_layers, interval); 1 = every layer
+  bridge_interval: 1                     # joint_cross_attn: bridge layers = range(0, geometry.num_layers, interval); joint_self_attn: must be 1
 
   # Variant-specific options
   detach_bridge: false                   # joint_cross_attn only
@@ -88,7 +88,7 @@ dim: 1024                        # ActionDiT hidden width
 ffn_dim: 4096                    # ActionDiT feed-forward width
 shift_action: 5.0                # action scheduler shift
 freq_dim: 256                    # sinusoidal timestep embedding width
-max_action_len: 1024             # learned action position table size
+max_action_len: 1024             # longest action chunk (action RoPE table length)
 eps: 1.0e-06                     # norm epsilon
 num_heads: ${..video_backbone.geometry.num_heads}   # attention geometry and the bridge / context widths
 head_dim: ${..video_backbone.geometry.head_dim}     #   come from the video backbone yaml's geometry block

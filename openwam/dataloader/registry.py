@@ -1,7 +1,4 @@
-"""Dataset registry for config-driven dataset construction.
-
-Replaces the if-else dispatch chains in ``training/runtime.py`` with a
-decorator-based registry pattern (consistent with the architecture registry).
+"""Dataset registry: ``dataloader.type`` -> the registered :class:`BaseDataset` class.
 
 Usage:
     # Register a dataset class
@@ -24,7 +21,7 @@ def register_dataset(name: str):
     """Decorator to register a dataset class by name.
 
     Args:
-        name: Config-level type name (e.g., "droid", "bridge_v2", "oxe").
+        name: str, the ``dataloader.type`` value (e.g. ``"yam_sharpa"``).
     """
 
     def wrapper(cls):
@@ -38,9 +35,8 @@ def build_dataset(config, split: str = "train") -> BaseDataset:
     """Build a dataset from a config dict or DictConfig.
 
     Looks up the dataset class from ``DATASET_REGISTRY`` using ``config.type``
-    and dispatches to ``cls.from_config(config, split)``. Every registered
-    class is required to implement ``from_config`` — there is no fallback
-    generic-kwargs path.
+    and dispatches to ``cls.from_config(config, split)`` (abstract on
+    :class:`BaseDataset`, so every registered class implements it).
 
     Args:
         config: Dict-like config with at least a ``type`` field.
@@ -53,13 +49,7 @@ def build_dataset(config, split: str = "train") -> BaseDataset:
     if dtype not in DATASET_REGISTRY:
         raise ValueError(f"Unknown dataset type '{dtype}'. Available: {list(DATASET_REGISTRY.keys())}")
 
-    cls = DATASET_REGISTRY[dtype]
-    if not hasattr(cls, "from_config"):
-        raise TypeError(
-            f"Registered dataset class {cls.__name__} (type={dtype!r}) lacks a "
-            f"from_config classmethod. All registered datasets must implement it."
-        )
-    return cls.from_config(config, split=split)
+    return DATASET_REGISTRY[dtype].from_config(config, split=split)
 
 
 # ---- Auto-registration of built-in datasets ----

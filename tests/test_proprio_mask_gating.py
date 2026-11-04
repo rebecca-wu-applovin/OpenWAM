@@ -170,9 +170,9 @@ def test_proprio_token_follows_the_padded_text():
 
 
 def test_action_dit_rejects_per_token_timestep():
-    from openwam.model.action_backbone.separate_action_dit import ActionDiT
+    from openwam.model.action_backbone.separate_action_dit import MoTActionDiT
 
-    dit = ActionDiT(
+    dit = MoTActionDiT(
         shift_action=5.0,
         train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=7,
@@ -180,9 +180,6 @@ def test_action_dit_rejects_per_token_timestep():
         ffn_dim=64,
         num_heads=4,
         num_layers=1,
-        video_dim=32,
-        bridge_layers=(0,),
-        variant="joint_self_attn",
         attn_head_dim=8,
         text_dim=4096,
         freq_dim=256,

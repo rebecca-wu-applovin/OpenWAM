@@ -11,23 +11,15 @@ class VideoColorJitter:
     ``(seed, epoch, idx)`` generator), so a sample does not depend on the worker or the global RNG state.
 
     Args:
-        brightness: Max brightness change factor.
-        contrast: Max contrast change factor.
-        saturation: Max saturation change factor.
-        hue: Max hue change (not applied in PIL-only mode).
+        brightness: float, max brightness change factor (factor drawn in [1 - b, 1 + b]).
+        contrast: float, max contrast change factor.
+        saturation: float, max saturation change factor.
     """
 
-    def __init__(
-        self,
-        brightness: float = 0.2,
-        contrast: float = 0.2,
-        saturation: float = 0.2,
-        hue: float = 0.0,
-    ):
+    def __init__(self, brightness: float, contrast: float, saturation: float):
         self.brightness = brightness
         self.contrast = contrast
         self.saturation = saturation
-        self.hue = hue
 
     def apply(self, frames: list, rng: np.random.Generator) -> list:
         """Jitter one clip.

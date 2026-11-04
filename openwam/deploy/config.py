@@ -67,9 +67,6 @@ def check_deploy(cfg: DictConfig) -> None:
     # The engine serves sparse-history yam_sharpa checkpoints (vstack canvas, history buffer) and nothing else.
     if dl.type != "yam_sharpa":
         raise ValueError(f"deploy serves yam_sharpa checkpoints only, got dataloader.type={dl.type!r}")
-    if not dl.multiview or dl.multiview_layout != "vstack":
-        raise ValueError(f"deploy composes the vstack canvas only, got multiview={dl.multiview} "
-                         f"multiview_layout={dl.multiview_layout!r}")
     if not normalization_on(dl.normalize_mode):
         raise ValueError("deploy needs a normalized checkpoint (dataloader.normalize_mode)")
     # Older checkpoints were trained without fps: required, never defaulted.

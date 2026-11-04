@@ -20,8 +20,8 @@ A window is only drawn where every future / action row exists. ``history_samplin
 only) replaces the fixed history offsets per sample by H-1 random rows of the past ``history_window`` rows plus
 frame t, drawn from the sample's ``(seed, epoch, idx)`` RNG; val keeps ``history_offsets`` (the layout deploy serves).
 
-Width D is 48 for ``fingertips_*`` (unify off) and 80 for ``unify_*`` (raw 62
-scattered by ``unify_action_map``). The unify switch and map are derived from
+Width D is 48 for ``fingertips_*`` (the raw 48, identity scatter) and 80 for ``unify_*`` (raw 62 scattered by
+``unify_action_map``): the reader's ``ACTION_REPR_DIM`` / ``ACTION_DIM``. The scatter map is derived from
 ``action_mode``; a config setting ``unify_action`` / ``unify_action_map`` raises.
 """
 
@@ -33,20 +33,27 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from openwam.dataloader.bases import BaseDataset, LeRobotV3Reader
 from openwam.dataloader.transforms.multiview import assemble_vstack_layout
 from openwam.dataloader.utils.normalization import apply_normalization, load_stats_file, normalization_on
 from openwam.dataloader.utils.sparse_history import history_rows, sample_history_offsets
+from openwam.dataloader.utils.unify_action import UNIFY_DIM, parse_unify_spec
 from openwam.dataloader.utils.video_io import decode_video_frames as _decode_video_frames
 from openwam.dataloader.utils.yam_sharpa_repr import (
+    ACTION_COL,
+    CAM_POSE_COL,
     CAM_POSE_DIM,
     JOINT56_DIM,
+    JOINT_COL,
     POSE48_DIM,
+    SETPOINT_COL,
+    STATE_COL,
     action_width,
     encode_action_pairs,
     encode_proprio_in_anchor_cam,
@@ -58,27 +65,19 @@ from openwam.dataloader.utils.yam_sharpa_repr import (
 
 logger = logging.getLogger(__name__)
 
-# Parquet columns (shapes per frame: 48, 48, 56, 56, 16).
-STATE_COL = "observation.state"  # measured hand pose
-ACTION_COL = "action"  # setpoint FK: target wrist + fingertips
-JOINT_COL = "joint_angles"  # measured joints (arm 12 + hand 44)
-SETPOINT_COL = "joint_setpoints"  # target joints
-CAM_POSE_COL = "camera_pose.ego_view"  # base_from_camera, row-major 4x4
+# Non-zero ranks wait for rank 0's stats scan: give up after this long, re-check this often (seconds).
+_STATS_WAIT_TIMEOUT_S = 12 * 60 * 60
+_STATS_POLL_INTERVAL_S = 10
 
 
 def _stats_builder_rank() -> int:
     """Rank that owns the stats scan (0 builds, the others wait).
 
     Returns:
-        int, the torch.distributed rank if initialized, else ``$RANK`` / ``$LOCAL_RANK`` / 0.
+        int, the torch.distributed rank if initialized, else ``$RANK`` / ``$LOCAL_RANK`` / 0 (single process).
     """
-    try:
-        import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized():
-            return int(dist.get_rank())
-    except Exception:
-        pass
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_rank())
     # torchrun sets RANK before init_process_group, so pre-init readers still agree.
     return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
 
@@ -137,13 +136,18 @@ class YamSharpaDataset(LeRobotV3Reader):
     """
 
     DATASET_NAME = "YamSharpa"
+    NEEDED_COLS = (STATE_COL, ACTION_COL, JOINT_COL, SETPOINT_COL, CAM_POSE_COL, "task_index")
 
-    # The dataloader keys every reader is built from (all required). target_camera is unused (camera_layout picks
-    # the cameras).
-    CONFIG_KEYS: ClassVar[Tuple[str, ...]] = tuple(k for k in LeRobotV3Reader.CONFIG_KEYS if k != "target_camera") + (
+    # The dataloader keys every reader is built from (all required); from_config forwards them as they are.
+    CONFIG_KEYS: ClassVar[Tuple[str, ...]] = (
+        "num_frames",
+        "window_stride",
+        "height",
+        "width",
+        "camera_layout",
+        "color_jitter",
         "action_mode",
         "fps",
-        "normalization_stats_path",
         "history_offsets",
         "future_offsets",
         "history_sampling",
@@ -154,24 +158,35 @@ class YamSharpaDataset(LeRobotV3Reader):
         self,
         dataset_dir: str,
         *,
+        dataset_id: str,
+        split: str,
+        normalizers: Tuple[Callable[[np.ndarray], np.ndarray], Callable[[np.ndarray], np.ndarray]],
         action_mode: str,
         fps: int,
-        normalization_stats_path: Optional[str],
+        num_frames: int,
+        window_stride: int,
+        height: int,
+        width: int,
         camera_layout: Sequence[str],
+        color_jitter: Any,
         history_offsets: Sequence[int],
         future_offsets: Sequence[int],
         history_sampling: str,
         history_window: int,
-        **kwargs: Any,
     ):
         """
         Args:
             dataset_dir: str, LeRobot v3 root (holds ``meta/info.json``).
+            dataset_id: str, source name used in logs and errors.
+            split: str, ``train`` / ``val``.
+            normalizers: (action, state) callables mapping raw ``(..., D)`` rows to model rows (the pooled-stats
+                normalization, or the identity when normalization is off); ``from_config`` decides them once.
             action_mode: str, one of ``ACTION_REPRS``.
             fps: int, the data rate the config states (rows per second; history / future offsets and deploy's
                 action rate are in these rows); must equal the source's ``meta/info.json`` fps.
-            normalization_stats_path: str, pooled stats file (required when normalization is on; None when off).
+            num_frames / window_stride / height / width: int, clip geometry (see the yaml).
             camera_layout: list[str] of camera feature keys, top-to-bottom (e.g. ego over chest).
+            color_jitter: DictConfig ``{enabled, brightness, contrast, saturation}`` (train split only).
             history_offsets: list[int] of H row offsets <= 0 ending at 0 (e.g. [-80,-60,-40,-20,0]; [0] = only
                 the current frame).
             future_offsets: list[int] of F increasing row offsets > 0 (e.g. [4,8,...,32]).
@@ -179,33 +194,68 @@ class YamSharpaDataset(LeRobotV3Reader):
                 sample, H-1 distinct random rows of the past ``history_window`` rows + frame t; val stays fixed).
                 ``resolve_config`` validates the value and that the window covers ``history_offsets``.
             history_window: int, rows back the random history may reach (100 = 5 s at 20 Hz); unused when fixed.
-            **kwargs: forwarded to :class:`LeRobotV3Reader` (num_frames, height, width, split, ...).
         """
-        self.action_mode = validate_repr(action_mode)
-        self._source_stats_path = normalization_stats_path
-        # Raw rows -> model rows: identity when normalization is off; _load_stats binds the stats when it is on.
-        self._normalize_action = self._normalize_state = _identity
-        self._layout_cams = [str(c) for c in camera_layout]
-        self._history_offsets, self._future_offsets = _validate_sparse_offsets(history_offsets, future_offsets)
-        # Read by _select_augmentations, which the base __init__ calls.
+        action_mode = validate_repr(action_mode)
+        history, future = _validate_sparse_offsets(history_offsets, future_offsets)
+        # The model slot of each raw dim: the unify map for unify_*, the identity scatter otherwise.
+        if is_unify(action_mode):
+            dst_index = parse_unify_spec(unify_action_map(action_mode), UNIFY_DIM)
+        else:
+            dst_index = np.arange(raw_dim(action_mode))
+        super().__init__(
+            dataset_dir,
+            dataset_id=dataset_id,
+            split=split,
+            num_frames=num_frames,
+            window_stride=window_stride,
+            # Rows t .. t + max_ahead must all lie inside the episode (every future frame and action row exists).
+            min_window_len=max(int(future[-1]), int(num_frames) - 1) + 1,
+            height=height,
+            width=width,
+            cameras=camera_layout,
+            dst_index=dst_index,
+            action_dim=action_width(action_mode),
+            color_jitter=color_jitter,
+        )
+        self.action_mode = action_mode
+        # Raw rows -> model rows (from_config's choice: pooled-stats normalization or the identity).
+        self._normalize_action, self._normalize_state = normalizers
+        self._history_offsets, self._future_offsets = history, future
         self._history_sampling = str(history_sampling)
         self._history_window = int(history_window)
+        self._check_schema(fps)
+        self._select_augmentations(train=split == "train")
 
-        # Raw (pre-unify) width; the base class scatters it to 80 when unify is on.
-        self.ACTION_DIM = raw_dim(self.action_mode)
-        self.NEEDED_COLS = (STATE_COL, ACTION_COL, JOINT_COL, SETPOINT_COL, CAM_POSE_COL, "task_index")
-        super().__init__(
-            dataset_dir=dataset_dir,
-            camera_layout=self._layout_cams,
-            # camera_layout picks the cameras; the action_mode decides unify (proprio shares the action's map).
-            target_camera=None,
-            unify_action=is_unify(self.action_mode),
-            unify_action_map=unify_action_map(self.action_mode),
-            **kwargs,
-        )
-        # The config's data rate is what deploy serves at: it must be the recorded one.
+    def _check_schema(self, fps: int) -> None:
+        """Fail fast if the source differs from what the representations assume.
+
+        Args:
+            fps: int, the config's data rate (deploy serves at it, so it must be the recorded one).
+
+        Returns:
+            None; raises on a fps / feature-shape / canvas-height mismatch.
+        """
         if self._fps != float(fps):
-            raise ValueError(f"yam_sharpa: dataloader.fps={fps} but {dataset_dir}/meta/info.json records fps={self._fps}")
+            raise ValueError(
+                f"yam_sharpa: dataloader.fps={fps} but {self._dataset_dir}/meta/info.json records fps={self._fps}"
+            )
+        features = self._info["features"]
+        expected = {
+            STATE_COL: POSE48_DIM,
+            ACTION_COL: POSE48_DIM,
+            JOINT_COL: JOINT56_DIM,
+            SETPOINT_COL: JOINT56_DIM,
+            CAM_POSE_COL: CAM_POSE_DIM,
+        }
+        for col, dim in expected.items():
+            if col not in features:
+                raise KeyError(f"YamSharpa({self._dataset_id}): feature {col!r} not in info.features")
+            shape = tuple(features[col]["shape"])
+            if shape != (dim,):
+                raise ValueError(f"YamSharpa({self._dataset_id}): feature {col!r} must have shape [{dim}], got {shape}")
+        # Each camera gets an equal-height tile of the canvas.
+        if self._height % len(self._cameras):
+            raise ValueError(f"YamSharpa: height={self._height} must split evenly over {len(self._cameras)} cameras")
 
     def _select_augmentations(self, train: bool) -> None:
         """The base's train-only augmentations plus random history (the base's single split rule, extended).
@@ -237,63 +287,6 @@ class YamSharpaDataset(LeRobotV3Reader):
         """rng: the sample's Generator. Returns: (H,) int64, H-1 random past rows of the window + frame t."""
         return sample_history_offsets(len(self._history_offsets), self._history_window, rng)
 
-    # ----- hooks ------------------------------------------------------------
-
-    def _min_window_len(self) -> int:
-        """Every future frame and every action row must exist (train and val alike)."""
-        # Rows t .. t + max_ahead must all lie inside the episode.
-        return max(int(self._future_offsets[-1]), self._num_frames - 1) + 1
-
-    def _resolve_cameras(self, info: dict):
-        """Map the layout onto the base (head, left, right) slots so every camera gets video offsets."""
-        if not 1 <= len(self._layout_cams) <= 3:
-            raise ValueError(f"YamSharpa camera_layout must list 1-3 cameras, got {self._layout_cams}")
-        cams = self._layout_cams + [None] * (3 - len(self._layout_cams))
-        return tuple(cams)
-
-    def _post_init(self, info: dict) -> None:
-        """Fail fast if the dataset schema differs from what the representations assume."""
-        features = info["features"]
-        expected = {
-            STATE_COL: POSE48_DIM,
-            ACTION_COL: POSE48_DIM,
-            JOINT_COL: JOINT56_DIM,
-            SETPOINT_COL: JOINT56_DIM,
-            CAM_POSE_COL: CAM_POSE_DIM,
-        }
-        for col, dim in expected.items():
-            if col not in features:
-                raise KeyError(f"YamSharpa({self._dataset_id}): feature {col!r} not in info.features")
-            shape = tuple(features[col]["shape"])
-            if shape != (dim,):
-                raise ValueError(f"YamSharpa({self._dataset_id}): feature {col!r} must have shape [{dim}], got {shape}")
-        missing = [c for c in self._layout_cams if c not in features]
-        if missing:
-            raise KeyError(f"YamSharpa({self._dataset_id}): cameras {missing} not in info.features")
-        # Each camera gets an equal-height tile of the canvas.
-        if self._height % len(self._layout_cams):
-            raise ValueError(
-                f"YamSharpa: height={self._height} must split evenly over {len(self._layout_cams)} cameras"
-            )
-
-    def _load_stats(self, info: dict) -> None:
-        """Bind the action and proprio normalization to the pooled stats file (normalization on only).
-
-        Args:
-            info: dict, the parsed ``meta/info.json`` (unused: the pooled file covers every source).
-
-        Returns:
-            None. Sets ``_normalize_action`` (``<action_mode>`` block) and ``_normalize_state``
-            (``<action_mode>_state`` block); a missing file / block / field raises.
-        """
-        dim = self._raw_action_dim
-        action = load_stats_file(self._source_stats_path, block=self.action_mode, dim=dim)
-        state = load_stats_file(self._source_stats_path, block=f"{self.action_mode}_state", dim=dim)
-        self._normalize_action = functools.partial(apply_normalization, stats=action, mode=self._normalize_mode)
-        self._normalize_state = functools.partial(apply_normalization, stats=state, mode=self._normalize_mode)
-        # The pooled file is also the deploy artifact copied into checkpoints.
-        self.normalization_stats_path = self._source_stats_path
-
     def _action_rows(self, win) -> np.ndarray:
         """Normalized raw action for the window.
 
@@ -301,7 +294,8 @@ class YamSharpaDataset(LeRobotV3Reader):
             win: DataFrame, rows t .. t+n-1 of one episode (n <= num_frames).
 
         Returns:
-            (n, D) float32; row k is the target at t+k w.r.t. anchor row 0 (base class keeps the first num_frames-1).
+            (n, D) normalized raw action; row k is the target at t+k w.r.t. anchor row 0 (``_finalize_action`` keeps
+            the first num_frames-1).
         """
         state = np.stack(win[STATE_COL].values)
         joints = np.stack(win[JOINT_COL].values)
@@ -332,21 +326,21 @@ class YamSharpaDataset(LeRobotV3Reader):
             dict with ``video`` (H+F PIL images: history then future), ``proprio`` (H, D) + ``proprio_mask``
             (H, D), ``action`` (num_frames-1, D) + ``action_mask`` (num_frames-1, D) and ``prompt``.
         """
+        # Window idx -> (episode, window start row ``offset`` inside it).
         ep_local = int(np.searchsorted(self._cum_n_starts, idx, side="right") - 1)
-        valid_start = int(self._ep_valid_start[ep_local])
-        offset = valid_start + (idx - int(self._cum_n_starts[ep_local])) * self._window_stride
+        offset = (idx - int(self._cum_n_starts[ep_local])) * self._window_stride
         row = self._eps_df.iloc[ep_local]
-        table = self._load_data_table(int(row["data/chunk_index"]), int(row["data/file_index"]))
+        table = self._data_tables[(int(row["data/chunk_index"]), int(row["data/file_index"]))]
         ep_row0 = int(self._ep_data_row_offset[ep_local])
 
-        # Action rows t .. t+num_frames-1 always exist (see _min_window_len).
+        # Action rows t .. t+num_frames-1 always exist (the base's min_window_len).
         win = table.slice(ep_row0 + offset, self._num_frames).to_pandas()
-        prompt = self._resolve_prompt(row, win)
-        action, action_mask = self._finalize_action(self._action_rows(win), self._num_frames)
+        prompt = self._resolve_prompt(int(win["task_index"].iloc[0]))
+        action, action_mask = self._finalize_action(self._action_rows(win))
 
-        # This sample's offsets (fixed, or drawn first in random mode); rows then clamp to the episode start
-        # (repeat the first frame), the same rule deploy uses.
-        hist_rows = history_rows(offset, self._draw_history_offsets(rng), valid_start)
+        # This sample's offsets (fixed, or drawn first in random mode); rows then clamp to the episode start (row 0:
+        # repeat the first frame), the same rule deploy uses.
+        hist_rows = history_rows(offset, self._draw_history_offsets(rng), 0)
         lo = int(hist_rows.min())
         hist_tab = table.slice(ep_row0 + lo, offset - lo + 1).to_pandas()
         hist = hist_tab.iloc[hist_rows - lo]
@@ -403,9 +397,9 @@ class YamSharpaDataset(LeRobotV3Reader):
         Returns:
             list of N PIL images (width x height).
         """
-        tile_h = self._height // len(self._layout_cams)
+        tile_h = self._height // len(self._cameras)
         per_cam: Dict[str, List] = {}
-        for cam in self._layout_cams:
+        for cam in self._cameras:
             path = self._dataset_dir / self._video_path_template.format(
                 video_key=cam,
                 chunk_index=int(row[f"videos/{cam}/chunk_index"]),
@@ -422,8 +416,8 @@ class YamSharpaDataset(LeRobotV3Reader):
             per_cam[cam] = frames
         video = [
             assemble_vstack_layout(
-                {cam: per_cam[cam][fi] for cam in self._layout_cams},
-                self._layout_cams,
+                {cam: per_cam[cam][fi] for cam in self._cameras},
+                self._cameras,
                 out_h=self._height,
                 out_w=self._width,
             )
@@ -470,7 +464,8 @@ class MultiYamSharpaDataset(BaseDataset):
                 by ``""`` (``resolve_config`` checks the range); :meth:`_select_augmentations` applies the split rule.
             split: str, ``train`` turns the train-only augmentations on (caption dropout here, the readers' own).
             seed: int, base RNG seed.
-            normalization_stats_path: str, pooled stats file copied into checkpoints (None: normalization off).
+            normalization_stats_path: str, pooled stats file copied into checkpoints (None: normalization off); the
+                one stats path, read by the trainer.
         """
         if not datasets:
             raise ValueError("MultiYamSharpaDataset needs at least one source")
@@ -480,7 +475,7 @@ class MultiYamSharpaDataset(BaseDataset):
         for ds, wi, name in zip(datasets, w, names):
             if wi > 0 and len(ds) == 0:
                 raise ValueError(f"MultiYamSharpaDataset: source {name!r} has weight {wi} but no windows")
-        dims = {int(ds.action_dim) for ds in datasets}
+        dims = {ds.ACTION_DIM for ds in datasets}
         if len(dims) != 1:
             raise ValueError(f"MultiYamSharpaDataset: sources disagree on action_dim {sorted(dims)}")
         self._datasets = list(datasets)
@@ -549,7 +544,7 @@ class MultiYamSharpaDataset(BaseDataset):
 
     @property
     def action_dim(self) -> int:
-        return int(self._datasets[0].action_dim)
+        return self._datasets[0].ACTION_DIM
 
     @property
     def names(self) -> List[str]:
@@ -608,19 +603,26 @@ class MultiYamSharpaDataset(BaseDataset):
             if key in config:
                 raise ValueError(f"yam_sharpa derives {key} from action_mode; remove it from the config")
 
+        # Normalization on / off is decided here, once: the readers get the (action, state) normalizer pair.
+        normalize_mode, raw_path = config.normalize_mode, config.normalization_stats_path
         stats_path = None
-        if normalization_on(config.normalize_mode):
-            raw_path = config.normalization_stats_path
+        normalizers = (_identity, _identity)
+        if normalization_on(normalize_mode):
             if not raw_path:
                 raise ValueError("yam_sharpa: normalization_stats_path is required when normalization is on")
-            stats_path = Path(str(raw_path)).expanduser()
-            cls._ensure_stats(stats_path, dirs, action_mode, num_frames)
-            kwargs["normalization_stats_path"] = str(stats_path)
-        else:
-            # Normalization off: the readers get no stats file.
-            kwargs["normalization_stats_path"] = None
+            stats_path = str(Path(str(raw_path)).expanduser())
+            cls._ensure_stats(Path(stats_path), dirs, action_mode, num_frames)
+            # Action: the <action_mode> block; proprio: <action_mode>_state (raw, pre-unify width).
+            normalizers = tuple(
+                functools.partial(
+                    apply_normalization,
+                    stats=load_stats_file(stats_path, block=block, dim=raw_dim(action_mode)),
+                    mode=normalize_mode,
+                )
+                for block in (action_mode, f"{action_mode}_state")
+            )
 
-        datasets = [YamSharpaDataset(dataset_dir=d, dataset_id=name, **kwargs) for name, d, _ in entries]
+        datasets = [YamSharpaDataset(d, dataset_id=name, normalizers=normalizers, **kwargs) for name, d, _ in entries]
         return cls(
             datasets,
             names=[n for n, _, _ in entries],
@@ -629,7 +631,7 @@ class MultiYamSharpaDataset(BaseDataset):
             caption_dropout_p=float(config["caption_dropout_p"]),
             split=split,
             seed=int(config.seed),
-            normalization_stats_path=str(stats_path) if stats_path else None,
+            normalization_stats_path=stats_path,
         )
 
     @staticmethod
@@ -664,11 +666,11 @@ class MultiYamSharpaDataset(BaseDataset):
             )
         if _stats_builder_rank() != 0:
             # Poll instead of dist.barrier(): the scan can exceed the NCCL timeout.
-            deadline = time.monotonic() + float(os.environ.get("OPENWAM_STATS_WAIT_TIMEOUT_S", 12 * 60 * 60))
+            deadline = time.monotonic() + _STATS_WAIT_TIMEOUT_S
             while _read_stats_meta(path) != want:
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"timed out waiting for rank 0 to build {path}")
-                time.sleep(float(os.environ.get("OPENWAM_STATS_POLL_INTERVAL_S", 10)))
+                time.sleep(_STATS_POLL_INTERVAL_S)
             return
         logger.info("yam_sharpa: building pooled %s stats at %s from %s", action_mode, path, list(dirs))
         save_stats(compute_yam_sharpa_stats(dirs, action_mode, num_frames=num_frames), path)

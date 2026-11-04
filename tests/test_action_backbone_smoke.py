@@ -51,9 +51,9 @@ def test_action_dit_small_instantiate():
     """ActionDiT should instantiate with small parameters."""
     import torch.nn as nn
 
-    from openwam.model.action_backbone.separate_action_dit import ActionDiT
+    from openwam.model.action_backbone.separate_action_dit import CrossAttnActionDiT
 
-    dit = ActionDiT(
+    dit = CrossAttnActionDiT(
         shift_action=5.0,
         train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=7,
@@ -62,8 +62,6 @@ def test_action_dit_small_instantiate():
         num_heads=4,
         num_layers=2,
         video_dim=128,
-        bridge_layers=(0, 1),
-        variant="joint_cross_attn",
         attn_head_dim=16,
         text_dim=4096,
         freq_dim=256,
@@ -88,9 +86,9 @@ def test_action_dit_small_instantiate():
 
 def test_action_dit_forward_shape():
     """ActionDiT forward should produce (B, T, action_dim)."""
-    from openwam.model.action_backbone.separate_action_dit import ActionDiT
+    from openwam.model.action_backbone.separate_action_dit import CrossAttnActionDiT
 
-    dit = ActionDiT(
+    dit = CrossAttnActionDiT(
         shift_action=5.0,
         train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=7,
@@ -99,8 +97,6 @@ def test_action_dit_forward_shape():
         num_heads=4,
         num_layers=2,
         video_dim=128,
-        bridge_layers=(0, 1),
-        variant="joint_cross_attn",
         attn_head_dim=16,
         text_dim=4096,
         freq_dim=256,
@@ -108,19 +104,23 @@ def test_action_dit_forward_shape():
         eps=1e-6,
     )
     actions = torch.randn(2, 5, 7)
-    bridges = {bid: torch.randn(2, 10, 128) for bid in (0, 1)}
+    bridges = [torch.randn(2, 10, 128) for _ in range(2)]
     timestep = torch.tensor([0.5, 0.8])
+    context, context_mask = torch.randn(2, 3, 4096), torch.ones(2, 3, dtype=torch.bool)
 
-    out = dit(actions, bridges, timestep)
+    out = dit(
+        actions, bridges, timestep, context=context, context_mask=context_mask,
+        use_gradient_checkpointing=False, use_gradient_checkpointing_offload=False,
+    )
     assert out.shape == (2, 5, 7)
 
 
 def test_action_dit_joint_cross_attn_context_shape_and_effect():
     """joint_cross_attn should accept action-owned raw text/proprio context."""
-    from openwam.model.action_backbone.separate_action_dit import ActionDiT
+    from openwam.model.action_backbone.separate_action_dit import CrossAttnActionDiT
 
     torch.manual_seed(0)
-    dit = ActionDiT(
+    dit = CrossAttnActionDiT(
         shift_action=5.0,
         train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=7,
@@ -129,8 +129,6 @@ def test_action_dit_joint_cross_attn_context_shape_and_effect():
         num_heads=4,
         num_layers=2,
         video_dim=48,
-        bridge_layers=(0, 1),
-        variant="joint_cross_attn",
         text_dim=16,
         attn_head_dim=8,
         freq_dim=256,
@@ -138,22 +136,29 @@ def test_action_dit_joint_cross_attn_context_shape_and_effect():
         eps=1e-6,
     ).eval()
     actions = torch.randn(2, 5, 7)
-    bridges = {bid: torch.randn(2, 10, 48) for bid in (0, 1)}
+    bridges = [torch.randn(2, 10, 48) for _ in range(2)]
     timestep = torch.tensor([0.5, 0.8])
     context_a = torch.randn(2, 4, 16, generator=torch.Generator().manual_seed(11))
     context_b = torch.randn(2, 4, 16, generator=torch.Generator().manual_seed(22))
     context_mask = torch.ones(2, 4, dtype=torch.bool)
 
     with torch.no_grad():
-        out_a = dit(actions, bridges, timestep, context=context_a, context_mask=context_mask)
-        out_b = dit(actions, bridges, timestep, context=context_b, context_mask=context_mask)
+        out_a = dit(
+            actions, bridges, timestep, context=context_a, context_mask=context_mask,
+            use_gradient_checkpointing=False, use_gradient_checkpointing_offload=False,
+        )
+        out_b = dit(
+            actions, bridges, timestep, context=context_b, context_mask=context_mask,
+            use_gradient_checkpointing=False, use_gradient_checkpointing_offload=False,
+        )
 
     assert out_a.shape == (2, 5, 7)
     assert not torch.allclose(out_a, out_b, atol=1e-5)
 
 
-def test_action_backbone_does_not_import_the_video_package():
-    """Shared model helpers (flow grid, gradient checkpointing) live at the model level, not in video_backbone."""
+def test_action_backbone_does_not_import_the_video_or_architecture_package():
+    """The action package imports only openwam.model.common / model-level helpers, never video_backbone or the
+    architectures (layering: architectures -> action_backbone -> common)."""
     import ast
     from pathlib import Path
 
@@ -164,5 +169,9 @@ def test_action_backbone_does_not_import_the_video_package():
         for node in ast.walk(ast.parse(path.read_text())):
             names = [node.module or ""] if isinstance(node, ast.ImportFrom) else []
             names += [a.name for a in node.names] if isinstance(node, ast.Import) else []
-            bad += [f"{path.name}: {n}" for n in names if n.startswith("openwam.model.video_backbone")]
+            bad += [
+                f"{path.name}: {n}"
+                for n in names
+                if n.startswith(("openwam.model.video_backbone", "openwam.model.architectures"))
+            ]
     assert not bad, bad

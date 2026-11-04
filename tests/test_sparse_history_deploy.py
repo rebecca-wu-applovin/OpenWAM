@@ -398,10 +398,10 @@ def test_build_deploy_cfg_validates_sampler(tmp_path, override, match):
 
 @pytest.mark.parametrize(
     "dataloader, match",
-    [({"type": "robotwin"}, "yam_sharpa checkpoints only"), ({"multiview_layout": "l_shape"}, "vstack canvas only")],
+    [({"type": "robotwin"}, "yam_sharpa checkpoints only")],
 )
-def test_check_deploy_rejects_non_yam_sharpa_vstack(tmp_path, dataloader, match):
-    """check_deploy on an assembled cfg: only yam_sharpa vstack checkpoints are served."""
+def test_check_deploy_rejects_non_yam_sharpa(tmp_path, dataloader, match):
+    """check_deploy on an assembled cfg: only yam_sharpa checkpoints are served."""
     from openwam.deploy.config import DEPLOY_YAML, check_deploy
 
     run = _ckpt_dir(tmp_path)

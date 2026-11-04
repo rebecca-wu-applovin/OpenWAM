@@ -49,14 +49,11 @@ history_window: 100
 # (seed, epoch, idx) RNG after the history offsets. Launch scripts set the backbone's recipe value (GE 0.06, flux 0.1).
 caption_dropout_p: 0.0
 window_stride: 1
-split: train
 
 # ── Rendering: cameras stacked top-to-bottom ─────────────────────────────────
 # 2 x (240x320) → 480x320 canvas (150 tokens per latent).
 height: 480
 width: 320
-multiview: true
-multiview_layout: vstack
 camera_layout: [observation.images.ego_view, observation.images.chest_view]
 
 # ── Video augmentation ───────────────────────────────────────────────────────
@@ -65,4 +62,3 @@ color_jitter:
   brightness: 0.2
   contrast: 0.2
   saturation: 0.2
-  hue: 0.0

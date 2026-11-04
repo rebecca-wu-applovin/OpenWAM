@@ -1,11 +1,12 @@
-# ActionDiT (cfg.model.action_backbone). Attention geometry and the bridge / context widths come from the
-# video backbone's geometry block; its layer count is len(range(0, geometry.num_layers, bridge_interval)).
+# ActionDiT (cfg.model.action_backbone; joint_cross_attn builds CrossAttnActionDiT, joint_self_attn MoTActionDiT).
+# Attention geometry and the bridge / context widths come from the video backbone's geometry block. Its layer
+# count: joint_self_attn geometry.num_layers; joint_cross_attn len(range(0, geometry.num_layers, bridge_interval)).
 dim: 1024
 ffn_dim: 4096
 shift_action: 5.0      # flow-matching α-shift for the ACTION scheduler (train + deploy single source of truth)
 train_timestep: {law: grid, weighting: bell}   # uniform draw over the 1000-step shifted grid, Wan bell loss weights
 freq_dim: 256          # sinusoidal timestep embedding width
-max_action_len: 1024   # learned action position table size
+max_action_len: 1024   # longest action chunk: length of the action RoPE frequency table
 eps: 1.0e-06           # norm epsilon
 num_heads: ${..video_backbone.geometry.num_heads}
 head_dim: ${..video_backbone.geometry.head_dim}

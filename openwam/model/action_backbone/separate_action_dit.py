@@ -1,24 +1,17 @@
-"""Shared ActionDiT for OpenWAM joint video-action architectures.
+"""ActionDiT: the action stream of the dual-system architectures, one class per coupling.
 
-Dual-system architectures share this module. It owns the
-action-side parameters and exposes both a standalone cross-attention path and
-a split pre/post interface for mixed self-attention drivers.
+:class:`ActionDiT` is the shared base: action encoder, action-owned text/proprio context embedding, action
+timestep conditioning, RoPE table, action decoder, scheduler, and the input preparation
+(:meth:`ActionDiT.prepare_state`). Each coupling is its own subclass:
 
-Three variants share this module:
-
-- ``variant='joint_cross_attn'``: a stack of :class:`CrossAttnActionDiTBlock`
-  blocks (self-attn over action tokens + cross-attn to a per-layer video
-  feature + cross-attn to text/proprio context + FFN).
-  :meth:`ActionDiT.forward(action_tokens, bridges, timestep, ...)` is the
-  single entry point; ``bridges`` is a ``{block_id: feat}`` dict keyed by
-  the architecture-side video DiT layer index, and the architecture invokes
-  it once after the video backbone has run to completion.
-
-- ``variant='joint_self_attn'``: a stack of :class:`SelfAttnActionDiTBlock`
-  blocks with the same Q/K/V split layout as the video DiT.
-  :class:`DualSystemMoTDriver` drives the per-layer loop via
-  :meth:`pre_attn_at_layer` / :meth:`post_attn_at_layer`, concatenating
-  Q/K/V across modalities and running a single mixed attention.
+- :class:`CrossAttnActionDiT` (``joint_cross_attn``): a stack of :class:`CrossAttnActionDiTBlock` blocks
+  (self-attn over action tokens + cross-attn to one video bridge feature + cross-attn to the text/proprio context
+  + FFN). :meth:`CrossAttnActionDiT.forward` runs once, after the video backbone ran to completion, on the list of
+  bridge features (one per block).
+- :class:`MoTActionDiT` (``joint_self_attn``): a stack of :class:`SelfAttnActionDiTBlock` blocks with the same
+  Q/K/V split layout as the video DiT. :class:`DualSystemMoTDriver` drives the per-layer loop through
+  :meth:`MoTActionDiT.pre_attn_at_layer` / :meth:`MoTActionDiT.post_attn_at_layer`, concatenating Q/K/V across
+  modalities and running one mixed attention.
 
 Inspired by:
 - CoVAR: Bridge attention between video and action streams (cross_attn).
@@ -29,16 +22,17 @@ Inspired by:
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
 from einops import rearrange
 from omegaconf import DictConfig
 
-from openwam.model.action_backbone.base import ActionDiTBackbone
 from openwam.model.action_backbone.components import (
     RMSNorm,
+    TimestepEmbedding,
+    TimestepModulation,
     precompute_freqs_cis_1d,
     rope_apply_1d,
 )
@@ -46,29 +40,21 @@ from openwam.model.common.attention import flash_attention
 from openwam.model.common.flow_scheduler import FlowScheduler
 from openwam.model.grad_checkpoint import gradient_checkpoint_forward
 
-if TYPE_CHECKING:
-    from openwam.model.architectures.base import ActionState
-
-
-_MOT_VARIANTS = ("joint_self_attn",)
-
 
 @dataclass
 class ActionDiTState:
-    """Mutable container threaded through the joint self-attention loop.
+    """Per-forward action-stream state: built by :meth:`ActionDiT.prepare_state`, read by the block loop.
 
-    Populated by :meth:`ActionDiT.prepare_state` and consumed by
-    :meth:`ActionDiT.pre_attn_at_layer` / :meth:`ActionDiT.post_attn_at_layer`
-    (called per layer from :class:`DualSystemMoTDriver`) and finally by
-    :meth:`ActionDiT.extract_prediction`.
+    The MoT driver threads it through :meth:`MoTActionDiT.pre_attn_at_layer` /
+    :meth:`MoTActionDiT.post_attn_at_layer` (only ``x_action`` changes per layer) and
+    :meth:`MoTActionDiT.extract_prediction` decodes it.
     """
 
-    x_action: torch.Tensor  # (B, T_action, dim)
-    t_mod: torch.Tensor  # (B, t_mod_params, dim)
-    t_embed: torch.Tensor  # (B, dim)
-    action_freqs: torch.Tensor  # 1D RoPE frequencies for action positions
-    context: Optional[torch.Tensor] = None  # (B, T_context, dim), action-projected raw text/proprio context
-    context_mask: Optional[torch.Tensor] = None  # (B, T_context) or (B, T_action, T_context), True means attendable
+    x_action: torch.Tensor  # (B, T_action, dim) action hidden state
+    t_mod: torch.Tensor  # (B, n_mod, dim) timestep modulation (n_mod = 9 cross-attn, 6 MoT)
+    action_freqs: torch.Tensor  # (T_action, head_dim // 2) complex RoPE frequencies of the action positions
+    context: torch.Tensor  # (B, L, dim) action-projected text/proprio context
+    context_mask: torch.Tensor  # (B, T_action, L) bool, True = attend
 
 
 class ActionSelfAttention(nn.Module):
@@ -80,18 +66,12 @@ class ActionSelfAttention(nn.Module):
     when their residual streams have different widths
     ([wan_video_dit.py:179-184](references/FastWAM/src/fastwam/models/wan22/wan_video_dit.py#L179)).
     For ``attn_head_dim == hidden_dim // num_heads`` this collapses back to
-    the homogeneous ``Linear(dim, dim)`` form.
-
-    Applies 1D rotary position embedding (RoPE) to Q/K when ``freqs`` is
-    supplied. Call with ``freqs=None`` to fall back to position-free attention.
+    the homogeneous ``Linear(dim, dim)`` form. 1D RoPE is applied to Q/K.
     """
 
     def __init__(self, hidden_dim: int, num_heads: int, attn_head_dim: int, eps: float):
         super().__init__()
-        if attn_head_dim <= 0:
-            raise ValueError(f"attn_head_dim must be > 0, got {attn_head_dim}")
-        if attn_head_dim % 2 != 0:
-            raise ValueError(f"attn_head_dim must be even for RoPE, got {attn_head_dim}")
+        # attn_head_dim (positive, even for RoPE) is validated once, by ActionDiT.__init__.
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.attn_head_dim = attn_head_dim
@@ -104,17 +84,21 @@ class ActionSelfAttention(nn.Module):
         self.norm_q = RMSNorm(self.attn_hidden_dim, eps=eps)
         self.norm_k = RMSNorm(self.attn_hidden_dim, eps=eps)
 
-    def forward(self, x, freqs: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        """Args: x: (B, S, hidden_dim) action tokens. freqs: (S, attn_head_dim // 2) complex RoPE frequencies.
+
+        Returns: (B, S, hidden_dim) attention output, projected back by ``o``.
+        """
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
 
+        # RoPE rotates per head: split heads, rotate Q/K.
         q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
-        if freqs is not None:
-            q = rope_apply_1d(q, freqs)
-            k = rope_apply_1d(k, freqs)
+        q = rope_apply_1d(q, freqs)
+        k = rope_apply_1d(k, freqs)
         # the shared dispatcher takes packed heads (B, S, H*D) and returns the same layout
         q, k, v = (rearrange(t, "b n s d -> b s (n d)") for t in (q, k, v))
         x = flash_attention(q, k, v, num_heads=self.num_heads)
@@ -122,28 +106,15 @@ class ActionSelfAttention(nn.Module):
 
 
 class BridgeCrossAttention(nn.Module):
-    """Cross-attention from action tokens to video DiT features.
+    """Cross-attention from action tokens to a key/value sequence (a video bridge feature or the context).
 
-    The bridge that transfers dynamics information from the video stream
-    to the action stream in the cross_attn variant. Q is projected from
-    the action ``hidden_dim``, K/V are projected from the video
-    ``kv_hidden_dim`` (which may differ from the action stream's hidden
-    dim — both are flattened into the shared
-    ``num_heads * attn_head_dim`` attention space). Inspired by CoVAR's
-    Bridge Attention and mimic-video's cross-attention to intermediate
-    video features.
+    Q is projected from the action ``hidden_dim``, K/V from ``kv_hidden_dim``; both land in the shared
+    ``num_heads * attn_head_dim`` attention space. Inspired by CoVAR's Bridge Attention and mimic-video's
+    cross-attention to intermediate video features.
     """
 
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_heads: int,
-        attn_head_dim: int,
-        eps: float,
-        kv_hidden_dim: Optional[int] = None,
-    ):
+    def __init__(self, hidden_dim: int, num_heads: int, attn_head_dim: int, eps: float, kv_hidden_dim: int):
         super().__init__()
-        kv_hidden_dim = kv_hidden_dim if kv_hidden_dim is not None else hidden_dim
         self.hidden_dim = hidden_dim
         self.kv_hidden_dim = kv_hidden_dim
         self.num_heads = num_heads
@@ -157,37 +128,35 @@ class BridgeCrossAttention(nn.Module):
         self.norm_q = RMSNorm(self.attn_hidden_dim, eps=eps)
         self.norm_k = RMSNorm(self.attn_hidden_dim, eps=eps)
 
-    def forward(self, x_action: torch.Tensor, x_video: torch.Tensor, ctx_mask: Optional[torch.Tensor] = None):
+    def forward(self, x_action: torch.Tensor, x_kv: torch.Tensor, ctx_mask: torch.Tensor | None) -> torch.Tensor:
+        """Args:
+            x_action: (B, S_q, hidden_dim) action tokens.
+            x_kv: (B, S_kv, kv_hidden_dim) keys/values (a projected video bridge, or the action context).
+            ctx_mask: (B, S_q, S_kv) bool, True = attend; None = every key (each call site states it; the video
+                bridge passes None).
+
+        Returns: (B, S_q, hidden_dim) attention output.
+        """
         q = self.norm_q(self.q(x_action))
-        k = self.norm_k(self.k(x_video))
-        v = self.v(x_video)
+        k = self.norm_k(self.k(x_kv))
+        v = self.v(x_kv)
 
         # (B, Sq, Skv) mask -> (B, 1, Sq, Skv) so it broadcasts over heads; a mask forces SDPA in flash_attention
-        if ctx_mask is not None and ctx_mask.dim() == 3:
+        if ctx_mask is not None:
             ctx_mask = ctx_mask.unsqueeze(1)
         x = flash_attention(q, k, v, num_heads=self.num_heads, attn_mask=ctx_mask)
         return self.o(x)
 
 
 class CrossAttnActionDiTBlock(nn.Module):
-    """Single ActionDiT block for the cross_attn variant.
+    """One :class:`CrossAttnActionDiT` block.
 
-    Layout: self-attn → cross-attn(to video bridge) → optional
-    cross-attn(to text/proprio context) → FFN. Self-attn, bridge
-    cross-attn, and FFN are AdaLN-modulated by the action diffusion
-    timestep; context cross-attn mirrors Wan/FastWAM text conditioning and
-    is not timestep-gated.
+    Layout: self-attn → cross-attn (to the video bridge) → cross-attn (to the text/proprio context) → FFN.
+    Self-attn, bridge cross-attn and FFN are AdaLN-modulated by the action diffusion timestep (9 params);
+    context cross-attn mirrors Wan/FastWAM text conditioning and is not timestep-gated.
     """
 
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_heads: int,
-        attn_head_dim: int,
-        ffn_dim: int,
-        eps: float,
-        kv_hidden_dim: Optional[int] = None,
-    ):
+    def __init__(self, hidden_dim: int, num_heads: int, attn_head_dim: int, ffn_dim: int, eps: float):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
@@ -196,16 +165,11 @@ class CrossAttnActionDiTBlock(nn.Module):
         self.self_attn = ActionSelfAttention(hidden_dim, num_heads, attn_head_dim, eps)
         self.self_attn_norm = nn.LayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
 
-        self.cross_attn = BridgeCrossAttention(hidden_dim, num_heads, attn_head_dim, eps, kv_hidden_dim=kv_hidden_dim)
+        # The bridge is projected to the action width by CrossAttnActionDiT.video_projs before it gets here.
+        self.cross_attn = BridgeCrossAttention(hidden_dim, num_heads, attn_head_dim, eps, kv_hidden_dim=hidden_dim)
         self.bridge_attn_norm = nn.LayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
 
-        self.context_attn = BridgeCrossAttention(
-            hidden_dim,
-            num_heads,
-            attn_head_dim,
-            eps,
-            kv_hidden_dim=hidden_dim,
-        )
+        self.context_attn = BridgeCrossAttention(hidden_dim, num_heads, attn_head_dim, eps, kv_hidden_dim=hidden_dim)
         self.context_attn_norm = nn.LayerNorm(hidden_dim, eps=eps)
 
         self.ffn = nn.Sequential(
@@ -219,13 +183,20 @@ class CrossAttnActionDiTBlock(nn.Module):
 
     def forward(
         self,
-        x_action,
-        x_video,
-        t_mod,
-        freqs: Optional[torch.Tensor] = None,
-        context: Optional[torch.Tensor] = None,
-        context_mask: Optional[torch.Tensor] = None,
-    ):
+        x_action: torch.Tensor,
+        x_video: torch.Tensor,
+        t_mod: torch.Tensor,
+        freqs: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Args:
+            x_action: (B, T_action, dim) action hidden state. x_video: (B, T_video, dim) projected bridge feature.
+            t_mod: (B, 9, dim) timestep modulation. freqs: (T_action, head_dim // 2) complex RoPE frequencies.
+            context: (B, L, dim) projected context. context_mask: (B, T_action, L) bool, True = attend.
+
+        Returns: (B, T_action, dim) action hidden state after the block.
+        """
         (shift_sa, scale_sa, gate_sa, shift_ca, scale_ca, gate_ca, shift_ff, scale_ff, gate_ff) = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
         ).chunk(9, dim=1)
@@ -234,10 +205,10 @@ class CrossAttnActionDiTBlock(nn.Module):
         x_action = x_action + gate_sa * self.self_attn(h, freqs=freqs)
 
         h = self.bridge_attn_norm(x_action) * (1 + scale_ca) + shift_ca
-        x_action = x_action + gate_ca * self.cross_attn(h, x_video)
+        # The video bridge has no padded tokens: no mask.
+        x_action = x_action + gate_ca * self.cross_attn(h, x_video, ctx_mask=None)
 
-        if context is not None:
-            x_action = x_action + self.context_attn(self.context_attn_norm(x_action), context, ctx_mask=context_mask)
+        x_action = x_action + self.context_attn(self.context_attn_norm(x_action), context, ctx_mask=context_mask)
 
         h = self.ffn_norm(x_action) * (1 + scale_ff) + shift_ff
         x_action = x_action + gate_ff * self.ffn(h)
@@ -246,28 +217,20 @@ class CrossAttnActionDiTBlock(nn.Module):
 
 
 class SelfAttnActionDiTBlock(nn.Module):
-    """Action expert block driven by the MoT joint self-attention loop.
+    """One :class:`MoTActionDiT` block, driven by the MoT joint self-attention loop.
 
     The block is split around self-attention so :class:`DualSystemMoTDriver` can
     concatenate video/action Q/K/V, run one mixed attention, and return the
     action slice. After that mixed attention, the action stream cross-attends
     to its own text/proprio context embedding and then runs the FFN. The
     mixed self-attention and FFN are AdaLN-modulated by the action diffusion
-    timestep; context cross-attention is not timestep-gated.
+    timestep (6 params); context cross-attention is not timestep-gated.
 
-    There is no ``forward``: :class:`ActionDiT` (``pre_attn_at_layer`` / ``post_attn_at_layer``) calls the
+    There is no ``forward``: :class:`MoTActionDiT` (``pre_attn_at_layer`` / ``post_attn_at_layer``) calls the
     sub-modules directly.
     """
 
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_heads: int,
-        attn_head_dim: int,
-        ffn_dim: int,
-        kv_hidden_dim: int,
-        eps: float,
-    ):
+    def __init__(self, hidden_dim: int, num_heads: int, attn_head_dim: int, ffn_dim: int, eps: float):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
@@ -279,7 +242,7 @@ class SelfAttnActionDiTBlock(nn.Module):
         self.self_attn = ActionSelfAttention(hidden_dim, num_heads, attn_head_dim, eps)
         # Cross-attention to the action expert's own text/proprio context
         # embedding. KV therefore lives in the action residual width.
-        self.cross_attn = BridgeCrossAttention(hidden_dim, num_heads, attn_head_dim, eps, kv_hidden_dim=kv_hidden_dim)
+        self.cross_attn = BridgeCrossAttention(hidden_dim, num_heads, attn_head_dim, eps, kv_hidden_dim=hidden_dim)
 
         self.self_attn_norm = nn.LayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
         self.context_attn_norm = nn.LayerNorm(hidden_dim, eps=eps)
@@ -292,124 +255,88 @@ class SelfAttnActionDiTBlock(nn.Module):
         )
         self.modulation = nn.Parameter(torch.randn(1, 6, hidden_dim) / hidden_dim**0.5)
 
-    def gate(self, x: torch.Tensor, gate: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        return x + gate * residual
 
+class ActionDiT(nn.Module):
+    """Shared base of the two ActionDiT couplings (not built on its own).
 
-class ActionDiT(ActionDiTBackbone):
-    """Lightweight Diffusion Transformer for action generation.
-
-    Two variants share the action encoder, action-owned text/proprio context
-    embedding, action timestep conditioning, RoPE cache, and simple action
-    decoder. They differ in how video features enter the action stream:
-
-    - ``joint_cross_attn`` → :class:`CrossAttnActionDiTBlock` + :meth:`forward`.
-    - ``joint_self_attn`` → :class:`SelfAttnActionDiTBlock` +
-      :meth:`pre_attn_at_layer` / :meth:`post_attn_at_layer`, driven by
-      :class:`DualSystemMoTDriver`.
+    Owns the scheduler, the action encoder, the action-owned text/proprio context embedding, the RoPE table and
+    the input preparation. Each subclass builds the rest (``time_embedding``, ``time_projection``, ``blocks``,
+    ``action_decoder``, plus its coupling modules) in its own ``__init__``, keeping the parameter creation order
+    (and so the init RNG draws) of the released checkpoints.
 
     Args:
-        action_dim: Dimension of raw action vectors (e.g. 20 for bimanual).
-        dim: Hidden dimension of the action residual stream. **May differ
-            from the video backbone's hidden dim** under ``joint_self_attn``
-            — Q/K/V are projected into the shared attention space
-            ``num_heads * attn_head_dim`` (FastWAM-Joint pattern) so the two
-            modalities can run a single mixed attention even with
-            heterogeneous residual widths.
-        ffn_dim: FFN intermediate dimension.
-        num_heads: Attention heads — under ``joint_self_attn`` must equal
-            the video backbone's ``num_heads``.
-        num_layers: Number of action-side blocks. For ``joint_self_attn`` this
-            **must** equal the video backbone's ``num_layers`` (validated by
-            :class:`DualSystemMoTDriver`).
-        video_dim: Cross-attn variant: video feature dim, projected to ``dim``
-            on entry (each bridge's last dim is checked against it). Self-attn
-            variant: informational only — the MoT driver validates
-            ``num_heads`` / ``attn_head_dim`` parity, not ``video_dim``.
-        text_dim: Raw context dimension before the action expert's own
-            FastWAM-style text/proprio projection (yaml ``text_dim``).
-        attn_head_dim: Per-head attention dim (yaml ``head_dim``). Under ``joint_self_attn``
-            must equal the video backbone's ``head_dim`` (validated by :class:`DualSystemMoTDriver`).
-        freq_dim / max_action_len / eps: sinusoidal timestep width, action RoPE table length,
-            norm epsilon (yaml ``freq_dim`` / ``max_action_len`` / ``eps``).
-        bridge_layers: Cross-attn variant: which video DiT layers feed each
-            action block (1:1 mapping). Self-attn variant: typically the full
-            ``range(num_layers)`` — the driver runs joint attention at every
-            layer regardless and this is informational only.
-        variant: ``"joint_cross_attn"`` or ``"joint_self_attn"``.
+        action_dim: raw action width (``common.action_dim``).
+        dim: action residual width. May differ from the video hidden dim: Q/K/V project into the shared
+            ``num_heads * attn_head_dim`` attention space (FastWAM-Joint pattern).
+        ffn_dim: FFN intermediate width.
+        num_heads / attn_head_dim: attention heads and per-head dim (yaml ``num_heads`` / ``head_dim``, the video
+            geometry's; the MoT driver checks the parity).
+        num_layers: number of action blocks.
+        text_dim: raw context width before the action expert's own text/proprio projection.
+        freq_dim / max_action_len / eps: sinusoidal timestep width, action RoPE table length, norm epsilon.
         shift_action: α-shift of the action scheduler's sigma grid (yaml ``shift_action``, train + deploy).
         train_timestep: DictConfig, the action scheduler's training law (yaml ``train_timestep``).
     """
 
-    @classmethod
-    def from_cfg(cls, ab: DictConfig, *, action_dim: int, bridge_layers: Tuple[int, ...], variant: str) -> "ActionDiT":
-        """Build from the ``action_backbone`` slice; the one place its yaml keys map to constructor args.
+    # Built by each subclass __init__ (between / after its coupling modules, in checkpoint creation order).
+    time_embedding: TimestepEmbedding
+    time_projection: TimestepModulation
+    blocks: nn.ModuleList
+    action_decoder: nn.Linear
+
+    @staticmethod
+    def _shared_kwargs(ab: DictConfig, action_dim: int, num_layers: int) -> dict:
+        """The one place the ``action_backbone`` yaml keys map to the shared constructor args.
 
         Args:
             ab: ``merge(common, model).action_backbone`` (DictConfig): dim / ffn_dim / num_heads / head_dim /
-                video_dim / text_dim / freq_dim / max_action_len / eps / shift_action / train_timestep.
+                text_dim / freq_dim / max_action_len / eps / shift_action / train_timestep.
             action_dim: int, raw action width (``common.action_dim``).
-            bridge_layers: tuple of video layer ids, one action block each (its length is ``num_layers``).
-            variant: ``"joint_cross_attn"`` or ``"joint_self_attn"``.
+            num_layers: int, number of action blocks (the architecture decides it).
 
-        Returns:
-            ActionDiT, freshly initialised on CPU.
+        Returns: dict of :class:`ActionDiT` constructor kwargs.
         """
-        # yaml head_dim is the constructor's attn_head_dim; the block count is implied by the bridge ids.
-        return cls(
+        # yaml head_dim is the constructor's attn_head_dim.
+        return dict(
             action_dim=int(action_dim), dim=int(ab.dim), ffn_dim=int(ab.ffn_dim), num_heads=int(ab.num_heads),
-            num_layers=len(bridge_layers), video_dim=int(ab.video_dim), bridge_layers=bridge_layers, variant=variant,
-            attn_head_dim=int(ab.head_dim), text_dim=int(ab.text_dim), freq_dim=int(ab.freq_dim),
-            max_action_len=int(ab.max_action_len), eps=float(ab.eps), shift_action=float(ab.shift_action),
-            train_timestep=ab.train_timestep,
+            attn_head_dim=int(ab.head_dim), num_layers=int(num_layers), text_dim=int(ab.text_dim),
+            freq_dim=int(ab.freq_dim), max_action_len=int(ab.max_action_len), eps=float(ab.eps),
+            shift_action=float(ab.shift_action), train_timestep=ab.train_timestep,
         )
 
     def __init__(
         self,
+        *,
         action_dim: int,
         dim: int,
         ffn_dim: int,
         num_heads: int,
-        num_layers: int,
-        video_dim: int,
-        bridge_layers: Tuple[int, ...],
-        variant: str,
         attn_head_dim: int,
+        num_layers: int,
         text_dim: int,
         freq_dim: int,
         max_action_len: int,
         eps: float,
-        *,
         shift_action: float,
         train_timestep: DictConfig,
     ):
-        super().__init__(FlowScheduler(shift=float(shift_action), train_timestep=train_timestep))
-        if variant not in ("joint_cross_attn", *_MOT_VARIANTS):
-            raise ValueError(f"Unknown variant '{variant}'. Choose from: joint_cross_attn, {', '.join(_MOT_VARIANTS)}")
-        if len(bridge_layers) != num_layers:
-            raise ValueError(
-                f"bridge_layers ({len(bridge_layers)}) must equal num_layers ({num_layers}). "
-                "Each action block connects to exactly one video DiT layer."
-            )
+        super().__init__()
+        # The only copy of the action α-shift, read by training and inference alike.
+        self.scheduler = FlowScheduler(shift=float(shift_action), train_timestep=train_timestep)
+        # The one head_dim check: RoPE rotates pairs of channels.
         if attn_head_dim <= 0 or attn_head_dim % 2 != 0:
             raise ValueError(f"attn_head_dim must be a positive even int, got {attn_head_dim}")
 
         self.action_dim = action_dim
         self.dim = dim
-        self.video_dim = int(video_dim)  # cross_attn: the bridge width forward checks
-        self._head_dim = attn_head_dim
-        self._num_heads = num_heads
-        self._num_layers = num_layers
+        self.ffn_dim = ffn_dim
+        self.num_heads = num_heads
+        self.head_dim = attn_head_dim
+        self.num_layers = num_layers
+        self.text_dim = int(text_dim)
         self.freq_dim = freq_dim
         self.max_action_len = max_action_len
-        self._bridge_layers = tuple(bridge_layers)
-        self.variant = variant
-        self.text_dim = int(text_dim)
-
-        from openwam.model.action_backbone.components import (
-            TimestepEmbedding,
-            TimestepModulation,
-        )
+        self.eps = eps
 
         # FastWAM-compatible action token embedding: raw action -> hidden.
         self.action_encoder = nn.Linear(action_dim, dim)
@@ -419,56 +346,13 @@ class ActionDiT(ActionDiTBackbone):
             nn.Linear(dim, dim),
         )
 
-        # Both variants rely on RoPE inside attention — no learned absolute PE.
+        # Both couplings rely on RoPE inside attention — no learned absolute PE.
         # Keep this as a plain attribute, not a buffer: Module.to(dtype=bf16)
         # casts complex buffers to real and drops the imaginary part. _apply()
         # below moves it across devices while preserving complex dtype.
         # RoPE freqs are sized by attn_head_dim (the per-head attention dim that
         # both modalities share), not by hidden_dim/num_heads.
         self.freqs = precompute_freqs_cis_1d(attn_head_dim, max_action_len)
-
-        # Cross-attn variant: per-layer projection from video_dim to action dim.
-        # Self-attn doesn't need this — the MoT driver handles modality coupling
-        # through the joint attention itself.
-        if variant == "joint_cross_attn":
-            if video_dim != dim:
-                self.video_projs = nn.ModuleList([nn.Linear(video_dim, dim) for _ in range(num_layers)])
-            else:
-                self.video_projs = nn.ModuleList([nn.Identity() for _ in range(num_layers)])
-
-        # Timestep embedding (independent from video timestep)
-        self.time_embedding = TimestepEmbedding(freq_dim, dim)
-        # Modulation params per block: 9 for cross_attn (3 self + 3 cross + 3 ffn);
-        # 6 for self_attn (3 self/joint + 3 ffn — text cross-attn has no modulation
-        # in the MoT block, mirroring FastWAM's Wan-aligned DiTBlock).
-        t_mod_params = 9 if variant == "joint_cross_attn" else 6
-        self.t_mod_params = t_mod_params
-        self.time_projection = TimestepModulation(dim, t_mod_params)
-
-        # Transformer blocks
-        if variant in _MOT_VARIANTS:
-            # SelfAttn variant: action owns an independent text/proprio
-            # embedding, so cross-attn KV lives in the action residual width.
-            self.blocks = nn.ModuleList(
-                [
-                    SelfAttnActionDiTBlock(
-                        dim,
-                        num_heads,
-                        attn_head_dim,
-                        ffn_dim,
-                        kv_hidden_dim=dim,
-                        eps=eps,
-                    )
-                    for _ in range(num_layers)
-                ]
-            )
-        else:
-            self.blocks = nn.ModuleList(
-                [CrossAttnActionDiTBlock(dim, num_heads, attn_head_dim, ffn_dim, eps) for _ in range(num_layers)]
-            )
-
-        # FastWAM-compatible simple action decoder; no AdaLN and no zero init.
-        self.action_decoder = nn.Linear(dim, action_dim)
 
     def _apply(self, fn, recurse=True):
         """Module ``_apply`` (``.to`` / ``.cuda`` / ...), then move the RoPE table to the parameters' device.
@@ -480,79 +364,67 @@ class ActionDiT(ActionDiTBackbone):
         self.freqs = self.freqs.to(device=self.action_decoder.weight.device)
         return module
 
-    # ------------------------------------------------------------------
-    # ActionDiTBackbone interface
-    # ------------------------------------------------------------------
+    def set_dtype_device(self, dtype: torch.dtype, device: torch.device) -> None:
+        """Move the parameters / buffers to (dtype, device); the RoPE table follows the device (``_apply``)."""
+        self.to(dtype=dtype, device=device)
 
-    @property
-    def uses_proprioception(self) -> bool:
-        return False
+    def save_deploy_assets(self, output_dir: str) -> None:
+        """No-op: the action weights are fully in the safetensors checkpoint (the architecture's deploy hook).
 
-    @property
-    def num_heads(self) -> int:
-        return self._num_heads
-
-    @property
-    def head_dim(self) -> int:
-        return self._head_dim
-
-    @property
-    def num_layers(self) -> int:
-        return self._num_layers
-
-    # ------------------------------------------------------------------
-    # Helpers shared by both variants
-    # ------------------------------------------------------------------
-
-    def _get_rope_freqs(self, seq_len: int) -> torch.Tensor:
-        if seq_len > self.freqs.shape[0]:
-            raise ValueError(
-                f"Action sequence length {seq_len} exceeds precomputed RoPE cache "
-                f"length {self.freqs.shape[0]}; increase ``max_action_len``."
-            )
-        return self.freqs[:seq_len]
+        Args: output_dir: str, the checkpoint dir (unused). Returns: None.
+        """
 
     def _embed_actions(self, action_tokens: torch.Tensor) -> torch.Tensor:
+        """Args: action_tokens: (B, T_action, action_dim) noisy actions. Returns: (B, T_action, dim) tokens."""
+        # The one length check: the RoPE table has max_action_len rows.
         T = action_tokens.shape[1]
         if T > self.max_action_len:
-            raise ValueError(f"Action sequence length {T} exceeds max_action_len {self.max_action_len}.")
+            raise ValueError(
+                f"Action sequence length {T} exceeds max_action_len {self.max_action_len} (the RoPE table length)."
+            )
         return self.action_encoder(action_tokens)
 
     def _prepare_context(
         self,
-        context: Optional[torch.Tensor],
-        context_mask: Optional[torch.Tensor],
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
         *,
         batch_size: int,
         seq_len: int,
         dtype: torch.dtype,
         device: torch.device,
-    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if context is None:
-            if context_mask is not None:
-                raise ValueError("context_mask was provided but context is None.")
-            return None, None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project the raw context to the action width and expand its mask to one row per action token.
+
+        Args:
+            context: (B, L, text_dim) raw text/proprio context. context_mask: (B, L) bool, True = attend.
+            batch_size: int B of the actions. seq_len: int T_action. dtype / device: of the action tokens.
+
+        Returns: (context_emb (B, L, dim), context_attn_mask (B, T_action, L) bool).
+        """
         if context.ndim != 3:
             raise ValueError(f"context must have shape [B, L, text_dim], got {tuple(context.shape)}")
         if context.shape[0] != batch_size:
             raise ValueError(f"context batch size ({context.shape[0]}) must match actions batch size ({batch_size})")
         if context.shape[-1] != self.text_dim:
             raise ValueError(f"context last dim must match text_dim={self.text_dim}, got {context.shape[-1]}")
+        if context_mask.shape != context.shape[:2]:
+            raise ValueError(
+                f"context_mask must have shape {tuple(context.shape[:2])}, got {tuple(context_mask.shape)}"
+            )
 
         context = context.to(device=device, dtype=dtype)
         context_emb = self.text_embedding(context)
-        if context_mask is None:
-            context_mask = torch.ones(context.shape[:2], dtype=torch.bool, device=device)
-        else:
-            if context_mask.shape != context.shape[:2]:
-                raise ValueError(
-                    f"context_mask must have shape {tuple(context.shape[:2])}, got {tuple(context_mask.shape)}"
-                )
-            context_mask = context_mask.to(device=device, dtype=torch.bool)
+        context_mask = context_mask.to(device=device, dtype=torch.bool)
+        # Every action token sees the same context keys.
         context_attn_mask = context_mask.unsqueeze(1).expand(-1, seq_len, -1)
         return context_emb, context_attn_mask
 
     def _prepare_timestep(self, timestep: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """Args: timestep: (B,) or (1,) action timestep. batch_size: int B.
+
+        Returns: (B,) timestep; a (1,) one is broadcast, which only inference may do.
+        """
         if timestep.ndim != 1:
             raise ValueError(f"action timestep must be 1D [B] or [1], got shape {tuple(timestep.shape)}")
         if timestep.shape[0] not in (1, batch_size):
@@ -563,36 +435,100 @@ class ActionDiT(ActionDiTBackbone):
             timestep = timestep.expand(batch_size)
         return timestep
 
-    # ------------------------------------------------------------------
-    # joint_cross_attn variant: standalone forward with bridge features
-    # ------------------------------------------------------------------
+    def prepare_state(
+        self,
+        noisy_actions: torch.Tensor,
+        timestep: torch.Tensor,
+        *,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+    ) -> ActionDiTState:
+        """Embed the actions and build the per-forward inputs of the block loop.
 
-    def bridge_tuple_from_dict(self, bridges: Dict[int, torch.Tensor]) -> tuple[torch.Tensor, ...]:
-        """Return bridges ordered by ``self._bridge_layers`` (one tensor per action block)."""
+        Args:
+            noisy_actions: (B, T_action, action_dim) noisy action sequence.
+            timestep: (B,) or (1,) action diffusion timestep.
+            context: (B, L, text_dim) raw text/proprio context.
+            context_mask: (B, L) bool, True = attend.
 
-        missing = [bid for bid in self._bridge_layers if bid not in bridges]
-        if missing:
-            raise ValueError(
-                f"bridges dict missing video block ids {missing}; "
-                f"expected one entry per bridge_layers={self._bridge_layers}."
-            )
-        return tuple(bridges[bid] for bid in self._bridge_layers)
+        Returns:
+            ActionDiTState: x_action (B, T_action, dim), its modulation, RoPE frequencies and projected context.
+        """
+        x = self._embed_actions(noisy_actions)
+        timestep = self._prepare_timestep(timestep, noisy_actions.shape[0])
+        t_mod = self.time_projection(self.time_embedding(timestep))
+        # _embed_actions checked T_action <= max_action_len, the table length.
+        action_freqs = self.freqs[: x.shape[1]].to(device=x.device)
+        action_context, action_context_mask = self._prepare_context(
+            context,
+            context_mask,
+            batch_size=noisy_actions.shape[0],
+            seq_len=x.shape[1],
+            dtype=x.dtype,
+            device=x.device,
+        )
+        return ActionDiTState(
+            x_action=x,
+            t_mod=t_mod,
+            action_freqs=action_freqs,
+            context=action_context,
+            context_mask=action_context_mask,
+        )
 
-    def _validate_bridge_tuple(self, x: torch.Tensor, bridge_tuple: tuple[torch.Tensor, ...]) -> None:
-        if len(bridge_tuple) != len(self._bridge_layers):
-            raise ValueError(
-                f"bridge_tuple length ({len(bridge_tuple)}) must match bridge_layers={self._bridge_layers}."
-            )
 
-        for i, bridge in enumerate(bridge_tuple):
+class CrossAttnActionDiT(ActionDiT):
+    """``joint_cross_attn`` ActionDiT: runs once on the video bridge features, one bridge per block.
+
+    Args: as :class:`ActionDiT`, plus ``video_dim``: int width of the bridge features (the video hidden dim),
+    projected to ``dim`` per block on entry.
+    """
+
+    @classmethod
+    def from_cfg(cls, ab: DictConfig, *, action_dim: int, num_layers: int) -> "CrossAttnActionDiT":
+        """Build from the ``action_backbone`` slice (keys of :meth:`ActionDiT._shared_kwargs` + ``video_dim``).
+
+        Args: ab: the slice. action_dim: int raw action width. num_layers: int, one block per bridged video layer.
+
+        Returns: CrossAttnActionDiT, freshly initialised on CPU.
+        """
+        return cls(**cls._shared_kwargs(ab, action_dim, num_layers), video_dim=int(ab.video_dim))
+
+    def __init__(self, *, video_dim: int, **shared):
+        super().__init__(**shared)
+        self.video_dim = int(video_dim)
+        dim, num_layers = self.dim, self.num_layers
+        # Creation order (= init RNG draws) is the checkpoints': video_projs come before the time embedding.
+        if video_dim != dim:
+            self.video_projs = nn.ModuleList([nn.Linear(video_dim, dim) for _ in range(num_layers)])
+        else:
+            self.video_projs = nn.ModuleList([nn.Identity() for _ in range(num_layers)])
+        self.time_embedding = TimestepEmbedding(self.freq_dim, dim)
+        # 9 modulation params per block: 3 self-attn + 3 bridge cross-attn + 3 FFN.
+        self.time_projection = TimestepModulation(dim, 9)
+        self.blocks = nn.ModuleList(
+            [
+                CrossAttnActionDiTBlock(dim, self.num_heads, self.head_dim, self.ffn_dim, self.eps)
+                for _ in range(num_layers)
+            ]
+        )
+        # FastWAM-compatible simple action decoder; no AdaLN and no zero init.
+        self.action_decoder = nn.Linear(dim, self.action_dim)
+
+    def _validate_bridges(self, x: torch.Tensor, bridges: list[torch.Tensor]) -> None:
+        """Raise unless there is one (B, T_video, video_dim) bridge per block on the actions' device / dtype.
+
+        Args: x: (B, T_action, dim) embedded actions. bridges: list of bridge features, block order.
+        """
+        if len(bridges) != self.num_layers:
+            raise ValueError(f"got {len(bridges)} bridge features for {self.num_layers} action blocks (one each)")
+        for i, bridge in enumerate(bridges):
             if bridge.ndim != 3:
                 raise ValueError(
-                    f"bridge tensor for video block {self._bridge_layers[i]} must have shape [B, T_video, C], "
-                    f"got {tuple(bridge.shape)}."
+                    f"bridge for action block {i} must have shape [B, T_video, C], got {tuple(bridge.shape)}"
                 )
             if bridge.shape[0] != x.shape[0]:
                 raise ValueError(
-                    f"bridge tensor batch size ({bridge.shape[0]}) must match actions batch size ({x.shape[0]})."
+                    f"bridge batch size ({bridge.shape[0]}) must match actions batch size ({x.shape[0]})."
                 )
             if bridge.device != x.device:
                 raise RuntimeError(
@@ -602,181 +538,110 @@ class ActionDiT(ActionDiTBackbone):
                 raise RuntimeError(
                     f"bridge dtype mismatch at action block {i}: bridge={bridge.dtype}, actions={x.dtype}."
                 )
-            expected_dim = self.video_dim
-            if bridge.shape[-1] != expected_dim:
+            if bridge.shape[-1] != self.video_dim:
                 raise ValueError(
-                    f"bridge tensor last dim ({bridge.shape[-1]}) must match expected video_dim={expected_dim} "
-                    f"for action block {i}."
+                    f"bridge last dim ({bridge.shape[-1]}) must match video_dim={self.video_dim} for action block {i}."
                 )
 
-    def forward_with_bridge_tuple(
+    def forward(
         self,
         action_tokens: torch.Tensor,
-        bridge_tuple: tuple[torch.Tensor, ...],
+        bridges: list[torch.Tensor],
         timestep: torch.Tensor,
         *,
-        context: Optional[torch.Tensor] = None,
-        context_mask: Optional[torch.Tensor] = None,
-        action_freqs: Optional[torch.Tensor] = None,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        use_gradient_checkpointing: bool,
+        use_gradient_checkpointing_offload: bool,
     ) -> torch.Tensor:
-        """Tuple-based cross-attn forward (bridges ordered as ``self._bridge_layers``); see :meth:`forward`."""
+        """Action prediction from the per-block video bridge features (the video backbone already ran).
 
-        x = self._embed_actions(action_tokens)
-        self._validate_bridge_tuple(x, bridge_tuple)
-        timestep = self._prepare_timestep(timestep, action_tokens.shape[0])
-        t = self.time_embedding(timestep)
-        t_mod = self.time_projection(t)
-        freqs = action_freqs if action_freqs is not None else self._get_rope_freqs(x.shape[1]).to(device=x.device)
-        context_emb, context_attn_mask = self._prepare_context(
-            context,
-            context_mask,
-            batch_size=action_tokens.shape[0],
-            seq_len=x.shape[1],
-            dtype=x.dtype,
-            device=x.device,
-        )
+        Args:
+            action_tokens: (B, T_action, action_dim) noisy action sequence.
+            bridges: list of num_layers (B, T_video, video_dim) video hidden states, block i's bridge at index i.
+            timestep: (B,) or (1,) action diffusion timestep.
+            context: (B, L, text_dim) raw text/proprio context. context_mask: (B, L) bool, True = attend.
+            use_gradient_checkpointing / use_gradient_checkpointing_offload: bool, per-block checkpointing
+                (only while training).
+
+        Returns:
+            (B, T_action, action_dim) predicted action velocity.
+        """
+        state = self.prepare_state(action_tokens, timestep, context=context, context_mask=context_mask)
+        x = state.x_action
+        self._validate_bridges(x, bridges)
 
         for i, block in enumerate(self.blocks):
-            x_video_i = self.video_projs[i](bridge_tuple[i])
+            x_video_i = self.video_projs[i](bridges[i])
             x = gradient_checkpoint_forward(
                 block,
                 self.training and use_gradient_checkpointing,
                 use_gradient_checkpointing_offload,
                 x,
                 x_video_i,
-                t_mod,
-                freqs,
-                context_emb,
-                context_attn_mask,
+                state.t_mod,
+                state.action_freqs,
+                state.context,
+                state.context_mask,
             )
 
         return self.action_decoder(x)
 
-    def forward(
-        self,
-        action_tokens: torch.Tensor,
-        bridges: Dict[int, torch.Tensor],
-        timestep: torch.Tensor,
-        *,
-        context: Optional[torch.Tensor] = None,
-        context_mask: Optional[torch.Tensor] = None,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
-    ) -> torch.Tensor:
-        """Standalone action prediction conditioned on per-layer video features.
 
-        ``DualSystemCrossAttnArchitecture.forward`` collects ``vstate.hidden_states`` at
-        the configured bridge layers after the video backbone runs to
-        completion and passes them in a ``{block_id: feat}`` dict. This entry
-        point does **not** touch the video backbone or any joint-attention
-        machinery.
+class MoTActionDiT(ActionDiT):
+    """``joint_self_attn`` ActionDiT: one block per video layer, driven by :class:`DualSystemMoTDriver`.
 
-        Args:
-            action_tokens: ``(B, T_action, action_dim)`` noisy action sequence.
-            bridges: ``{block_id: (B, T_video, video_dim)}`` mapping from
-                video DiT block index to its captured hidden state. Must
-                contain every index in ``self._bridge_layers``.
-            timestep: ``(B,)`` or ``(1,)`` action diffusion timestep.
-            context: Optional raw text/proprio context ``(B, L, text_dim)``.
-            context_mask: Optional bool mask ``(B, L)`` where True means attend.
-        Returns:
-            ``(B, T_action, action_dim)`` predicted action noise.
+    Args: as :class:`ActionDiT`; ``num_layers`` is the video backbone's layer count.
+    """
+
+    @classmethod
+    def from_cfg(cls, ab: DictConfig, *, action_dim: int, num_layers: int) -> "MoTActionDiT":
+        """Build from the ``action_backbone`` slice (keys of :meth:`ActionDiT._shared_kwargs`).
+
+        Args: ab: the slice. action_dim: int raw action width. num_layers: int, the video backbone's layer count.
+
+        Returns: MoTActionDiT, freshly initialised on CPU.
         """
+        return cls(**cls._shared_kwargs(ab, action_dim, num_layers))
 
-        return self.forward_with_bridge_tuple(
-            action_tokens,
-            self.bridge_tuple_from_dict(bridges),
-            timestep,
-            context=context,
-            context_mask=context_mask,
-            use_gradient_checkpointing=use_gradient_checkpointing,
-            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+    def __init__(self, **shared):
+        super().__init__(**shared)
+        dim = self.dim
+        self.time_embedding = TimestepEmbedding(self.freq_dim, dim)
+        # 6 modulation params per block: 3 joint self-attn + 3 FFN (text cross-attn has no modulation in the
+        # MoT block, mirroring FastWAM's Wan-aligned DiTBlock).
+        self.time_projection = TimestepModulation(dim, 6)
+        self.blocks = nn.ModuleList(
+            [
+                SelfAttnActionDiTBlock(dim, self.num_heads, self.head_dim, self.ffn_dim, self.eps)
+                for _ in range(self.num_layers)
+            ]
         )
-
-    # ------------------------------------------------------------------
-    # joint_self_attn variant: MoT-driven entry points
-    # ------------------------------------------------------------------
-
-    def prepare_state(
-        self,
-        noisy_actions: torch.Tensor,
-        timestep: torch.Tensor,
-        *,
-        context: Optional[torch.Tensor] = None,
-        context_mask: Optional[torch.Tensor] = None,
-    ) -> "ActionState":
-        """MoT coupling: embed the actions and build the per-layer state the driver threads through the blocks.
-
-        Args:
-            noisy_actions: (B, T_action, action_dim) noisy action sequence.
-            timestep: (B,) or (1,) action diffusion timestep.
-            context: (B, L, text_dim) raw text/proprio context (required for ``joint_self_attn``), or None.
-            context_mask: (B, L) bool, True = attend, or None.
-
-        Returns:
-            ActionState whose ``payload`` is an :class:`ActionDiTState` (x_action (B, T_action, dim), modulation,
-            RoPE, projected context).
-        """
-        from openwam.model.architectures.base import ActionState
-
-        x = self._embed_actions(noisy_actions)
-        timestep = self._prepare_timestep(timestep, noisy_actions.shape[0])
-        t = self.time_embedding(timestep)
-        t_mod = self.time_projection(t)
-        action_freqs = self._get_rope_freqs(x.shape[1]).to(device=x.device)
-
-        action_context = None
-        action_context_mask = None
-        if self.variant in _MOT_VARIANTS:
-            if context is None:
-                raise ValueError("ActionDiT.prepare_state requires raw context for variant='joint_self_attn'.")
-            action_context, action_context_mask = self._prepare_context(
-                context,
-                context_mask,
-                batch_size=noisy_actions.shape[0],
-                seq_len=x.shape[1],
-                dtype=x.dtype,
-                device=x.device,
-            )
-
-        payload = ActionDiTState(
-            x_action=x,
-            t_mod=t_mod,
-            t_embed=t,
-            action_freqs=action_freqs,
-            context=action_context,
-            context_mask=action_context_mask,
-        )
-        return ActionState(
-            action_latents=noisy_actions,
-            timestep=timestep,
-            payload=payload,
-        )
+        # FastWAM-compatible simple action decoder; no AdaLN and no zero init.
+        self.action_decoder = nn.Linear(dim, self.action_dim)
 
     def pre_attn_at_layer(
-        self, layer_id: int, astate: "ActionState"
+        self, layer_id: int, astate: ActionDiTState
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """First half of an action block: self-attn norm + AdaLN + Q/K/V + RoPE.
 
         Args:
-            layer_id: int, action block index. astate: ActionState from :meth:`prepare_state`.
+            layer_id: int, action block index. astate: ActionDiTState from :meth:`prepare_state` (or the
+                previous layer).
 
         Returns: (q, k, v, post_state): Q/K/V shaped ``(B, T_action, num_heads * head_dim)`` (matching
         the layout produced by Wan ``self_attn.q/k/v`` after RMSNorm and RoPE
         — ready to concatenate with the video Q/K/V); ``post_state`` the dict of block tensors
         :meth:`post_attn_at_layer` consumes.
         """
-        payload: ActionDiTState = astate.payload
         block: SelfAttnActionDiTBlock = self.blocks[layer_id]
 
-        chunks = (block.modulation.to(dtype=payload.t_mod.dtype, device=payload.t_mod.device) + payload.t_mod).chunk(
+        chunks = (block.modulation.to(dtype=astate.t_mod.dtype, device=astate.t_mod.device) + astate.t_mod).chunk(
             6, dim=1
         )
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = chunks
 
-        residual_x = payload.x_action
+        residual_x = astate.x_action
         attn_input = block.self_attn_norm(residual_x) * (1 + scale_msa) + shift_msa
 
         sa = block.self_attn
@@ -785,20 +650,19 @@ class ActionDiT(ActionDiTBackbone):
         v = sa.v(attn_input)
 
         # Apply RoPE in head-split layout to match flash_attn / Wan rope_apply.
-        q = rearrange(q, "b s (n d) -> b n s d", n=self._num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=self._num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=self._num_heads)
+        q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
+        k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
+        v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
 
-        q = rope_apply_1d(q, payload.action_freqs)
-        k = rope_apply_1d(k, payload.action_freqs)
+        q = rope_apply_1d(q, astate.action_freqs)
+        k = rope_apply_1d(k, astate.action_freqs)
         # Driver consumes (B, S, H*D) — keep modality streams in matching layout.
-        q_out = rearrange(q, "b n s d -> b s (n d)", n=self._num_heads)
-        k_out = rearrange(k, "b n s d -> b s (n d)", n=self._num_heads)
-        v_out = rearrange(v, "b n s d -> b s (n d)", n=self._num_heads)
+        q_out = rearrange(q, "b n s d -> b s (n d)", n=self.num_heads)
+        k_out = rearrange(k, "b n s d -> b s (n d)", n=self.num_heads)
+        v_out = rearrange(v, "b n s d -> b s (n d)", n=self.num_heads)
 
         # Tensors the block's second half (post_attn_at_layer) consumes.
         post_state = {
-            "block": block,
             "residual_x": residual_x,
             "gate_msa": gate_msa,
             "shift_mlp": shift_mlp,
@@ -810,10 +674,10 @@ class ActionDiT(ActionDiTBackbone):
     def post_attn_at_layer(
         self,
         layer_id: int,
-        astate: "ActionState",
+        astate: ActionDiTState,
         attn_out: torch.Tensor,
         post_state: dict,
-    ) -> "ActionState":
+    ) -> ActionDiTState:
         """Second half of an action block: gate(residual, self_attn.o(attn_out))
         → action-owned text/proprio cross-attn → FFN.
 
@@ -823,36 +687,28 @@ class ActionDiT(ActionDiTBackbone):
         ``text_embedding`` stored in :class:`ActionDiTState`.
 
         Args:
-            layer_id: int, action block index. astate: ActionState. attn_out: (B, T_action, num_heads * head_dim)
+            layer_id: int, action block index. astate: ActionDiTState. attn_out: (B, T_action, num_heads * head_dim)
                 attention output of the action slice. post_state: dict from :meth:`pre_attn_at_layer`.
 
-        Returns: ``astate`` with ``payload.x_action`` (B, T_action, dim) updated.
+        Returns: ``astate`` with ``x_action`` (B, T_action, dim) advanced by one block.
         """
-        payload: ActionDiTState = astate.payload
         block: SelfAttnActionDiTBlock = self.blocks[layer_id]
         residual_x = post_state["residual_x"]
         gate_msa, shift_mlp = post_state["gate_msa"], post_state["shift_mlp"]
         scale_mlp, gate_mlp = post_state["scale_mlp"], post_state["gate_mlp"]
 
-        x = block.gate(residual_x, gate_msa, block.self_attn.o(attn_out))
-        if payload.context is not None:
-            text_mask = payload.context_mask
-            if text_mask is not None:
-                if text_mask.dim() == 2:
-                    text_mask = text_mask.unsqueeze(1).expand(-1, x.shape[1], -1)
-                elif text_mask.dim() not in (3, 4):
-                    raise ValueError(
-                        "ActionDiTState.context_mask must be [B, L], [B, T_action, L], "
-                        f"or broadcastable [B, heads, T_action, L], got {tuple(text_mask.shape)}"
-                    )
-            x = x + block.cross_attn(block.context_attn_norm(x), payload.context, ctx_mask=text_mask)
+        # Gated residual of the joint attention, then the (ungated) context cross-attn, then the gated FFN.
+        x = residual_x + gate_msa * block.self_attn.o(attn_out)
+        x = x + block.cross_attn(block.context_attn_norm(x), astate.context, ctx_mask=astate.context_mask)
         mlp_input = block.ffn_norm(x) * (1 + scale_mlp) + shift_mlp
-        x = block.gate(x, gate_mlp, block.ffn(mlp_input))
+        x = x + gate_mlp * block.ffn(mlp_input)
 
-        payload.x_action = x
+        astate.x_action = x
         return astate
 
-    def extract_prediction(self, astate: "ActionState") -> torch.Tensor:
-        """astate: ActionState after the last block. Returns: (B, T_action, action_dim) decoded prediction."""
-        payload: ActionDiTState = astate.payload
-        return self.action_decoder(payload.x_action)
+    def extract_prediction(self, astate: ActionDiTState) -> torch.Tensor:
+        """astate: ActionDiTState after the last block. Returns: (B, T_action, action_dim) decoded prediction."""
+        return self.action_decoder(astate.x_action)
+
+
+__all__ = ["ActionDiT", "ActionDiTState", "CrossAttnActionDiT", "MoTActionDiT"]

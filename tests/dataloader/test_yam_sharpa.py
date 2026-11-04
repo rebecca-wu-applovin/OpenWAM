@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from contextlib import contextmanager
 from pathlib import Path
@@ -153,7 +154,7 @@ def _mock_decoder():
 
 
 # Color jitter off, at the strengths the yaml ships; tests that want it on pass {**_JITTER, "enabled": True}.
-_JITTER = {"enabled": False, "brightness": 0.2, "contrast": 0.2, "saturation": 0.2, "hue": 0.0}
+_JITTER = {"enabled": False, "brightness": 0.2, "contrast": 0.2, "saturation": 0.2}
 
 
 def _cfg(sources: dict, **overrides):
@@ -183,8 +184,6 @@ def _cfg(sources: dict, **overrides):
         "caption_dropout_p": 0.0,
         "seed": 0,
         "window_stride": 1,
-        "split": "train",
-        "multiview": False,
         "normalization_stats_path": None,
         "color_jitter": _JITTER,
     }
@@ -321,7 +320,7 @@ def test_fps_must_match_info_json(source):
         build_dataset(_cfg({"a": (root, 1.0)}, fps=30), "train")
 
 
-@pytest.mark.parametrize("key", ["seed", "num_frames", "sources.a.weight", "sources.a.enabled", "color_jitter.hue"])
+@pytest.mark.parametrize("key", ["seed", "num_frames", "sources.a.weight", "sources.a.enabled", "color_jitter.saturation"])
 def test_from_config_requires_every_key(source, key):
     # No hidden defaults: a config missing any key the dataset reads fails instead of silently using a value.
     root, _ = source
@@ -362,14 +361,11 @@ def test_preload_never_rereads(source):
     with patch("pyarrow.parquet.read_table", side_effect=AssertionError("re-read a shard")) as read:
         got = _all_samples(reader)
     read.assert_not_called()
-    # Same samples, byte for byte, as reading the shard straight from parquet for every sample.
+    # Same samples, byte for byte, as a reader whose shard table is read straight from parquet.
     shard = root / "data" / "chunk-000" / "file-000.parquet"
-
-    def _direct(self, chunk_idx, file_idx):
-        return pq.read_table(shard, columns=list(self.NEEDED_COLS))
-
-    with patch.object(type(reader), "_load_data_table", _direct):
-        want = _all_samples(reader)
+    direct = copy.copy(reader)
+    direct._data_tables = {(0, 0): pq.read_table(shard, columns=list(type(reader).NEEDED_COLS))}
+    want = _all_samples(direct)
     assert len(got) == len(want) > 0
     for g, w in zip(got, want):
         assert g["prompt"] == w["prompt"]
@@ -655,6 +651,20 @@ def test_stats_shapes_pinning_and_sharing(source, mode):
             np.testing.assert_array_equal(act[k], st[k])
 
 
+def test_stats_num_frames_is_required(source, tmp_path):
+    """The action horizon comes from the dataloader's num_frames: no default in the function or the CLI."""
+    from openwam.dataloader.utils.stats_computation.yam_sharpa_stats_computation import main
+
+    root, _ = source
+    with pytest.raises(TypeError, match="num_frames"):
+        compute_yam_sharpa_stats([root], "fingertips_rel", workers=1)
+    with pytest.raises(SystemExit):
+        main(["--dataset-dirs", str(root), "--action-mode", "fingertips_rel", "--output", str(tmp_path / "s.npy")])
+    # The payload is the two blocks + the provenance the reader matches (no unread schema field).
+    payload = compute_yam_sharpa_stats([root], "fingertips_rel", num_frames=5, workers=1)
+    assert set(payload) == {"fingertips_rel", "fingertips_rel_state", "yam_sharpa_meta"}
+
+
 def test_stats_cover_every_supervised_pair(source):
     """min/max equal a brute-force scan over every (t, t+k) the reader can supervise."""
     root, eps = source
@@ -729,7 +739,6 @@ def test_repo_config_resolves_stats_path_per_mode():
     cfg.action_mode = "unify_rel"
     assert cfg.normalization_stats_path.endswith("yam_sharpa_unify_rel.npy")
     assert list(cfg.camera_layout) == [EGO, CHEST] and (cfg.height, cfg.width) == (480, 320)
-    assert cfg.multiview_layout == "vstack"
     assert "unify_action" not in cfg
 
 
@@ -796,3 +805,14 @@ def test_deploy_canvas_matches_training_resize():
     tiles = {c: Image.fromarray(im).resize((224, 192), Image.LANCZOS) for c, im in native.items()}
     train = np.asarray(assemble_vstack_layout(tiles, [EGO, CHEST], out_h=384, out_w=224))
     assert np.array_equal(deploy, train)
+
+
+def test_vstack_layout_pastes_tiles_and_rejects_unresized_frames():
+    """Tiles are pasted as they are (top to bottom); a frame not resized to its tile raises instead of cropping."""
+    from openwam.dataloader.transforms.multiview import assemble_vstack_layout
+
+    tiles = {EGO: Image.new("RGB", (224, 192), (255, 0, 0)), CHEST: Image.new("RGB", (224, 192), (0, 255, 0))}
+    canvas = np.asarray(assemble_vstack_layout(tiles, [EGO, CHEST], out_h=384, out_w=224))
+    assert (canvas[:192] == (255, 0, 0)).all() and (canvas[192:] == (0, 255, 0)).all()
+    with pytest.raises(ValueError, match="expected"):
+        assemble_vstack_layout({EGO: Image.new("RGB", (640, 480))}, [EGO, CHEST], out_h=384, out_w=224)

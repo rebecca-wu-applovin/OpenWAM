@@ -1,14 +1,19 @@
-"""Shared components for action model architectures.
-
-These building blocks are used by DualSystem (``ActionDiT``).
-"""
+"""Building blocks of the ActionDiT action stream (timestep embedding / modulation, RMSNorm, 1D RoPE)."""
 
 import torch
 import torch.nn as nn
 
 
 def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
-    """Sinusoidal positional embedding for timestep conditioning."""
+    """Sinusoidal embedding of a timestep (cos half, then sin half), computed in float64.
+
+    Args:
+        dim: int embedding width (even).
+        position: (B,) timesteps.
+
+    Returns:
+        (B, dim) embedding in ``position``'s dtype.
+    """
     sinusoid = torch.outer(
         position.type(torch.float64),
         torch.pow(10000, -torch.arange(dim // 2, dtype=torch.float64, device=position.device).div(dim // 2)),
@@ -27,7 +32,6 @@ def precompute_freqs_cis_1d(head_dim: int, max_len: int = 1024, theta: float = 1
         The default `max_len=1024` matches FastWAM to support action sequences
         up to 1024 steps (e.g., ~3.5s at 300Hz or ~7s at 150Hz).
     """
-    assert head_dim % 2 == 0, f"head_dim must be even for RoPE, got {head_dim}"
     freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).double() / head_dim))
     freqs = torch.outer(torch.arange(max_len).double(), freqs)
     return torch.polar(torch.ones_like(freqs), freqs)
@@ -52,7 +56,10 @@ def rope_apply_1d(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
 
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization."""
+    """Root Mean Square Layer Normalization over the last dim, with a learned per-channel scale.
+
+    Args: dim: int normalized width. eps: float added to the mean square.
+    """
 
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -60,6 +67,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Args: x: (..., dim). Returns: (..., dim) normalized in float32, cast back to x's dtype, then scaled."""
         dtype = x.dtype
         normed = x.float() * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return normed.to(dtype) * self.weight
@@ -82,6 +90,7 @@ class TimestepEmbedding(nn.Module):
         )
 
     def forward(self, timestep: torch.Tensor) -> torch.Tensor:
+        """Args: timestep: (B,) timesteps. Returns: (B, dim) embedding."""
         t = sinusoidal_embedding_1d(self.freq_dim, timestep)
         return self.mlp(t)
 
@@ -102,4 +111,5 @@ class TimestepModulation(nn.Module):
         )
 
     def forward(self, t_embed: torch.Tensor) -> torch.Tensor:
+        """Args: t_embed: (B, dim) timestep embedding. Returns: (B, n_params, dim) modulation parameters."""
         return self.proj(t_embed).unflatten(-1, (self.n_params, -1))

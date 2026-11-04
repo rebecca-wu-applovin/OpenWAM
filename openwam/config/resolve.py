@@ -12,7 +12,8 @@ Latent layout of one sample (H history frames, the last one is the current frame
 * current frame t (clean): encoded alone, 1 latent;
 * future (noisy target): the clip [t, F future frames] encoded as one, its latent 0 (= t) dropped: F/tc latents.
 
-It also runs the cross-block checks (attention keys, proprio routing, random-history window) and validates the
+It also runs the cross-block checks (attention keys, joint_self_attn bridge_interval, proprio routing,
+random-history window) and validates the
 dataloader's sampling keys (``history_sampling`` / ``history_window`` / ``caption_dropout_p``) in this one place: the
 dataset reads them without re-checking. The ``training`` switches (mixed_precision, lr_scheduler, the null-means-off
 step / clip knobs, the checkpoint-source paths) are checked here too, so the trainer reads them as written.
@@ -138,6 +139,29 @@ def _check_attention(model_cfg: DictConfig) -> None:
         )
     if va not in VERIFIED_VA_MODES:
         raise ValueError(f"unknown attention_mask_mode {va!r}; choose from {VERIFIED_VA_MODES + UNVERIFIED_VA_MODES}")
+
+
+def _check_bridge_interval(arch: DictConfig) -> None:
+    """Every value check of ``model.architecture.bridge_interval``, in one place.
+
+    It is a stride over the video layers (>= 1), and only selects layers under joint_cross_attn: joint_self_attn
+    runs one mixed attention per video layer (its ActionDiT has one block per layer), so any value other than 1
+    there would be silently meaningless.
+
+    Args:
+        arch: ``cfg.model.architecture`` (``variant``, ``bridge_interval``).
+
+    Returns:
+        None. ValueError naming the key for a stride below 1, or joint_self_attn with bridge_interval != 1.
+    """
+    # range() with a non-positive step is empty / raises later; reject it here by key name.
+    if int(arch.bridge_interval) < 1:
+        raise ValueError(f"model.architecture.bridge_interval must be >= 1, got {arch.bridge_interval}")
+    if arch.variant == "joint_self_attn" and int(arch.bridge_interval) != 1:
+        raise ValueError(
+            "model.architecture.bridge_interval must be 1 for variant=joint_self_attn (one mixed attention per "
+            f"video layer); got {arch.bridge_interval}"
+        )
 
 
 def _check_proprio_input(model_cfg: DictConfig, state_dim: int) -> None:
@@ -293,6 +317,7 @@ def resolve_config(cfg: DictConfig) -> DictConfig:
             "(the dataset drops prompts with the per-sample RNG); remove them and set that key instead"
         )
     _check_attention(cfg.model)
+    _check_bridge_interval(arch)
     _check_proprio_input(cfg.model, int(cfg.common.state_dim))
     dl = cfg.dataloader
     want = latent_layout(

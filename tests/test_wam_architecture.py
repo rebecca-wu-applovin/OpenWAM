@@ -42,8 +42,8 @@ def _make_dual_system_self_attn_mot_fixture():
     }
     # 2 history + 2 future latents = the 4 one-token frames of _dual_system_self_attn_mot_states.
     backbone = _MockVideoBackbone(dim=32, num_layers=2, num_heads=4)
-    arch = build_test_arch("dual_system_self_attn", cfg, backbone, layout=make_layout(h=2))
-    driver = arch.mot_driver
+    arch = build_test_arch("joint_self_attn", cfg, backbone, layout=make_layout(h=2))
+    driver = arch._mot_driver
     arch.eval()
     return arch, driver
 
@@ -64,7 +64,7 @@ def _make_dual_system_cross_attn_fixture():
         "num_dit_layers": 2,
         "text_dim": 16,
     }
-    arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
+    arch = build_test_arch("joint_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     arch.eval()
     return arch
 
@@ -100,7 +100,7 @@ def _dual_system_cross_attn_inputs(arch, seed: int):
     g = torch.Generator().manual_seed(seed)
     actions = torch.randn(1, 3, 7, generator=g)
     timestep = torch.tensor([0.5])
-    bridges = {bid: torch.randn(1, 4, 48, generator=g) for bid in arch.action_backbone.bridge_layers}
+    bridges = [torch.randn(1, 4, 48, generator=g) for _ in arch.bridge_layers]
     context = torch.randn(1, 4, arch.action_backbone.text_dim, generator=g)
     context_mask = torch.ones(1, 4, dtype=torch.bool)
     return actions, bridges, timestep, context, context_mask
@@ -123,6 +123,7 @@ def test_architecture_state_types_import():
 
 
 def test_freeze_modules_supports_dotted_path():
+    from openwam.model.action_backbone.separate_action_dit import MoTActionDiT
     from openwam.model.architectures.base import BaseWAMArchitecture
 
     backbone = stub_backbone({})
@@ -130,11 +131,13 @@ def test_freeze_modules_supports_dotted_path():
     class TestArch(BaseWAMArchitecture):
         def __init__(self):
             super().__init__(
-                arch_params({}, backbone),
+                arch_params({"dim": 32, "ffn_dim": 64, "action_dim": 1}, backbone),
                 mode=LoadMode.PRETRAINED,
                 assets=TEST_ASSETS,
                 ckpt_dir=None,
                 train_options=TEST_TRAIN_OPTIONS,
+                action_dit_cls=MoTActionDiT,
+                num_action_layers=backbone.num_layers,
             )
             self.aux_backbone = torch.nn.Module()
             self.aux_backbone.inner = torch.nn.Linear(2, 2)
@@ -233,7 +236,7 @@ def test_build_architecture_dual_system():
         "video_dim": 256,
         "num_dit_layers": 2,
     }
-    arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
+    arch = build_test_arch("joint_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     assert arch.action_dim == 7
     assert arch.bridge_layers == (0, 1)
     assert arch.action_backbone is not None
@@ -268,14 +271,14 @@ def test_dual_system_prepare_and_extract():
         "video_dim": 128,
         "num_dit_layers": 2,
     }
-    arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
+    arch = build_test_arch("joint_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     arch.eval()
 
     B, T_action = 1, 10
     noisy_actions = torch.randn(B, T_action, 7)
     timestep = torch.tensor([500.0])
 
-    bridges = {bid: torch.randn(B, 20, 128) for bid in arch.action_backbone.bridge_layers}
+    bridges = [torch.randn(B, 20, 128) for _ in arch.bridge_layers]
     context, context_mask = _action_context(arch.action_backbone, B)
 
     with torch.no_grad():
@@ -285,6 +288,8 @@ def test_dual_system_prepare_and_extract():
             timestep,
             context=context,
             context_mask=context_mask,
+            use_gradient_checkpointing=False,
+            use_gradient_checkpointing_offload=False,
         )
     assert action_pred.shape == (B, T_action, 7)
 
@@ -306,23 +311,26 @@ def test_dual_system_bridge_interval_resolves():
         "bridge_interval": 2,
         "num_dit_layers": 30,
     }
-    arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
+    arch = build_test_arch("joint_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     assert arch.bridge_layers == tuple(range(0, 30, 2))
     assert len(arch.bridge_layers) == 15
 
     cfg["bridge_interval"] = 1
-    arch_full = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
+    arch_full = build_test_arch("joint_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     assert arch_full.bridge_layers == tuple(range(30))
 
 
 def test_bridge_layers_interval():
-    """bridge_layers strides over the video layers; an interval below 1 raises with the config key."""
-    from openwam.model.architectures.utils.common import bridge_layers
+    """select_bridge_layers strides over the video layers; resolve_config rejects an interval below 1 by key."""
+    from omegaconf import OmegaConf
 
-    assert bridge_layers(30, 2) == tuple(range(0, 30, 2))
-    assert bridge_layers(30, 1) == tuple(range(30))
-    with pytest.raises(ValueError, match="bridge_interval"):
-        bridge_layers(30, 0)
+    from openwam.config.resolve import _check_bridge_interval
+    from openwam.model.architectures.dual_system.joint_cross_attn import select_bridge_layers
+
+    assert select_bridge_layers(30, 2) == tuple(range(0, 30, 2))
+    assert select_bridge_layers(30, 1) == tuple(range(30))
+    with pytest.raises(ValueError, match=r"model\.architecture\.bridge_interval must be >= 1"):
+        _check_bridge_interval(OmegaConf.create({"variant": "joint_cross_attn", "bridge_interval": 0}))
 
 
 @pytest.mark.parametrize("key", GEOMETRY_KEYS)
@@ -346,7 +354,7 @@ def test_action_self_attention_rope_breaks_permutation_equivariance():
     """Without positional info, self-attention is permutation-equivariant.
     RoPE injects absolute position into Q/K, so permuting the input tokens
     must NOT merely permute the output (the model distinguishes positions).
-    Also: supplying RoPE freqs must change the output relative to freqs=None.
+    Also: real RoPE freqs must change the output relative to a no-rotation table (all ones).
     """
     from openwam.model.action_backbone.components import precompute_freqs_cis_1d
     from openwam.model.action_backbone.separate_action_dit import ActionSelfAttention
@@ -357,16 +365,19 @@ def test_action_self_attention_rope_breaks_permutation_equivariance():
 
     x = torch.randn(1, seq, dim)
     freqs = precompute_freqs_cis_1d(head_dim, max_len=seq)
+    # Unit complex numbers at angle 0: RoPE then rotates nothing (position-free attention).
+    angle0 = torch.zeros(seq, head_dim // 2, dtype=torch.float64)
+    no_rotation = torch.polar(torch.ones_like(angle0), angle0)
     perm = torch.tensor([3, 1, 2, 0])  # non-identity permutation
     x_perm = x[:, perm, :]
 
     with torch.no_grad():
-        out_plain = attn(x, freqs=None)
-        out_plain_perm = attn(x_perm, freqs=None)
+        out_plain = attn(x, freqs=no_rotation)
+        out_plain_perm = attn(x_perm, freqs=no_rotation)
         out_rope = attn(x, freqs=freqs)
         out_rope_perm = attn(x_perm, freqs=freqs)
 
-    # Sanity: freqs=None is permutation-equivariant.
+    # Sanity: the no-rotation table is permutation-equivariant.
     assert torch.allclose(out_plain_perm, out_plain[:, perm, :], atol=1e-5)
     # RoPE must break that symmetry (content same, positions shuffled → non-permute-equivalent output).
     assert not torch.allclose(out_rope_perm, out_rope[:, perm, :], atol=1e-5), (
@@ -378,9 +389,9 @@ def test_action_self_attention_rope_breaks_permutation_equivariance():
 
 def test_action_dit_joint_cross_attn_uses_rope():
     """ActionDiT joint_cross_attn runs end-to-end with RoPE (no learned absolute PE)."""
-    from openwam.model.action_backbone.separate_action_dit import ActionDiT
+    from openwam.model.action_backbone.separate_action_dit import CrossAttnActionDiT
 
-    dit = ActionDiT(
+    dit = CrossAttnActionDiT(
         shift_action=5.0,
         train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=7,
@@ -389,8 +400,6 @@ def test_action_dit_joint_cross_attn_uses_rope():
         num_heads=4,
         num_layers=2,
         video_dim=128,
-        bridge_layers=(0, 1),
-        variant="joint_cross_attn",
         attn_head_dim=16,
         text_dim=4096,
         freq_dim=256,
@@ -401,17 +410,21 @@ def test_action_dit_joint_cross_attn_uses_rope():
     assert hasattr(dit, "freqs") and dit.freqs.shape == (1024, 64 // 4 // 2)
 
     actions = torch.randn(2, 5, 7)
-    bridges = {bid: torch.randn(2, 10, 128) for bid in (0, 1)}
+    bridges = [torch.randn(2, 10, 128) for _ in range(2)]
     timestep = torch.tensor([0.5, 0.8])
-    out = dit(actions, bridges, timestep)
+    context, context_mask = _action_context(dit, 2)
+    out = dit(
+        actions, bridges, timestep, context=context, context_mask=context_mask,
+        use_gradient_checkpointing=False, use_gradient_checkpointing_offload=False,
+    )
     assert out.shape == (2, 5, 7)
 
 
 def test_action_dit_rope_freqs_preserve_complex_dtype_on_dtype_to():
     """ActionDiT RoPE cache must not be cast to real by dtype-only Module.to()."""
-    from openwam.model.action_backbone.separate_action_dit import ActionDiT
+    from openwam.model.action_backbone.separate_action_dit import CrossAttnActionDiT
 
-    dit = ActionDiT(
+    dit = CrossAttnActionDiT(
         shift_action=5.0,
         train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=7,
@@ -420,8 +433,6 @@ def test_action_dit_rope_freqs_preserve_complex_dtype_on_dtype_to():
         num_heads=4,
         num_layers=2,
         video_dim=128,
-        bridge_layers=(0, 1),
-        variant="joint_cross_attn",
         attn_head_dim=16,
         text_dim=4096,
         freq_dim=256,
@@ -437,12 +448,13 @@ def test_action_dit_rope_freqs_preserve_complex_dtype_on_dtype_to():
     assert "freqs" not in dit.state_dict()
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for ActionDiT RoPE device migration check")
 def test_action_dit_rope_freqs_follow_cuda_to_without_dtype_cast():
     """ActionDiT.to(cuda, bf16) should move RoPE freqs to CUDA but keep them complex."""
-    from openwam.model.action_backbone.separate_action_dit import ActionDiT
+    from openwam.model.action_backbone.separate_action_dit import MoTActionDiT
 
-    dit = ActionDiT(
+    dit = MoTActionDiT(
         shift_action=5.0,
         train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=7,
@@ -450,9 +462,6 @@ def test_action_dit_rope_freqs_follow_cuda_to_without_dtype_cast():
         ffn_dim=128,
         num_heads=4,
         num_layers=2,
-        video_dim=64,
-        bridge_layers=(0, 1),
-        variant="joint_self_attn",
         text_dim=16,
         attn_head_dim=16,
         freq_dim=256,
@@ -473,15 +482,15 @@ def test_action_dit_rope_freqs_follow_cuda_to_without_dtype_cast():
         context=context,
         context_mask=context_mask,
     )
-    assert astate.payload.action_freqs.device.type == "cuda"
-    assert astate.payload.action_freqs.is_complex()
+    assert astate.action_freqs.device.type == "cuda"
+    assert astate.action_freqs.is_complex()
 
 
 def test_action_dit_joint_self_attn_uses_only_rope():
     """joint_self_attn relies solely on RoPE (no learned absolute PE)."""
-    from openwam.model.action_backbone.separate_action_dit import ActionDiT
+    from openwam.model.action_backbone.separate_action_dit import MoTActionDiT
 
-    dit = ActionDiT(
+    dit = MoTActionDiT(
         shift_action=5.0,
         train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=7,
@@ -489,9 +498,6 @@ def test_action_dit_joint_self_attn_uses_only_rope():
         ffn_dim=128,
         num_heads=4,
         num_layers=2,
-        video_dim=64,
-        bridge_layers=(0, 1),
-        variant="joint_self_attn",
         attn_head_dim=16,
         text_dim=4096,
         freq_dim=256,
@@ -504,13 +510,10 @@ def test_action_dit_joint_self_attn_uses_only_rope():
     astate = dit.prepare_state(
         torch.randn(2, 5, 7), torch.tensor([0.5, 0.8]), context=context, context_mask=context_mask
     )
-    payload = astate.payload
     # RoPE freqs on the action stream are pre-computed and stashed for
-    # consumption by pre_attn_at_layer; their length equals the (proprio +
-    # action) prefix that the attention sees.
-    assert payload.action_freqs is not None
-    assert payload.action_freqs.shape[0] == payload.x_action.shape[1]
-    assert payload.action_freqs.device == payload.x_action.device
+    # consumption by pre_attn_at_layer; their length is the action sequence the attention sees.
+    assert astate.action_freqs.shape[0] == astate.x_action.shape[1]
+    assert astate.action_freqs.device == astate.x_action.device
 
 
 def test_dual_system_joint_self_attn_pre_post_attn_round_trip():
@@ -528,7 +531,7 @@ def test_dual_system_joint_self_attn_pre_post_attn_round_trip():
         "video_dim": 32,
         "num_dit_layers": 1,
     }
-    arch = build_test_arch("dual_system_self_attn", cfg, stub_backbone(cfg), layout=make_layout())
+    arch = build_test_arch("joint_self_attn", cfg, stub_backbone(cfg), layout=make_layout())
     arch.eval()
 
     noisy_actions = torch.randn(2, 5, 7)
@@ -568,11 +571,11 @@ def test_dual_system_joint_cross_attn_no_per_layer_state():
         "video_dim": 128,
         "num_dit_layers": 2,  # every layer of the 2-layer stub backbone
     }
-    arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
+    arch = build_test_arch("joint_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
 
     # cross_attn calls ab.forward(actions, bridges, timestep) directly —
     # no per-layer state machinery on the action backbone.
-    bridges = {bid: torch.randn(1, 9, 128) for bid in arch.action_backbone.bridge_layers}
+    bridges = [torch.randn(1, 9, 128) for _ in arch.bridge_layers]
     context, context_mask = _action_context(arch.action_backbone, 1)
     with torch.no_grad():
         out = arch.action_backbone(
@@ -581,6 +584,8 @@ def test_dual_system_joint_cross_attn_no_per_layer_state():
             torch.tensor([0.5]),
             context=context,
             context_mask=context_mask,
+            use_gradient_checkpointing=False,
+            use_gradient_checkpointing_offload=False,
         )
     assert out.shape == (1, 5, 7)
 
@@ -607,7 +612,7 @@ def test_dual_system_joint_cross_attn_passes_appended_proprio_context_to_action(
         "text_dim": 16,
     }
     backbone = _MockVideoBackbone(dim=32, num_layers=1, num_heads=4, text_dim=16)
-    arch = build_test_arch("dual_system_cross_attn", cfg, backbone)
+    arch = build_test_arch("joint_cross_attn", cfg, backbone)
     arch.eval()
 
     seen = {}
@@ -657,35 +662,31 @@ def test_dual_system_detached_joint_cross_attn_blocks_grad_to_video():
         "video_dim": 128,
         "num_dit_layers": 1,
     }
-    arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
+    arch = build_test_arch("joint_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     # detach is owned by the architecture; the action backbone has no such flag.
-    assert arch.detach_bridge is True
+    assert arch._detach_bridge is True
     assert "detach_bridge" not in dir(arch.action_backbone)
 
 
-def test_action_dit_cross_attn_bridge_tuple_matches_dict():
-    """Ordered bridge tuple path should preserve the existing dict-path result."""
+def test_action_dit_cross_attn_bridges_one_per_block():
+    """The bridge list is block-ordered, one per block: a short list or a wrong width raises, a right one runs."""
 
     arch = _make_dual_system_cross_attn_fixture()
     ab = arch.action_backbone
     actions, bridges, timestep, context, context_mask = _dual_system_cross_attn_inputs(arch, 7)
-    bridge_tuple = ab.bridge_tuple_from_dict(bridges)
+    kw = dict(context=context, context_mask=context_mask, use_gradient_checkpointing=False,
+              use_gradient_checkpointing_offload=False)
 
     with torch.no_grad():
-        dict_out = ab(actions, bridges, timestep, context=context, context_mask=context_mask)
-        tuple_out = ab.forward_with_bridge_tuple(
-            actions,
-            bridge_tuple,
-            timestep,
-            context=context,
-            context_mask=context_mask,
-        )
-
-    assert torch.allclose(tuple_out, dict_out, atol=1e-6)
+        assert ab(actions, bridges, timestep, **kw).shape == actions.shape
+        with pytest.raises(ValueError, match="2 action blocks"):
+            ab(actions, bridges[:1], timestep, **kw)
+        with pytest.raises(ValueError, match="video_dim=48"):
+            ab(actions, [b[..., :8] for b in bridges], timestep, **kw)
 
 
 def test_dual_system_joint_self_attn_creates_dit_state():
-    """joint_self_attn populates ActionDiTState payload via prepare_state."""
+    """joint_self_attn: prepare_state builds the ActionDiTState the driver threads."""
 
     cfg = {
         "framework": "dual_system",
@@ -699,16 +700,14 @@ def test_dual_system_joint_self_attn_creates_dit_state():
         "video_dim": 32,
         "num_dit_layers": 2,
     }
-    arch = build_test_arch("dual_system_self_attn", cfg, stub_backbone(cfg), layout=make_layout())
+    arch = build_test_arch("joint_self_attn", cfg, stub_backbone(cfg), layout=make_layout())
 
     context, context_mask = _action_context(arch.action_backbone, 1)
     state = arch.action_backbone.prepare_state(
         torch.randn(1, 5, 7), torch.tensor([0.5]), context=context, context_mask=context_mask
     )
-    payload = state.payload
-    assert payload is not None
-    assert payload.x_action.shape == (1, 5, 32)
-    assert payload.action_freqs is not None
+    assert state.x_action.shape == (1, 5, 32)
+    assert state.action_freqs.shape == (5, arch.action_backbone.head_dim // 2)
 
 
 def test_build_architecture_injects_framework_variant_and_detach_option():
@@ -726,14 +725,16 @@ def test_build_architecture_injects_framework_variant_and_detach_option():
         "video_dim": 128,
         "num_dit_layers": 2,
     }
-    arch = build_test_arch("dual_system_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
-    assert arch.cfg.architecture.framework == "dual_system"
-    assert arch.cfg.architecture.variant == "joint_cross_attn"
-    assert arch.detach_bridge is True
+    arch = build_test_arch("joint_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
+    from openwam.model.architectures.dual_system import DualSystemCrossAttnArchitecture
+
+    # (framework, variant) picked the class; detach_bridge reached the architecture.
+    assert type(arch) is DualSystemCrossAttnArchitecture
+    assert arch._detach_bridge is True
 
 
-def test_dual_system_self_attn_payload_is_action_dit_state():
-    """joint_self_attn populates a flat payload of type ActionDiTState."""
+def test_dual_system_self_attn_state_is_action_dit_state():
+    """joint_self_attn: prepare_state returns an ActionDiTState (no wrapper)."""
     from openwam.model.action_backbone.separate_action_dit import ActionDiTState
 
     cfg = {
@@ -748,34 +749,31 @@ def test_dual_system_self_attn_payload_is_action_dit_state():
         "video_dim": 32,
         "num_dit_layers": 2,
     }
-    arch = build_test_arch("dual_system_self_attn", cfg, stub_backbone(cfg), layout=make_layout())
+    arch = build_test_arch("joint_self_attn", cfg, stub_backbone(cfg), layout=make_layout())
     context, context_mask = _action_context(arch.action_backbone, 1)
     state = arch.action_backbone.prepare_state(
         torch.randn(1, 5, 7), torch.tensor([0.5]), context=context, context_mask=context_mask
     )
-    assert isinstance(state.payload, ActionDiTState)
+    assert isinstance(state, ActionDiTState)
 
 
 def test_register_custom_architecture():
     """Verify that custom architectures can be registered under a (framework, variant) pair."""
     from openwam.model.architectures.base import BaseWAMArchitecture
-    from openwam.model.architectures.registry import (
-        _FRAMEWORK_VARIANT_INDEX,
-        ARCHITECTURE_REGISTRY,
-        register_architecture,
-    )
+    from openwam.model.architectures.registry import ARCHITECTURE_REGISTRY, register_architecture
 
-    @register_architecture("test_custom", framework="test", variant="custom")
+    @register_architecture(framework="test", variant="custom")
     class TestArch(BaseWAMArchitecture):
         def forward(self, noisy_actions, action_timestep, **_kw):
             return None, noisy_actions
 
-    assert ARCHITECTURE_REGISTRY["test_custom"] is TestArch
-    assert _FRAMEWORK_VARIANT_INDEX[("test", "custom")] == "test_custom"
+    assert ARCHITECTURE_REGISTRY[("test", "custom")] is TestArch
+    # A pair registers once.
+    with pytest.raises(ValueError, match="already registered"):
+        register_architecture(framework="test", variant="custom")(TestArch)
 
     # Cleanup
-    del ARCHITECTURE_REGISTRY["test_custom"]
-    del _FRAMEWORK_VARIANT_INDEX[("test", "custom")]
+    del ARCHITECTURE_REGISTRY[("test", "custom")]
 
 
 def test_freeze_modules_disables_grad_and_wraps_forward_in_no_grad():
@@ -953,8 +951,6 @@ def test_sample_frozen_lag_stream_stays_in_forward_context():
     class _ActionBackbone(torch.nn.Module):
         scheduler = _Scheduler()
         action_dim = 3
-        bridge_layers = ()
-        uses_proprioception = False
 
     class _Arch(BaseWAMArchitecture):
         def __init__(self):
@@ -1006,8 +1002,6 @@ def _make_inactive_dim_probe_arch():
     class _ActionBackbone(torch.nn.Module):
         scheduler = _Scheduler()
         action_dim = _PIN_ACTION_DIM
-        bridge_layers = ()
-        uses_proprioception = False
 
     class _Arch(BaseWAMArchitecture):
         def __init__(self):

@@ -72,7 +72,10 @@ def _px(img):
 
 def test_sampling_range(readers):
     # Rows t .. t+32 must exist for every layout: the history length does not change the windows.
-    assert readers["h1"]._min_window_len() == readers["h5"]._min_window_len() == 33
+    # An episode of L rows holds max(L - 33 + 1, 0) windows (stride 1), whatever the history layout.
+    for r in (readers["h1"], readers["h5"]):
+        length = r._eps_df["length"].to_numpy()
+        assert np.array_equal(np.diff(r._cum_n_starts), np.maximum(length - 33 + 1, 0))
     assert len(readers["h1"]) == len(readers["h5"])
 
 

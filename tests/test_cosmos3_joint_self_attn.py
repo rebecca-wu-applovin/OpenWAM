@@ -140,11 +140,11 @@ class _TinyActionBackbone(nn.Module):
         self.o = nn.ModuleList(nn.Linear(width, dim) for _ in range(num_layers))
 
     def pre_attn_at_layer(self, layer_id, astate):
-        x = astate.payload.x_action
+        x = astate.x_action
         return self.q[layer_id](x), self.k[layer_id](x), self.v[layer_id](x), {"layer": layer_id}
 
     def post_attn_at_layer(self, layer_id, astate, attn_out, post_state):
-        astate.payload.x_action = astate.payload.x_action + self.o[post_state["layer"]](attn_out)
+        astate.x_action = astate.x_action + self.o[post_state["layer"]](attn_out)
         return astate
 
 
@@ -178,12 +178,12 @@ def test_driver_video_blind_to_action_matches_run_block_loop(padded_und):
             ref = cosmos3_dit.run_block(net, i, ref, gen_mask=_visible(ref))
 
         joint = _build_state(net, ids, lat, padded_und=padded_und)
-        astate = types.SimpleNamespace(payload=types.SimpleNamespace(x_action=torch.randn(1, 5, MINI["hidden_size"])))
+        astate = types.SimpleNamespace(x_action=torch.randn(1, 5, MINI["hidden_size"]))
         joint_v, joint_a = driver.run_joint_loop(joint, astate)
 
     diff = (joint_v.hidden_states - ref.hidden_states).abs().max().item()
     assert diff < 1e-5, f"action-blind video stream deviates from run_block: {diff}"
-    assert torch.isfinite(joint_a.payload.x_action).all()
+    assert torch.isfinite(joint_a.x_action).all()
 
 
 def _padded_state(net, poison: bool, pad: int = 2):
@@ -249,13 +249,11 @@ def test_joint_loop_keeps_padded_und_keys_out(n_clean):
     for poison in (False, True):
         state = _padded_state(net, poison)
         astate = types.SimpleNamespace(
-            payload=types.SimpleNamespace(
-                x_action=torch.arange(2 * 3 * MINI["hidden_size"]).float().view(2, 3, -1) * 1e-2
-            )
+            x_action=torch.arange(2 * 3 * MINI["hidden_size"]).float().view(2, 3, -1) * 1e-2
         )
         with torch.no_grad():
             v, a = driver.run_joint_loop(state, astate)
-        outs.append((v.hidden_states, a.payload.x_action))
+        outs.append((v.hidden_states, a.x_action))
 
     d_video = (outs[0][0] - outs[1][0]).abs().max().item()
     d_action = (outs[0][1] - outs[1][1]).abs().max().item()
@@ -307,7 +305,7 @@ def test_action_blind_video_matches_direct_blocks_with_matching_mask(batch, padd
     driver = DualSystemMoTDriver(vb, ab, frame_mask=frame_mask, mot_checkpoint_mixed_attn=True)
     ids = torch.tensor([1, 2, 3, 4])
     lat = torch.randn(batch, MINI["latent_channel"], 3, 2, 2)
-    astate = types.SimpleNamespace(payload=types.SimpleNamespace(x_action=torch.randn(batch, 5, MINI["hidden_size"])))
+    astate = types.SimpleNamespace(x_action=torch.randn(batch, 5, MINI["hidden_size"]))
 
     with torch.no_grad():
         direct = _build_state(net, ids, lat, ncp=1, padded_und=padded_und)
@@ -329,4 +327,4 @@ def test_action_blind_video_matches_direct_blocks_with_matching_mask(batch, padd
             joint, astate = driver.step(i, joint, astate, attn_mask=joint_masks[i])
             torch.testing.assert_close(direct.hidden_states, joint.hidden_states, rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(vb.finalize(direct), vb.finalize(joint), rtol=1e-5, atol=1e-5)
-        assert torch.isfinite(astate.payload.x_action).all()
+        assert torch.isfinite(astate.x_action).all()

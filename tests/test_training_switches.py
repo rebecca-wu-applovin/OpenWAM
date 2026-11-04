@@ -124,7 +124,7 @@ def test_architecture_has_no_dtype_before_set_dtype_device():
     from tests.test_openwam_trainer import _TINY_ARCH_CFG, _MockVideoBackbone
 
     backbone = _MockVideoBackbone(dim=64, num_layers=2, num_heads=2, head_dim=16, text_dim=64)
-    arch = build_test_arch("dual_system_cross_attn", _TINY_ARCH_CFG, backbone)
+    arch = build_test_arch("joint_cross_attn", _TINY_ARCH_CFG, backbone)
     with pytest.raises(RuntimeError, match="set_dtype_device"):
         _ = arch.dtype
     with pytest.raises(RuntimeError, match="set_dtype_device"):

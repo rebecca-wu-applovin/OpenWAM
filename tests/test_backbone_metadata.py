@@ -15,14 +15,14 @@ _CFG = {
 def test_architecture_video_dim_defaults_to_backbone_dim():
     """The ActionDiT reads the backbone's hidden size."""
     cfg = {**_CFG, "bridge_interval": 1}
-    arch = build_test_arch("dual_system_cross_attn", cfg, _MockVideoBackbone(dim=96, num_layers=2))
+    arch = build_test_arch("joint_cross_attn", cfg, _MockVideoBackbone(dim=96, num_layers=2))
     assert arch.action_backbone.video_projs[0].in_features == 96
 
 
 def test_architecture_derives_bridge_layers_from_backbone_num_layers():
     """bridge_interval counts over video_backbone.num_layers."""
     cfg = {**_CFG, "bridge_interval": 5}
-    arch = build_test_arch("dual_system_cross_attn", cfg, _MockVideoBackbone(dim=128, num_layers=20))
+    arch = build_test_arch("joint_cross_attn", cfg, _MockVideoBackbone(dim=128, num_layers=20))
     assert arch.bridge_layers == (0, 5, 10, 15)
 
 

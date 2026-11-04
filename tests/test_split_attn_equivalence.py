@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from openwam.model.action_backbone.separate_action_dit import ActionDiT, SelfAttnActionDiTBlock
+from openwam.model.action_backbone.separate_action_dit import MoTActionDiT, SelfAttnActionDiTBlock
 from openwam.model.video_backbone.base import BlockLoopState
 from openwam.model.video_backbone.wan.dit import DiTBlock, precompute_freqs_cis_3d
 
@@ -56,9 +56,11 @@ def _wan_freqs(num_tokens: int, dim: int, num_heads: int) -> torch.Tensor:
     return freqs
 
 
-def _masked_action_context(dit: ActionDiT, batch_size: int):
-    context = torch.zeros(batch_size, 1, dit.text_dim)
-    context_mask = torch.zeros(batch_size, 1, dtype=torch.bool)
+def _action_context(dit: MoTActionDiT, batch_size: int):
+    """Raw action context (batch_size, 3, text_dim) and its (batch_size, 3) mask, the last key of row 1 padded."""
+    context = torch.randn(batch_size, 3, dit.text_dim)
+    context_mask = torch.ones(batch_size, 3, dtype=torch.bool)
+    context_mask[1, -1] = False
     return context, context_mask
 
 
@@ -130,47 +132,46 @@ def test_wan_dit_block_split_equivalence():
     )
 
 
-def _self_attn_block_reference(block, x, t_mod, freqs):
-    """The whole SelfAttnActionDiTBlock in one pass (no context): the reference the split path must equal.
+def _self_attn_block_reference(block, x, t_mod, freqs, context, context_mask):
+    """The whole SelfAttnActionDiTBlock in one pass: the reference the split path must equal.
 
     Args:
         block: SelfAttnActionDiTBlock. x: (B, S, dim) hidden state. t_mod: (B, 6, dim) modulation.
-        freqs: (S, head_dim / 2) complex RoPE table.
+        freqs: (S, head_dim / 2) complex RoPE table. context: (B, L, dim) projected context.
+        context_mask: (B, S, L) bool, True = attend.
 
     Returns:
-        (B, S, dim): x + gated self-attention, then + gated FFN (AdaLN-modulated, as the block's halves do).
+        (B, S, dim): x + gated self-attention, + context cross-attention, then + gated FFN (AdaLN-modulated, as
+        the block's halves do).
     """
     chunks = (block.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = chunks
     attn_input = block.self_attn_norm(x) * (1 + scale_msa) + shift_msa
-    x = block.gate(x, gate_msa, block.self_attn(attn_input, freqs=freqs))
+    x = x + gate_msa * block.self_attn(attn_input, freqs=freqs)
+    x = x + block.cross_attn(block.context_attn_norm(x), context, ctx_mask=context_mask)
     mlp_input = block.ffn_norm(x) * (1 + scale_mlp) + shift_mlp
-    return block.gate(x, gate_mlp, block.ffn(mlp_input))
+    return x + gate_mlp * block.ffn(mlp_input)
 
 
 # ---------------------------------------------------------------------------
-# Action SelfAttnActionDiTBlock equivalence — drives the ActionDiT(joint_self_attn) path.
+# Action SelfAttnActionDiTBlock equivalence — drives the MoTActionDiT (joint_self_attn) path.
 # ---------------------------------------------------------------------------
 
 
 def test_action_mot_block_split_equivalence():
-    """ActionDiT pre_attn + attention + post_attn ≡ _self_attn_block_reference (no context)."""
+    """MoTActionDiT pre_attn + attention + post_attn ≡ _self_attn_block_reference (with a padded context)."""
     torch.manual_seed(0)
     action_dim, dim, num_heads, ffn_dim = 7, 32, 4, 64
     B, S = 2, 5
-    bridge_layers = (0, 1)
 
-    dit = ActionDiT(
+    dit = MoTActionDiT(
         shift_action=5.0,
         train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=action_dim,
         dim=dim,
         ffn_dim=ffn_dim,
         num_heads=num_heads,
-        num_layers=len(bridge_layers),
-        video_dim=dim,
-        bridge_layers=bridge_layers,
-        variant="joint_self_attn",
+        num_layers=2,
         attn_head_dim=dim // num_heads,
         text_dim=4096,
         freq_dim=256,
@@ -184,32 +185,26 @@ def test_action_mot_block_split_equivalence():
 
     # Reference: drive the block manually
     with torch.no_grad():
-        context, context_mask = _masked_action_context(dit, B)
+        context, context_mask = _action_context(dit, B)
         astate = dit.prepare_state(actions, timestep, context=context, context_mask=context_mask)
-        payload = astate.payload
-        payload.context = None
-        payload.context_mask = None
-        x_init = payload.x_action.clone()
-        t_mod = payload.t_mod.clone()
-        freqs = payload.action_freqs.clone()
+        x_init = astate.x_action.clone()
+        t_mod = astate.t_mod.clone()
+        freqs = astate.action_freqs.clone()
 
         block: SelfAttnActionDiTBlock = dit.blocks[0]
-        # The one-pass reference, context=None: self-attn norm/proj + RoPE + FFN.
-        out_ref = _self_attn_block_reference(block, x_init, t_mod, freqs)
+        # The one-pass reference: self-attn norm/proj + RoPE, context cross-attn, FFN.
+        out_ref = _self_attn_block_reference(block, x_init, t_mod, freqs, astate.context, astate.context_mask)
 
     # Split: ActionDiT pre/post_attn_at_layer round-trip with single-stream attention
     with torch.no_grad():
-        context, context_mask = _masked_action_context(dit, B)
         astate2 = dit.prepare_state(actions, timestep, context=context, context_mask=context_mask)
-        astate2.payload.context = None
-        astate2.payload.context_mask = None
         q, k, v, post = dit.pre_attn_at_layer(0, astate2)
         attn_out = _attention_action(q, k, v, num_heads)
         astate2 = dit.post_attn_at_layer(0, astate2, attn_out, post)
-        out_split = astate2.payload.x_action
+        out_split = astate2.x_action
 
     assert torch.allclose(out_ref, out_split, atol=0, rtol=0), (
-        f"ActionDiT split disagrees with _self_attn_block_reference; max diff = {(out_ref - out_split).abs().max().item()}"
+        f"MoTActionDiT split disagrees with _self_attn_block_reference; max diff = {(out_ref - out_split).abs().max().item()}"
     )
 
 
@@ -224,19 +219,15 @@ def test_action_mot_block_heterogeneous_hidden_dim():
     # Heterogeneous: action hidden_dim=32, attn_hidden_dim = 4*16 = 64.
     action_dim, dim, num_heads, attn_head_dim, ffn_dim = 7, 32, 4, 16, 64
     B, S = 2, 5
-    bridge_layers = (0, 1)
 
-    dit = ActionDiT(
+    dit = MoTActionDiT(
         shift_action=5.0,
         train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=action_dim,
         dim=dim,
         ffn_dim=ffn_dim,
         num_heads=num_heads,
-        num_layers=len(bridge_layers),
-        video_dim=128,  # video residual width — irrelevant for the action-only check
-        bridge_layers=bridge_layers,
-        variant="joint_self_attn",
+        num_layers=2,
         attn_head_dim=attn_head_dim,
         text_dim=4096,
         freq_dim=256,
@@ -254,26 +245,20 @@ def test_action_mot_block_heterogeneous_hidden_dim():
     timestep = torch.randn(B)
 
     with torch.no_grad():
-        context, context_mask = _masked_action_context(dit, B)
+        context, context_mask = _action_context(dit, B)
         astate = dit.prepare_state(actions, timestep, context=context, context_mask=context_mask)
-        payload = astate.payload
-        payload.context = None
-        payload.context_mask = None
-        x_init = payload.x_action.clone()
-        t_mod = payload.t_mod.clone()
-        freqs = payload.action_freqs.clone()
-        out_ref = _self_attn_block_reference(block, x_init, t_mod, freqs)
+        x_init = astate.x_action.clone()
+        t_mod = astate.t_mod.clone()
+        freqs = astate.action_freqs.clone()
+        out_ref = _self_attn_block_reference(block, x_init, t_mod, freqs, astate.context, astate.context_mask)
 
-        context, context_mask = _masked_action_context(dit, B)
         astate2 = dit.prepare_state(actions, timestep, context=context, context_mask=context_mask)
-        astate2.payload.context = None
-        astate2.payload.context_mask = None
         q, k, v, post = dit.pre_attn_at_layer(0, astate2)
         # Q/K/V are already in (B, S, num_heads*attn_head_dim) — driver-ready.
         assert q.shape == (B, S, num_heads * attn_head_dim)
         attn_out = _attention_action(q, k, v, num_heads)
         astate2 = dit.post_attn_at_layer(0, astate2, attn_out, post)
-        out_split = astate2.payload.x_action
+        out_split = astate2.x_action
 
     assert torch.allclose(out_ref, out_split, atol=0, rtol=0), (
         f"heterogeneous-hidden split disagrees with _self_attn_block_reference; "

@@ -1,7 +1,7 @@
 """WAM architecture registry: ``(framework, variant)`` from the model config picks the class.
 
 Usage:
-    @register_architecture("dual_system_cross_attn", framework="dual_system", variant="joint_cross_attn")
+    @register_architecture(framework="dual_system", variant="joint_cross_attn")
     class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
         ...
 
@@ -10,36 +10,32 @@ Usage:
                               train_options=...)
 """
 
-from typing import Dict, Optional, Type
+from typing import Dict, Optional, Tuple, Type
 
 from omegaconf import DictConfig
 
 from openwam.model.architectures.base import BaseWAMArchitecture, TrainOptions
 from openwam.model.video_backbone.registry import LoadMode
 
-# Registry name -> class (names are unique; they label the class in logs and tests).
-ARCHITECTURE_REGISTRY: Dict[str, Type[BaseWAMArchitecture]] = {}
-# (framework, variant) as the yaml spells it -> registry name.
-_FRAMEWORK_VARIANT_INDEX: Dict[tuple, str] = {}
+# (framework, variant) as the yaml spells it -> class.
+ARCHITECTURE_REGISTRY: Dict[Tuple[str, str], Type[BaseWAMArchitecture]] = {}
 
 
-def register_architecture(name: str, *, framework: str, variant: str):
-    """Decorator registering a WAM architecture class under ``name`` and its ``(framework, variant)``.
+def register_architecture(*, framework: str, variant: str):
+    """Decorator registering a WAM architecture class under its ``(framework, variant)``.
 
     Args:
-        name: str registry key (e.g. ``"dual_system_cross_attn"``).
         framework: str ``model.architecture.framework`` value (e.g. ``"dual_system"``).
         variant: str ``model.architecture.variant`` value (e.g. ``"joint_cross_attn"``).
 
     Returns:
-        the class decorator (returns the class unchanged). ValueError on a duplicate name or pair.
+        the class decorator (returns the class unchanged). ValueError on a duplicate pair.
     """
 
     def decorator(cls: Type[BaseWAMArchitecture]):
-        if name in ARCHITECTURE_REGISTRY or (framework, variant) in _FRAMEWORK_VARIANT_INDEX:
-            raise ValueError(f"Architecture '{name}' ({framework}, {variant}) already registered")
-        ARCHITECTURE_REGISTRY[name] = cls
-        _FRAMEWORK_VARIANT_INDEX[(framework, variant)] = name
+        if (framework, variant) in ARCHITECTURE_REGISTRY:
+            raise ValueError(f"Architecture ({framework}, {variant}) already registered")
+        ARCHITECTURE_REGISTRY[(framework, variant)] = cls
         return cls
 
     return decorator
@@ -69,12 +65,12 @@ def build_architecture(
         BaseWAMArchitecture. KeyError when no class is registered for the (framework, variant) pair.
     """
     key = (str(model_cfg.architecture.framework), str(model_cfg.architecture.variant))
-    if key not in _FRAMEWORK_VARIANT_INDEX:
+    if key not in ARCHITECTURE_REGISTRY:
         raise KeyError(
             f"Unsupported architecture framework={key[0]!r} variant={key[1]!r}; "
-            f"available: {sorted(_FRAMEWORK_VARIANT_INDEX)}"
+            f"available: {sorted(ARCHITECTURE_REGISTRY)}"
         )
-    cls = ARCHITECTURE_REGISTRY[_FRAMEWORK_VARIANT_INDEX[key]]
+    cls = ARCHITECTURE_REGISTRY[key]
     return cls(model_cfg, mode=mode, assets=assets, ckpt_dir=ckpt_dir, train_options=train_options)
 
 

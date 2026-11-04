@@ -27,8 +27,9 @@ architecture:
   # clip, 1 + (H - 2) / tc latents; needs H - 1 = 1 + tc*k). The current frame is always encoded alone.
   history_encoding: per_frame
 
-  # ActionDiT bridge layers = range(0, video_backbone.geometry.num_layers, bridge_interval) (1 = every layer,
-  # 2 = every other). joint_cross_attn: which video layers feed the bridge; joint_self_attn: sizes ActionDiT.
+  # joint_cross_attn: the video layers that feed the ActionDiT bridges (one block each) are
+  # range(0, video_backbone.geometry.num_layers, bridge_interval) (1 = every layer, 2 = every other).
+  # joint_self_attn: must be 1 (one mixed attention per video layer; resolve_config rejects other values).
   bridge_interval: 1
 
   detach_bridge: false             # joint_cross_attn only

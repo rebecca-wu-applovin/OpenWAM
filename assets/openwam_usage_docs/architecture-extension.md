@@ -24,12 +24,12 @@ cosmos3_edge   cosmos3_nano             # cosmos3/
 ge_base_fast                            # ge/
 flux3_action_base                       # flux/
 
-# Architecture
-dual_system_cross_attn
-dual_system_self_attn
+# Architecture ((framework, variant) as the model yaml spells it)
+dual_system / joint_cross_attn
+dual_system / joint_self_attn
 ~~~
 
-Architecture keys are resolved from `architecture.framework` and `architecture.variant`. A new registration should fail clearly when a required capability is unavailable.
+Architecture classes are registered under and resolved from the pair `architecture.framework`, `architecture.variant`. A new registration should fail clearly when a required capability is unavailable.
 
 ## Add a video DiT backbone
 
@@ -97,16 +97,18 @@ checks every registered family. Build it through `build_video_backbone(cfg.model
 
 ## Add an action backbone
 
-The base contracts are in [openwam/model/action_backbone/base.py](../../openwam/model/action_backbone/base.py):
+The action stream lives in [openwam/model/action_backbone/separate_action_dit.py](../../openwam/model/action_backbone/separate_action_dit.py): one class per coupling on a shared base.
 
 ~~~text
-# DualSystem
-ActionDiTBackbone: num_layers, num_heads, head_dim, bridge forward,
-                  prepare_state, pre_attn_at_layer, post_attn_at_layer,
-                  extract_prediction
+ActionDiT (shared base): scheduler, num_layers, num_heads, head_dim, set_dtype_device, save_deploy_assets,
+                         prepare_state(noisy_actions, timestep, context=, context_mask=) -> ActionDiTState
+CrossAttnActionDiT (joint_cross_attn): forward(actions, bridges: list (one per block), timestep, context=, ...)
+MoTActionDiT (joint_self_attn):        pre_attn_at_layer, post_attn_at_layer, extract_prediction (MoT driver)
 ~~~
 
-There is no separate action-backbone registry. Each architecture constructs its action implementation directly. Keep the constructor compatible with the matching group under [configs/model/action_backbone/](../../configs/model/action_backbone/).
+There is no action-backbone registry and no variant argument: each architecture names its ActionDiT class (passed to
+`BaseWAMArchitecture.__init__` as `action_dit_cls`), and that class's `from_cfg(ab, action_dim=, num_layers=)` reads
+the matching group under [configs/model/action_backbone/](../../configs/model/action_backbone/).
 
 ~~~yaml
 # configs/model/action_backbone/separate_action_dit.yaml
@@ -114,7 +116,7 @@ dim: 1024                         # ActionDiT hidden width
 ffn_dim: 4096                     # feed-forward width
 shift_action: 5.0                 # action scheduler shift
 freq_dim: 256                     # timestep embedding width
-max_action_len: 1024              # action position table size
+max_action_len: 1024              # longest action chunk (action RoPE table length)
 eps: 1.0e-06                      # norm epsilon
 num_heads: ${..video_backbone.geometry.num_heads}   # geometry: the video backbone yaml's geometry block
 head_dim: ${..video_backbone.geometry.head_dim}
@@ -122,37 +124,38 @@ video_dim: ${..video_backbone.geometry.dim}
 text_dim: ${..video_backbone.geometry.text_dim}
 ~~~
 
-Every video backbone yaml declares `model.video_backbone.geometry` (`dim`, `num_heads`, `head_dim`, `num_layers`, `text_dim`); the architecture checks it against the built module and raises on any difference. The ActionDiT has one block per bridge layer, `range(0, geometry.num_layers, model.architecture.bridge_interval)`, and needs an even positive `head_dim`. MoT requires video and action layer/head geometry to match. Keep actions and predictions shaped `(B, T_action, action_dim)` and preserve scheduler and `shift_action` behavior through the base interface.
+Every video backbone yaml declares `model.video_backbone.geometry` (`dim`, `num_heads`, `head_dim`, `num_layers`, `text_dim`); the architecture checks it against the built module and raises on any difference. `CrossAttnActionDiT` has one block per bridge layer, `range(0, geometry.num_layers, model.architecture.bridge_interval)`; `MoTActionDiT` has one block per video layer (`bridge_interval` must be 1, checked by `resolve_config`). Both need an even positive `head_dim`; MoT requires video and action head geometry to match. Keep actions and predictions shaped `(B, T_action, action_dim)` and preserve scheduler and `shift_action` behavior through the base interface.
 
 ## Add an architecture
 
-Subclass `BaseWAMArchitecture` in [openwam/model/architectures/base.py](../../openwam/model/architectures/base.py) and register a canonical name in the relevant [openwam/model/architectures/](../../openwam/model/architectures/) package:
+Subclass `BaseWAMArchitecture` in [openwam/model/architectures/base.py](../../openwam/model/architectures/base.py) and register its `(framework, variant)` pair in the relevant [openwam/model/architectures/](../../openwam/model/architectures/) package. The base builds the video backbone, the proprio context encoder and the action backbone (in that order); the subclass names the ActionDiT class and its block count:
 
 ~~~python
+from openwam.model.action_backbone import MoTActionDiT
 from openwam.model.architectures import BaseWAMArchitecture, register_architecture
 
-@register_architecture(
-    'my_architecture',
-    framework='my_framework',
-    variant='default',
-)
+@register_architecture(framework='my_framework', variant='default')
 class MyArchitecture(BaseWAMArchitecture):
     # cfg is merge(cfg.common, cfg.model) (layout at cfg.layout); assets = cfg.assets.video_backbone
     def __init__(self, cfg, *, mode, assets, ckpt_dir, train_options):
-        super().__init__(cfg, mode=mode, assets=assets, ckpt_dir=ckpt_dir, train_options=train_options)
-        self.action_backbone = ...
+        super().__init__(
+            cfg, mode=mode, assets=assets, ckpt_dir=ckpt_dir, train_options=train_options,
+            action_dit_cls=MoTActionDiT, num_action_layers=int(cfg.video_backbone.geometry.num_layers),
+        )
 
     def forward(self, noisy_actions, action_timestep, *, latents, timestep, text, proprio, proprio_mask,
                 use_gradient_checkpointing, use_gradient_checkpointing_offload):
-        video_text, action_text = self.build_contexts(text, proprio, proprio_mask)
-        ...  # -> (video_noise, action_noise_or_none)
+        # build_contexts + video_backbone.prepare, shared by every coupling
+        vstate, action_text = self._prepare_video(latents, timestep, text, proprio, proprio_mask,
+                                                  use_gradient_checkpointing, use_gradient_checkpointing_offload)
+        ...  # -> (video_noise, action_noise)
 ~~~
 
 The base class owns the training step (`compute_loss(batch)` on the collated `Batch`) and inference
 (`sample(hist_latents, text, proprio, schedule, seed=...)`); the forward method returns
-`(video_noise_pred, action_noise_pred_or_none)`. `build_contexts` applies `proprio_input`: ActionDiT always reads
+`(video_noise_pred, action_noise_pred)` (both streams always run). `build_contexts` applies `proprio_input`: ActionDiT always reads
 text + proprio tokens, the video backbone the same context (`context_token`) or the text alone (`backbone_stream`). Use public backbone methods, set architecture-owned trainable modules explicitly, and fail clearly when a required capability is absent. Import the implementation from the family `__init__.py` so the decorator runs.
 
-Add a model YAML with `architecture.framework` and `architecture.variant`. [openwam/model/architectures/registry.py](../../openwam/model/architectures/registry.py) maps that pair to the canonical name. Keep mask rules in the architecture. A backbone should expose geometry and mask builders as methods and must not inspect architecture configuration or import an architecture module.
+Add a model YAML with `architecture.framework` and `architecture.variant`. [openwam/model/architectures/registry.py](../../openwam/model/architectures/registry.py) maps that pair to the class. Keep mask rules in the architecture. A backbone should expose geometry and mask builders as methods and must not inspect architecture configuration or import an architecture module.
 
 For runtime settings, see [Training and deployment](train-and-deploy.md). For dataset and client adapters, see [Benchmark integration](benchmark-integration.md).

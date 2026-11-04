@@ -11,9 +11,9 @@ The benchmark owns action ordering, units, signs, ranges, and gripper meaning. K
 
 ### Choose a base and register it
 
-For a custom source, subclass `BaseDataset` in [openwam/dataloader/bases/dataset.py](../../openwam/dataloader/bases/dataset.py). For LeRobot v3 data, subclass `LeRobotV3Reader` in [openwam/dataloader/bases/lerobot_v3_reader.py](../../openwam/dataloader/bases/lerobot_v3_reader.py), which provides parquet windows, video decoding, prompts, statistics, masks, and multiview composition.
+For a custom source, subclass `BaseDataset` in [openwam/dataloader/bases/dataset.py](../../openwam/dataloader/bases/dataset.py). For LeRobot v3 data, subclass `LeRobotV3Reader` in [openwam/dataloader/bases/lerobot_v3_reader.py](../../openwam/dataloader/bases/lerobot_v3_reader.py), which provides the episode table and window index, the in-memory data shards, prompts, the retrying `sample`, train-only color jitter, and the action / proprio scatter into the model width with its masks.
 
-Implement the three required hooks — `_getitem_impl(idx, rng)` (builds the sample; `rng` is the per-sample generator, the only random source a reader may use), `_action_rows` (the normalized raw action of a window) and `_load_stats` (called only when `normalize_mode` is on) — set `ACTION_DIM`, and override only the optional hooks that differ, such as `_resolve_cameras` and `_resolve_prompt`. The subclass decides `unify_action` and its map (yam_sharpa: from `action_mode`). A `LeRobotV3Reader` is a source: the registered mixture (e.g. `MultiYamSharpaDataset`) calls its `sample(idx, rng)` with a `(seed, epoch, idx)` generator, and the reader reads every data shard into memory at construction. Register the trainer-facing `BaseDataset` (the mixture, not the reader) in [openwam/dataloader/registry.py](../../openwam/dataloader/registry.py):
+The base calls no subclass hook while it is built: the subclass passes everything it decides as `__init__` arguments (`cameras`, `min_window_len`, the scatter map `dst_index` and the model width `action_dim`; yam_sharpa derives the map from `action_mode`, the identity for `fingertips_*`), sets the class constants `DATASET_NAME` / `NEEDED_COLS`, implements `_getitem_impl(idx, rng)` (builds the sample; `rng` is the per-sample generator, the only random source a reader may use), sets its own fields after `super().__init__()` and ends its `__init__` with `self._select_augmentations(train=split == "train")`. The reader exposes `ACTION_REPR_DIM` (raw representation width) and `ACTION_DIM` (model width). Normalization is decided once by the mixture's `from_config`, which hands each reader its (action, state) normalizer pair. A `LeRobotV3Reader` is a source: the registered mixture (e.g. `MultiYamSharpaDataset`) calls its `sample(idx, rng)` with a `(seed, epoch, idx)` generator, and the reader reads every data shard into memory at construction. Register the trainer-facing `BaseDataset` (the mixture, not the reader) in [openwam/dataloader/registry.py](../../openwam/dataloader/registry.py):
 
 ~~~python
 from openwam.dataloader.bases import BaseDataset
@@ -30,9 +30,12 @@ class MyBenchmarkDataset(BaseDataset):
     # Required (abstract): the same windows with every train-only augmentation off; the trainer's
     # visualization samples from it. A dataset without augmentations can return a view of itself.
     def eval_view(self): ...
+    def set_epoch(self, epoch): ...    # called by the trainer once per epoch
+    def all_prompts(self): ...         # every prompt a sample can carry (text-embedding cache)
+    # And an attribute: normalization_stats_path (str, or None with normalization off), copied into checkpoints.
 ~~~
 
-Import the module before calling `build_dataset(config)`. Every registered class must implement `from_config`; built-in readers are imported by the registry.
+Import the module before calling `build_dataset(config)`. Every registered class implements the abstract `from_config`, `set_epoch`, `all_prompts` and `eval_view`; built-in readers are imported by the registry.
 
 ### Return the canonical sample
 
@@ -60,7 +63,7 @@ Every video frame is real (there is no video padding mask); a source window too 
 
 ### Define an action space
 
-An action may contain joints, EEF pose, base motion, or any combination. The final action width must be consistent across readers that are mixed together; `MixtureDataset` enforces this in strict mode.
+An action may contain joints, EEF pose, base motion, or any combination. The final action width must be consistent across readers that are mixed together; `MultiYamSharpaDataset` checks it when it is built.
 
 For schema-free scatter/gather, use [openwam/dataloader/utils/unify_action.py](../../openwam/dataloader/utils/unify_action.py):
 
@@ -99,13 +102,13 @@ window_stride: 1
 # Image layout
 height: 384
 width: 320
-multiview: false
+camera_layout: [observation.images.ego_view]   # cameras stacked top-to-bottom
 
 # Action preprocessing
 normalize_mode: min-max              # min-max, z-score, quantile, or null
 ~~~
 
-Use [openwam/dataloader/utils/normalization.py](../../openwam/dataloader/utils/normalization.py) for normalization, [openwam/dataloader/utils/rotation.py](../../openwam/dataloader/utils/rotation.py) for the 6D rotation conversion and [openwam/dataloader/transforms/video.py](../../openwam/dataloader/transforms/video.py) for color jitter (train split, inside the dataset). Compute statistics from the training split; the reader exposes the stats file as `normalization_stats_path`, which the trainer copies into the checkpoint as `normalization_stats.npy`. Deployment gathers unified slots back to raw dimensions before inverting the normalization (`invert_normalization`). Keep the same statistics artifact with the checkpoint.
+Use [openwam/dataloader/utils/normalization.py](../../openwam/dataloader/utils/normalization.py) for normalization, [openwam/dataloader/utils/rotation.py](../../openwam/dataloader/utils/rotation.py) for the 6D rotation conversion and [openwam/dataloader/transforms/video.py](../../openwam/dataloader/transforms/video.py) for color jitter (train split, inside the dataset). Compute statistics from the training split; the registered dataset exposes the stats file as `normalization_stats_path`, which the trainer copies into the checkpoint as `normalization_stats.npy`. Deployment gathers unified slots back to raw dimensions before inverting the normalization (`invert_normalization`). Keep the same statistics artifact with the checkpoint.
 
 Inspect one sample through the registry:
 

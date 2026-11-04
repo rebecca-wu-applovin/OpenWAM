@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import torch.nn as nn
 
+from openwam.model.action_backbone.separate_action_dit import ActionDiT, MoTActionDiT
 from openwam.model.architectures.base import BaseWAMArchitecture
 from openwam.model.video_backbone import LoadMode
 from tests._arch import TEST_ASSETS, TEST_TRAIN_OPTIONS, arch_params, backbone_double
@@ -38,11 +39,13 @@ def test_dispatch_to_all_backbones(tmp_path):
     vb.dim, vb.num_heads, vb.head_dim, vb.num_layers, vb.text_dim = 64, 4, 16, 2, 64  # the yaml geometry block
     with backbone_double(vb):
         arch = _ConcreteArch(
-            arch_params({}, vb),
+            arch_params({"dim": 32, "ffn_dim": 64, "action_dim": 1}, vb),
             mode=LoadMode.PRETRAINED,
             assets=TEST_ASSETS,
             ckpt_dir=None,
             train_options=TEST_TRAIN_OPTIONS,
+            action_dit_cls=MoTActionDiT,
+            num_action_layers=vb.num_layers,
         )
     ab = _RecordingBackbone()
     arch.action_backbone = ab
@@ -57,8 +60,7 @@ def test_all_backbone_bases_declare_hook():
     """Direction-A contract: every backbone base declares save_deploy_assets on
     itself (default no-op), so the dispatcher calls it unconditionally rather than
     probing with hasattr. ``vars`` (not hasattr) catches a root that forgot it."""
-    from openwam.model.action_backbone.base import ActionDiTBackbone
     from openwam.model.video_backbone.base import VideoBackbone
 
-    for base in (VideoBackbone, ActionDiTBackbone):
+    for base in (VideoBackbone, ActionDiT):
         assert "save_deploy_assets" in vars(base), f"{base.__name__} must declare the no-op hook"

@@ -6,9 +6,10 @@ dataset so all sources share one transform::
     {
       "<action_mode>":        {mean, std, min, max, q01, q99},   # action (deploy unnormalize)
       "<action_mode>_state":  {mean, std, min, max, q01, q99},   # proprio (deploy normalize)
-      "yam_sharpa_stats_schema": 1,
-      "yam_sharpa_meta": {"action_mode", "sources", "num_frames"},
+      "yam_sharpa_meta": {"action_mode", "sources", "num_frames"},   # provenance the reader matches before reuse
     }
+
+(Files written before 2026-11 also carry ``"yam_sharpa_stats_schema": 1``; nothing reads it.)
 
 Stats are in RAW (pre-unify) space. Action statistics cover every
 (anchor t, target t+k) pair a training window can supervise
@@ -21,7 +22,7 @@ uniform random subsample.
 Usage::
 
     python -m openwam.dataloader.utils.stats_computation.yam_sharpa_stats_computation \\
-        --dataset-dirs <dir1> <dir2> --action-mode fingertips_rel --output <stats.npy>
+        --dataset-dirs <dir1> <dir2> --action-mode fingertips_rel --num-frames 33 --output <stats.npy>
 """
 
 from __future__ import annotations
@@ -41,6 +42,11 @@ import pandas as pd
 
 from openwam.dataloader.utils.normalization import pin_rot6d_identity
 from openwam.dataloader.utils.yam_sharpa_repr import (
+    ACTION_COL,
+    CAM_POSE_COL,
+    JOINT_COL,
+    SETPOINT_COL,
+    STATE_COL,
     encode_action_pairs,
     encode_proprio,
     is_relative,
@@ -51,10 +57,8 @@ from openwam.dataloader.utils.yam_sharpa_repr import (
 
 logger = logging.getLogger(__name__)
 
-STATS_SCHEMA_VERSION = 1
-# Columns read per parquet shard (camera pose kept separate for clarity).
-_COLS = ["episode_index", "frame_index", "observation.state", "action", "joint_angles", "joint_setpoints"]
-_CAM_COL = "camera_pose.ego_view"
+# Columns read per parquet shard: the episode / frame keys + the representation columns (shared with the reader).
+_COLS = ["episode_index", "frame_index", STATE_COL, ACTION_COL, JOINT_COL, SETPOINT_COL, CAM_POSE_COL]
 _QUANTILE_ROWS_PER_EPISODE = 64  # rows kept per episode for the q01/q99 subsample
 
 
@@ -128,23 +132,22 @@ def _pair_indices(length: int, horizon: int):
     return np.concatenate(anchors), np.concatenate(targets)
 
 
-def _episode_rows(ep: pd.DataFrame, cam_col: str) -> Dict[str, np.ndarray]:
+def _episode_rows(ep: pd.DataFrame) -> Dict[str, np.ndarray]:
     """Stack one episode's columns in frame order.
 
     Args:
         ep: DataFrame rows of one episode.
-        cam_col: str, camera-pose column name.
 
     Returns:
         dict: state (L, 48), action (L, 48), joints (L, 56), setpoints (L, 56), cam (L, 16).
     """
     ep = ep.sort_values("frame_index")
     return {
-        "state": np.stack(ep["observation.state"].to_numpy()),
-        "action": np.stack(ep["action"].to_numpy()),
-        "joints": np.stack(ep["joint_angles"].to_numpy()),
-        "setpoints": np.stack(ep["joint_setpoints"].to_numpy()),
-        "cam": np.stack(ep[cam_col].to_numpy()),
+        "state": np.stack(ep[STATE_COL].to_numpy()),
+        "action": np.stack(ep[ACTION_COL].to_numpy()),
+        "joints": np.stack(ep[JOINT_COL].to_numpy()),
+        "setpoints": np.stack(ep[SETPOINT_COL].to_numpy()),
+        "cam": np.stack(ep[CAM_POSE_COL].to_numpy()),
     }
 
 
@@ -161,9 +164,9 @@ def _scan_file(args) -> tuple:
     rng = np.random.default_rng(seed)
     dim = raw_dim(action_mode)
     act, prop = _Accum(dim), _Accum(dim)
-    df = pd.read_parquet(path, columns=_COLS + [_CAM_COL])
+    df = pd.read_parquet(path, columns=_COLS)
     for _, ep in df.groupby("episode_index", sort=False):
-        r = _episode_rows(ep, _CAM_COL)
+        r = _episode_rows(ep)
         prop.add(encode_proprio(action_mode, r["state"], r["joints"]), rng)
         # Same encoder as the reader, over all supervised (t, t+k) pairs.
         ia, it = _pair_indices(len(ep), horizon)
@@ -186,7 +189,7 @@ def compute_yam_sharpa_stats(
     dataset_dirs: Sequence[str],
     action_mode: str,
     *,
-    num_frames: int = 33,
+    num_frames: int,
     workers: int = 8,
     seed: int = 0,
 ) -> dict:
@@ -200,7 +203,7 @@ def compute_yam_sharpa_stats(
         seed: int, quantile-subsample seed.
 
     Returns:
-        dict ``{action_mode: stats, action_mode+'_state': stats, schema, meta}``, each stats a
+        dict ``{action_mode: stats, action_mode+'_state': stats, 'yam_sharpa_meta': meta}``, each stats a
         dict of (D,) float32 {mean, std, min, max, q01, q99}, D = raw_dim(action_mode).
     """
     action_mode = validate_repr(action_mode)
@@ -234,7 +237,6 @@ def compute_yam_sharpa_stats(
     return {
         action_mode: action_stats,
         f"{action_mode}_state": state_stats,
-        "yam_sharpa_stats_schema": STATS_SCHEMA_VERSION,
         "yam_sharpa_meta": stats_meta(dataset_dirs, action_mode, num_frames),
     }
 
@@ -283,7 +285,7 @@ def main(argv=None) -> None:
     ap.add_argument("--dataset-dirs", nargs="+", required=True)
     ap.add_argument("--action-mode", required=True)
     ap.add_argument("--output", required=True)
-    ap.add_argument("--num-frames", type=int, default=33)
+    ap.add_argument("--num-frames", type=int, required=True, help="the dataloader's num_frames (action chunk + 1)")
     ap.add_argument("--workers", type=int, default=8)
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
