@@ -86,7 +86,7 @@ def test_flux_requires_backbone_stream():
     """flux reads proprio from its own stream: its yaml pins proprio_input=backbone_stream."""
     from openwam.config import resolve_config
 
-    flux = ["model/video_backbone=flux3_action_base", "model.architecture.state_dim=48"]
+    flux = ["model/video_backbone=flux3_action_base", "common.state_dim=48"]
     with pytest.raises(ValueError, match="proprio_input"):
         resolve_config(_compose([*flux, "model.architecture.proprio_input=context_token"]))
     resolve_config(_compose([*flux, "model.architecture.proprio_input=backbone_stream"]))
@@ -108,12 +108,12 @@ def fake_arch():
             "dim": 64,
             "ffn_dim": 128,
             "num_heads": 4,
-            "bridge_layers": (0, 1),
+            "num_dit_layers": 2,
             "text_dim": 16,
             "use_proprioception": True,
             "state_dim": 6,
         }
-        backbone = _MockVideoBackbone(dim=64, num_layers=2, num_heads=4)
+        backbone = _MockVideoBackbone(dim=64, num_layers=2, num_heads=4, text_dim=16)
         return build_test_arch("dual_system_self_attn", cfg, backbone, layout=make_layout(h=5))
 
     return _build

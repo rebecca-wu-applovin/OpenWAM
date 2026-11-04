@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Tuple
 import torch
 from torch import nn
 
-from openwam.model.action_backbone.scheduler import ActionScheduler
+from openwam.model.common.flow_scheduler import FlowScheduler
 
 if TYPE_CHECKING:
     from openwam.model.architectures.base import ActionState
@@ -34,18 +34,15 @@ class ActionDiTBackbone(nn.Module, ABC):
     """
 
     # Set by the subclass __init__ (no default: a subclass that forgets them fails on first read).
-    _shift_action: float
     _bridge_layers: tuple[int, ...]
 
-    def __init__(self):
+    def __init__(self, scheduler: FlowScheduler):
+        """Args:
+            scheduler: FlowScheduler of the action stream (yaml ``shift_action`` + ``train_timestep``); its ``shift``
+                is the only copy of the action α-shift, read by training and inference alike.
+        """
         super().__init__()
-        self.scheduler = ActionScheduler()
-
-    @property
-    def shift_action(self) -> float:
-        """α-shift for the action scheduler — single source of truth read by the architecture for both
-        training and inference. Symmetric to ``VideoBackbone.shift_video``."""
-        return self._shift_action
+        self.scheduler = scheduler
 
     @property
     def bridge_layers(self) -> tuple[int, ...]:

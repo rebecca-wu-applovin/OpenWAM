@@ -8,11 +8,9 @@ only re-exports the public classes.
 """
 
 from openwam.model.action_backbone.base import ActionDiTBackbone
-from openwam.model.action_backbone.scheduler import ActionScheduler
 from openwam.model.action_backbone.separate_action_dit import ActionDiT
 
 __all__ = [
     "ActionDiT",
-    "ActionScheduler",
     "ActionDiTBackbone",
 ]

@@ -19,7 +19,7 @@ def widen_mask_for_prefix_kv(mask: Tensor, prefix_len: int, prefix_mask) -> Tens
         mask: (S_q, S_k) bool, or (B, 1, S_q, S_k).
         prefix_len: int P, prefix keys (0 = nothing to add).
         prefix_mask: (B, P) bool per-sample validity of the prefix keys, or None when every prefix key is real
-            (keeps the cheap batch-shared 2-D mask; testing a tensor here would sync / break the compiled MoT loop).
+            (keeps the cheap batch-shared 2-D mask; testing a tensor here would force a device sync).
 
     Returns:
         (S_q, P + S_k) bool when ``prefix_mask`` is None (rank kept), else (B, 1, S_q, P + S_k).

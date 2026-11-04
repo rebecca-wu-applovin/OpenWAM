@@ -40,10 +40,10 @@ def variant(request):
 
     repo = str(Path(__file__).resolve().parent.parent)
     with initialize_config_dir(config_dir=f"{repo}/configs", version_base=None):
-        cfg = compose("train", overrides=[f"model/video_backbone={name}", f"model.video_backbone.model_path={asset}"])
+        cfg = compose("train", overrides=[f"model/video_backbone={name}", f"assets.video_backbone.model_path={asset}"])
     vb_cfg = cfg.model.video_backbone
     OmegaConf.set_readonly(vb_cfg, True)
-    backbone = build_video_backbone(vb_cfg, LoadMode.PRETRAINED, None)
+    backbone = build_video_backbone(vb_cfg, LoadMode.PRETRAINED, cfg.assets.video_backbone, None)
     backbone.set_dtype_device(torch.bfloat16, torch.device("cuda"))
     yield name, backbone, geometry
     del backbone  # free the GPU before the next variant builds

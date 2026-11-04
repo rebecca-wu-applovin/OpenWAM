@@ -1,6 +1,6 @@
 # DEBUG ONLY: read-the-code config. Same training pipeline as train.yaml, but
 #   - tiny random video DiT / T5 (configs/model/video_backbone/wan22_ti2v_tiny.yaml)
-#   - tiny ActionDiT (layers / heads auto-follow the video DiT)
+#   - tiny ActionDiT (layers / heads follow the tiny backbone's geometry block)
 #   - 1 GPU, batch 1, num_workers 0 (DataLoader runs in the main process, so
 #     breakpoints inside the dataset __getitem__ work), no wandb, no checkpoints.
 # Launch: bash scripts/train_debug.sh  (plain python, no torchrun -> pdb / IDE debugger work)
@@ -15,10 +15,6 @@ model:
   action_backbone:
     dim: 512          # real: 1024
     ffn_dim: 2048     # real: 4096
-  architecture:
-    action_dim: 48    # must match dataloader.action_mode (fingertips_* = 48, unify_* = 80)
-    state_dim: 48
-    mot_checkpoint_mixed_attn: false   # no recompute -> backward is easier to follow
 
 dataloader:
   action_mode: fingertips_rel
@@ -32,6 +28,7 @@ training:
   lr_scheduler: null              # constant LR
   zero_stage: 2
   use_gradient_checkpointing: false
+  mot_checkpoint_mixed_attn: false   # no recompute -> backward is easier to follow
   save_steps: 0                   # 0 = never save (also skips the final save)
   output_path: outputs/debug_checkpoints   # run dir still gets config.yaml + tokenizer (~21MB); keep it away from real runs
   vis_steps: 0                    # no world-model rollouts

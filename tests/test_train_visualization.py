@@ -5,18 +5,14 @@ import torch
 from PIL import Image
 
 from openwam.model.architectures.base import BaseWAMArchitecture
+from openwam.model.common.flow_scheduler import FlowScheduler
 from openwam.train.utils.visualization import TrainVisualizer
 from tests._layout import make_layout
 
 
-class _Sched:
-    """Minimal flow-matching scheduler stub accepted by make_schedule('sync')."""
-
-    num_train_timesteps = 1000
-
-    def set_timesteps(self, num_inference_steps, shift=None, **_):
-        self.timesteps = torch.linspace(1000, 0, num_inference_steps + 1)[:-1]
-        self.sigmas = torch.linspace(1, 0, num_inference_steps + 1)
+def _sched() -> FlowScheduler:
+    """Returns: a real FlowScheduler (shift 5, the Wan / action grid law)."""
+    return FlowScheduler(shift=5.0, train_timestep={"law": "grid", "weighting": "bell"})
 
 
 class _StubBackbone(torch.nn.Module):
@@ -26,7 +22,6 @@ class _StubBackbone(torch.nn.Module):
         super().__init__()
         self.size = None  # (w, h) of the frames to return, taken from the history
         self.prompts = None
-        self.shift_video = 5.0
 
     def preprocess_condition(self, history, prompts, layout):
         torch.rand(3)  # consumes the global RNG like an encoder may
@@ -52,8 +47,7 @@ class _StubArch(torch.nn.Module):
         self.vae = torch.nn.Linear(2, 2).eval()  # frozen part (eval mode)
         self.video_backbone = _StubBackbone()
         self.action_backbone = torch.nn.Module()
-        self.action_backbone.shift_action = 5.0
-        self.video_scheduler, self.action_scheduler = _Sched(), _Sched()
+        self.video_scheduler, self.action_scheduler = _sched(), _sched()
         self.calls = []
 
     def sample(self, hist_latents, text, proprio, schedule, *, seed, active_action_mask):
@@ -105,6 +99,7 @@ def test_rollout_logs_video_and_restores_modes(tmp_path):
 
     call = arch.calls[0]
     assert len(call["schedule"]) == 4  # denoise_steps + 1 points
+    assert call["schedule"][:-1] == list(zip(*[s.inference_timesteps(3).tolist() for s in (_sched(), _sched())]))
     assert call["seed"] == 42 and call["prompt"] == "pick the cube"
 
     step, logged = run.logged[0]

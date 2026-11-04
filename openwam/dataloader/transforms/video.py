@@ -4,19 +4,6 @@ import numpy as np
 from PIL import ImageEnhance
 
 
-def color_jitter_enabled(color_jitter) -> bool:
-    """Whether a yaml ``color_jitter`` value asks for jitter.
-
-    ``None`` / ``False`` / ``{}`` → disabled. A dict may also disable itself
-    explicitly with ``enabled: false`` while keeping its strength knobs.
-    """
-    if not color_jitter:
-        return False
-    if hasattr(color_jitter, "get") and not color_jitter.get("enabled", True):
-        return False
-    return True
-
-
 class VideoColorJitter:
     """Random brightness / contrast / saturation jitter, the same factors for all frames of a clip.
 

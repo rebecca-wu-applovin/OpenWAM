@@ -72,7 +72,7 @@ class VideoBackbone(ABC, nn.Module):
     Inherits ``nn.Module`` so named children (``self.dit`` / ``self.vae`` / ...)
     are moved by :meth:`set_dtype_device` and serialized into the state_dict.
 
-    Every family's ``__init__`` sets the three fields declared below (``_shift_video``, ``_causal_temporal``,
+    Every family's ``__init__`` sets the two fields declared below (``_causal_temporal``,
     ``_temporal_compression``); the properties read them directly.
     """
 
@@ -80,7 +80,6 @@ class VideoBackbone(ABC, nn.Module):
     _device: torch.device = torch.device("cuda")
     _dtype: torch.dtype = torch.bfloat16
     # Set by every family's __init__ (no default: a family that forgets them fails on first read).
-    _shift_video: float
     _causal_temporal: bool
     _temporal_compression: int
     # Prompts per text-encoder forward while build_text_cache fills the cache (class attribute of each caching family).
@@ -92,11 +91,13 @@ class VideoBackbone(ABC, nn.Module):
 
     @classmethod
     @abstractmethod
-    def from_pretrained(cls, cfg) -> "VideoBackbone":
+    def from_pretrained(cls, cfg, assets) -> "VideoBackbone":
         """Build from the upstream weights.
 
         Args:
-            cfg: ``cfg.model.video_backbone`` (DictConfig): module geometry, ``model_path`` and the family's knobs.
+            cfg: ``cfg.model.video_backbone`` (DictConfig): module geometry and the family's knobs.
+            assets: ``cfg.assets.video_backbone`` (DictConfig): where the upstream files are (``model_path``, ...)
+                and how they are loaded; the only place a family reads paths from.
 
         Returns:
             VideoBackbone with every weight loaded (CPU). Raises ValueError when the weights do not match the
@@ -162,11 +163,11 @@ class VideoBackbone(ABC, nn.Module):
         """Per-token raw text-context width (the context the framework appends proprio tokens to)."""
 
     @property
-    @abstractmethod
     def scheduler(self):
-        """Flow-matching scheduler: ``set_timesteps`` / ``timesteps`` / ``sigmas`` / ``step`` for deploy, and
-        ``sample_train(batch_size, *, device, dtype) -> (timesteps (B,), sigmas (B,), loss_weights (B,) fp32)``
-        for the training noise (the grid draw, or a family's native law)."""
+        """The stream's :class:`openwam.model.common.flow_scheduler.FlowScheduler`; set ``self._scheduler`` in
+        ``__init__`` from the yaml ``shift_video`` and ``train_timestep`` (its ``shift`` is the only copy of the video
+        α-shift)."""
+        return self._scheduler
 
     @property
     def temporal_compression(self) -> int:
@@ -182,11 +183,6 @@ class VideoBackbone(ABC, nn.Module):
     def dtype(self) -> torch.dtype:
         """torch.dtype of the backbone's compute (set by :meth:`set_dtype_device`)."""
         return self._dtype
-
-    @property
-    def shift_video(self) -> float:
-        """α-shift for the video scheduler (single source of truth for train + inference)."""
-        return self._shift_video
 
     @property
     def causal_temporal(self) -> bool:
@@ -415,7 +411,7 @@ class VideoBackbone(ABC, nn.Module):
         return tensor_to_pil_frames(self.decode_latents(segment))[1:]
 
     # ================================================================
-    # Block loop (prepare / run_block / finalize required; MoT split, masks and compile optional)
+    # Block loop (prepare / run_block / finalize required; MoT split and masks optional)
     # ================================================================
 
     @abstractmethod
@@ -513,17 +509,6 @@ class VideoBackbone(ABC, nn.Module):
         mask = expand_frame_mask(frame_mask, [tpf] * (frame_mask.shape[0] - 1), s_action, state.hidden_states.device)
         return [mask] * self.num_layers
 
-    def apply_compile_optimizations(self, compile_cfg) -> None:
-        """Deploy-time compile hook.
-
-        Args:
-            compile_cfg: the deploy ``optimization.compile`` block (see ``openwam.model.compile_options``).
-
-        Returns:
-            None. Default: eager execution, nothing to compile.
-        """
-        return None
-
     # ================================================================
     # Deploy assets
     # ================================================================
@@ -568,7 +553,7 @@ def expand_frame_mask(frame_mask: Tensor, frame_of_tokens, s_action: int, device
         (sum(frame_of_tokens) + s_action, same) bool: token i inherits the row / column of its frame.
     """
     counts = [int(n) for n in frame_of_tokens] + [int(s_action)]
-    # output_size from python ints: no data-dependent shape inside a compiled MoT loop.
+    # output_size from python ints: the repeat needs no device sync for its output shape.
     index = torch.repeat_interleave(
         torch.arange(len(counts), device=device), torch.tensor(counts, device=device), output_size=sum(counts)
     )

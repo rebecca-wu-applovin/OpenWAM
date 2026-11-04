@@ -42,6 +42,7 @@ from einops import rearrange
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor, nn
 
+from openwam.model.common.flow_scheduler import FlowScheduler
 from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
 from openwam.model.video_backbone.flux.dit import JointSingleSeq, JointSingleSeqParams, apply_rope
 from openwam.model.video_backbone.flux.masks import (
@@ -51,7 +52,6 @@ from openwam.model.video_backbone.flux.masks import (
     build_flux_layer_masks,
     build_stream_ids,
 )
-from openwam.model.video_backbone.flux.scheduler import FluxFlowScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -205,9 +205,8 @@ class FluxActionVideoBackbone(VideoBackbone):
         text_encoder: nn.Module,
         text_encoder_dir: str,
         action_cond_dim: int,
-        shift_video: float = 5.0,
-        train_timestep_width: float = 0.75,
-        train_timestep_shift: float = 42.0,
+        shift_video: float,
+        train_timestep: DictConfig,
     ):
         """Wrap built modules; use :meth:`from_pretrained` / :meth:`from_checkpoint_dir` instead.
 
@@ -217,9 +216,9 @@ class FluxActionVideoBackbone(VideoBackbone):
             text_encoder: Qwen3VLEmbedder (frozen).
             text_encoder_dir: str, the dir its config / processor files were read from (save_deploy_assets copies it).
             action_cond_dim: int, proprio width fed to the P stream (``resolve_config`` checks it equals
-                ``model.architecture.state_dim``).
+                ``common.state_dim``).
             shift_video: float, inference shift of the OpenWAM scheduler (flux DROID inference: 5).
-            train_timestep_width / train_timestep_shift: native training timestep law (logit-logistic + rational shift).
+            train_timestep: DictConfig, the native training timestep law (yaml logit_logistic: width, shift).
         """
         super().__init__()
         self.dit = dit
@@ -227,25 +226,20 @@ class FluxActionVideoBackbone(VideoBackbone):
         self.text_encoder = text_encoder
         self._text_encoder_dir = text_encoder_dir
         self.state_dim = int(action_cond_dim)
-        self._shift_video = float(shift_video)
-        # Shared shifted grid for deploy; its sample_train is flux's native training timestep law.
-        self._scheduler = FluxFlowScheduler(
-            shift_video=self._shift_video,
-            train_timestep_width=train_timestep_width,
-            train_timestep_shift=train_timestep_shift,
-        )
+        # Shifted grid for deploy; training draws flux's native timestep law (yaml train_timestep).
+        self._scheduler = FlowScheduler(shift=shift_video, train_timestep=train_timestep)
         self._temporal_compression = _TEMPORAL_COMPRESSION
         self._causal_temporal = True
         # Text slot read by encode_text: the online Qwen3-VL here, a PromptCache after build_text_cache.
         self.text_lookup = self._qwen_entries
 
     @classmethod
-    def from_pretrained(cls, cfg: DictConfig) -> "FluxActionVideoBackbone":
-        """Build from the pretrained flux bundle at ``cfg.model_path``.
+    def from_pretrained(cls, cfg: DictConfig, assets: DictConfig) -> "FluxActionVideoBackbone":
+        """Build from the pretrained flux bundle at ``assets.model_path``.
 
         Args:
-            cfg: ``cfg.model.video_backbone``: ``dit`` geometry, ``action_cond_dim``, ``model_path`` and the
-                scalar knobs.
+            cfg: ``cfg.model.video_backbone``: ``dit`` geometry, ``action_cond_dim`` and the scalar knobs.
+            assets: ``cfg.assets.video_backbone``: ``model_path`` (the bundle root).
 
         Returns:
             FluxActionVideoBackbone with trunk, VAE and text encoder loaded (CPU). Raises ValueError when the
@@ -253,7 +247,7 @@ class FluxActionVideoBackbone(VideoBackbone):
         """
         from openwam.model.video_backbone.flux.text_encoder import Qwen3VLEmbedder
 
-        root = str(cfg.model_path)
+        root = str(assets.model_path)
         # Built in this order (trunk, VAE): their random inits are part of the training seed stream.
         dit = build_flux_dit(
             f"{root}/flux-3-action-base.safetensors", cfg.dit, action_cond_dim=int(cfg.action_cond_dim), head_seed=0
@@ -310,8 +304,7 @@ class FluxActionVideoBackbone(VideoBackbone):
             text_encoder_dir=text_encoder_dir,
             action_cond_dim=int(cfg.action_cond_dim),
             shift_video=float(cfg.shift_video),
-            train_timestep_width=float(cfg.train_timestep_width),
-            train_timestep_shift=float(cfg.train_timestep_shift),
+            train_timestep=cfg.train_timestep,
         )
 
     # ================================================================
@@ -342,11 +335,6 @@ class FluxActionVideoBackbone(VideoBackbone):
     def text_dim(self) -> int:
         """Qwen3-VL context width (8 stacked layers, 20480)."""
         return self.dit.params.context_in_dim
-
-    @property
-    def scheduler(self):
-        """FluxFlowScheduler: the shared grid for deploy, flux's native timestep law for ``sample_train``."""
-        return self._scheduler
 
     # ================================================================
     # Video and text IO

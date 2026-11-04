@@ -1,13 +1,6 @@
-"""Schedule generator composing two backbone-owned schedulers.
+"""Denoising schedules composed from the two streams' :class:`FlowScheduler` s (video and action).
 
-This module knows nothing about flow-matching math or specific backbone
-formulas. It receives two scheduler references (video and action,
-typically pulled from the architecture) and asks each to produce its own
-timestep series via the duck-typed minimum interface:
-
-    scheduler.set_timesteps(num_inference_steps, shift=...)
-    scheduler.timesteps    # 1-D tensor / array
-
+Each stream's grid comes from its scheduler (``inference_timesteps`` / ``shift``); nothing here mutates a scheduler.
 ``schedule_sync`` returns a list of ``(t_video, t_action)`` pairs
 describing the per-iteration noise levels for the joint denoising loop,
 terminated with a ``(0.0, 0.0)`` sentinel.
@@ -27,10 +20,15 @@ Two denoising modes are supported:
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import List, Tuple
 
 import torch
+from omegaconf import DictConfig
+
+from openwam.config import cfg_get
+from openwam.model.common.flow_scheduler import NUM_TRAIN_TIMESTEPS, FlowScheduler, alpha_shift
 
 Schedule = List[Tuple[float, float]]
 VALID_DENOISE_MODES = ("sync", "async")
@@ -38,18 +36,12 @@ VALID_DENOISE_MODES = ("sync", "async")
 
 @dataclass(frozen=True)
 class DenoiseConfig:
-    denoise_mode: str = "sync"
-    lead_modality: str = "video"
-    variance_shift_alpha: float = 1.0
-    linear_offset: float = 0.0
+    """Validated denoising settings (see :func:`normalize_denoise_config`); every field is required."""
 
-
-def _config_value(cfg, name: str, default):
-    if cfg is None:
-        return default
-    if isinstance(cfg, dict):
-        return cfg.get(name, default)
-    return getattr(cfg, name, default)
+    denoise_mode: str
+    lead_modality: str
+    variance_shift_alpha: float
+    linear_offset: float
 
 
 def _finite_float(value, name: str) -> float:
@@ -64,31 +56,33 @@ def _finite_float(value, name: str) -> float:
     return value
 
 
-def normalize_denoise_config(cfg=None, *, reset_inactive: bool = False) -> DenoiseConfig:
-    """Normalize and validate denoising settings (``deploy.sampler`` / the training visualizer's sampler).
+def normalize_denoise_config(sampler: DictConfig | Mapping) -> DenoiseConfig:
+    """Read and validate the four denoising settings (``deploy.sampler``, or the dict :func:`make_schedule` builds).
 
-    ``reset_inactive`` drops the async-only controls back to their defaults
-    under ``denoise_mode="sync"`` instead of rejecting them. :func:`make_schedule`
-    is handed an already-merged config and cannot tell a user-written value
-    from one inherited from the yaml, so it builds what it is given; the
-    strict config-shape check runs once, at deploy startup (``check_deploy``).
+    Args:
+        sampler: DictConfig / dict holding ``denoise_mode``, ``lead_modality``, ``variance_shift_alpha`` and
+            ``linear_offset`` (all required; other keys such as ``denoise_steps`` are ignored).
+
+    Returns:
+        DenoiseConfig with the normalized values.
+
+    Raises:
+        KeyError: one of the four keys is missing. ValueError: an invalid value, or a non-identity async control
+            (``lead_modality != "video"``, ``alpha != 1``, ``offset != 0``) under ``denoise_mode="sync"``.
     """
-    mode = str(_config_value(cfg, "denoise_mode", "sync")).strip().lower()
+    mode = str(cfg_get(sampler, "denoise_mode")).strip().lower()
     if mode not in VALID_DENOISE_MODES:
         raise ValueError(f"Unsupported denoise mode {mode!r}; expected one of {VALID_DENOISE_MODES}")
 
-    if mode == "sync" and reset_inactive:
-        return DenoiseConfig()
-
-    lead = str(_config_value(cfg, "lead_modality", "video")).strip().lower()
+    lead = str(cfg_get(sampler, "lead_modality")).strip().lower()
     if lead not in ("action", "video"):
         raise ValueError(f"lead_modality must be 'action' or 'video', got {lead!r}")
 
-    alpha = _finite_float(_config_value(cfg, "variance_shift_alpha", 1.0), "variance_shift_alpha")
+    alpha = _finite_float(cfg_get(sampler, "variance_shift_alpha"), "variance_shift_alpha")
     if alpha < 1.0:
         raise ValueError(f"variance_shift_alpha must be >= 1, got {alpha!r}")
 
-    offset = _finite_float(_config_value(cfg, "linear_offset", 0.0), "linear_offset")
+    offset = _finite_float(cfg_get(sampler, "linear_offset"), "linear_offset")
     if not 0.0 <= offset < 1.0:
         raise ValueError(f"linear_offset must satisfy 0 <= value < 1, got {offset!r}")
 
@@ -115,68 +109,46 @@ def normalize_denoise_config(cfg=None, *, reset_inactive: bool = False) -> Denoi
 def denoise_async_is_noop(config: DenoiseConfig) -> bool:
     """True when ``async`` reproduces the ``sync`` trajectory bit-for-bit.
 
-    ``alpha=1, offset=0`` is the diagonal, so a run labelled ``async`` at the
-    shipped defaults produces exactly the ``sync`` schedule — worth a warning
-    rather than silently attributing the numbers to a shifted trajectory.
+    ``alpha=1, offset=0`` is the diagonal, so a run labelled ``async`` at those
+    values produces exactly the ``sync`` schedule — worth a warning rather than
+    silently attributing the numbers to a shifted trajectory.
+
+    Args:
+        config: DenoiseConfig from :func:`normalize_denoise_config`.
+
+    Returns:
+        bool, True for ``async`` on the identity trajectory.
     """
-    defaults = DenoiseConfig()
-    return (
-        config.denoise_mode == "async"
-        and config.variance_shift_alpha == defaults.variance_shift_alpha
-        and config.linear_offset == defaults.linear_offset
-    )
+    # alpha = 1.0 and offset = 0.0 define the identity (diagonal) trajectory.
+    return config.denoise_mode == "async" and config.variance_shift_alpha == 1.0 and config.linear_offset == 0.0
 
 
-def schedule_sync(
-    video_scheduler,
-    action_scheduler,
-    num_steps: int = 50,
-    shift: float = 5.0,
-    *,
-    shift_video: float = None,
-) -> Schedule:
-    """Both streams advance in lockstep on their own timestep series.
+def schedule_sync(video_scheduler: FlowScheduler, action_scheduler: FlowScheduler, num_steps: int) -> Schedule:
+    """Both streams advance in lockstep, each on its own scheduler's inference grid.
 
-    ``shift_video`` (when set, typically from ``arch.video_backbone.shift_video``)
-    overrides the video scheduler's α-shift independently of the action
-    scheduler. Action always uses ``shift`` — by design, since the
-    Reconstruction-or-Semantics recipe (arXiv:2605.06388) applies
-    dim-dependent shift to non-VAE video encoders only. The model was
-    trained on independent ``(sigma_v, sigma_a)`` samples (independent
-    randint per stream in ``compute_loss``), so any per-stream shift
-    combination is in-distribution.
+    The streams were trained on independent ``(sigma_v, sigma_a)`` draws, so any per-stream shift pair is
+    in-distribution; each shift is the scheduler's own (yaml ``shift_video`` / ``shift_action``).
+
+    Args:
+        video_scheduler / action_scheduler: FlowScheduler of each stream (read only; grids are not mutated).
+        num_steps: int, N denoise steps.
+
+    Returns:
+        Schedule: N (t_video, t_action) pairs plus the ``(0.0, 0.0)`` sentinel.
     """
-    sv = shift if shift_video is None else shift_video
-    video_scheduler.set_timesteps(num_steps, shift=sv)
-    action_scheduler.set_timesteps(num_steps, shift=shift)
-    v_ts = video_scheduler.timesteps.tolist()
-    a_ts = action_scheduler.timesteps.tolist()
+    v_ts = video_scheduler.inference_timesteps(num_steps).tolist()
+    a_ts = action_scheduler.inference_timesteps(num_steps).tolist()
     return [(v, a) for v, a in zip(v_ts, a_ts)] + [(0.0, 0.0)]
 
 
-def _alpha_shift(u, shift: float):
-    """alpha-shift ``u`` (float or tensor) in [0, 1] into a shifted sigma.
-
-    ``f_alpha(u) = shift*u / (1 + (shift - 1)*u)`` -- the time shift that
-    is informationally equivalent to scaling the latent variance by
-    ``shift`` (Esser et al. 2024, SD3; Latent Forcing arXiv:2602.11401
-    Eq. 4). Same closed form, same operation order as the backbone
-    schedulers' ``set_timesteps``, so float32 tensor input reproduces
-    their grids bit-for-bit.
-    """
-    return shift * u / (1.0 + (shift - 1.0) * u)
-
-
 def schedule_variance_shift(
-    video_scheduler,
-    action_scheduler,
-    num_steps: int = 50,
+    video_scheduler: FlowScheduler,
+    action_scheduler: FlowScheduler,
+    num_steps: int,
     *,
-    lead: str = "video",
-    alpha: float = 1.0,
-    offset: float = 0.0,
-    shift_video: float = 5.0,
-    shift_action: float = 5.0,
+    lead: str,
+    alpha: float,
+    offset: float,
 ) -> Schedule:
     """Latent-Forcing-style ordered schedule: one stream denoises earlier.
 
@@ -186,7 +158,7 @@ def schedule_variance_shift(
     optionally delayed by ``offset``: cleanness stays 0 (sigma 1) until global
     progress passes ``offset``, then advances linearly (the piecewise variant).
     Each stream's sigma stays on the backbone's training grid via
-    ``alpha_shift(1 - cleanness, shift_stream)``.
+    ``alpha_shift(1 - cleanness, scheduler.shift)``.
 
     Computed in float32 on the schedulers' own base grid
     (``linspace(1, 0, n+1)[:-1]``), with the lead curve applied as the
@@ -195,44 +167,24 @@ def schedule_variance_shift(
     the lag grid untouched, so ``alpha=1, offset=0`` reproduces
     ``schedule_sync`` bit-for-bit.
 
-    Sigma is monotonically decreasing and the schedule ends with the
-    ``(0.0, 0.0)`` sentinel -- consumed by ``BaseWAMArchitecture.generate``
-    exactly like ``sync`` (every supported architecture, unchanged).
-
     Args:
-        video_scheduler: Video stream's scheduler (only its
-            ``num_train_timesteps`` attribute is read).
-        action_scheduler: Action stream's scheduler (only its
-            ``num_train_timesteps`` attribute is read).
-        num_steps: Number of denoising steps per stream.
-        lead: Which stream denoises earlier -- ``"action"`` or ``"video"``.
-        alpha: Lead-curve strength, must be ``>= 1`` (``>1`` leads;
-            ``1`` = sync diagonal).
-        offset: Fraction of pre-shift progress to delay the lag stream's start;
-            must satisfy ``0 <= offset < 1``.
-        shift_video: alpha-shift for the video stream's sigma grid.
-        shift_action: alpha-shift for the action stream's sigma grid.
+        video_scheduler / action_scheduler: FlowScheduler of each stream (only ``shift`` is read).
+        num_steps: int, N denoising steps per stream.
+        lead: ``"action"`` or ``"video"``, the stream that denoises earlier. alpha: float >= 1, lead-curve
+            strength (1 = sync diagonal). offset: float in [0, 1), delay of the lag stream's start. All three
+            already validated by :func:`normalize_denoise_config`.
+
+    Returns:
+        Schedule: N (t_video, t_action) pairs plus the ``(0.0, 0.0)`` sentinel; sigma decreases monotonically.
     """
-    options = normalize_denoise_config(
-        {
-            "denoise_mode": "async",
-            "lead_modality": lead,
-            "variance_shift_alpha": alpha,
-            "linear_offset": offset,
-        }
-    )
-    lead = options.lead_modality
-    alpha = options.variance_shift_alpha
-    offset = options.linear_offset
-    num_train_v = float(getattr(video_scheduler, "num_train_timesteps", 1000))
-    num_train_a = float(getattr(action_scheduler, "num_train_timesteps", 1000))
+    num_train = float(NUM_TRAIN_TIMESTEPS)
 
     # s[k] = 1 - k/num_steps: the schedulers' float32 base sigma grid.
     s = torch.linspace(1.0, 0.0, num_steps + 1)[:-1]
     # Lead pre-shift sigma 1 - f_alpha(1-s) rewritten as f_{1/alpha}(s), which
     # leaves s bitwise untouched at alpha=1; the lag stream stays on s unless
     # delayed by offset below.
-    lead_sigma = _alpha_shift(s, 1.0 / alpha)
+    lead_sigma = alpha_shift(s, 1.0 / alpha)
     if offset > 0.0:
         # lag cleanness = clamp((u - off)/(1 - off), 0, 1) in sigma form;
         # the off == 0 passthrough keeps alpha=1 bitwise == sync.
@@ -244,72 +196,34 @@ def schedule_variance_shift(
     else:
         v_sigma, a_sigma = lag_sigma, lead_sigma
     # Each stream's sigma rides its own alpha-shift grid (matches training).
-    v_ts = (_alpha_shift(v_sigma, shift_video) * num_train_v).tolist()
-    a_ts = (_alpha_shift(a_sigma, shift_action) * num_train_a).tolist()
+    v_ts = (alpha_shift(v_sigma, video_scheduler.shift) * num_train).tolist()
+    a_ts = (alpha_shift(a_sigma, action_scheduler.shift) * num_train).tolist()
 
     return [(v, a) for v, a in zip(v_ts, a_ts)] + [(0.0, 0.0)]
 
 
 def make_schedule(
-    mode: str,
-    video_scheduler,
-    action_scheduler,
-    num_steps: int = 50,
-    shift: float = 5.0,
-    *,
-    shift_video: float = None,
-    lead: str = "video",
-    alpha: float = 1.0,
-    offset: float = 0.0,
+    config: DenoiseConfig, video_scheduler: FlowScheduler, action_scheduler: FlowScheduler, num_steps: int
 ) -> Schedule:
-    """Build the schedule for a synchronous or asynchronous denoising trajectory.
+    """Build the sync or async denoising trajectory named by ``config.denoise_mode``.
 
     Args:
-        mode: ``"sync"`` (lockstep) or ``"async"`` (shifted trajectory).
-        video_scheduler: Video stream's scheduler (e.g.
-            ``architecture.video_scheduler``).
-        action_scheduler: Action stream's scheduler (e.g.
-            ``architecture.action_scheduler``).
-        num_steps: Denoising step count for both streams.
-        shift: Global α-shift; used by the action scheduler always, and by
-            the video scheduler when ``shift_video`` is ``None``.
-        shift_video: Optional override of the video α-shift only. Typically
-            sourced from ``arch.video_backbone.shift_video`` so train and
-            inference sigma grids match.
-        lead: ``async`` only -- which stream denoises earlier
-            (``"action"`` or ``"video"``).
-        alpha: ``async`` only -- lead-curve strength (``>1`` leads;
-            ``1`` = diagonal = sync).
-        offset: ``async`` only -- delay the lag stream's start
-            (``0`` = pure curve; ``>0`` = piecewise offset).
+        config: DenoiseConfig from :func:`normalize_denoise_config` (validated once there).
+        video_scheduler / action_scheduler: FlowScheduler of each stream (e.g. ``arch.video_scheduler``).
+        num_steps: int, N denoise steps.
 
-    ``mode="sync"`` ignores the three ``async`` arguments rather than
-    rejecting them: the yaml always carries them, so rejecting here would
-    fail every sync run. The strict shape check runs once at deploy startup
-    (``check_deploy`` -> :func:`normalize_denoise_config`).
+    Returns:
+        Schedule: N (t_video, t_action) pairs plus the ``(0.0, 0.0)`` sentinel.
     """
-    options = normalize_denoise_config(
-        {
-            "denoise_mode": mode,
-            "lead_modality": lead,
-            "variance_shift_alpha": alpha,
-            "linear_offset": offset,
-        },
-        reset_inactive=True,
-    )
-    if options.denoise_mode == "sync":
-        return schedule_sync(
-            video_scheduler, action_scheduler, num_steps=num_steps, shift=shift, shift_video=shift_video
-        )
+    if config.denoise_mode == "sync":
+        return schedule_sync(video_scheduler, action_scheduler, num_steps)
     return schedule_variance_shift(
         video_scheduler,
         action_scheduler,
-        num_steps=num_steps,
-        lead=options.lead_modality,
-        alpha=options.variance_shift_alpha,
-        offset=options.linear_offset,
-        shift_video=shift if shift_video is None else shift_video,
-        shift_action=shift,
+        num_steps,
+        lead=config.lead_modality,
+        alpha=config.variance_shift_alpha,
+        offset=config.linear_offset,
     )
 
 

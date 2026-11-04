@@ -1,18 +1,24 @@
+# @package _global_
 # LongLive2.0-Robot-S video backbone (cfg.model.video_backbone.*): the Wan2.2-TI2V-5B backbone
 # (same geometry, VAE, umT5 and tokenizer from model_path) whose DiT weights come from the LongLive
 # robot-video generator model.pt instead. Follows Long-WAM: 128-token prompts and per-frame causal
 # attention among the clean history latents (required_clean_attention below).
 
 defaults:
-  - wan22_ti2v_5b         # geometry, model_path, weights, shift_video
+  - wan22_ti2v_5b         # geometry, shift_video; assets (model_path, weights, tokenizer_path)
   - _self_
 
-name: longlive2_robot_s
-dit_weights: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/LongLive2.0-Robot-S/model.pt  # [Required] Robot-S generator weights (825 DiT tensors)
-dit_weights_prefix: "model."
+model:
+  video_backbone:
+    name: longlive2_robot_s
 
-shift_video: 5.0       # LongLive2.0 timestep_shift (configs/inference.yaml) = Wan2.2's
-text_max_length: 128   # Long-WAM tokenizer_max_len
-# Long-WAM history mask (clean latent i sees clean latents 0..i). resolve_config raises unless
-# model.architecture.clean_attention equals this, so a wrong launch fails fast (the backbone never reads it).
-required_clean_attention: causal
+    shift_video: 5.0       # LongLive2.0 timestep_shift (configs/inference.yaml) = Wan2.2's
+    text_max_length: 128   # Long-WAM tokenizer_max_len
+    # Long-WAM history mask (clean latent i sees clean latents 0..i). resolve_config raises unless
+    # model.architecture.clean_attention equals this, so a wrong launch fails fast (the backbone never reads it).
+    required_clean_attention: causal
+
+assets:
+  video_backbone:
+    dit_weights: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/LongLive2.0-Robot-S/model.pt  # [Required] Robot-S generator weights (825 DiT tensors)
+    dit_weights_prefix: "model."

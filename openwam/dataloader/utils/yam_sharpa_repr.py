@@ -36,6 +36,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from openwam.dataloader.utils.rotation import matrix_to_rotation_6d, rotation_6d_to_matrix
+from openwam.dataloader.utils.unify_action import UNIFY_DIM
 
 ACTION_REPRS: Tuple[str, ...] = ("fingertips_abs", "fingertips_rel", "unify_abs", "unify_rel")
 
@@ -92,6 +93,18 @@ def raw_dim(action_repr: str) -> int:
         int, 62 for ``unify_*`` (2 x [wrist 9 + hand joints 22]), 48 for ``fingertips_*``.
     """
     return 2 * _UNIFY_HAND_RAW_DIM if is_unify(action_repr) else POSE48_DIM
+
+
+def action_width(action_repr: str) -> int:
+    """Width of the action / proprio rows the dataset emits (the model's ``common.action_dim`` / ``state_dim``).
+
+    Args:
+        action_repr: str.
+
+    Returns:
+        int, ``UNIFY_DIM`` (80) for ``unify_*`` (raw 62 scattered into the unified layout), else ``raw_dim`` (48).
+    """
+    return UNIFY_DIM if is_unify(action_repr) else raw_dim(action_repr)
 
 
 def _wrist_offsets(action_repr: str) -> Tuple[int, int]:
@@ -363,6 +376,7 @@ __all__ = [
     "JOINT56_DIM",
     "POSE48_DIM",
     "UNIFY_ACTION_MAP",
+    "action_width",
     "decode_action",
     "encode_action_pairs",
     "encode_proprio",

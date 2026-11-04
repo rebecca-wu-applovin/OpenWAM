@@ -74,7 +74,7 @@ def test_text_cache_after_resume(tmp_path):
         "training.run_dir_name=run",
         "training.save_steps=1",
         "training.save_full_states_for_resume=true",
-        "++model.video_backbone.text_cache=true",
+        "training.text_cache=true",
     ]
     _run(
         os.path.join(out, "cache_fresh.pt"),

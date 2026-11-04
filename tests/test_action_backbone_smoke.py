@@ -55,6 +55,7 @@ def test_action_dit_small_instantiate():
 
     dit = ActionDiT(
         shift_action=5.0,
+        train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=7,
         dim=64,
         ffn_dim=128,
@@ -63,6 +64,11 @@ def test_action_dit_small_instantiate():
         video_dim=128,
         bridge_layers=(0, 1),
         variant="joint_cross_attn",
+        attn_head_dim=16,
+        text_dim=4096,
+        freq_dim=256,
+        max_action_len=1024,
+        eps=1e-6,
     )
     assert dit.action_dim == 7
     assert dit.num_layers == 2
@@ -86,6 +92,7 @@ def test_action_dit_forward_shape():
 
     dit = ActionDiT(
         shift_action=5.0,
+        train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=7,
         dim=64,
         ffn_dim=128,
@@ -94,6 +101,11 @@ def test_action_dit_forward_shape():
         video_dim=128,
         bridge_layers=(0, 1),
         variant="joint_cross_attn",
+        attn_head_dim=16,
+        text_dim=4096,
+        freq_dim=256,
+        max_action_len=1024,
+        eps=1e-6,
     )
     actions = torch.randn(2, 5, 7)
     bridges = {bid: torch.randn(2, 10, 128) for bid in (0, 1)}
@@ -110,6 +122,7 @@ def test_action_dit_joint_cross_attn_context_shape_and_effect():
     torch.manual_seed(0)
     dit = ActionDiT(
         shift_action=5.0,
+        train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=7,
         dim=32,
         ffn_dim=64,
@@ -119,6 +132,10 @@ def test_action_dit_joint_cross_attn_context_shape_and_effect():
         bridge_layers=(0, 1),
         variant="joint_cross_attn",
         text_dim=16,
+        attn_head_dim=8,
+        freq_dim=256,
+        max_action_len=1024,
+        eps=1e-6,
     ).eval()
     actions = torch.randn(2, 5, 7)
     bridges = {bid: torch.randn(2, 10, 48) for bid in (0, 1)}

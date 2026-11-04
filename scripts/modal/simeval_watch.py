@@ -111,12 +111,13 @@ def run_settings(run: str) -> dict:
     if not cfg_file.is_file():
         raise FileNotFoundError(f"{cfg_file}: no such run (or the trainer has not written its config yet)")
     cfg = OmegaConf.load(cfg_file)
-    if OmegaConf.select(cfg, "dataloader.type") != "yam_sharpa":
-        raise ValueError(f"{run}: dataloader.type {OmegaConf.select(cfg, 'dataloader.type')!r}, not yam_sharpa")
+    # Required keys of every run config: a missing one raises with its full path.
+    if cfg.dataloader.type != "yam_sharpa":
+        raise ValueError(f"{run}: dataloader.type {cfg.dataloader.type!r}, not yam_sharpa")
     return {"run_dir": run_dir, "name": run_dir.name,
-            "interface": f"openwam_{OmegaConf.select(cfg, 'dataloader.action_mode')}_v1",
-            "wandb_project": OmegaConf.select(cfg, "project.wandb.project"),
-            "wandb_group": OmegaConf.select(cfg, "project.wandb.group")}
+            "interface": f"openwam_{cfg.dataloader.action_mode}_v1",
+            "wandb_project": cfg.project.wandb.project,
+            "wandb_group": cfg.project.wandb.group}
 
 
 def wait_for_config(run: str) -> None:

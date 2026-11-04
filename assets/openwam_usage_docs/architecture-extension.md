@@ -33,7 +33,7 @@ Architecture keys are resolved from `architecture.framework` and `architecture.v
 
 ## Add a video DiT backbone
 
-Adding a backbone = **implement the 14 abstract members of `VideoBackbone` + write one yaml**. Everything else
+Adding a backbone = **implement the 13 abstract members of `VideoBackbone` + write one yaml**. Everything else
 (pixel conversion, history / future encoding, text of the latent clip, decoding, frame-major attention masks) is
 implemented once in [openwam/model/video_backbone/base.py](../../openwam/model/video_backbone/base.py) on top of them.
 
@@ -45,17 +45,17 @@ implemented once in [openwam/model/video_backbone/base.py](../../openwam/model/v
 from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
 
 class MyVideoBackbone(VideoBackbone):
-    # Construction: 2 abstract classmethods + __init__. cfg = cfg.model.video_backbone, read-only; the entry point picks the constructor (LoadMode).
-    def __init__(self, ...):                     # set _shift_video, _causal_temporal, _temporal_compression
-        ...
+    # Construction: 2 abstract classmethods + __init__. cfg = cfg.model.video_backbone, assets = cfg.assets.video_backbone
+    # (upstream paths), both read-only; the entry point picks the constructor (LoadMode).
+    def __init__(self, ...):                     # set _causal_temporal, _temporal_compression and
+        self._scheduler = FlowScheduler(shift=shift_video, train_timestep=train_timestep)  # base `scheduler` returns it
     @classmethod
-    def from_pretrained(cls, cfg): ...           # upstream weights, checked against the yaml geometry (raise on mismatch)
+    def from_pretrained(cls, cfg, assets): ...   # upstream weights at the assets paths, checked against the yaml geometry
     @classmethod
     def from_checkpoint_dir(cls, cfg, ckpt_dir): ...  # meta-device shell of one of our checkpoints; the caller loads weights
 
-    # Geometry (6 properties)
+    # Geometry (5 properties)
     dim, num_layers, num_heads, head_dim, text_dim  # ints
-    scheduler                                        # set_timesteps / timesteps / sigmas / step + sample_train(B, *, device, dtype)
 
     # Video and text IO (3)
     def encode_pixels(self, pixels): ...         # (N, 3, T, H, W) in [-1, 1] -> (N, z, 1 + (T-1)/tc, h, w) normalized
@@ -72,24 +72,27 @@ class MyVideoBackbone(VideoBackbone):
 2. Register it at the bottom of [openwam/model/video_backbone/__init__.py](../../openwam/model/video_backbone/__init__.py):
    `register_video_backbone("my_video")(MyVideoBackbone)`.
 
-3. Write `configs/model/video_backbone/my_video.yaml`: `name: my_video`, the module geometry (checked against the
-   weights at build), `temporal_compression`, `shift_video`, `text_cache`, weight paths. Pin what the backbone
-   requires with `required_clean_attention` / `required_proprio_input`; `resolve_config` checks them once.
+3. Write `configs/model/video_backbone/my_video.yaml` (`# @package _global_`): under `model.video_backbone`,
+   `name: my_video`, the module geometry (checked against the weights at build), `temporal_compression`,
+   `shift_video`, `train_timestep` (the training noise law: `{law: grid, weighting: bell | uniform}`,
+   `{law: logit_logistic, width, shift}` or `{law: ge_native}`), and what the backbone requires (`required_clean_attention`: null or a value,
+   `required_proprio_input`; `resolve_config` checks them once); under `assets.video_backbone`, the upstream weight
+   paths (not compared on finetune); under `training`, `freeze` (paths that exist on the model) and `text_cache`.
 
 Optional hooks have working defaults; override only what the family supports:
 
 ~~~text
 pre_attn_at_layer / post_attn_at_layer   # joint_self_attn (MoT); default raises
 build_joint_attention_masks              # only when the token order is not frame-major (views, extra tokens, prefix keys)
-build_text_cache                         # text_cache: true; base caches text_lookup (needs text_lookup / text_encoder /
+build_text_cache                         # training.text_cache: true; base caches text_lookup (needs text_lookup / text_encoder /
                                          # _text_cache_batch_size); override to raise if the text cannot be cached
 save_deploy_assets                       # non-weight files (tokenizer, configs) copied into the checkpoint; default none
-apply_compile_optimizations / set_dtype_device
+set_dtype_device
 ~~~
 
 Never override the shared flow (`to_pixels`, `encode_frames`, `encode_clip`, `preprocess_condition`,
 `preprocess_train`, `decode_future`): `tests/test_video_backbone_base.py::test_families_do_not_override_base_flow`
-checks every registered family. Build it through `build_video_backbone(cfg.model.video_backbone, mode, ckpt_dir)`
+checks every registered family. Build it through `build_video_backbone(cfg.model.video_backbone, mode, assets, ckpt_dir)`
 (the architecture does this); architecture code stays on the public contract and never reaches into `backbone.dit`.
 
 ## Add an action backbone
@@ -110,10 +113,16 @@ There is no separate action-backbone registry. Each architecture constructs its 
 dim: 1024                         # ActionDiT hidden width
 ffn_dim: 4096                     # feed-forward width
 shift_action: 5.0                 # action scheduler shift
-# num_layers, video_dim, num_heads, and attn_head_dim resolve from video geometry
+freq_dim: 256                     # timestep embedding width
+max_action_len: 1024              # action position table size
+eps: 1.0e-06                      # norm epsilon
+num_heads: ${..video_backbone.geometry.num_heads}   # geometry: the video backbone yaml's geometry block
+head_dim: ${..video_backbone.geometry.head_dim}
+video_dim: ${..video_backbone.geometry.dim}
+text_dim: ${..video_backbone.geometry.text_dim}
 ~~~
 
-`ActionDiT` expects one `bridge_layers` entry per action block and an even positive `attn_head_dim`. MoT requires video and action layer/head geometry to match. Keep actions and predictions shaped `(B, T_action, action_dim)` and preserve scheduler and `shift_action` behavior through the base interface.
+Every video backbone yaml declares `model.video_backbone.geometry` (`dim`, `num_heads`, `head_dim`, `num_layers`, `text_dim`); the architecture checks it against the built module and raises on any difference. The ActionDiT has one block per bridge layer, `range(0, geometry.num_layers, model.architecture.bridge_interval)`, and needs an even positive `head_dim`. MoT requires video and action layer/head geometry to match. Keep actions and predictions shaped `(B, T_action, action_dim)` and preserve scheduler and `shift_action` behavior through the base interface.
 
 ## Add an architecture
 
@@ -128,8 +137,9 @@ from openwam.model.architectures import BaseWAMArchitecture, register_architectu
     variant='default',
 )
 class MyArchitecture(BaseWAMArchitecture):
-    def __init__(self, cfg, *, layout, mode, ckpt_dir, train_options):
-        super().__init__(cfg, layout=layout, mode=mode, ckpt_dir=ckpt_dir, train_options=train_options)
+    # cfg is merge(cfg.common, cfg.model) (layout at cfg.layout); assets = cfg.assets.video_backbone
+    def __init__(self, cfg, *, mode, assets, ckpt_dir, train_options):
+        super().__init__(cfg, mode=mode, assets=assets, ckpt_dir=ckpt_dir, train_options=train_options)
         self.action_backbone = ...
 
     def forward(self, noisy_actions, action_timestep, *, latents, timestep, text, proprio, proprio_mask,

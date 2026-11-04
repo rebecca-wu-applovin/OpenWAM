@@ -10,7 +10,7 @@ Usage (from the repo root):
 
     # real run, 8 GPUs (OPENWAM_GPU_TYPE=H100|H200|B200, default H100), detached
     OPENWAM_GPU_TYPE=B200 modal run --detach scripts/modal/train.py \
-        --overrides "dataloader.action_mode=fingertips_rel model.architecture.action_dim=48 ..."
+        --overrides "dataloader.action_mode=fingertips_rel common.action_dim=48 ..."
     # (normally launched via run_modal.sh, which sets these env vars)
 
 See scripts/modal/README.md for the volume layout, resume, and gotchas.
@@ -45,7 +45,7 @@ PATH_OVERRIDES = {
     "dataloader.sources.simteleop.dataset_dir": "/data/simteleop_1004_fleet",
     "dataloader.sources.gpt_rollout.dataset_dir": "/data/gpt_fleet_depth",
     "dataloader.normalization_stats_path": f"/runs/{RUNS_SUBDIR}/norm_stats_modal/yam_sharpa_${{.action_mode}}.npy",
-    "model.video_backbone.model_path": "/assets/video_backbone_ckpt/Wan2.2-TI2V-5B",
+    "assets.video_backbone.model_path": "/assets/video_backbone_ckpt/Wan2.2-TI2V-5B",
 }
 
 # ── Image: CUDA 12.8 devel (nvcc for DeepSpeed JIT ops) + the frozen local venv ──

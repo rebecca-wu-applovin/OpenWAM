@@ -16,7 +16,6 @@ Usage:
 from typing import Dict, Type
 
 from openwam.dataloader.bases import BaseDataset
-from openwam.dataloader.utils import get_cfg
 
 DATASET_REGISTRY: Dict[str, Type[BaseDataset]] = {}
 
@@ -50,7 +49,7 @@ def build_dataset(config, split: str = "train") -> BaseDataset:
     Returns:
         Instantiated dataset.
     """
-    dtype = get_cfg(config, "type")
+    dtype = config.type
     if dtype not in DATASET_REGISTRY:
         raise ValueError(f"Unknown dataset type '{dtype}'. Available: {list(DATASET_REGISTRY.keys())}")
 

@@ -77,20 +77,6 @@ def test_video_only_masks(masks):
     assert torch.equal(m[1], m[0] & (vid[:, None] == vid[None, :]))  # per-view block = GE's (b v) batching
 
 
-def test_native_noise_sampler_matches_ge_trainer():
-    # ge_trainer.py: idx = floor(u*1000), sigma = FlowMatchEuler(shift 1).sigmas[idx], t = floor(sigma*1000), w = 1.
-    from openwam.model.video_backbone.ge.scheduler import GEFlowScheduler
-
-    torch.manual_seed(0)
-    ts, sig, w = GEFlowScheduler(shift_video=1.0).sample_train(4096, device="cpu", dtype=torch.float32)
-    assert ((sig > 0) & (sig <= 1)).all() and w.eq(1).all()
-    torch.testing.assert_close(ts, torch.floor(sig * 1000))
-    # Grid sigma_i = (1000 - i) / 1000: every sample sits on it, and it is covered ~uniformly.
-    idx = torch.round(1000 - sig * 1000)
-    torch.testing.assert_close(sig, (1000 - idx) / 1000)
-    assert 0.45 < sig.mean().item() < 0.55
-
-
 def test_dropped_caption_is_the_empty_prompt_with_its_own_mask():
     """Task 12: a caption-dropped sample reaches GE as "" and gets the empty prompt's embedding *and* mask.
 

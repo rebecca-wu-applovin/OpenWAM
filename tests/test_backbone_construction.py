@@ -1,10 +1,11 @@
-"""cosmos3 / GE / flux construction: ``from_pretrained(cfg)`` / ``from_checkpoint_dir(cfg, ckpt_dir)`` + ``LoadMode``.
+"""cosmos3 / GE / flux construction: ``from_pretrained(cfg, assets)`` / ``from_checkpoint_dir(cfg, ckpt_dir)`` + ``LoadMode``.
 
 The same two constructors Wan got (``tests/test_wan_construction.py``):
-  - ``from_pretrained(cfg)``: upstream weights (each family's own loaders for its frozen third-party parts);
+  - ``from_pretrained(cfg, assets)``: upstream weights at the ``assets.video_backbone`` paths (each family's own
+    loaders for its frozen third-party parts);
   - ``from_checkpoint_dir(cfg, ckpt_dir)``: a meta shell built from the yaml geometry plus the non-weight
     assets ``save_deploy_assets`` copied into the checkpoint dir (tokenizer / processor / ``config.json``).
-``build_video_backbone(cfg, mode, ckpt_dir)`` picks one of the two from the explicit ``LoadMode``.
+``build_video_backbone(cfg, mode, assets, ckpt_dir)`` picks one of the two from the explicit ``LoadMode``.
 
 ``gpu``-marked tests read the real weights (skipped when they are not on this machine).
 """
@@ -54,12 +55,23 @@ def _cls(name: str):
     return _VIDEO_BACKBONE_REGISTRY[name]
 
 
+def _assets(name: str):
+    """name: family. Returns: its read-only ``cfg.assets.video_backbone`` (upstream paths)."""
+    from hydra import compose, initialize_config_dir
+
+    with initialize_config_dir(config_dir=os.path.join(REPO, "configs"), version_base=None):
+        assets = compose("train", overrides=[f"model/video_backbone={name}"]).assets.video_backbone
+    OmegaConf.set_readonly(assets, True)
+    return assets
+
+
 def _real_cfg(name: str):
-    """name: family. Returns: its yaml cfg; skips when the upstream weights are not on this machine."""
-    cfg = _compose_vb(name)
-    if not os.path.isdir(cfg.model_path):
-        pytest.skip(f"{name} weights not found at {cfg.model_path}")
-    return cfg
+    """name: family. Returns: (model.video_backbone, assets.video_backbone); skips when the upstream weights are
+    not on this machine."""
+    cfg, assets = _compose_vb(name), _assets(name)
+    if not os.path.isdir(assets.model_path):
+        pytest.skip(f"{name} weights not found at {assets.model_path}")
+    return cfg, assets
 
 
 # ----------------------------------------------------------------------------- LoadMode dispatch (CPU)
@@ -72,20 +84,25 @@ def test_build_mode_checkpoint_skips_pretrained(name, monkeypatch, tmp_path):
 
     cls = _cls(name)
     calls = []
-    monkeypatch.setattr(cls, "from_pretrained", classmethod(lambda c, cfg: calls.append("pretrained") or "P"))
+    monkeypatch.setattr(cls, "from_pretrained", classmethod(lambda c, cfg, a: calls.append(("pretrained", a)) or "P"))
     monkeypatch.setattr(cls, "from_checkpoint_dir", classmethod(lambda c, cfg, d: calls.append(("ckpt", d)) or "C"))
     cfg = _compose_vb(name)
 
-    assert build_video_backbone(cfg, LoadMode.CHECKPOINT, str(tmp_path)) == "C"
+    assets = _assets(name)
+
+    assert build_video_backbone(cfg, LoadMode.CHECKPOINT, None, str(tmp_path)) == "C"
     assert calls == [("ckpt", str(tmp_path))]
     with pytest.raises(ValueError, match="ckpt_dir"):
-        build_video_backbone(cfg, LoadMode.CHECKPOINT, None)
-    assert build_video_backbone(cfg, LoadMode.PRETRAINED, None) == "P"
-    assert calls[-1] == "pretrained"
+        build_video_backbone(cfg, LoadMode.CHECKPOINT, None, None)
+    # PRETRAINED hands the assets slice (not the model slice) to from_pretrained.
+    assert build_video_backbone(cfg, LoadMode.PRETRAINED, assets, None) == "P"
+    assert calls[-1] == ("pretrained", assets)
 
 
 def test_text_cache_switch_in_backbone_yaml():
-    """The text-cache switch lives with the backbone: wan / ge / flux cache, cosmos3 cannot."""
+    """The text-cache switch lives in the backbone yaml's training block: wan / ge / flux cache, cosmos3 cannot."""
+    from hydra import compose, initialize_config_dir
+
     expected = {
         "wan22_ti2v_5b": True,
         "longlive2_robot_s": True,
@@ -94,16 +111,17 @@ def test_text_cache_switch_in_backbone_yaml():
         "cosmos3_edge": False,
         "cosmos3_nano": False,
     }
-    for name, value in expected.items():
-        assert _compose_vb(name).text_cache is value, name
+    with initialize_config_dir(config_dir=os.path.join(REPO, "configs"), version_base=None):
+        for name, value in expected.items():
+            assert compose("train", overrides=[f"model/video_backbone={name}"]).training.text_cache is value, name
 
 
-def test_cosmos3_build_text_cache_raises():
-    """cosmos3's text encode needs the latent grid, so a prompt cache is impossible."""
+def test_cosmos3_text_cache_error_names_training_key():
+    """cosmos3's text encode needs the latent grid, so a prompt cache is impossible; the error names the key."""
     from openwam.model.video_backbone import Cosmos3EdgeVideoBackbone
 
     vb = Cosmos3EdgeVideoBackbone.__new__(Cosmos3EdgeVideoBackbone)
-    with pytest.raises(ValueError, match="text_cache"):
+    with pytest.raises(ValueError, match=r"training\.text_cache=false"):
         vb.build_text_cache(["pick the cup"])
 
 
@@ -166,11 +184,11 @@ def _flux_ckpt_assets(tmp_path) -> str:
     Returns: the ckpt dir; skips when the bundle is absent."""
     from openwam.model.video_backbone.flux.backbone import FluxActionVideoBackbone
 
-    cfg = _compose_vb("flux3_action_base")
-    if not os.path.isdir(cfg.model_path):
-        pytest.skip(f"flux bundle not found at {cfg.model_path}")
+    assets = _assets("flux3_action_base")
+    if not os.path.isdir(assets.model_path):
+        pytest.skip(f"flux bundle not found at {assets.model_path}")
     vb = FluxActionVideoBackbone.__new__(FluxActionVideoBackbone)
-    object.__setattr__(vb, "_text_encoder_dir", os.path.join(cfg.model_path, "text_encoder"))
+    object.__setattr__(vb, "_text_encoder_dir", os.path.join(assets.model_path, "text_encoder"))
     vb.save_deploy_assets(str(tmp_path))
     return str(tmp_path)
 
@@ -188,7 +206,7 @@ def test_flux_checkpoint_shell_from_yaml(tmp_path):
 
 
 def test_flux_action_cond_dim_must_equal_state_dim():
-    """The P stream input width is declared in the backbone yaml; resolve_config rejects a different state_dim."""
+    """The P stream input width is declared in the backbone yaml; resolve_config rejects a different common.state_dim."""
     from hydra import compose, initialize_config_dir
 
     from openwam.config import resolve_config
@@ -200,8 +218,8 @@ def test_flux_action_cond_dim_must_equal_state_dim():
                 "model/video_backbone=flux3_action_base",
                 "model=dual_system",
                 "model.architecture.proprio_input=backbone_stream",
-                "model.architecture.state_dim=80",
-                "model.architecture.action_dim=80",
+                "common.state_dim=80",
+                "common.action_dim=80",
             ],
         )
     with pytest.raises(ValueError, match="action_cond_dim"):
@@ -226,19 +244,20 @@ def _assert_same_backbone(a, b) -> None:
     assert {n: p.requires_grad for n, p in a.named_parameters()} == {
         n: p.requires_grad for n, p in b.named_parameters()
     }
-    for prop in ("dim", "num_layers", "num_heads", "head_dim", "text_dim", "temporal_compression", "shift_video"):
+    for prop in ("dim", "num_layers", "num_heads", "head_dim", "text_dim", "temporal_compression"):
         assert getattr(a, prop) == getattr(b, prop), prop
+    assert a.scheduler.shift == b.scheduler.shift
 
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("name", FAMILIES)
 def test_checkpoint_matches_pretrained(name, tmp_path):
-    """from_checkpoint_dir(cfg, ckpt) + a strict load of the pretrained state == from_pretrained(cfg)."""
+    """from_checkpoint_dir(cfg, ckpt) + a strict load of the pretrained state == from_pretrained(cfg, assets)."""
     from openwam.model.video_backbone.common.weights import load_strict
 
-    cfg = _real_cfg(name)
+    cfg, assets = _real_cfg(name)
     cls = _cls(name)
-    a = cls.from_pretrained(cfg)
+    a = cls.from_pretrained(cfg, assets)
     a.save_deploy_assets(str(tmp_path))
     b = cls.from_checkpoint_dir(cfg, str(tmp_path))
     assert all(p.is_meta for p in b.parameters()), "from_checkpoint_dir must not read any weight"
@@ -258,13 +277,13 @@ def test_geometry_mismatch_raises(name, tmp_path):
     """A yaml geometry the weights do not have fails at build, in both modes."""
     from openwam.model.video_backbone.common.weights import load_strict
 
-    cfg = _real_cfg(name)
+    cfg, assets = _real_cfg(name)
     key, wrong = _GEOMETRY_KEY[name]
     bad = _with(cfg, **{key: wrong})
     cls = _cls(name)
     with pytest.raises(ValueError):
-        cls.from_pretrained(bad)
-    a = cls.from_pretrained(cfg)
+        cls.from_pretrained(bad, assets)
+    a = cls.from_pretrained(cfg, assets)
     a.save_deploy_assets(str(tmp_path))
     shell = cls.from_checkpoint_dir(bad, str(tmp_path))
     with pytest.raises(ValueError):

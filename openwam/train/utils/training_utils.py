@@ -1,6 +1,6 @@
 """Stateless trainer helpers.
 
-Pure compute / IO with no training state: config access, parameter reporting,
+Pure compute / IO with no training state: parameter reporting,
 LR scheduling, wandb, cross-rank reduction, debug-CSV writing.
 """
 
@@ -8,17 +8,10 @@ import logging
 import os
 
 import torch
+from omegaconf import DictConfig, OmegaConf
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 logger = logging.getLogger(__name__)
-
-
-def cfg_get(cfg, key: str, default=None):
-    """Read ``key`` from a dict or attr-style config, with default."""
-    if cfg is None:
-        return default
-    if isinstance(cfg, dict):
-        return cfg.get(key, default)
-    return getattr(cfg, key, default)
 
 
 def log_parameter_counts(architecture, *, is_main: bool) -> None:
@@ -56,22 +49,31 @@ def log_parameter_counts(architecture, *, is_main: bool) -> None:
     print("=" * 60, flush=True)
 
 
-def build_cosine_scheduler(optimizer, *, total_opt_steps: int, cfg, num_processes: int = 1):
+def build_cosine_scheduler(
+    optimizer, *, total_opt_steps: int, training_cfg: DictConfig, num_processes: int
+) -> SequentialLR:
     """Linear-warmup + cosine-anneal LR schedule.
 
     total_opt_steps is in per-process optimizer steps; prepare() wraps the scheduler in
     AcceleratedScheduler which advances it num_processes times per opt step, so scale the
     horizons by num_processes to cancel that out.
-    """
-    from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-    t = cfg.training
-    lr = float(t.learning_rate)
-    warmup_ratio = float(getattr(t, "warmup_ratio", 0.05))
-    lr_min_ratio = float(getattr(t, "lr_min_ratio", 0.01))
+    Args:
+        optimizer: torch Optimizer whose LR the schedule drives.
+        total_opt_steps: int, per-process optimizer steps of the whole run.
+        training_cfg: ``cfg.training`` (``learning_rate``, ``warmup_ratio``, ``lr_min_ratio``).
+        num_processes: int, the Accelerator's process count.
+
+    Returns:
+        SequentialLR: LinearLR warmup then CosineAnnealingLR down to ``learning_rate * lr_min_ratio``.
+    """
+    lr = float(training_cfg.learning_rate)
+    warmup_ratio = float(training_cfg.warmup_ratio)
+    lr_min_ratio = float(training_cfg.lr_min_ratio)
     n = max(int(num_processes), 1)
     warmup_steps = int(total_opt_steps * warmup_ratio)
     cosine_steps = max(total_opt_steps - warmup_steps, 1)
+    # Horizons in scheduler.step() calls: n per optimizer step under AcceleratedScheduler.
     warmup_iters = warmup_steps * n
     warmup_sched = LinearLR(optimizer, start_factor=1.0 / max(warmup_iters, 1), total_iters=warmup_iters)
     cosine_sched = CosineAnnealingLR(optimizer, T_max=cosine_steps * n, eta_min=lr * lr_min_ratio)
@@ -85,12 +87,18 @@ def build_cosine_scheduler(optimizer, *, total_opt_steps: int, cfg, num_processe
     return scheduler
 
 
-def init_wandb(cfg):
-    """Init a wandb run from cfg.project.wandb. Returns the run or None."""
-    wandb_cfg = cfg.project.get("wandb", None)
-    if wandb_cfg is None:
-        return None
-    project = getattr(wandb_cfg, "project", None)
+def init_wandb(cfg: DictConfig):
+    """Init a wandb run from ``cfg.project.wandb``.
+
+    Args:
+        cfg: the run config (``project.wandb.{project, run_name, entity, group}``; the whole config is logged).
+
+    Returns:
+        the wandb Run, or None when ``project.wandb.project`` is null (the yaml's "off") or wandb is not installed.
+    """
+    wandb_cfg = cfg.project.wandb
+    project = wandb_cfg.project
+    # null project = wandb off (train_debug.yaml).
     if not project:
         return None
     try:
@@ -99,16 +107,11 @@ def init_wandb(cfg):
         logger.warning("wandb not installed, skipping wandb logging")
         return None
 
-    run_name = getattr(wandb_cfg, "run_name", None)
-    entity = getattr(wandb_cfg, "entity", None)
-    group = getattr(wandb_cfg, "group", None)  # groups runs of one ablation in the wandb UI
-    from omegaconf import OmegaConf
-
     run = wandb.init(
         project=project,
-        name=run_name,
-        entity=entity,
-        group=group,
+        name=wandb_cfg.run_name,
+        entity=wandb_cfg.entity,
+        group=wandb_cfg.group,  # groups runs of one ablation in the wandb UI
         config=OmegaConf.to_container(cfg, resolve=True),
         resume="allow",
     )

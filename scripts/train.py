@@ -69,7 +69,7 @@ def _build_accelerator(cfg: DictConfig):
 
     t = cfg.training
     grad_accum = int(t.gradient_accumulation_steps)
-    max_grad_norm = getattr(t, "max_grad_norm", None)
+    max_grad_norm = t.max_grad_norm
     mixed_precision = str(t.mixed_precision)
     if os.environ.get("LOCAL_RANK", "0") == "0":
         logger.info("mixed_precision = %s (from cfg.training.mixed_precision)", mixed_precision)
@@ -90,29 +90,11 @@ def _build_accelerator(cfg: DictConfig):
     )
 
 
-def _inject_project_seed(cfg: DictConfig) -> None:
-    """Propagate ``cfg.project.seed`` down to ``cfg.dataloader.seed``.
-
-    Dataloader yamls no longer carry their own ``seed`` field; the
-    authoritative source is ``project.seed`` in train.yaml. When
-    ``project.seed`` is null (production stochastic runs), the dataset
-    ctor's ``seed=42`` default kicks in.
-    """
-    project_seed = OmegaConf.select(cfg, "project.seed", default=None)
-    if project_seed is None:
-        return
-    dl = cfg.get("dataloader", None)
-    if dl is None:
-        return
-    OmegaConf.update(dl, "seed", int(project_seed), force_add=True)
-
-
 def _train(cfg: DictConfig) -> None:
     """Package-native training path."""
     from openwam.config import resolve_config
 
-    _inject_project_seed(cfg)
-    resume_path = OmegaConf.select(cfg, "training.resume_ckpt_path", default=None)
+    resume_path = cfg.training.resume_ckpt_path
     if resume_path:
         from openwam.train.utils.ckpt_model_loader import load_resume_cfg
 
@@ -133,17 +115,15 @@ def _train_openwam(cfg: DictConfig) -> None:
     # Seed Python random / numpy / torch BEFORE dataset construction so that
     # any reader-time randomness (e.g. lerobot splits) is reproducible.
     # OpenWAMTrainer.__init__ re-seeds via seed_process for model init using the
-    # same RANK_OFFSET rank stride (cudnn stays as configured here). Null
-    # cfg.project.seed = production stochastic run, so we skip seeding here.
-    project_seed = OmegaConf.select(cfg, "project.seed", default=None)
-    if project_seed is not None:
-        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
-        seed_everything(int(project_seed), rank=rank)
+    # same RANK_OFFSET rank stride (cudnn stays as configured here). resolve_config
+    # already checked cfg.project.seed is an int.
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+    seed_everything(int(cfg.project.seed), rank=rank)
 
     accelerator = _build_accelerator(cfg)
 
-    # Build dataset via registry
-    dataset = build_dataset(cfg.dataloader, split="train")
+    # Build dataset via registry from its slice (common's action / state dims are checked against action_mode)
+    dataset = build_dataset(OmegaConf.merge(cfg.common, cfg.dataloader), split="train")
 
     # Build trainer and run
     trainer = OpenWAMTrainer(cfg, accelerator=accelerator, dataset=dataset)

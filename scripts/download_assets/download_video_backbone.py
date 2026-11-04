@@ -302,7 +302,8 @@ def write_config(model: Model, targets: list[Path]) -> None:
     config_path = CONFIG_DIR / model.config
     text = config_path.read_text(encoding="utf-8")
     for field, target in zip(model.config_fields, targets):
-        pattern = re.compile(rf"^({re.escape(field)}:\s*)\S+([^\n]*)$", re.MULTILINE)
+        # The field sits indented under assets.video_backbone: keep its indent and trailing comment.
+        pattern = re.compile(rf"^(\s*{re.escape(field)}:\s*)\S+([^\n]*)$", re.MULTILINE)
         if not pattern.search(text):
             print(red(f"Warning: field {field!r} not found in {config_path}; update it manually."))
             continue

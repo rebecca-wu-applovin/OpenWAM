@@ -21,7 +21,7 @@ import glob
 import logging
 import os
 import shutil
-from typing import Callable, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -29,18 +29,11 @@ from einops import rearrange
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 
-from openwam.model.compile_options import (
-    compile_enabled,
-    section_enabled,
-    torch_compile_kwargs,
-    wan_blocks_compile_cfg,
-)
+from openwam.model.common.flow_scheduler import FlowScheduler
 from openwam.model.grad_checkpoint import gradient_checkpoint_forward
 from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
 from openwam.model.video_backbone.common.weights import load_strict, read_weights
-from openwam.model.video_backbone.wan import dit_forward as wan_dit_forward
-from openwam.model.video_backbone.wan.dit import WanModel
-from openwam.model.video_backbone.wan.scheduler import FlowMatchScheduler
+from openwam.model.video_backbone.wan.dit import WanModel, build_time_modulation
 from openwam.model.video_backbone.wan.text_encoder import HuggingfaceTokenizer, WanTextEncoder
 from openwam.model.video_backbone.wan.vae import WanVideoVAE38
 
@@ -142,6 +135,7 @@ class WanBackbone(VideoBackbone):
         tokenizer,
         tokenizer_dir: str,
         shift_video: float,
+        train_timestep: DictConfig,
         text_max_length: int,
     ):
         """Wrap already-built modules. Use :meth:`from_pretrained` / :meth:`from_checkpoint_dir` instead.
@@ -150,7 +144,7 @@ class WanBackbone(VideoBackbone):
             dit: WanModel. vae: WanVideoVAE38. text_encoder: WanTextEncoder.
             tokenizer: callable umT5 tokenizer (HuggingfaceTokenizer).
             tokenizer_dir: str, the dir ``tokenizer`` was read from (save_deploy_assets copies it).
-            shift_video: float, α-shift of the video scheduler (single source of truth behind the property).
+            shift_video: float, α-shift of the video scheduler. train_timestep: DictConfig, its training law (yaml).
             text_max_length: int, umT5 tokens per prompt (512 Wan, 128 LongLive).
         """
         super().__init__()
@@ -159,59 +153,55 @@ class WanBackbone(VideoBackbone):
         self.text_encoder = text_encoder
         self._tokenizer = tokenizer
         self._tokenizer_dir = tokenizer_dir
-        self._scheduler = FlowMatchScheduler()
+        self._scheduler = FlowScheduler(shift=shift_video, train_timestep=train_timestep)
         self._device = torch.device("cuda")
         self._dtype = torch.bfloat16
-        self._shift_video = float(shift_video)
         self.text_max_length = int(text_max_length)
         # Wan native contract: VAE 4× temporal compression + causal first-frame token.
         self._temporal_compression, self._causal_temporal = 4, True
-        self._wan_blocks_compile_enabled = False
-        self._wan_blocks_compile_kwargs: dict | None = None
-        self._compiled_wan_blocks: dict[int, Callable[..., Tensor]] = {}
         # Text slot read by encode_text: the online umT5 here, a PromptCache after build_text_cache.
         self.text_lookup = self._t5_entries
 
     @classmethod
-    def from_pretrained(cls, cfg: DictConfig) -> "WanBackbone":
-        """Build from upstream weights (``init: pretrained``) or a random init (``init: random``).
+    def from_pretrained(cls, cfg: DictConfig, assets: DictConfig) -> "WanBackbone":
+        """Build from upstream weights (``assets.init: pretrained``) or a random init (``assets.init: random``).
 
         Args:
-            cfg: ``cfg.model.video_backbone``. Reads the ``dit`` / ``vae`` / ``text_encoder`` geometry,
-                ``init``, ``model_path`` + ``weights`` (file names), ``dit_weights`` /
-                ``dit_weights_prefix`` (DiT file override, LongLive), ``tokenizer_path``,
-                ``shift_video``, ``text_max_length``.
+            cfg: ``cfg.model.video_backbone``: the ``dit`` / ``vae`` / ``text_encoder`` geometry, ``shift_video``,
+                ``text_max_length``.
+            assets: ``cfg.assets.video_backbone``: ``init``, ``model_path`` + ``weights`` (file names),
+                ``dit_weights`` / ``dit_weights_prefix`` (DiT file override, LongLive), ``tokenizer_path``.
 
         Returns:
             WanBackbone on CPU, every module in bf16 and eval mode. Raises ValueError when a weight file
             does not match the yaml geometry.
         """
-        if cfg.init == "random":
+        if assets.init == "random":
             # Debug backbone: real tensors, default init, no file read.
             dit, vae, text_encoder = _build_modules(cfg)
-        elif cfg.init == "pretrained":
+        elif assets.init == "pretrained":
             dit, vae, text_encoder = _build_meta_modules(cfg)
             # DiT: the model_path shards, or the dit_weights file (LongLive model.pt) instead of them.
-            if cfg.dit_weights is None:
-                dit_files = sorted(glob.glob(os.path.join(cfg.model_path, cfg.weights.dit)))
+            if assets.dit_weights is None:
+                dit_files = sorted(glob.glob(os.path.join(assets.model_path, assets.weights.dit)))
             else:
-                dit_files = [str(cfg.dit_weights)]
+                dit_files = [str(assets.dit_weights)]
             if not dit_files:
-                raise FileNotFoundError(f"no DiT weights match {os.path.join(cfg.model_path, cfg.weights.dit)}")
+                raise FileNotFoundError(f"no DiT weights match {os.path.join(assets.model_path, assets.weights.dit)}")
             logger.info("Wan DiT weights: %s", dit_files)
-            dit_state = _strip_prefix(read_weights(dit_files), str(cfg.dit_weights_prefix), str(dit_files))
+            dit_state = _strip_prefix(read_weights(dit_files), str(assets.dit_weights_prefix), str(dit_files))
             _load_component(dit, dit_state, cfg.dit, "dit")
             # Cast now so the fp32 shards (~20 GB) are freed before the next file is read.
             del dit_state
             dit.to(dtype=torch.bfloat16)
             # Upstream VAE keys are the inner VideoVAE38_'s; the wrapper holds it as ``model``.
-            vae_state = read_weights([os.path.join(cfg.model_path, cfg.weights.vae)])
+            vae_state = read_weights([os.path.join(assets.model_path, assets.weights.vae)])
             _load_component(vae, {f"model.{k}": v for k, v in vae_state.items()}, cfg.vae, "vae")
-            te_state = read_weights([os.path.join(cfg.model_path, cfg.weights.text_encoder)])
+            te_state = read_weights([os.path.join(assets.model_path, assets.weights.text_encoder)])
             _load_component(text_encoder, te_state, cfg.text_encoder, "text_encoder")
         else:
-            raise ValueError(f"video_backbone.init must be 'pretrained' or 'random', got {cfg.init!r}")
-        return cls._assemble(cfg, dit, vae, text_encoder, str(cfg.tokenizer_path))
+            raise ValueError(f"assets.video_backbone.init must be 'pretrained' or 'random', got {assets.init!r}")
+        return cls._assemble(cfg, dit, vae, text_encoder, str(assets.tokenizer_path))
 
     @classmethod
     def from_checkpoint_dir(cls, cfg: DictConfig, ckpt_dir: str) -> "WanBackbone":
@@ -252,6 +242,7 @@ class WanBackbone(VideoBackbone):
             tokenizer=tokenizer,
             tokenizer_dir=tokenizer_dir,
             shift_video=float(cfg.shift_video),
+            train_timestep=cfg.train_timestep,
             text_max_length=int(cfg.text_max_length),
         )
 
@@ -288,11 +279,6 @@ class WanBackbone(VideoBackbone):
     def text_dim(self) -> int:
         """Raw text-context width the DiT's text embedding takes (= yaml ``dit.text_dim``)."""
         return int(self._dit.text_embedding[0].in_features)
-
-    @property
-    def scheduler(self):
-        """The Wan :class:`FlowMatchScheduler` (bell-weighted 1000-step training grid, shift_video at deploy)."""
-        return self._scheduler
 
     # ================================================================
     # Video and text IO
@@ -394,7 +380,7 @@ class WanBackbone(VideoBackbone):
 
         grid_frames, grid_height, grid_width = hidden_states.shape[2:]
         # Per-token time embedding / modulation: the clean history frames at t = 0, the rest at timestep.
-        time_embed, time_modulation = wan_dit_forward.build_time_modulation(
+        time_embed, time_modulation = build_time_modulation(
             dit, timestep, int(layout.num_hist_latents), int(layout.num_latents), grid_height * grid_width
         )
         hidden_states = rearrange(hidden_states, "b c f h w -> b (f h w) c").contiguous()
@@ -438,8 +424,7 @@ class WanBackbone(VideoBackbone):
         )
 
     def run_block(self, block_id: int, state: BlockLoopState, attn_mask: Tensor) -> BlockLoopState:
-        """One Wan DiT block on the video stream alone (compiled when deploy compile is on, else eager /
-        gradient-checkpointed).
+        """One Wan DiT block on the video stream alone (eager, or gradient-checkpointed when training asks).
 
         Args:
             block_id: int. state: BlockLoopState. attn_mask: (S, S) bool self-attention mask of this layer.
@@ -448,10 +433,6 @@ class WanBackbone(VideoBackbone):
             ``state`` with ``hidden_states`` updated.
         """
         block = state.extras["dit"].blocks[block_id]
-        # Compile only the deploy (no checkpointing) path; checkpointing wraps whichever callable runs.
-        checkpointing = state.use_gradient_checkpointing or state.use_gradient_checkpointing_offload
-        if self._wan_blocks_compile_enabled and not checkpointing:
-            block = self._compiled_wan_block(block_id, block)
         # DiTBlock(x, context, t_mod, freqs, cross-attn mask, self-attn mask).
         state.hidden_states = gradient_checkpoint_forward(
             block,
@@ -520,45 +501,6 @@ class WanBackbone(VideoBackbone):
             (B, 1, S, L) bool (an expanded view).
         """
         return state.context_mask.unsqueeze(1).expand(-1, state.hidden_states.shape[1], -1).unsqueeze(1)
-
-    def apply_compile_optimizations(self, compile_cfg) -> None:
-        """Enable lazy per-layer Wan ``DiTBlock.forward`` compile for deploy.
-
-        Args:
-            compile_cfg: the deploy compile block; its ``wan_blocks`` section holds the ``torch.compile`` kwargs.
-
-        Returns:
-            None. :meth:`run_block` then compiles each block on first use (never while checkpointing).
-        """
-        # Reset first: a disabled config leaves the backbone eager.
-        self._compiled_wan_blocks.clear()
-        self._wan_blocks_compile_enabled = False
-        self._wan_blocks_compile_kwargs = None
-
-        if not compile_enabled(compile_cfg, default=False, strict=True):
-            return
-
-        # The wan_blocks section may switch the per-block compile off on its own.
-        section = wan_blocks_compile_cfg(compile_cfg)
-        if not section_enabled(section, default=True):
-            logger.info("Wan block compile disabled by config; running eager.")
-            return
-
-        kwargs = torch_compile_kwargs(section, default_mode="default")
-        self._wan_blocks_compile_kwargs = kwargs
-        self._wan_blocks_compile_enabled = True
-        logger.info("Enabled lazy Wan block compile with torch.compile kwargs=%s", kwargs)
-
-    def _compiled_wan_block(self, block_id: int, block: nn.Module) -> Callable[..., Tensor]:
-        """Lazily ``torch.compile`` one DiTBlock (deploy compile). block_id: int. block: DiTBlock.
-
-        Returns: the compiled callable, cached per block id.
-        """
-        compiled = self._compiled_wan_blocks.get(block_id)
-        if compiled is None:
-            compiled = torch.compile(block, **(self._wan_blocks_compile_kwargs or {}))
-            self._compiled_wan_blocks[block_id] = compiled
-        return compiled
 
     # ================================================================
     # Deploy assets

@@ -1,3 +1,4 @@
+# @package _global_
 # DEBUG ONLY: Wan2.2-TI2V backbone with tiny, randomly initialized modules (init: random, no weight
 # files read). Shapes / masks / data flow match real training, values don't. The real umT5 tokenizer
 # (vocab 256384) is still read from tokenizer_path. Used by configs/train_debug.yaml.
@@ -6,21 +7,35 @@ defaults:
   - wan22_ti2v_5b
   - _self_
 
-name: wan22_ti2v_5b   # keep: registry dispatch
-init: random
+model:
+  video_backbone:
+    name: wan22_ti2v_5b   # keep: registry dispatch
 
-dit:                   # real TI2V-5B: dim 3072, ffn 14336, heads 24, layers 30, text_dim 4096
-  dim: 768
-  ffn_dim: 3072
-  num_heads: 6         # head_dim stays 128 like the real model
-  num_layers: 4
-  text_dim: 128        # must equal text_encoder.dim (context width)
-vae:
-  z_dim: 48            # latent channels: must stay 48 (DiT in_dim)
-  dim: 32              # real: 160. Barely shrinks it (561M vs 705M); VAE is frozen + random either way
-text_encoder:          # real umT5-XXL: 4096 / 4096 / 10240 / 64 heads / 24 layers
-  dim: 128
-  dim_attn: 128
-  dim_ffn: 512
-  num_heads: 2
-  num_layers: 2
+    # what the action stream reads; checked against the built module at construction
+    # (from the native block: dit.dim / dit.num_heads / dim ÷ heads / dit.num_layers / dit.text_dim)
+    geometry:
+      dim: 768
+      num_heads: 6
+      head_dim: 128
+      num_layers: 4
+      text_dim: 128
+
+    dit:                   # real TI2V-5B: dim 3072, ffn 14336, heads 24, layers 30, text_dim 4096
+      dim: 768
+      ffn_dim: 3072
+      num_heads: 6         # head_dim stays 128 like the real model
+      num_layers: 4
+      text_dim: 128        # must equal text_encoder.dim (context width)
+    vae:
+      z_dim: 48            # latent channels: must stay 48 (DiT in_dim)
+      dim: 32              # real: 160. Barely shrinks it (561M vs 705M); VAE is frozen + random either way
+    text_encoder:          # real umT5-XXL: 4096 / 4096 / 10240 / 64 heads / 24 layers
+      dim: 128
+      dim_attn: 128
+      dim_ffn: 512
+      num_heads: 2
+      num_layers: 2
+
+assets:
+  video_backbone:
+    init: random           # no weight files read (tokenizer_path still is)

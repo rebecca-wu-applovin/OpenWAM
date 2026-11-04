@@ -34,7 +34,6 @@ def main() -> None:
 
     import torch
     from hydra import compose, initialize_config_dir
-    from omegaconf import OmegaConf
 
     sys.path.insert(0, REPO)
     # INFO on stdout: the test reads the trainer's "[resume] resumed at global_step=N" line.
@@ -46,6 +45,8 @@ def main() -> None:
     train = _load_train_script()
     with initialize_config_dir(config_dir=os.path.join(REPO, "configs"), version_base=None):
         cfg = compose("train_debug", overrides=overrides)
+
+    from omegaconf import OmegaConf
 
     from openwam.dataloader.registry import build_dataset
     from openwam.train import openwam_trainer
@@ -65,14 +66,12 @@ def main() -> None:
                 raise _Stop
 
         openwam_trainer.save_full_state = save_then_stop
-    train._inject_project_seed(cfg)
     from openwam.config import resolve_config
 
-    resolve_config(cfg)  # what scripts/train.py's entry does: cfg.common.layout
-    seed_everything(int(OmegaConf.select(cfg, "project.seed")), rank=0)
-    trainer = openwam_trainer.OpenWAMTrainer(
-        cfg, accelerator=train._build_accelerator(cfg), dataset=build_dataset(cfg.dataloader, split="train")
-    )
+    resolve_config(cfg)  # what scripts/train.py's entry does: cfg.common.layout, project.seed checked
+    seed_everything(int(cfg.project.seed), rank=0)
+    dataset = build_dataset(OmegaConf.merge(cfg.common, cfg.dataloader), split="train")
+    trainer = openwam_trainer.OpenWAMTrainer(cfg, accelerator=train._build_accelerator(cfg), dataset=dataset)
     try:
         trainer.train()
     except _Stop:

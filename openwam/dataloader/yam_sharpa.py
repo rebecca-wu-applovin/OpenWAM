@@ -39,7 +39,6 @@ import torch
 
 from openwam.dataloader.bases import BaseDataset, LeRobotV3Reader
 from openwam.dataloader.transforms.multiview import assemble_vstack_layout
-from openwam.dataloader.utils import get_cfg
 from openwam.dataloader.utils.normalization import apply_normalization, load_stats_file
 from openwam.dataloader.utils.sparse_history import history_rows, sample_history_offsets
 from openwam.dataloader.utils.video_io import decode_video_frames as _decode_video_frames
@@ -47,6 +46,7 @@ from openwam.dataloader.utils.yam_sharpa_repr import (
     CAM_POSE_DIM,
     JOINT56_DIM,
     POSE48_DIM,
+    action_width,
     encode_action_pairs,
     encode_proprio_in_anchor_cam,
     is_unify,
@@ -63,9 +63,6 @@ ACTION_COL = "action"  # setpoint FK: target wrist + fingertips
 JOINT_COL = "joint_angles"  # measured joints (arm 12 + hand 44)
 SETPOINT_COL = "joint_setpoints"  # target joints
 CAM_POSE_COL = "camera_pose.ego_view"  # base_from_camera, row-major 4x4
-DEFAULT_CAMERA_LAYOUT: Tuple[str, ...] = ("observation.images.ego_view", "observation.images.chest_view")
-
-_CONFIG_UNSET = object()  # distinguishes an absent config key from an explicit null
 
 
 def _stats_builder_rank() -> int:
@@ -134,11 +131,13 @@ class YamSharpaDataset(LeRobotV3Reader):
     """
 
     DATASET_NAME = "YamSharpa"
-    DEFAULT_NORMALIZE_MODE = "min-max"
 
-    # unify_* keys are derived from action_mode, so they are not accepted from config.
+    # The dataloader keys every reader is built from (all required). unify_* are derived from action_mode, so they
+    # are not accepted from config; target_camera is unused (camera_layout picks the cameras).
     CONFIG_KEYS: ClassVar[Tuple[str, ...]] = tuple(
-        k for k in LeRobotV3Reader.CONFIG_KEYS if k not in ("unify_action", "unify_action_map", "unify_state_map")
+        k
+        for k in LeRobotV3Reader.CONFIG_KEYS
+        if k not in ("unify_action", "unify_action_map", "unify_state_map", "target_camera")
     ) + (
         "action_mode",
         "fps",
@@ -155,8 +154,8 @@ class YamSharpaDataset(LeRobotV3Reader):
         *,
         action_mode: str,
         fps: int,
-        normalization_stats_path: Optional[str] = None,
-        camera_layout: Optional[Sequence[str]] = None,
+        normalization_stats_path: Optional[str],
+        camera_layout: Sequence[str],
         history_offsets: Sequence[int],
         future_offsets: Sequence[int],
         history_sampling: str,
@@ -169,8 +168,8 @@ class YamSharpaDataset(LeRobotV3Reader):
             action_mode: str, one of ``ACTION_REPRS``.
             fps: int, the data rate the config states (rows per second; history / future offsets and deploy's
                 action rate are in these rows); must equal the source's ``meta/info.json`` fps.
-            normalization_stats_path: str, pooled stats file (required when normalization is on).
-            camera_layout: list[str] of camera feature keys, top-to-bottom; default ego over chest.
+            normalization_stats_path: str, pooled stats file (required when normalization is on; None when off).
+            camera_layout: list[str] of camera feature keys, top-to-bottom (e.g. ego over chest).
             history_offsets: list[int] of H row offsets <= 0 ending at 0 (e.g. [-80,-60,-40,-20,0]; [0] = only
                 the current frame).
             future_offsets: list[int] of F increasing row offsets > 0 (e.g. [4,8,...,32]).
@@ -186,7 +185,7 @@ class YamSharpaDataset(LeRobotV3Reader):
         self.action_mode = validate_repr(action_mode)
         self._source_stats_path = str(normalization_stats_path) if normalization_stats_path else None
         self._state_normalization_stats: Optional[dict] = None  # filled by _load_stats
-        self._layout_cams = [str(c) for c in (camera_layout or DEFAULT_CAMERA_LAYOUT)]
+        self._layout_cams = [str(c) for c in camera_layout]
         self._history_offsets, self._future_offsets = _validate_sparse_offsets(history_offsets, future_offsets)
         # Read by _select_augmentations, which the base __init__ calls.
         self._history_sampling = str(history_sampling)
@@ -198,8 +197,11 @@ class YamSharpaDataset(LeRobotV3Reader):
         super().__init__(
             dataset_dir=dataset_dir,
             camera_layout=self._layout_cams,
+            # camera_layout picks the cameras; the proprio unify map is the action's (None).
+            target_camera=None,
             unify_action=is_unify(self.action_mode),
             unify_action_map=unify_action_map(self.action_mode),
+            unify_state_map=None,
             **kwargs,
         )
         # The config's data rate is what deploy serves at: it must be the recorded one.
@@ -463,8 +465,8 @@ class MultiYamSharpaDataset(BaseDataset):
         weights: Sequence[float],
         caption_dropout_p: float,
         split: str,
-        seed: int = 42,
-        normalization_stats_path: Optional[str] = None,
+        seed: int,
+        normalization_stats_path: Optional[str],
     ):
         """
         Args:
@@ -475,7 +477,7 @@ class MultiYamSharpaDataset(BaseDataset):
                 by ``""`` (``resolve_config`` checks the range); :meth:`_select_augmentations` applies the split rule.
             split: str, ``train`` turns the train-only augmentations on (caption dropout here, the readers' own).
             seed: int, base RNG seed.
-            normalization_stats_path: str, pooled stats file copied into checkpoints.
+            normalization_stats_path: str, pooled stats file copied into checkpoints (None: normalization off).
         """
         if not datasets:
             raise ValueError("MultiYamSharpaDataset needs at least one source")
@@ -580,48 +582,52 @@ class MultiYamSharpaDataset(BaseDataset):
         """Build all sources from ``configs/dataloader/yam_sharpa.yaml``.
 
         Args:
-            config: dataloader config with ``sources``, ``action_mode`` and shared reader keys.
+            config: ``merge(cfg.common, cfg.dataloader)``: ``sources``, ``action_mode``, shared reader keys and
+                ``action_dim`` / ``state_dim`` (the model's widths, checked against the action_mode).
             split: str, forwarded to every reader.
 
         Returns:
             MultiYamSharpaDataset; the pooled stats file is built first if missing.
         """
-        action_mode = validate_repr(get_cfg(config, "action_mode"))
-        sources = get_cfg(config, "sources")
+        action_mode = validate_repr(config.action_mode)
+        # The model's action / proprio widths must be the rows this action_mode produces.
+        width = action_width(action_mode)
+        if not int(config.action_dim) == int(config.state_dim) == width:
+            raise ValueError(
+                f"common.action_dim={config.action_dim} / common.state_dim={config.state_dim} do not match "
+                f"dataloader.action_mode={action_mode}, which produces {width}-wide action and proprio rows"
+            )
+        sources = config.sources
         if not sources:
             raise ValueError("yam_sharpa: config needs a non-empty 'sources' mapping {name: {dataset_dir, weight}}")
-        entries = [
-            (str(name), str(get_cfg(src, "dataset_dir")), float(get_cfg(src, "weight", 1.0)))
-            for name, src in sources.items()
-            if get_cfg(src, "enabled", True)
-        ]
+        # Every source states its weight and whether it is on; disabled ones are skipped.
+        entries = [(str(name), str(src.dataset_dir), float(src.weight)) for name, src in sources.items() if src.enabled]
         if not entries:
             raise ValueError("yam_sharpa: every source is disabled")
         dirs = [d for _, d, _ in entries]
-        num_frames = int(get_cfg(config, "num_frames", 33))
+        num_frames = int(config.num_frames)
 
-        # Shared reader kwargs; explicit normalize_mode=null must survive (disables normalization).
-        kwargs: Dict[str, Any] = {"split": split}
-        for key in YamSharpaDataset.CONFIG_KEYS:
-            v = get_cfg(config, key, _CONFIG_UNSET)
-            if v is _CONFIG_UNSET or (v is None and key != "normalize_mode"):
-                continue
-            kwargs[key] = v
+        # Shared reader kwargs: every key is required (a missing one raises); null values pass through as-is.
+        kwargs: Dict[str, Any] = {key: config[key] for key in YamSharpaDataset.CONFIG_KEYS}
+        kwargs["split"] = split
+        # unify_* are derived from action_mode: a config still setting them is stale.
         for key in ("unify_action", "unify_action_map", "unify_state_map"):
-            if get_cfg(config, key, None) is not None:
+            if key in config:
                 raise ValueError(f"yam_sharpa derives {key} from action_mode; remove it from the config")
 
-        normalize_mode = kwargs.get("normalize_mode", YamSharpaDataset.DEFAULT_NORMALIZE_MODE)
+        # null normalize_mode = no normalization (the reader's own string check).
+        normalize_mode = config.normalize_mode
         stats_path = None
         if normalize_mode and str(normalize_mode).lower() not in ("none", "null"):
-            raw_path = get_cfg(config, "normalization_stats_path")
+            raw_path = config.normalization_stats_path
             if not raw_path:
                 raise ValueError("yam_sharpa: normalization_stats_path is required when normalization is on")
             stats_path = Path(str(raw_path)).expanduser()
             cls._ensure_stats(stats_path, dirs, action_mode, num_frames)
             kwargs["normalization_stats_path"] = str(stats_path)
         else:
-            kwargs.pop("normalization_stats_path", None)
+            # Normalization off: the readers get no stats file.
+            kwargs["normalization_stats_path"] = None
 
         datasets = [YamSharpaDataset(dataset_dir=d, dataset_id=name, **kwargs) for name, d, _ in entries]
         return cls(
@@ -631,7 +637,7 @@ class MultiYamSharpaDataset(BaseDataset):
             # Required key, validated (present, in [0, 1]) by resolve_config; the split rule is applied inside.
             caption_dropout_p=float(config["caption_dropout_p"]),
             split=split,
-            seed=int(get_cfg(config, "seed", 42)),
+            seed=int(config.seed),
             normalization_stats_path=str(stats_path) if stats_path else None,
         )
 
@@ -677,4 +683,4 @@ class MultiYamSharpaDataset(BaseDataset):
         save_stats(compute_yam_sharpa_stats(dirs, action_mode, num_frames=num_frames), path)
 
 
-__all__ = ["DEFAULT_CAMERA_LAYOUT", "MultiYamSharpaDataset", "YamSharpaDataset"]
+__all__ = ["MultiYamSharpaDataset", "YamSharpaDataset"]

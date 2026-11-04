@@ -21,9 +21,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
+from omegaconf import DictConfig
 from torch import Tensor, nn
 
-from openwam.model.compile_options import compile_enabled
 from openwam.model.video_backbone.registry import LoadMode, build_video_backbone
 
 
@@ -65,9 +65,7 @@ def _wrap_forward_in_no_grad(module: nn.Module) -> None:
     parent will NOT receive gradients, because every descendant ``forward`` is
     wrapped in ``no_grad``. For partial-freeze setups (e.g. LoRA on a frozen base,
     or training only the head of an otherwise frozen model), do NOT pass the
-    parent's dotted path to ``freeze_modules``; pass the specific leaves you want
-    frozen instead. The current freeze list in ``configs/model/*.yaml``
-    only names complete subtrees, so this limitation does not bite today.
+    parent's dotted path to ``freeze_modules``; pass the specific leaves you want frozen instead.
     """
     for sub in module.modules():
         _wrap_single_forward(sub)
@@ -90,35 +88,37 @@ class TrainOptions:
         use_gradient_checkpointing_offload: bool, also offload the checkpointed activations to CPU.
         lambda_video: float, weight of the video flow-matching loss (0 = the term is left out of the loss).
         lambda_action: float, weight of the action flow-matching loss (0 = the term is left out of the loss).
+        mot_checkpoint_mixed_attn: bool, joint_self_attn: grad-checkpoint the mixed attention in training.
     """
 
     use_gradient_checkpointing: bool
     use_gradient_checkpointing_offload: bool
     lambda_video: float
     lambda_action: float
+    mot_checkpoint_mixed_attn: bool
 
+
+# Video backbone properties the action stream reads from ``model.video_backbone.geometry``.
+GEOMETRY_KEYS = ("dim", "num_heads", "head_dim", "num_layers", "text_dim")
 
 # Deploy builds: no loss is ever computed, so no checkpointing and both loss weights unused.
 INFERENCE_ONLY = TrainOptions(
-    use_gradient_checkpointing=False, use_gradient_checkpointing_offload=False, lambda_video=0.0, lambda_action=0.0
+    use_gradient_checkpointing=False,
+    use_gradient_checkpointing_offload=False,
+    lambda_video=0.0,
+    lambda_action=0.0,
+    mot_checkpoint_mixed_attn=False,
 )
 
 
 @dataclass
 class ActionState:
-    """Mutable state container used by the joint self-attention path.
-
-    Only ``DualSystemSelfAttnArchitecture`` needs this — its action stream is
-    threaded through ``DualSystemMoTDriver``, which mutates the payload across
-    layers. DualSystem cross-attn doesn't go through this
-    container.
+    """Mutable action-stream state that ``DualSystemMoTDriver`` threads across layers (joint_self_attn only).
 
     Fields:
         action_latents: (B, T_action, action_dim) noisy actions (input to forward).
-        timestep: action diffusion timestep (raw shape preserved for the action
-            backbone's internal use).
-        payload: backbone-specific per-forward state (typically
-            ``ActionDiTState``).
+        timestep: action diffusion timestep (raw shape preserved for the action backbone's internal use).
+        payload: backbone-specific per-forward state (typically ``ActionDiTState``).
     """
 
     action_latents: Optional[Tensor] = None
@@ -134,13 +134,14 @@ class BaseWAMArchitecture(ABC, nn.Module):
     subclass in ``__init__`` and own the complete ``forward()`` control flow.
 
     Args:
-        cfg: dict of architecture params (``resolve_architecture_config(...).params``): ``clean_attention`` and
-            ``attention_mask_mode`` pick the frame-level mask, ``proprio_input`` the proprio routing (all validated by
-            ``resolve_config``), ``video_backbone`` is the backbone's cfg slice.
-        layout: ``cfg.common.layout`` from the entry point's ``resolve_config`` (DictConfig): the latent layout
-            the preprocessing, the attention mask, the loss and deploy read. Never re-derived here.
+        cfg: ``OmegaConf.merge(cfg.common, cfg.model)``: ``layout`` (the latent layout ``resolve_config`` derived;
+            the preprocessing, the attention mask, the loss and deploy read it, never re-derived here),
+            ``action_dim`` / ``state_dim``, ``architecture`` (``clean_attention`` / ``attention_mask_mode`` pick
+            the frame-level mask, ``proprio_input`` the proprio routing; validated by ``resolve_config``),
+            ``video_backbone`` (the backbone's slice) and ``action_backbone``.
         mode: LoadMode the entry point chose for the video backbone (PRETRAINED: upstream weights;
             CHECKPOINT: an empty shell of ``ckpt_dir`` the caller fills).
+        assets: ``cfg.assets.video_backbone`` (upstream paths) for PRETRAINED, None for CHECKPOINT.
         ckpt_dir: str checkpoint dir for CHECKPOINT, None for PRETRAINED.
         train_options: TrainOptions (gradient checkpointing, loss weights) the trainer decided; deploy passes
             ``INFERENCE_ONLY``.
@@ -151,34 +152,43 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
     # --- Construction & config resolution ---
 
-    def __init__(self, cfg: dict, *, layout, mode: LoadMode, ckpt_dir: Optional[str], train_options: TrainOptions):
+    def __init__(
+        self, cfg: DictConfig, *, mode: LoadMode, assets: Optional[DictConfig], ckpt_dir: Optional[str],
+        train_options: TrainOptions,
+    ):
         from openwam.model.architectures.utils.mask_modes import build_frame_mask
 
         super().__init__()
         self.cfg = cfg
-        self.layout = layout
+        self.layout = cfg.layout
         self.train_options = train_options
+        arch = cfg.architecture
         # Frame-level [latents, action] visibility, built once; backbones expand it to tokens per forward.
-        self.frame_mask = build_frame_mask(layout, str(cfg["clean_attention"]), str(cfg["attention_mask_mode"]))
+        self.frame_mask = build_frame_mask(self.layout, str(arch.clean_attention), str(arch.attention_mask_mode))
         # How the video backbone gets the proprio (validated by resolve_config); build_contexts applies it.
-        self.proprio_input = str(cfg["proprio_input"])
+        self.proprio_input = str(arch.proprio_input)
         self._device = torch.device("cuda")
         self._dtype = torch.bfloat16
 
-        self.video_backbone: "VideoBackbone" = self._build_video_backbone(cfg["video_backbone"], mode, ckpt_dir)
+        self.video_backbone: "VideoBackbone" = self._build_video_backbone(cfg.video_backbone, mode, assets, ckpt_dir)
 
     @staticmethod
-    def _build_video_backbone(vb_cfg, mode: LoadMode, ckpt_dir: Optional[str]) -> "VideoBackbone":
-        """Build the video backbone with the load mode the entry point chose, and check the yaml's VAE contract.
+    def _build_video_backbone(
+        vb_cfg, mode: LoadMode, assets: Optional[DictConfig], ckpt_dir: Optional[str]
+    ) -> "VideoBackbone":
+        """Build the video backbone with the load mode the entry point chose, and check the yaml's contracts.
 
         Args:
             vb_cfg: ``cfg.model.video_backbone`` (DictConfig slice; ``name`` picks the registered class).
-            mode: LoadMode decided by the entry point. ckpt_dir: str for CHECKPOINT, None for PRETRAINED.
+            mode: LoadMode decided by the entry point.
+            assets: ``cfg.assets.video_backbone`` (DictConfig) for PRETRAINED, None for CHECKPOINT.
+            ckpt_dir: str checkpoint dir for CHECKPOINT, None for PRETRAINED.
 
         Returns:
-            VideoBackbone. Raises ValueError when the yaml's temporal contract disagrees with the built backbone.
+            VideoBackbone. Raises ValueError when the yaml's temporal contract or ``geometry`` block disagrees
+            with the built backbone.
         """
-        video_backbone = build_video_backbone(vb_cfg, mode, ckpt_dir)
+        video_backbone = build_video_backbone(vb_cfg, mode, assets, ckpt_dir)
         # The layout and the dataloader read the yaml's temporal_compression: it must be the VAE's.
         declared = (int(vb_cfg["temporal_compression"]), bool(vb_cfg["causal_temporal"]))
         actual = (video_backbone.temporal_compression, video_backbone.causal_temporal)
@@ -187,7 +197,21 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 f"video_backbone.temporal_compression / causal_temporal yaml {declared} does not match native VAE "
                 f"{actual}. Update the yaml fields to match."
             )
+        BaseWAMArchitecture._check_geometry(vb_cfg.geometry, video_backbone)
         return video_backbone
+
+    @staticmethod
+    def _check_geometry(geometry: DictConfig, video_backbone: "VideoBackbone") -> None:
+        """Raise ValueError listing every ``geometry`` key whose yaml value differs from the built module.
+
+        Args: geometry: ``model.video_backbone.geometry`` (``GEOMETRY_KEYS`` ints the action stream reads).
+        video_backbone: the built VideoBackbone (a meta-device CHECKPOINT shell exposes the same properties).
+        """
+        # The action stream sizes itself from the yaml; a stale block (e.g. a dit override) must fail here.
+        diff = {k: (int(geometry[k]), getattr(video_backbone, k)) for k in GEOMETRY_KEYS}
+        diff = {k: v for k, v in diff.items() if v[0] != v[1]}
+        if diff:
+            raise ValueError(f"video_backbone.geometry (yaml, built) differs from the built module: {diff}")
 
     # --- Backbone composition ---
 
@@ -197,7 +221,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         Subclasses with additional backbones should override this to include
         them. The returned dict
-        is used by ``init_training_schedulers``, ``set_dtype_device``,
+        is used by ``set_dtype_device``,
         ``move_frozen_to_device``, and ``save_assets_for_deployment`` to iterate
         over all backbones generically.
         """
@@ -229,17 +253,17 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
     # --- Proprio-as-context conditioning ---
 
-    def _init_proprio_context(self, cfg: dict, *, text_dim: int) -> None:
+    def _init_proprio_context(self, *, enabled: bool, state_dim: int, text_dim: int) -> None:
         """Initialize FastWAM-style proprio-as-context conditioning.
 
         Args:
-            cfg: dict of architecture params (``use_proprioception``, ``state_dim``).
+            enabled: bool, ``architecture.use_proprioception``.
+            state_dim: int proprio width D (``common.state_dim``); only read when enabled.
             text_dim: int, width of the text context the proprio tokens are appended to.
 
         Returns:
             None. Declares ``proprio_encoder`` / ``proprio_slot_emb`` (None when unused).
         """
-        enabled = bool(cfg["use_proprioception"])
         self._use_proprioception_context = enabled
         self.proprio_encoder: Optional[nn.Module] = None
         self.proprio_slot_emb: Optional[nn.Embedding] = None
@@ -249,8 +273,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
         self.num_proprio_tokens = int(self.layout.num_proprio_tokens)
         if not enabled:
             return
-        # Required by the yaml; only read when the proprio tokens exist.
-        state_dim = int(cfg["state_dim"])
         if state_dim <= 0:
             raise ValueError("use_proprioception=True requires explicit state_dim for context-token proprio.")
         self.proprio_dim = state_dim
@@ -381,27 +403,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
     # --- Training: module management ---
 
-    def init_training_schedulers(self, num_timesteps: int = 1000) -> None:
-        """Initialize all backbone schedulers for training.
-
-        Single source of truth for each stream's α-shift:
-        ``video_backbone.shift_video`` and ``action_backbone.shift_action``.
-        The same properties are read by the deploy schedule at inference time,
-        so the discrete training sigma buffer and the inference denoising
-        trajectory are sampled from the same shifted schedule — train/inference
-        cannot drift, and the shift is owned by the checkpoint config (not a
-        separate deploy-time knob).
-
-        Args:
-            num_timesteps: int, size of the discrete training grid.
-
-        Returns:
-            None.
-        """
-        video_backbone, action_backbone = self.video_backbone, self.action_backbone
-        video_backbone.scheduler.set_timesteps(num_timesteps, training=True, shift=video_backbone.shift_video)
-        action_backbone.scheduler.set_timesteps(num_timesteps, training=True, shift=action_backbone.shift_action)
-
     def freeze_modules(self, names: list[str]) -> list[str]:
         """Freeze named sub-modules by dotted path. Returns actually frozen names.
 
@@ -418,28 +419,28 @@ class BaseWAMArchitecture(ABC, nn.Module):
         no-op (nested ``no_grad``). For modules called inside the training
         forward graph, the wrapper is what actually saves activation memory.
 
-        Uses ``nn.Module.get_submodule()`` so dotted paths like
-        ``video_backbone.text_encoder`` work naturally; unknown names
-        are silently skipped, so a freeze list mentioning modules absent on a
-        given architecture (a module that exists only on another backbone)
-        is harmless.
+        Uses ``nn.Module.get_submodule()`` so dotted paths like ``video_backbone.text_encoder`` work.
+
+        Args:
+            names: list[str] dotted submodule paths (``training.freeze``); each must exist on this model.
+
+        Returns:
+            list[str], ``names`` (all frozen). ValueError naming ``training.freeze`` and the path when one is not
+            a submodule.
         """
-        frozen = []
         for name in names:
             try:
                 module = self.get_submodule(name)
-            except (AttributeError, KeyError):
-                module = None
-            if module is not None:
-                module.requires_grad_(False)
-                # Set eval mode on the frozen subtree. Use modules() instead
-                # of .eval() to avoid infinite recursion when a submodule has
-                # self-referential aliases (e.g. HF model.model = self).
-                for sub in module.modules():
-                    sub.training = False
-                _wrap_forward_in_no_grad(module)
-                frozen.append(name)
-        return frozen
+            except AttributeError as err:
+                raise ValueError(f"training.freeze: {name!r} is not a submodule of {type(self).__name__}") from err
+            module.requires_grad_(False)
+            # Set eval mode on the frozen subtree. Use modules() instead
+            # of .eval() to avoid infinite recursion when a submodule has
+            # self-referential aliases (e.g. HF model.model = self).
+            for sub in module.modules():
+                sub.training = False
+            _wrap_forward_in_no_grad(module)
+        return list(names)
 
     def get_trainable_modules(self, freeze_list: list[str] = ()) -> dict[str, nn.Module]:
         """Return top-level trainable sub-modules.
@@ -517,7 +518,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
             loss_video, loss_action (weighted, detached).
         """
         video_backbone = self.video_backbone
-        action_scheduler = self.action_backbone.scheduler
+        video_scheduler, action_scheduler = self.video_scheduler, self.action_scheduler
         lambda_video, lambda_action = self.train_options.lambda_video, self.train_options.lambda_action
         _dtype = self.dtype
         _device = self.device
@@ -527,16 +528,16 @@ class BaseWAMArchitecture(ABC, nn.Module):
         B = clean_latents.shape[0]
 
         # --- Sample video timesteps ---
-        # The scheduler owns the training noise law: the grid draw (Wan / cosmos3) or a native one (GE / flux).
-        video_timesteps, video_sigmas, video_loss_weights = video_backbone.scheduler.sample_train(
+        # The scheduler owns the training noise law (yaml train_timestep): grid draw or a family's native one.
+        video_timesteps, video_sigmas, video_loss_weights = video_scheduler.sample_train(
             B, device=_device, dtype=_dtype
         )
 
         # --- Add video noise (flow-matching: linear interp + velocity target) ---
         video_noise = torch.randn_like(clean_latents)
         sigma_bc = video_sigmas.view(B, 1, 1, 1, 1)
-        noisy_latents = (1 - sigma_bc) * clean_latents + sigma_bc * video_noise
-        video_target = video_noise - clean_latents
+        noisy_latents = video_scheduler.add_noise(clean_latents, video_noise, sigma_bc)
+        video_target = video_scheduler.training_target(clean_latents, video_noise)
 
         # The clean prefix (the layout's history latents) stays clean.
         n_clean = int(self.layout.num_hist_latents)
@@ -667,8 +668,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
         proprio: Tensor,
         proprio_mask: Tensor,
         inactive_action_dims: Optional[Tensor] = None,
-        cfg_scale: float = 1.0,
-        cfg_merge: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """Joint video-action Euler loop over a ``(t_video, t_action)`` schedule (``sample``: deploy and vis).
 
@@ -679,14 +678,12 @@ class BaseWAMArchitecture(ABC, nn.Module):
             hist_latents: (B, C, num_hist_latents, h, w) clean prefix, re-imposed after every video step.
             text: TextCondition. proprio: (B, H, D) normalized proprio. proprio_mask: (B, H, D) bool.
             inactive_action_dims: (A,) index of unified-action dims kept on the analytic noise path, or None.
-            cfg_scale / cfg_merge: classifier-free guidance (scale 1 = off).
 
         Returns: (latents (B, C, T, h, w) denoised video latents, actions (B, K, A) in normalized space).
         """
         from tqdm import tqdm
 
         dtype, device = self.dtype, self.device
-        cfg_scale_f = float(cfg_scale)
         inactive_action_noise = None
 
         num_train_ts_v = float(self.video_scheduler.num_train_timesteps)
@@ -714,34 +711,21 @@ class BaseWAMArchitecture(ABC, nn.Module):
             v_timestep = torch.tensor([t_v], dtype=dtype, device=device)
             a_timestep = torch.tensor([t_a], dtype=dtype, device=device)
 
-            if cfg_scale_f > 1.0:
-                # _forward_with_cfg runs its own cudagraph_mark_step_begin()
-                # before each inner forward (1 for cfg_merge, 2 for sequential).
-                noise_pred, action_noise_pred = self._forward_with_cfg(
-                    action_latents=action_latents,
-                    a_timestep=a_timestep,
-                    inputs_shared={"latents": latents, "text": text, "proprio": proprio},
-                    v_timestep=v_timestep,
-                    cfg_scale=cfg_scale_f,
-                    cfg_merge=bool(cfg_merge),
-                )
-            else:
-                torch.compiler.cudagraph_mark_step_begin()
-                # Inference never checkpoints (it would also bypass the compiled loops).
-                noise_pred, action_noise_pred = self.forward(
-                    action_latents,
-                    a_timestep,
-                    latents=latents,
-                    timestep=v_timestep,
-                    text=text,
-                    proprio=proprio,
-                    proprio_mask=proprio_mask,
-                    use_gradient_checkpointing=False,
-                    use_gradient_checkpointing_offload=False,
-                )
+            # Inference never checkpoints.
+            noise_pred, action_noise_pred = self.forward(
+                action_latents,
+                a_timestep,
+                latents=latents,
+                timestep=v_timestep,
+                text=text,
+                proprio=proprio,
+                proprio_mask=proprio_mask,
+                use_gradient_checkpointing=False,
+                use_gradient_checkpointing_offload=False,
+            )
 
             if video_stepping:
-                new_latents = latents + noise_pred * (sigma_v_next - sigma_v)
+                new_latents = self.video_scheduler.step(noise_pred, sigma_v, sigma_v_next, latents)
                 new_latents = new_latents.clone()
                 new_latents[:, :, : hist_latents.shape[2]] = hist_latents
                 latents = new_latents
@@ -752,7 +736,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
                     if sigma_a_f <= 0.0:
                         raise ValueError("Cannot initialize inactive action noise from a non-positive sigma.")
                     inactive_action_noise = action_latents[..., inactive_action_dims].detach().clone() / sigma_a_f
-                action_latents = self.action_scheduler.flow_step(
+                action_latents = self.action_scheduler.step(
                     action_noise_pred, sigma_a, sigma_a_next, action_latents
                 )
                 if inactive_action_dims is not None:
@@ -831,87 +815,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
         hist_latents, text = self.video_backbone.preprocess_condition(history, prompts, self.layout)
         return self.sample(hist_latents, text, proprio, schedule, seed=seed, active_action_mask=active_action_mask)
 
-    # --- §15: Classifier-Free Guidance helpers (inference-time) ---
-
-    def _forward_with_cfg(
-        self,
-        *,
-        action_latents: Optional[Tensor],
-        a_timestep: Optional[Tensor],
-        inputs_shared: dict,
-        v_timestep: Tensor,
-        cfg_scale: float,
-        cfg_merge: bool,
-    ) -> tuple:
-        """Run cond + uncond forwards and combine via ``pred = uncond + s·(cond - uncond)``.
-
-        Two paths gated on ``cfg_merge``:
-
-        - ``cfg_merge=False`` (default): two sequential forwards. The cond
-          branch consumes ``inputs_shared['context']`` unchanged; the uncond
-          branch temporarily swaps in ``inputs_shared['uncond_context']`` and
-          swaps back via ``try/finally``.
-        - ``cfg_merge=True``: stack ``[uncond, cond]`` along batch axis 0 for
-          all batch-shaped tensors in ``inputs_shared`` plus ``action_latents``
-          and the timesteps, then chunk the merged output. One forward, ~B=2
-          memory peak.
-
-        Action and video streams share the same text context, so a single
-        ``cfg_scale`` is applied to both ``noise_pred`` and (when present)
-        ``action_noise_pred``.
-        """
-        uncond_context = inputs_shared.get("uncond_context")
-        if not isinstance(uncond_context, Tensor):
-            raise RuntimeError(
-                "CFG combine requested but `inputs_shared['uncond_context']` is missing "
-                "or not a tensor; no video backbone produces an unconditional context (see followups)."
-            )
-
-        if cfg_merge:
-            expanded, exp_al, exp_vt, exp_at = _expand_inputs_for_cfg(
-                inputs_shared,
-                action_latents=action_latents,
-                v_timestep=v_timestep,
-                a_timestep=a_timestep,
-            )
-            torch.compiler.cudagraph_mark_step_begin()
-            merged_noise, merged_action = self.forward(exp_al, exp_at, **expanded, timestep=exp_vt)
-            uncond_noise, cond_noise = merged_noise.chunk(2, dim=0)
-            noise_pred = _combine_cfg(uncond_noise, cond_noise, cfg_scale)
-            if isinstance(merged_action, Tensor):
-                uncond_action, cond_action = merged_action.chunk(2, dim=0)
-                action_noise_pred = _combine_cfg(uncond_action, cond_action, cfg_scale)
-            else:
-                action_noise_pred = None
-            return noise_pred, action_noise_pred
-
-        # Sequential path: cond → uncond → combine. Mark before each forward
-        # so CUDA Graph tree sees both as distinct dispatch sites.
-        torch.compiler.cudagraph_mark_step_begin()
-        cond_noise, cond_action = self.forward(action_latents, a_timestep, **inputs_shared, timestep=v_timestep)
-        saved_context = inputs_shared["context"]
-        inputs_shared["context"] = uncond_context
-        try:
-            torch.compiler.cudagraph_mark_step_begin()
-            uncond_noise, uncond_action = self.forward(action_latents, a_timestep, **inputs_shared, timestep=v_timestep)
-        finally:
-            inputs_shared["context"] = saved_context
-
-        noise_pred = _combine_cfg(uncond_noise, cond_noise, cfg_scale)
-        if isinstance(cond_action, Tensor) and isinstance(uncond_action, Tensor):
-            action_noise_pred = _combine_cfg(uncond_action, cond_action, cfg_scale)
-        else:
-            # One side dropped the action stream; keep cond as-is.
-            action_noise_pred = cond_action
-        return noise_pred, action_noise_pred
-
-    # --- Deploy helpers (combine action module + video backbone) ---
-
-    def apply_compile_optimizations(self, compile_cfg) -> None:
-        """Apply architecture-specific deploy-time compile optimizations."""
-        _ = compile_enabled(compile_cfg, default=False, strict=True)
-        self.video_backbone.apply_compile_optimizations(compile_cfg)
-
     @abstractmethod
     def forward(
         self,
@@ -946,60 +849,3 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 inference: False).
         """
         ...
-
-
-# ----------------------------------------------------------------------
-# §15 — Classifier-Free Guidance helpers (module-level so they stay
-# stateless / testable without a full architecture instance).
-# ----------------------------------------------------------------------
-
-
-def _combine_cfg(uncond: Tensor, cond: Tensor, scale: float) -> Tensor:
-    """Linear CFG combine: ``uncond + scale·(cond - uncond)``.
-
-    Matches upstream Cosmos formula in
-    ``cosmos_predict2/_src/predict2/models/text2world_model_rectified_flow.py:484-488``.
-    """
-    return uncond + float(scale) * (cond - uncond)
-
-
-# Keys in ``inputs_shared`` that carry a leading batch axis and therefore
-# need duplication when stacking ``[uncond, cond]`` for cfg_merge=True.
-_CFG_BATCH_AXIS_KEYS: tuple = (
-    "latents",
-    "proprio",
-)
-
-
-def _expand_inputs_for_cfg(
-    inputs_shared: dict,
-    *,
-    action_latents: Optional[Tensor],
-    v_timestep: Tensor,
-    a_timestep: Optional[Tensor],
-) -> Tuple[dict, Optional[Tensor], Tensor, Optional[Tensor]]:
-    """Stack ``[uncond, cond]`` along batch axis for the cfg_merge=True path.
-
-    Returns ``(expanded_inputs_shared, action_latents, v_timestep, a_timestep)``
-    where the inputs_shared copy has:
-
-    - ``context`` replaced by ``cat([uncond_context, cond_context], dim=0)``
-    - ``uncond_context`` cleared (downstream forwards don't read it)
-    - every other batch-axis tensor in ``_CFG_BATCH_AXIS_KEYS`` duplicated
-
-    Scalar / None entries are passed through unchanged.
-    """
-    uncond_context = inputs_shared["uncond_context"]
-    cond_context = inputs_shared["context"]
-    expanded = dict(inputs_shared)
-    expanded["context"] = torch.cat([uncond_context, cond_context], dim=0)
-    expanded["uncond_context"] = None
-
-    for key in _CFG_BATCH_AXIS_KEYS:
-        v = expanded.get(key)
-        if isinstance(v, Tensor):
-            expanded[key] = torch.cat([v, v], dim=0)
-    al = torch.cat([action_latents, action_latents], dim=0) if isinstance(action_latents, Tensor) else None
-    vt = torch.cat([v_timestep, v_timestep], dim=0) if isinstance(v_timestep, Tensor) else v_timestep
-    at = torch.cat([a_timestep, a_timestep], dim=0) if isinstance(a_timestep, Tensor) else None
-    return expanded, al, vt, at

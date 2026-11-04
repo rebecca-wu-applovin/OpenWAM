@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 from openwam.deploy.history_buffer import ObsHistoryBuffer
 
@@ -90,19 +91,16 @@ class InferenceEngine:
         """
         from openwam.dataloader.utils.yam_sharpa_repr import raw_dim
         from openwam.deploy.model_loader import DTYPES, load_architecture, load_norm_stats
-        from openwam.model.denoise_schedule import make_schedule
+        from openwam.model.denoise_schedule import make_schedule, normalize_denoise_config
 
         dl, dep = cfg.dataloader, cfg.deploy
-        arch = load_architecture(cfg.model, cfg.common.layout, dep.ckpt.dir, dep.ckpt.name,
+        arch = load_architecture(OmegaConf.merge(cfg.common, cfg.model), dep.ckpt.dir, dep.ckpt.name,
                                  dtype=DTYPES[str(cfg.training.mixed_precision)], device=dep.server.device)
         state_stats, action_stats = load_norm_stats(dl, dep.ckpt.dir)
-        # Both streams' α-shifts come from the checkpoint's backbones; the sampler config sets the trajectory.
+        # Both streams' α-shifts come from the checkpoint's schedulers; the sampler config sets the trajectory.
         sm = dep.sampler
-        schedule = make_schedule(
-            sm.denoise_mode, video_scheduler=arch.video_scheduler, action_scheduler=arch.action_scheduler,
-            num_steps=sm.denoise_steps, shift=arch.action_backbone.shift_action,
-            shift_video=arch.video_backbone.shift_video, lead=sm.lead_modality, alpha=sm.variance_shift_alpha,
-            offset=sm.linear_offset)
+        schedule = make_schedule(normalize_denoise_config(sm), arch.video_scheduler, arch.action_scheduler,
+                                 int(sm.denoise_steps))
         mode = str(dl.action_mode)
         spec = EngineSpec(
             ckpt=f"{dep.ckpt.dir}/{dep.ckpt.name}", action_mode=mode, action_dim=raw_dim(mode),

@@ -40,9 +40,9 @@ from einops import rearrange
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 
+from openwam.model.common.flow_scheduler import FlowScheduler
 from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
 from openwam.model.video_backbone.common.weights import load_strict
-from openwam.model.video_backbone.ge.scheduler import GEFlowScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +76,11 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         tokenizer,
         text_encoder,
         assets_dir: str,
-        shift_video: float = 1.0,
-        n_view: int = 2,
-        text_max_length: int = 128,
-        vae_sample: bool = True,
+        shift_video: float,
+        train_timestep: DictConfig,
+        n_view: int,
+        text_max_length: int,
+        vae_sample: bool,
     ) -> None:
         """Wrap built modules; use :meth:`from_pretrained` / :meth:`from_checkpoint_dir` instead.
 
@@ -87,7 +88,7 @@ class GEBaseFastVideoBackbone(VideoBackbone):
             dit: LTXVideoTransformer3DModel. vae: AutoencoderKLLTXVideo. tokenizer: T5Tokenizer. text_encoder: T5.
             assets_dir: str, LTX-Video layout dir the VAE / T5 configs and tokenizer were read from
                 (``ltx_path`` or ``<ckpt>/ltx``); save_deploy_assets copies from it.
-            shift_video: float, deploy-grid α-shift (GE trains on the shift-1 grid).
+            shift_video: float, deploy-grid α-shift. train_timestep: DictConfig, the training law (ge_native).
             n_view: int, camera tiles stacked in the canvas. text_max_length: int, T5 tokens.
             vae_sample: bool, sample the VAE posterior.
         """
@@ -106,11 +107,9 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         self._n_view = int(n_view)
         self._text_max_length = int(text_max_length)
         self._vae_sample = bool(vae_sample)
-        # GE trains with diffusers' default FlowMatchEulerDiscreteScheduler (shift 1): with the yaml's
-        # shift_video 1.0 the adapter's 1000-step grid sigma_i = 1 - i/1000 is the same grid (used by deploy);
-        # its sample_train is GE's native training-noise draw.
-        self._shift_video = float(shift_video)
-        self._scheduler = GEFlowScheduler(shift_video=self._shift_video)
+        # GE trains with diffusers' default FlowMatchEulerDiscreteScheduler (shift 1), the yaml's ge_native law;
+        # with shift_video 1.0 the deploy grid is that same shift-1 grid.
+        self._scheduler = FlowScheduler(shift=shift_video, train_timestep=train_timestep)
         self._temporal_compression = _GE_TEMPORAL_COMPRESSION
         self._causal_temporal = True
         # Text slot read by encode_text: the online T5 here, a PromptCache after build_text_cache.
@@ -118,12 +117,13 @@ class GEBaseFastVideoBackbone(VideoBackbone):
         self._mask_cache: dict = {}
 
     @classmethod
-    def from_pretrained(cls, cfg: DictConfig) -> "GEBaseFastVideoBackbone":
+    def from_pretrained(cls, cfg: DictConfig, assets: DictConfig) -> "GEBaseFastVideoBackbone":
         """Build from the pretrained GE / LTX weights.
 
         Args:
-            cfg: ``cfg.model.video_backbone``: ``dit`` geometry, ``model_path`` + ``weights_file`` (GE DiT),
-                ``ltx_path`` (LTX-Video dir: vae/, text_encoder/, tokenizer/) and the scalar knobs.
+            cfg: ``cfg.model.video_backbone``: ``dit`` geometry and the scalar knobs.
+            assets: ``cfg.assets.video_backbone``: ``model_path`` + ``weights_file`` (GE DiT), ``ltx_path``
+                (LTX-Video dir: vae/, text_encoder/, tokenizer/).
 
         Returns:
             GEBaseFastVideoBackbone on CPU in bf16. Raises ValueError when the DiT weights do not match the
@@ -135,10 +135,10 @@ class GEBaseFastVideoBackbone(VideoBackbone):
 
         from openwam.model.video_backbone.ge.dit import LTXVideoTransformer3DModel
 
-        ltx_path = str(cfg.ltx_path)
+        ltx_path = str(assets.ltx_path)
         # Real (random) init before the load: its RNG draws are part of the training seed stream.
         dit = LTXVideoTransformer3DModel(**OmegaConf.to_container(cfg.dit))
-        state = load_file(os.path.join(str(cfg.model_path), str(cfg.weights_file)))
+        state = load_file(os.path.join(str(assets.model_path), str(assets.weights_file)))
         try:
             load_strict(dit, state, assign=False)  # 718 tensors, no action expert
         except ValueError as err:
@@ -204,6 +204,7 @@ class GEBaseFastVideoBackbone(VideoBackbone):
             text_encoder=text_encoder,
             assets_dir=assets_dir,
             shift_video=float(cfg.shift_video),
+            train_timestep=cfg.train_timestep,
             n_view=int(cfg.n_view),
             text_max_length=int(cfg.text_max_length),
             vae_sample=bool(cfg.vae_sample),
@@ -237,11 +238,6 @@ class GEBaseFastVideoBackbone(VideoBackbone):
     def text_dim(self) -> int:
         """T5-XXL hidden width (the context the framework appends proprio to)."""
         return int(self.dit.config.caption_channels)
-
-    @property
-    def scheduler(self):
-        """GEFlowScheduler: the shared grid for deploy, GE's native training-noise law for ``sample_train``."""
-        return self._scheduler
 
     # ================================================================
     # Video and text IO

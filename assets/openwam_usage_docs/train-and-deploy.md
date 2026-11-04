@@ -25,10 +25,8 @@ architecture:
   framework: dual_system
   variant: joint_self_attn               # joint_self_attn | joint_cross_attn
 
-  # Token geometry and inputs
-  action_dim: 80                         # action-token width; match dataloader output
+  # Inputs (the action / proprio widths are common.action_dim / common.state_dim in configs/train.yaml)
   use_proprioception: true               # require a proprio field in each sample
-  state_dim: 80                          # proprioception width
 
   # Attention visibility
   attention_mask_mode: mutual            # only mutual is implemented (the other three values are rejected)
@@ -36,13 +34,16 @@ architecture:
   history_encoding: per_frame            # past history frames: per_frame | clip
 
   # Bridge and memory controls
-  bridge_layers: null                    # explicit layers; null uses bridge_interval
-  bridge_interval: 1                     # use every layer when set to 1
-  mot_checkpoint_mixed_attn: true        # checkpoint mixed attention to reduce GPU memory
+  bridge_interval: 1                     # bridge layers = range(0, video geometry.num_layers, interval); 1 = every layer
 
   # Variant-specific options
   detach_bridge: false                   # joint_cross_attn only
 ~~~
+
+Values several components share live in `common:` of `configs/train.yaml` (`action_dim`, `state_dim`: 48 for
+`fingertips_*`, 80 for `unify_*`; the dataset checks them against `dataloader.action_mode`). Each component gets
+`OmegaConf.merge(cfg.common, cfg.<component>)`. `training.mot_checkpoint_mixed_attn` checkpoints the mixed
+attention to reduce GPU memory.
 
 Implementations and registries are in [openwam/model/architectures/](../../openwam/model/architectures/). The model file composes the video and action groups through its `defaults` list.
 
@@ -60,16 +61,21 @@ Edit the selected group file, for example [wan22_ti2v_5b.yaml](../../configs/mod
 
 ~~~yaml
 # configs/model/video_backbone/<selected_group>.yaml
-# Identity and weights
-name: wan22_ti2v_5b                 # registry key; use the selected backbone name
-model_path: /path/to/video_backbone_checkpoint  # weights or bundle root
-
-# Scheduler
-shift_video: 5.0                    # flow-matching scheduler shift
-# Cosmos3 additionally defines fps, prompt_duration_template, and freeze_und.
+# @package _global_          (the file writes model.video_backbone, its assets and its own training switches)
+model:
+  video_backbone:                       # what the model is (compared on finetune)
+    name: wan22_ti2v_5b                 # registry key; use the selected backbone name
+    shift_video: 5.0                    # flow-matching scheduler shift
+    # Cosmos3 additionally defines fps, prompt_duration_template, and freeze_und.
+assets:
+  video_backbone:                       # where the upstream files are (not compared; finetune / deploy never read it)
+    model_path: /path/to/video_backbone_checkpoint  # weights or bundle root
+training:
+  freeze: [video_backbone.text_encoder, video_backbone.vae]  # every path must exist on the model
+  text_cache: true                      # cosmos3: false (true raises)
 ~~~
 
-The selected backbone supplies video geometry to the architecture and action backbone. Keep `model_path` consistent with the assets in [Assets Preparation](../../README.md#assets-preparation).
+The selected backbone supplies video geometry to the architecture and action backbone. Keep `assets.video_backbone.model_path` consistent with the assets in [Assets Preparation](../../README.md#assets-preparation).
 
 ### Action backbone
 
@@ -81,10 +87,16 @@ DualSystem constructs [separate_action_dit.yaml](../../configs/model/action_back
 dim: 1024                        # ActionDiT hidden width
 ffn_dim: 4096                    # ActionDiT feed-forward width
 shift_action: 5.0                # action scheduler shift
-# num_layers, video_dim, num_heads, and attn_head_dim resolve from the video backbone
+freq_dim: 256                    # sinusoidal timestep embedding width
+max_action_len: 1024             # learned action position table size
+eps: 1.0e-06                     # norm epsilon
+num_heads: ${..video_backbone.geometry.num_heads}   # attention geometry and the bridge / context widths
+head_dim: ${..video_backbone.geometry.head_dim}     #   come from the video backbone yaml's geometry block
+video_dim: ${..video_backbone.geometry.dim}
+text_dim: ${..video_backbone.geometry.text_dim}
 ~~~
 
-The only group is `model/action_backbone=separate_action_dit`; keep its output aligned with `architecture.action_dim` and the dataloader.
+The only group is `model/action_backbone=separate_action_dit`; keep its output aligned with `common.action_dim` and the dataloader.
 
 ### Dataloader selection and loading
 
@@ -109,7 +121,7 @@ With a pretrained video backbone, a fresh run loads the selected components and 
 ~~~bash
 # Model and dataloader
 bash scripts/train.sh model=dual_system dataloader=yam_sharpa \
-  dataloader.dataset_dir=<dataset_dir_path> \
+  dataloader.sources.<source_name>.dataset_dir=<dataset_dir_path> \
   training.output_path=<output_dir_path> \
   training.batch_size=1 \
   training.max_steps=20
@@ -129,6 +141,10 @@ training:
 ~~~
 
 The two paths are mutually exclusive. Fine-tuning starts at step 0 in a new output directory; resume restores optimizer, scheduler, RNG, and model state in the original run.
+
+A finetune requires the launch's `model` + `common` blocks to equal the checkpoint's: any difference raises one error listing every differing key (nothing is merged). The upstream weight paths live in `assets` and are not compared; `training` and `dataloader` may differ.
+
+A resume runs the run's own saved `config.yaml`: any other difference in the launch's config raises. Only the resume-location keys (`training.resume_ckpt_path` / `output_path` / `run_dir_name`) come from the launch. `assets` is compared too (a resume must not change any setting).
 
 ### Memory, precision, and distributed launch
 

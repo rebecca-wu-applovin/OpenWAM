@@ -3,9 +3,8 @@
 Pure compute + IO — no GPU, no real Accelerator.
 """
 
-import types
-
 import torch
+from omegaconf import OmegaConf
 
 from openwam.train.utils.training_utils import (
     build_cosine_scheduler,
@@ -45,14 +44,14 @@ def test_reduce_step_metrics_num_processes_one_uses_fast_path():
 
 
 def _cosine_cfg(lr=1e-4, warmup_ratio=0.1, lr_min_ratio=0.01):
-    training = types.SimpleNamespace(learning_rate=lr, warmup_ratio=warmup_ratio, lr_min_ratio=lr_min_ratio)
-    return types.SimpleNamespace(training=training)
+    """The ``cfg.training`` slice build_cosine_scheduler reads. Returns: DictConfig."""
+    return OmegaConf.create({"learning_rate": lr, "warmup_ratio": warmup_ratio, "lr_min_ratio": lr_min_ratio})
 
 
 def _build(total_opt_steps, num_processes, lr=1e-4, warmup_ratio=0.1, lr_min_ratio=0.01):
     opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=lr)
     cfg = _cosine_cfg(lr=lr, warmup_ratio=warmup_ratio, lr_min_ratio=lr_min_ratio)
-    return build_cosine_scheduler(opt, total_opt_steps=total_opt_steps, cfg=cfg, num_processes=num_processes)
+    return build_cosine_scheduler(opt, total_opt_steps=total_opt_steps, training_cfg=cfg, num_processes=num_processes)
 
 
 def test_cosine_scheduler_scales_horizons_by_num_processes():

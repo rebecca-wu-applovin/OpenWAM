@@ -5,6 +5,7 @@
 #   ACTION_MODE=unify_abs bash run_dual.sh            # action-repr ablation arm (dim set automatically)
 #   BACKBONE=cosmos3_nano bash run_dual.sh            # video-backbone ablation arm: wan22_ti2v_5b | cosmos3_edge | cosmos3_nano
 #   bash run_dual.sh training.save_full_states_for_resume=true   # extra Hydra overrides are appended
+#   bash run_dual.sh training.resume_ckpt_path=outputs/openwam_checkpoints/<index>_<run_name>   # resume (same env vars)
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./base.sh   # next_run_index
@@ -37,19 +38,32 @@ case "${BACKBONE}" in
 esac
 
 # <index>_<run_name> (index from base.sh, taken once per launch) is both the wandb run name and the
-# run dir outputs/openwam_checkpoints/<index>_<run_name>/. A resume (training.resume_ckpt_path=...)
-# reuses its old dir; the trainer ignores run_dir_name then.
-WANDB_RUN_NAME="$(next_run_index)_${WANDB_RUN_NAME}"
+# run dir outputs/openwam_checkpoints/<index>_<run_name>/.
+RESUME_PATH=""
+for arg in "$@"; do
+    [[ "${arg}" == training.resume_ckpt_path=* ]] && RESUME_PATH="${arg#training.resume_ckpt_path=}"
+done
+if [[ -z "${RESUME_PATH}" ]]; then
+    WANDB_RUN_NAME="$(next_run_index)_${WANDB_RUN_NAME}"
+    RUN_DIR_OVERRIDE=(training.run_dir_name="${WANDB_RUN_NAME}")
+else
+    # Resuming (run dir, or a .safetensors inside it): a resume must launch the run's saved config, so no new
+    # index and the wandb name is the run dir's name again; run_dir_name / output_path stay at their defaults.
+    RUN_DIR="${RESUME_PATH%/}"
+    [[ "${RUN_DIR}" == *.safetensors ]] && RUN_DIR="$(dirname "${RUN_DIR}")"
+    WANDB_RUN_NAME="${RUN_DIR##*/}"
+    RUN_DIR_OVERRIDE=()
+fi
 echo "[run_dual] run ${WANDB_RUN_NAME}"
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}" bash scripts/train.sh dataloader=yam_sharpa \
   dataloader.action_mode="${ACTION_MODE}" \
   model=dual_system model/video_backbone="${BACKBONE}" \
   model.architecture.variant=joint_self_attn model.architecture.attention_mask_mode=mutual \
-  model.architecture.action_dim="${ACTION_DIM}" model.architecture.state_dim="${ACTION_DIM}" \
+  common.action_dim="${ACTION_DIM}" common.state_dim="${ACTION_DIM}" \
   project.wandb.project="${WANDB_PROJECT}" \
   project.wandb.group="${WANDB_GROUP}" \
   project.wandb.run_name="${WANDB_RUN_NAME}" \
-  training.run_dir_name="${WANDB_RUN_NAME}" \
+  "${RUN_DIR_OVERRIDE[@]}" \
   "${BACKBONE_EXTRA[@]}" \
   "$@"

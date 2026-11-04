@@ -71,7 +71,7 @@ def check_deploy(cfg: DictConfig) -> None:
     if dl.normalize_mode in (None, "none", "null"):
         raise ValueError("deploy needs a normalized checkpoint (dataloader.normalize_mode)")
     # Older checkpoints were trained without fps: required, never defaulted.
-    if OmegaConf.select(dl, "fps") is None:
+    if "fps" not in dl or dl.fps is None:
         raise ValueError(f"{Path(dep.ckpt.dir) / 'config.yaml'}: dataloader.fps is missing; deploy serves actions at "
                          "the data rate and needs it written in the checkpoint config")
     # K: one observation every K action steps, so it must fit the chunk resolve_config derived ...

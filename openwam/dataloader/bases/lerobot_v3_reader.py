@@ -52,7 +52,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from openwam.dataloader.transforms.video import VideoColorJitter, color_jitter_enabled
+from openwam.dataloader.transforms.video import VideoColorJitter
 from openwam.dataloader.utils.eef import (
     EEF_DIM,
     build_action_mask_2d,
@@ -71,10 +71,6 @@ from openwam.dataloader.utils.unify_action import UNIFY_DIM, map_to_unify, parse
 logger = logging.getLogger(__name__)
 
 _GETITEM_MAX_RETRIES = 64
-
-# Sentinel so an explicit ``normalize_mode=None`` (disable normalization) is
-# distinguishable from "not passed" (fall back to the subclass default).
-_NORMALIZE_MODE_UNSET = object()
 
 
 def _read_data_table(path: str, columns: Tuple[str, ...]):
@@ -127,52 +123,53 @@ class LeRobotV3Reader:
     STATS_FILENAME: ClassVar[Optional[str]] = None
     STATS_DIM: ClassVar[int] = EEF_DIM
     STATS_STRICT_MINMAX: ClassVar[bool] = False
-    # Default normalize_mode when the caller doesn't pass one. OXE readers
-    # override to "quantile" (their historical default); RoboCOIN/EgoDex keep
-    # None (no in-reader normalization unless a config opts in).
-    DEFAULT_NORMALIZE_MODE: ClassVar[Optional[str]] = None
 
     def __init__(
         self,
         dataset_dir: str,
         *,
-        num_frames: int = 33,
-        window_stride: int = 1,
-        height: int = 384,
-        width: int = 320,
-        split: str = "train",
-        multiview: bool = False,
-        normalize_mode: Any = _NORMALIZE_MODE_UNSET,
-        dataset_id: Optional[str] = None,
-        target_camera: Optional[str] = None,
-        camera_layout: Optional[List[str]] = None,
-        # Unified action space. unify_action=True scatters this reader's raw
-        # ACTION_DIM-wide action/proprio into a UNIFY_DIM-wide vector and marks
-        # only the mapped dims valid. unify_action_map is the yaml spec (see
-        # openwam.dataloader.utils.unify_action); None + unify_action=True maps
-        # the raw dims in order (0..raw_dim-1). The unified width is the global
-        # UNIFY_DIM constant (not per-dataset configurable).
-        unify_action: bool = False,
-        unify_action_map: Optional[Any] = None,
-        unify_state_map: Optional[Any] = None,
-        # Optional load-time video color jitter, applied consistently across a
-        # clip's frames and ONLY on the train split. None / False / {} → disabled
-        # (default). Truthy → enabled; a dict overrides
-        # the per-channel strengths {brightness, contrast, saturation, hue}.
-        color_jitter: Optional[Any] = None,
-        **_unused: Any,
+        num_frames: int,
+        window_stride: int,
+        height: int,
+        width: int,
+        split: str,
+        multiview: bool,
+        normalize_mode: Optional[str],
+        camera_layout: Optional[List[str]],
+        dataset_id: str,
+        target_camera: Optional[str],
+        unify_action: bool,
+        unify_action_map: Optional[Any],
+        unify_state_map: Optional[Any],
+        color_jitter: Any,
     ):
+        """Every argument is required; the caller states each value (None where the feature is off).
+
+        Args:
+            dataset_dir: str, LeRobot v3 root. num_frames / window_stride / height / width: ints, clip geometry.
+            split: str, ``train`` / ``val``. multiview: bool. normalize_mode: str or None (no in-reader norm).
+            camera_layout: list[str] camera keys top-to-bottom, or None (the reader's default cameras).
+            dataset_id: str, source name used in logs and errors.
+            target_camera: str camera key to read alone, or None (``camera_layout`` / defaults pick cameras).
+            unify_action: bool, scatter the raw ACTION_DIM-wide action / proprio into the global UNIFY_DIM-wide
+                vector and mark only the mapped dims valid.
+            unify_action_map: unify spec (``openwam.dataloader.utils.unify_action``), or None = raw dims in order.
+            unify_state_map: the proprio's unify spec, or None = same as ``unify_action_map``.
+            color_jitter: DictConfig ``{enabled, brightness, contrast, saturation, hue}``, applied consistently
+                across a clip's frames and only on the train split.
+
+        Returns:
+            None; the reader is ready for ``sample(idx, rng)``.
+        """
         self._dataset_dir = Path(dataset_dir)
-        self._dataset_id = dataset_id or self._dataset_dir.name
+        self._dataset_id = str(dataset_id)
         self._num_frames = int(num_frames)
         self._window_stride = max(1, int(window_stride))
         self._height = int(height)
         self._width = int(width)
         self._split = split
         self._multiview = bool(multiview)
-        self._normalize_mode = (
-            self.DEFAULT_NORMALIZE_MODE if normalize_mode is _NORMALIZE_MODE_UNSET else normalize_mode
-        )
+        self._normalize_mode = normalize_mode  # null / "none" = no in-reader normalization
         self._target_camera = target_camera
         self._camera_layout_param = list(camera_layout) if camera_layout else None
 
@@ -182,13 +179,12 @@ class LeRobotV3Reader:
         # the config for any split; _select_augmentations turns it on for train
         # only, so val / eval / disabled keeps video byte-identical.
         self._train_color_jitter = None
-        if color_jitter_enabled(color_jitter):
-            cj_get = color_jitter.get if hasattr(color_jitter, "get") else (lambda k, d: d)
+        if color_jitter.enabled:
             self._train_color_jitter = VideoColorJitter(
-                brightness=float(cj_get("brightness", 0.2)),
-                contrast=float(cj_get("contrast", 0.2)),
-                saturation=float(cj_get("saturation", 0.2)),
-                hue=float(cj_get("hue", 0.0)),
+                brightness=float(color_jitter.brightness),
+                contrast=float(color_jitter.contrast),
+                saturation=float(color_jitter.saturation),
+                hue=float(color_jitter.hue),
             )
 
         # ── unified action space ──────────────────────────────────────────

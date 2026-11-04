@@ -3,8 +3,8 @@
 Regression (21_longlive_audit, run 89): a resume recomposed ``training`` / ``dataloader`` / ``project``
 from the current code + CLI and only warned on ``model`` differences, so a changed default or a new
 override silently changed a running run. The shapes below are run 89's: on resume the launcher drops
-``output_path`` / ``run_dir_name`` and adds ``resume_ckpt_path``; only the saved file has the
-``components`` / ``tokenizer`` specs and resolve_config's ``common.layout``.
+``output_path`` / ``run_dir_name`` and adds ``resume_ckpt_path``; only the saved file has resolve_config's
+``common.layout`` (run 89's ``components`` / ``tokenizer`` specs are no longer written by any code).
 """
 
 import pytest
@@ -14,12 +14,7 @@ from openwam.train.utils import ckpt_model_loader as cml
 
 SAVED = {
     "model": {
-        "video_backbone": {
-            "name": "longlive2_robot_s",
-            "text_max_length": 128,
-            "components": [{"attr": "dit", "model_class": "x.WanModel", "extra_kwargs": {"dim": 3072}}],
-            "tokenizer": {"class": "x.Tok", "attr": "tokenizer", "subdir": "tokenizer/google/umt5-xxl"},
-        },
+        "video_backbone": {"name": "longlive2_robot_s", "text_max_length": 128},
         "architecture": {"attention_mask_mode": "mutual"},
     },
     "common": {"layout": {"num_history_latents": 5, "num_future_latents": 2}},  # written by resolve_config
@@ -32,6 +27,7 @@ SAVED = {
     },
     "dataloader": {"action_mode": "fingertips_rel", "stats": "/n/yam_sharpa_${.action_mode}.npy"},
     "project": {"seed": None},
+    "assets": {"video_backbone": {"model_path": "/host_a/assets/Wan2.2-TI2V-5B"}},
 }
 
 
@@ -42,7 +38,7 @@ def _run_dir(tmp_path):
 
 
 def _launch(run_dir, **patch):
-    """A resume launch's composed cfg: SAVED minus the saved-only specs, resume keys as the launcher sets them.
+    """A resume launch's composed cfg: SAVED minus the saved-only layout, resume keys as the launcher sets them.
 
     Args:
         run_dir: str, value of training.resume_ckpt_path.
@@ -52,8 +48,6 @@ def _launch(run_dir, **patch):
         DictConfig in struct mode, as Hydra hands it over.
     """
     cfg = OmegaConf.create(SAVED)
-    del cfg.model.video_backbone["components"]
-    del cfg.model.video_backbone["tokenizer"]
     del cfg["common"]
     cfg.training.output_path = "outputs/openwam_checkpoints"
     cfg.training.run_dir_name = None
@@ -71,7 +65,7 @@ def test_matching_launch_runs_the_saved_config(tmp_path):
 
     assert cfg.training.resume_ckpt_path == run_dir
     assert cfg.training.batch_size == 6
-    assert cfg.model.video_backbone.components[0].attr == "dit"  # saved-only specs kept
+    assert cfg.common.layout.num_future_latents == 2  # saved-only layout kept
     # Interpolations stay unresolved, as in the saved file.
     assert OmegaConf.to_container(cfg.dataloader, resolve=False)["stats"] == "/n/yam_sharpa_${.action_mode}.npy"
 
@@ -99,7 +93,7 @@ def test_key_only_in_the_launch_raises(tmp_path):
 
 
 def test_key_only_in_the_saved_config_raises(tmp_path):
-    """Outside the saved-only specs, a key the launch lost is a difference."""
+    """Outside the saved-only layout, a key the launch lost is a difference."""
     run_dir = _run_dir(tmp_path)
     launch = _launch(run_dir)
     OmegaConf.set_struct(launch, False)
@@ -120,3 +114,12 @@ def test_trainer_guard_accepts_the_swapped_config(tmp_path):
     run_dir = _run_dir(tmp_path)
     cfg = cml.load_resume_cfg(_launch(run_dir), run_dir)
     cml.check_resume_cfg(OmegaConf.load(tmp_path / "config.yaml"), cfg, "config.yaml")
+
+
+def test_changed_assets_raise(tmp_path):
+    """assets is compared like every other block: a resume runs the run's own config, so a changed upstream
+    path means someone touched the run's setup."""
+    run_dir = _run_dir(tmp_path)
+    launch = _launch(run_dir, assets__video_backbone__model_path="/host_b/Wan2.2-TI2V-5B")
+    with pytest.raises(ValueError, match=r"assets\.video_backbone\.model_path: saved=.* launch='/host_b/"):
+        cml.load_resume_cfg(launch, run_dir)

@@ -18,8 +18,9 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _VIDEO_BACKBONES = PROJECT_ROOT / "assets" / "video_backbone_ckpt"
-# yam_sharpa LeRobot v3 sources (the training smoke tests read real episodes).
-_DATASETS = Path("/root/projects/2610_policy_model/datasets")
+# yam_sharpa LeRobot v3 sources (the training smoke tests read real episodes). Tests read the 1004 snapshot;
+# configs/dataloader/yam_sharpa.yaml keeps the training default (datasets/).
+_DATASETS = Path("/root/projects/2610_policy_model/datasets_1004")
 
 # canonical env var -> (legacy env vars, default location written by the downloader)
 _ASSETS: dict[str, tuple[tuple[str, ...], Path]] = {

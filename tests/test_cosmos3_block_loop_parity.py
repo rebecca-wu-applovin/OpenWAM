@@ -18,7 +18,7 @@ from openwam.model.video_backbone.cosmos3 import text as cosmos3_text  # noqa: E
 from openwam.model.video_backbone.cosmos3._vendor.transformer_cosmos3 import (  # noqa: E402
     Cosmos3OmniTransformer,
 )
-from tests._cosmos3_shell import unused_io_kwargs  # noqa: E402
+from tests._cosmos3_shell import edge_scalar_kwargs, unused_io_kwargs  # noqa: E402
 
 MINI = dict(
     attention_bias=False,
@@ -215,6 +215,7 @@ def _mini_backbone(net):
     return Cosmos3EdgeVideoBackbone(
         net=net,
         **unused_io_kwargs(),
+        **edge_scalar_kwargs(),
         dim=MINI["hidden_size"],
         num_layers=MINI["num_hidden_layers"],
         num_heads=MINI["num_attention_heads"],
@@ -359,12 +360,12 @@ def _tokenizer_backbone():
     vb = Cosmos3EdgeVideoBackbone(
         net=_build(MINI),
         **{**unused_io_kwargs(), "tokenizer": _VocabSafeTokenizer()},
+        **{**edge_scalar_kwargs(), "prompt_templates": False},
         dim=MINI["hidden_size"],
         num_layers=MINI["num_hidden_layers"],
         num_heads=MINI["num_attention_heads"],
         head_dim=MINI["head_dim"],
         context_dim=MINI["hidden_size"],
-        prompt_templates=False,
         clip_fps=24.0,
     ).eval()
     # ``device``/``dtype`` default to cuda/bf16 on the ABC; pin them so

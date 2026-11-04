@@ -1,8 +1,9 @@
 """``resolve_config``: every value derived from the run config, and every cross-block check, in one place.
 
 Entry points (training, resume, deploy) call :func:`resolve_config` once right after reading the config. It
-writes the latent layout into ``cfg.common.layout`` and makes that block read-only; every layer below reads the
-layout from there (passed down explicitly), never from samples, tensor shapes or key presence.
+writes the latent layout into ``cfg.common.layout`` and makes the whole config read-only (interpolations stay
+unresolved, so a saved config.yaml keeps the yaml text); every layer below reads the layout from there (passed
+down explicitly), never from samples, tensor shapes or key presence.
 
 Latent layout of one sample (H history frames, the last one is the current frame t, then F future frames):
 
@@ -13,9 +14,7 @@ Latent layout of one sample (H history frames, the last one is the current frame
 
 It also runs the cross-block checks (attention keys, proprio routing, random-history window) and validates the
 dataloader's sampling keys (``history_sampling`` / ``history_window`` / ``caption_dropout_p``) in this one place: the
-dataset reads them without re-checking. Later blocks of this
-function (the config refactor) add the remaining derived values (action_dim / state_dim) and freeze the whole
-config; for now only ``common.layout`` is frozen.
+dataset reads them without re-checking.
 """
 
 from __future__ import annotations
@@ -111,17 +110,18 @@ def _check_attention(model_cfg: DictConfig) -> None:
         NotImplementedError for a known but unverified v<->a mode.
     """
     arch = model_cfg.architecture
-    clean = arch.get("clean_attention")
+    clean = arch.clean_attention
     if clean not in CLEAN_ATTENTIONS:
         raise ValueError(f"model.architecture.clean_attention must be one of {CLEAN_ATTENTIONS}, got {clean!r}")
-    # A backbone yaml may pin it (LongLive: causal); the backbone code never reads this key.
-    required = model_cfg.video_backbone.get("required_clean_attention")
+    # Every backbone yaml states it: null = no requirement, a value pins it (LongLive: causal); the backbone
+    # code never reads this key.
+    required = model_cfg.video_backbone.required_clean_attention
     if required is not None and required != clean:
         raise ValueError(
-            f"video_backbone {model_cfg.video_backbone.get('name')!r} requires "
+            f"video_backbone {model_cfg.video_backbone.name!r} requires "
             f"model.architecture.clean_attention={required!r}, got {clean!r}"
         )
-    va = arch.get("attention_mask_mode")
+    va = arch.attention_mask_mode
     if va in UNVERIFIED_VA_MODES:
         raise NotImplementedError(
             f"attention_mask_mode={va!r} is not verified; implement it in build_frame_mask together with a "
@@ -131,34 +131,36 @@ def _check_attention(model_cfg: DictConfig) -> None:
         raise ValueError(f"unknown attention_mask_mode {va!r}; choose from {VERIFIED_VA_MODES + UNVERIFIED_VA_MODES}")
 
 
-def _check_proprio_input(model_cfg: DictConfig) -> None:
+def _check_proprio_input(model_cfg: DictConfig, state_dim: int) -> None:
     """Cross-checks of ``model.architecture.proprio_input`` against the video backbone.
 
-    A backbone yaml with its own proprio stream pins ``required_proprio_input: backbone_stream`` (flux); every
-    other backbone has no such stream, so ``backbone_stream`` would leave the video side without proprio.
+    Every backbone yaml states ``required_proprio_input``: ``backbone_stream`` for a backbone with its own
+    proprio stream (flux), ``context_token`` for every other (``backbone_stream`` would leave its video side
+    without proprio).
 
     Args:
         model_cfg: ``cfg.model`` (``architecture`` and ``video_backbone`` blocks).
+        state_dim: int proprio width, ``common.state_dim``.
 
     Returns:
         None. ValueError for an unknown value, a value the backbone does not take, or (backbone_stream) a
-        proprio stream width ``video_backbone.action_cond_dim`` that differs from ``architecture.state_dim``.
+        proprio stream width ``video_backbone.action_cond_dim`` that differs from ``state_dim``.
     """
-    arch, video_backbone = model_cfg.architecture, model_cfg.video_backbone
-    proprio_input = arch.get("proprio_input")
+    video_backbone = model_cfg.video_backbone
+    proprio_input = model_cfg.architecture.proprio_input
     if proprio_input not in PROPRIO_INPUTS:
         raise ValueError(f"model.architecture.proprio_input must be one of {PROPRIO_INPUTS}, got {proprio_input!r}")
-    supported = video_backbone.get("required_proprio_input", "context_token")
+    supported = video_backbone.required_proprio_input
     if proprio_input != supported:
         raise ValueError(
-            f"video_backbone {video_backbone.get('name')!r} takes model.architecture.proprio_input={supported!r}, "
+            f"video_backbone {video_backbone.name!r} takes model.architecture.proprio_input={supported!r}, "
             f"got {proprio_input!r}"
         )
-    if proprio_input == "backbone_stream" and int(video_backbone.action_cond_dim) != int(arch.state_dim):
+    if proprio_input == "backbone_stream" and int(video_backbone.action_cond_dim) != state_dim:
         # The backbone's proprio stream has a fixed input width.
         raise ValueError(
             f"video_backbone.action_cond_dim={video_backbone.action_cond_dim} must equal "
-            f"model.architecture.state_dim={arch.state_dim}"
+            f"common.state_dim={state_dim}"
         )
 
 
@@ -172,11 +174,8 @@ def _check_history_sampling(dl: DictConfig) -> None:
         dl: ``cfg.dataloader`` (``history_offsets``, ``history_sampling``, ``history_window``).
 
     Returns:
-        None. ValueError for a missing key, an unknown mode, or (random) a window that does not cover the offsets.
+        None. ValueError for an unknown mode, or (random) a window that does not cover the offsets.
     """
-    for key in ("history_sampling", "history_window"):
-        if dl.get(key) is None:
-            raise ValueError(f"dataloader.{key} is required")
     mode, window, offsets = dl.history_sampling, int(dl.history_window), list(dl.history_offsets)
     if mode not in HISTORY_SAMPLINGS:
         raise ValueError(f"dataloader.history_sampling must be one of {HISTORY_SAMPLINGS}, got {mode!r}")
@@ -189,6 +188,24 @@ def _check_history_sampling(dl: DictConfig) -> None:
         )
 
 
+def _check_seed(project: DictConfig) -> None:
+    """Check ``project.seed`` is an int (the training entry seeds from it before any dataset exists).
+
+    Args:
+        project: ``cfg.project``.
+
+    Returns:
+        None. ValueError when the seed is null, a bool (yaml ``true``) or any other non-int.
+    """
+    seed = project.seed
+    # bool is an int subclass: reject it explicitly so a yaml `true` is not read as seed 1.
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(
+            "project.seed must be an int (null is not supported): the dataset's per-sample RNG, the per-step "
+            "seeds and the vis sample all derive from it"
+        )
+
+
 def _check_caption_dropout(dl: DictConfig) -> None:
     """Check ``dataloader.caption_dropout_p`` (the dataset reads it without re-checking).
 
@@ -196,27 +213,28 @@ def _check_caption_dropout(dl: DictConfig) -> None:
         dl: ``cfg.dataloader``.
 
     Returns:
-        None. ValueError when the key is missing / null or the probability is outside [0, 1].
+        None. ValueError when the probability is outside [0, 1] (0.0 = no caption dropout).
     """
-    p = dl.get("caption_dropout_p")
-    if p is None:
-        raise ValueError("dataloader.caption_dropout_p is required (0.0 = no caption dropout)")
+    p = dl.caption_dropout_p
     if not 0.0 <= float(p) <= 1.0:
         raise ValueError(f"dataloader.caption_dropout_p must be in [0, 1], got {p!r}")
 
 
 def resolve_config(cfg: DictConfig) -> DictConfig:
-    """Derive the latent layout into ``cfg.common.layout`` (read-only) and run the cross-block checks.
+    """Derive the latent layout into ``cfg.common.layout``, run the cross-block checks, freeze the whole config.
 
     Args:
-        cfg: the run config (``dataloader``, ``model.architecture``, ``model.video_backbone``). A checkpoint's
-            config already carries ``common.layout``: it is then only checked against a fresh derivation.
+        cfg: the run config (``project``, ``common``, ``dataloader``, ``model.architecture``,
+            ``model.video_backbone``). A checkpoint's config already carries ``common.layout``: it is then only
+            checked against a fresh derivation.
 
     Returns:
-        ``cfg`` itself, with ``cfg.common.layout`` set and read-only. Raises ValueError when a stale hand-written
-        architecture key or a removed backbone caption-dropout key is present, an existing layout disagrees with
-        the derived one, or a check above fails.
+        ``cfg`` itself, with ``cfg.common.layout`` set and the whole config read-only (``OmegaConf.set_readonly``,
+        interpolations unresolved; struct off so component slices can be merged). Raises ValueError when a stale
+        hand-written architecture key or a removed backbone caption-dropout key is present, an existing layout
+        disagrees with the derived one, ``project.seed`` is not an int, or a check above fails.
     """
+    _check_seed(cfg.project)
     arch = cfg.model.architecture
     stale = [k for k in REMOVED_ARCH_KEYS if k in arch]
     if stale:
@@ -225,7 +243,7 @@ def resolve_config(cfg: DictConfig) -> DictConfig:
             "remove them (the history length comes from dataloader.history_offsets alone)"
         )
     video_backbone = cfg.model.video_backbone
-    removed = {**REMOVED_BACKBONE_KEYS, **(REMOVED_GE_KEYS if video_backbone.get("name") == "ge_base_fast" else {})}
+    removed = {**REMOVED_BACKBONE_KEYS, **(REMOVED_GE_KEYS if video_backbone.name == "ge_base_fast" else {})}
     stale = {k: meaning for k, meaning in removed.items() if k in video_backbone}
     if stale:
         raise ValueError(
@@ -233,11 +251,8 @@ def resolve_config(cfg: DictConfig) -> DictConfig:
             "(the dataset drops prompts with the per-sample RNG); remove them and set that key instead"
         )
     _check_attention(cfg.model)
-    _check_proprio_input(cfg.model)
+    _check_proprio_input(cfg.model, int(cfg.common.state_dim))
     dl = cfg.dataloader
-    for key in ("history_offsets", "future_offsets"):
-        if dl.get(key) is None:
-            raise ValueError(f"dataloader.{key} is required (it defines the latent layout)")
     want = latent_layout(
         list(dl.history_offsets),
         list(dl.future_offsets),
@@ -248,18 +263,20 @@ def resolve_config(cfg: DictConfig) -> DictConfig:
     # After the layout: history_offsets is known to hold at least frame t.
     _check_history_sampling(dl)
     _check_caption_dropout(dl)
-    have = OmegaConf.select(cfg, "common.layout", default=None)
-    if have is not None:
-        # Re-resolving a saved config (deploy / resume): the stored layout must be exactly the derived one.
-        have = OmegaConf.to_container(have)
+    # A saved config.yaml (deploy / resume) carries the layout; a composed launch config does not.
+    if "layout" in cfg.common:
+        # Re-resolving a saved config: the stored layout must be exactly the derived one.
+        have = OmegaConf.to_container(cfg.common.layout)
         if have != want:
             raise ValueError(f"cfg.common.layout {have} disagrees with the layout derived from the config {want}")
     else:
         with open_dict(cfg):
-            if cfg.get("common") is None:
-                cfg.common = {}
             cfg.common.layout = want
-    OmegaConf.set_readonly(cfg.common.layout, True)
+    # The run config is fixed from here on; no OmegaConf.resolve (interpolations stay as the yaml wrote them).
+    # Read-only already forbids new keys; dropping Hydra's struct flag lets OmegaConf.merge(cfg.common,
+    # cfg.<component>) build each component's slice (merge adds the component's keys to a copy of common).
+    OmegaConf.set_struct(cfg, False)
+    OmegaConf.set_readonly(cfg, True)
     return cfg
 
 

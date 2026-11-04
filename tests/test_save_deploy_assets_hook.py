@@ -13,8 +13,7 @@ import torch.nn as nn
 
 from openwam.model.architectures.base import BaseWAMArchitecture
 from openwam.model.video_backbone import LoadMode
-from tests._arch import TEST_TRAIN_OPTIONS, arch_params, backbone_double
-from tests._layout import make_layout
+from tests._arch import TEST_ASSETS, TEST_TRAIN_OPTIONS, arch_params, backbone_double
 
 
 class _RecordingBackbone(nn.Module):
@@ -36,9 +35,14 @@ class _ConcreteArch(BaseWAMArchitecture):
 def test_dispatch_to_all_backbones(tmp_path):
     vb = _RecordingBackbone()
     vb.temporal_compression, vb.causal_temporal = 4, True  # the yaml contract the constructor checks
+    vb.dim, vb.num_heads, vb.head_dim, vb.num_layers, vb.text_dim = 64, 4, 16, 2, 64  # the yaml geometry block
     with backbone_double(vb):
         arch = _ConcreteArch(
-            arch_params({}, vb), layout=make_layout(), mode=LoadMode.PRETRAINED, ckpt_dir=None, train_options=TEST_TRAIN_OPTIONS
+            arch_params({}, vb),
+            mode=LoadMode.PRETRAINED,
+            assets=TEST_ASSETS,
+            ckpt_dir=None,
+            train_options=TEST_TRAIN_OPTIONS,
         )
     ab = _RecordingBackbone()
     arch.action_backbone = ab

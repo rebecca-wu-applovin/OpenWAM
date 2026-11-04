@@ -29,7 +29,7 @@ from openwam.model.video_backbone.cosmos3 import text as cosmos3_text  # noqa: E
 from openwam.model.video_backbone.cosmos3._vendor.transformer_cosmos3 import (  # noqa: E402
     Cosmos3OmniTransformer,
 )
-from tests._cosmos3_shell import unused_io_kwargs  # noqa: E402
+from tests._cosmos3_shell import edge_scalar_kwargs, unused_io_kwargs  # noqa: E402
 
 MINI = dict(
     attention_bias=False,
@@ -158,6 +158,7 @@ def test_driver_video_blind_to_action_matches_run_block_loop(padded_und):
     vb = Cosmos3EdgeVideoBackbone(
         net=net,
         **unused_io_kwargs(),
+        **edge_scalar_kwargs(),
         dim=MINI["hidden_size"],
         num_layers=MINI["num_hidden_layers"],
         num_heads=MINI["num_attention_heads"],
@@ -169,7 +170,7 @@ def test_driver_video_blind_to_action_matches_run_block_loop(padded_und):
         MINI["hidden_size"], MINI["num_hidden_layers"], MINI["num_attention_heads"], MINI["head_dim"]
     ).eval()
     # All 3 latents clean: the video rows read neither the action nor anything outside the (bidirectional) video.
-    driver = DualSystemMoTDriver(vb, ab, frame_mask=_fm(3, 3))
+    driver = DualSystemMoTDriver(vb, ab, frame_mask=_fm(3, 3), mot_checkpoint_mixed_attn=True)
 
     with torch.no_grad():
         ref = _build_state(net, ids, lat, padded_und=padded_und)
@@ -230,6 +231,7 @@ def test_joint_loop_keeps_padded_und_keys_out(n_clean):
     vb = Cosmos3EdgeVideoBackbone(
         net=net,
         **unused_io_kwargs(),
+        **edge_scalar_kwargs(),
         dim=MINI["hidden_size"],
         num_layers=MINI["num_hidden_layers"],
         num_heads=MINI["num_attention_heads"],
@@ -289,6 +291,7 @@ def test_action_blind_video_matches_direct_blocks_with_matching_mask(batch, padd
     vb = Cosmos3EdgeVideoBackbone(
         net=net,
         **unused_io_kwargs(),
+        **edge_scalar_kwargs(),
         dim=MINI["hidden_size"],
         num_layers=MINI["num_hidden_layers"],
         num_heads=MINI["num_attention_heads"],
@@ -301,7 +304,7 @@ def test_action_blind_video_matches_direct_blocks_with_matching_mask(batch, padd
     ).eval()
     # All latents clean: the video rows never read the action; the clean rule is the one under test.
     frame_mask = _fm(3, 3, clean_attention)
-    driver = DualSystemMoTDriver(vb, ab, frame_mask=frame_mask)
+    driver = DualSystemMoTDriver(vb, ab, frame_mask=frame_mask, mot_checkpoint_mixed_attn=True)
     ids = torch.tensor([1, 2, 3, 4])
     lat = torch.randn(batch, MINI["latent_channel"], 3, 2, 2)
     astate = types.SimpleNamespace(payload=types.SimpleNamespace(x_action=torch.randn(batch, 5, MINI["hidden_size"])))

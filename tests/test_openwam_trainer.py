@@ -10,9 +10,10 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn as nn
+from omegaconf import OmegaConf
 
 from openwam.dataloader.collate import Batch
-from openwam.model.flow_grid import sample_grid
+from openwam.model.common.flow_scheduler import FlowScheduler
 from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
 from tests._arch import TEST_TRAIN_OPTIONS, build_test_arch
 
@@ -44,7 +45,7 @@ class _MockPipeline:
         self.text_encoder = nn.Linear(4, 4)
         self.torch_dtype = torch.float32
         self.device = "cpu"
-        self.scheduler = _MockScheduler()
+        self.scheduler = _mock_scheduler()
         self.units = []
         self.in_iteration_models = ["dit"]
 
@@ -92,12 +93,15 @@ class _MockPipeline:
 class _MockVideoBackbone(VideoBackbone):
     """Minimal VideoBackbone implementing the ABC for tests."""
 
-    def __init__(self, dim=64, num_layers=2, num_heads=4):
+    def __init__(self, dim=64, num_layers=2, num_heads=4, head_dim=None, text_dim=4096):
         super().__init__()
         self._dim = dim
         self._num_layers = num_layers
         self._num_heads = num_heads
-        self._scheduler = _MockScheduler()
+        # head_dim None = dim / num_heads (the usual square attention space).
+        self._head_dim = dim // num_heads if head_dim is None else int(head_dim)
+        self._text_dim = int(text_dim)
+        self._scheduler = _mock_scheduler()
         self._dit = nn.Linear(dim, dim)
         self._vae = nn.Linear(4, 4)
         self._text_encoder = nn.Linear(4, 4)
@@ -106,12 +110,11 @@ class _MockVideoBackbone(VideoBackbone):
         # ABC-property backings (mirror Wan native so legacy mask code stays
         # bit-for-bit identical).
         self._temporal_compression, self._causal_temporal = 4, True
-        self._shift_video = 5.0
         self.last_injected = None
         self.last_extracted = None
 
     @classmethod
-    def from_pretrained(cls, cfg):
+    def from_pretrained(cls, cfg, assets):
         return cls()
 
     @classmethod
@@ -132,7 +135,7 @@ class _MockVideoBackbone(VideoBackbone):
 
     @property
     def head_dim(self) -> int:
-        return self._dim // self._num_heads
+        return self._head_dim
 
     @property
     def scheduler(self):
@@ -140,7 +143,7 @@ class _MockVideoBackbone(VideoBackbone):
 
     @property
     def text_dim(self) -> int:
-        return 4096
+        return self._text_dim
 
     @property
     def submodule_names(self) -> list:
@@ -235,35 +238,9 @@ class _MockVideoBackbone(VideoBackbone):
         pass
 
 
-class _MockScheduler:
-    """Minimal scheduler mock for loss tests."""
-
-    num_train_timesteps = 1000
-
-    def __init__(self, n=1000):
-        self.timesteps = torch.linspace(1, 0, n)
-        self.sigmas = torch.linspace(1, 0, n)
-        self.linear_timesteps_weights = torch.ones(n)
-
-    def set_timesteps(self, n, **kwargs):
-        self.timesteps = torch.linspace(1, 0, n)
-        self.sigmas = torch.linspace(1, 0, n)
-        self.linear_timesteps_weights = torch.ones(n)
-
-    def add_noise(self, original, noise, sigma):
-        return (1 - sigma) * original + sigma * noise
-
-    def training_target(self, original, noise):
-        return noise - original
-
-    def sample_train(self, batch_size, *, device, dtype):
-        """Uniform grid draw, like the real grid schedulers. Returns (timesteps, sigmas, weights), each (B,)."""
-        return sample_grid(
-            self.timesteps, self.sigmas, self.linear_timesteps_weights, batch_size, device=device, dtype=dtype
-        )
-
-    def flow_step(self, pred, sigma, sigma_next, sample):
-        return sample + pred * (sigma_next - sigma)
+def _mock_scheduler() -> FlowScheduler:
+    """Returns: the real FlowScheduler at shift 5 with the Wan / action law (grid draw, bell weights)."""
+    return FlowScheduler(shift=5.0, train_timestep=OmegaConf.create({"law": "grid", "weighting": "bell"}))
 
 
 # ---------------------------------------------------------------------------
@@ -283,15 +260,15 @@ _TINY_ARCH_CFG = {
     "num_layers": 2,
     "video_dim": 64,
     "text_dim": 64,
-    "bridge_layers": (0, 1),
+    "num_dit_layers": 2,
 }
 
 
 def _make_tiny_arch(train_options=TEST_TRAIN_OPTIONS):
     """Tiny joint_cross_attn architecture on a mock video backbone (CPU, fp32)."""
-    arch = build_test_arch(
-        "dual_system_cross_attn", _TINY_ARCH_CFG, _MockVideoBackbone(dim=64, num_layers=2), train_options=train_options
-    )
+    # The ActionDiT geometry follows the backbone: 2 heads of 16, a 64-wide text context.
+    backbone = _MockVideoBackbone(dim=64, num_layers=2, num_heads=2, head_dim=16, text_dim=64)
+    arch = build_test_arch("dual_system_cross_attn", _TINY_ARCH_CFG, backbone, train_options=train_options)
     arch._device = torch.device("cpu")
     arch._dtype = torch.float32
     return arch
@@ -308,31 +285,6 @@ def _make_batch(B=1, action_dim=7, T_action=5):
         proprio_mask=torch.ones(B, 1, action_dim, dtype=torch.bool),
         source=["test"] * B,
     )
-
-
-def test_resolve_architecture_config_merges_action_backbone_fields():
-    from types import SimpleNamespace
-
-    from openwam.model import resolve_architecture_config
-
-    model_cfg = SimpleNamespace(
-        architecture={
-            "framework": "dual_system",
-            "clean_attention": "bidirectional",
-            "attention_mask_mode": "mutual",
-            "variant": "joint_cross_attn",
-            "detach_bridge": False,
-            "action_dim": 7,
-        },
-        action_backbone={"dim": 64, "ffn_dim": 128, "num_heads": 2},
-    )
-    resolved = resolve_architecture_config(model_cfg, video_dim=64, num_dit_layers=12)
-
-    assert resolved.registry_name == "dual_system_cross_attn"
-    assert resolved.params["dim"] == 64
-    assert resolved.params["ffn_dim"] == 128
-    assert resolved.params["num_heads"] == 2
-    assert resolved.params["video_dim"] == 64
 
 
 def _apply_freeze(pipe, trainer_attrs, freeze_list):
@@ -398,7 +350,7 @@ def test_freeze_custom_list():
 def test_single_batch_loss():
     """B=1: architecture.compute_loss produces valid scalar losses."""
     arch = _make_tiny_arch()
-    arch.action_backbone.scheduler = _MockScheduler()
+    arch.action_backbone.scheduler = _mock_scheduler()
 
     result = arch.compute_loss(_make_batch(B=1))
 
@@ -414,7 +366,7 @@ def test_single_batch_loss():
 def test_multi_batch_loss():
     """B=2: architecture.compute_loss produces valid scalar losses with batched input."""
     arch = _make_tiny_arch()
-    arch.action_backbone.scheduler = _MockScheduler()
+    arch.action_backbone.scheduler = _mock_scheduler()
 
     result = arch.compute_loss(_make_batch(B=2))
 
@@ -428,7 +380,7 @@ def _video_only_loss(lambda_video: float) -> float:
 
     torch.manual_seed(0)
     arch = _make_tiny_arch(replace(TEST_TRAIN_OPTIONS, lambda_video=lambda_video, lambda_action=0.0))
-    arch.action_backbone.scheduler = _MockScheduler()
+    arch.action_backbone.scheduler = _mock_scheduler()
     return arch.compute_loss(_make_batch(B=1))["loss"].item()
 
 
@@ -438,7 +390,7 @@ def test_video_only_loss():
 
     torch.manual_seed(0)  # same noise draw as _video_only_loss
     arch = _make_tiny_arch(replace(TEST_TRAIN_OPTIONS, lambda_action=0.0))
-    arch.action_backbone.scheduler = _MockScheduler()
+    arch.action_backbone.scheduler = _mock_scheduler()
 
     result = arch.compute_loss(_make_batch(B=1))
 
@@ -457,7 +409,7 @@ def test_action_only_loss():
     from dataclasses import replace
 
     arch = _make_tiny_arch(replace(TEST_TRAIN_OPTIONS, lambda_video=0.0, lambda_action=0.5))
-    arch.action_backbone.scheduler = _MockScheduler()
+    arch.action_backbone.scheduler = _mock_scheduler()
 
     result = arch.compute_loss(_make_batch(B=1))
 
@@ -472,7 +424,7 @@ def test_video_only_loss_is_weighted_video_term():
     from dataclasses import replace
 
     arch = _make_tiny_arch(replace(TEST_TRAIN_OPTIONS, lambda_video=0.5, lambda_action=0.0))
-    arch.action_backbone.scheduler = _MockScheduler()
+    arch.action_backbone.scheduler = _mock_scheduler()
 
     result = arch.compute_loss(_make_batch(B=1))
 
@@ -488,12 +440,13 @@ def test_trainer_rejects_both_lambdas_zero():
 
     cfg = OmegaConf.create(
         {
-            "project": {"seed": None},
+            "project": {"seed": 0},
             "training": {
                 "use_gradient_checkpointing": False,
                 "use_gradient_checkpointing_offload": False,
                 "lambda_video": 0.0,
                 "lambda_action": 0.0,
+                "mot_checkpoint_mixed_attn": False,
             },
         }
     )
@@ -501,11 +454,88 @@ def test_trainer_rejects_both_lambdas_zero():
         OpenWAMTrainer(cfg, accelerator=None, dataset=None)
 
 
+class _StopTraining(Exception):
+    """Raised by the stubbed StepTimer: train() got past the text-cache decision."""
+
+
+@pytest.mark.parametrize("text_cache", [True, False])
+def test_trainer_reads_training_freeze_text_cache_and_mot(monkeypatch, text_cache):
+    """freeze list, mixed-attention recompute and the text cache all come from cfg.training."""
+    from types import SimpleNamespace
+
+    from omegaconf import OmegaConf
+
+    import openwam.train.openwam_trainer as trainer_mod
+    from tests._layout import make_layout
+
+    seen = {"frozen": [], "text_cache_calls": 0}
+
+    class _Arch(nn.Module):
+        dtype, device = torch.float32, torch.device("cpu")
+        backbones = property(lambda self: {})  # nothing for the parameter report to count
+
+        def set_dtype_device(self, dtype, device):  # noqa: ARG002
+            return None
+
+        def freeze_modules(self, names):
+            seen["frozen"].append(list(names))
+            return list(names)
+
+    def _fake_build(model_cfg, *, mode, assets, ckpt_dir, train_options):  # noqa: ARG001
+        seen["train_options"], seen["model_cfg"], seen["assets"] = train_options, model_cfg, assets
+        return _Arch()
+
+    monkeypatch.setattr("openwam.model.build_architecture", _fake_build)
+    cfg = OmegaConf.create(
+        {
+            "project": {"seed": 0},
+            "training": {
+                "finetune_ckpt_path": None, "resume_ckpt_path": None, "initialize_model_on_cpu": False,
+                "use_gradient_checkpointing": False, "use_gradient_checkpointing_offload": False,
+                "lambda_video": 1.0, "lambda_action": 1.0, "mot_checkpoint_mixed_attn": True,
+                "freeze": ["video_backbone.vae"], "text_cache": text_cache,
+                # train() up to the step loop (debug: no wandb).
+                "debug": True, "num_epochs": 1, "max_steps": None, "batch_size": 1, "gradient_accumulation_steps": 1,
+                "max_grad_norm": None, "save_steps": 0, "keep_last_k_ckpts": 1, "save_full_states_for_resume": False,
+                "vis_steps": 0, "log_step_timing": False,
+            },
+            "model": {"architecture": {"framework": "dual_system", "variant": "joint_self_attn"}},
+            "common": {"action_dim": 7, "state_dim": 7, "layout": make_layout()},
+            "assets": {"video_backbone": {"model_path": "/upstream"}},
+        }
+    )
+    trainer = trainer_mod.OpenWAMTrainer(cfg, accelerator=None, dataset=None)
+    assert seen["frozen"] == [["video_backbone.vae"]]
+    assert seen["train_options"].mot_checkpoint_mixed_attn is True
+    # The architecture gets merge(common, model): the shared dims sit next to the model blocks.
+    assert seen["model_cfg"].action_dim == 7 and seen["model_cfg"].architecture.variant == "joint_self_attn"
+    # A fresh run reads the upstream files at the assets slice, passed beside (not inside) the model slice.
+    assert seen["assets"] == cfg.assets.video_backbone and "assets" not in seen["model_cfg"]
+
+    # Stub everything train() touches before the text-cache decision; the step timer right after it stops the run.
+    trainer.accelerator = SimpleNamespace(num_processes=1, is_main_process=True)
+    monkeypatch.setattr(trainer, "build_optimizer", lambda: SimpleNamespace(param_groups=[]))
+    monkeypatch.setattr(trainer, "build_dataloader", lambda batch_size: [0])
+    monkeypatch.setattr(trainer, "build_lr_scheduler", lambda *a, **k: None)
+    monkeypatch.setattr(trainer, "setup_output_dir", lambda *a: ("out", None))
+    monkeypatch.setattr(trainer, "prepare_accelerate", lambda o, d, s: (o, d, s))
+    monkeypatch.setattr(trainer_mod, "wire_sampler_seed", lambda *a, **k: None)
+    monkeypatch.setattr(trainer, "build_text_cache", lambda: seen.__setitem__("text_cache_calls", 1))
+
+    def _stop(*a, **k):
+        raise _StopTraining
+
+    monkeypatch.setattr(trainer_mod, "StepTimer", _stop)
+    with pytest.raises(_StopTraining):
+        trainer.train()
+    assert seen["text_cache_calls"] == int(text_cache)
+
+
 def test_loss_backward():
     """Loss should be differentiable and backward should succeed."""
     arch = _make_tiny_arch()
     arch.train()
-    arch.action_backbone.scheduler = _MockScheduler()
+    arch.action_backbone.scheduler = _mock_scheduler()
 
     result = arch.compute_loss(_make_batch(B=1))
 
@@ -524,7 +554,7 @@ def test_training_step():
     """Run 3 optimizer steps: loss should decrease or remain stable."""
     arch = _make_tiny_arch()
     arch.train()
-    arch.action_backbone.scheduler = _MockScheduler()
+    arch.action_backbone.scheduler = _mock_scheduler()
 
     optimizer = torch.optim.Adam(arch.parameters(), lr=1e-3)
 
@@ -614,13 +644,3 @@ def test_manage_checkpoints():
         names = [r.name for r in remaining]
         assert "checkpoint_step_400.safetensors" in names
         assert "checkpoint_step_500.safetensors" in names
-
-
-def test_architecture_variant_strings_for_sampler_guard():
-    """The guard keys on canonical.variant == 'joint_self_attn'; pin the variant
-    string for every architecture so the guard cannot silently drift."""
-    import openwam.model.architectures  # noqa: F401  (run every @register_architecture)
-    from openwam.model.architectures.registry import normalize_architecture_spec
-
-    assert normalize_architecture_spec("dual_system_self_attn").variant == "joint_self_attn"
-    assert normalize_architecture_spec("dual_system_cross_attn").variant != "joint_self_attn"

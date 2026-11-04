@@ -191,7 +191,7 @@ entry points for using and extending the repository:
 | Guide | Use it when you want to… |
 |---|---|
 | [Training and deployment](assets/openwam_usage_docs/train-and-deploy.md) | choose a model/dataloader, prepare assets, train, fine-tune, resume, or deploy a policy |
-| [Architecture extension](assets/openwam_usage_docs/architecture-extension.md) | add a video backbone (implement the base class's 14 abstract members + write one yaml), an action backbone, or a WAM architecture |
+| [Architecture extension](assets/openwam_usage_docs/architecture-extension.md) | add a video backbone (implement the base class's 13 abstract members + write one yaml), an action backbone, or a WAM architecture |
 | [Benchmark integration](assets/openwam_usage_docs/benchmark-integration.md) | extend a dataloader and serve the deploy engine to a benchmark |
 
 > 💡 **Agent tip:** Pick the guide that matches your task and feed it directly

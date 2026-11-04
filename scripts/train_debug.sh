@@ -3,7 +3,7 @@
 # Plain `python` instead of torchrun, so `breakpoint()` / pdb / an IDE debugger attach normally.
 #   bash scripts/train_debug.sh
 #   bash scripts/train_debug.sh training.max_steps=1 dataloader.action_mode=unify_rel \
-#        model.architecture.action_dim=80 model.architecture.state_dim=80
+#        common.action_dim=80 common.state_dim=80
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

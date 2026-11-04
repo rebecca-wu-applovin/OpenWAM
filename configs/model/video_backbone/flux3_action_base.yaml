@@ -1,30 +1,48 @@
+# @package _global_
 # flux-3-action-base video trunk (cfg.model.video_backbone.*), 07_sparse_history_backbones.
 # Only the video side of FLUX 3 Action: 5 mode blocks + 28 single-stream blocks (hidden 3072, 24 heads),
 # ViTNorm video VAE (4x / 32x, 96 ch, needs NATTEN), Qwen3-VL-4B text (8 stacked layers, 20480 ch).
 # OpenWAM's ActionDiT replaces flux's action stream; proprio rides flux's x_action_cond stream (proprio_input=backbone_stream).
 
-name: flux3_action_base
-temporal_compression: 4   # ViTNorm VAE (yaml contract checked against the backbone at build; the latent layout reads it)
-causal_temporal: true     # the VAE encodes frame 0 alone (yaml contract checked against the backbone at build)
-model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/flux-3-action-base  # [Required] flux-3-action-base.safetensors + video_vae.safetensors + text_encoder/
+model:
+  video_backbone:
+    name: flux3_action_base
+    required_clean_attention: null   # clean_attention this backbone needs (null = any); resolve_config checks it
+    temporal_compression: 4   # ViTNorm VAE (yaml contract checked against the backbone at build; the latent layout reads it)
+    causal_temporal: true     # the VAE encodes frame 0 alone (yaml contract checked against the backbone at build)
 
-shift_video: 5.0             # inference sampler shift (flux DROID_INFERENCE_SETTINGS); training uses the native law below
-train_timestep_width: 0.75   # PolicyConfig.train_timestep_width: logit(t) ~ Logistic(0, 0.75)
-train_timestep_shift: 42.0   # PolicyConfig.train_timestep_shift: rational shift
-text_cache: true             # trainer encodes the dataset's prompt set once after the weights are in place, Qwen then on CPU
-action_cond_dim: 48          # P (proprio) stream input width; resolve_config requires it to equal model.architecture.state_dim
-required_proprio_input: backbone_stream  # proprio rides the P stream: launch with model.architecture.proprio_input=backbone_stream
+    shift_video: 5.0             # inference sampler shift (flux DROID_INFERENCE_SETTINGS); training uses the native law below
+    train_timestep: {law: logit_logistic, width: 0.75, shift: 42.0}   # flux PolicyConfig training law: logit(t) ~ Logistic(0, width), then the rational shift
+    action_cond_dim: 48          # P (proprio) stream input width; resolve_config requires it to equal common.state_dim
+    required_proprio_input: backbone_stream  # proprio rides the P stream: launch with model.architecture.proprio_input=backbone_stream
 
-dit:                         # JointSingleSeqParams (stream wiring video / video_cond / action_cond is fixed in code)
-  vec_in_dim: 768
-  context_in_dim: 20480      # 8 stacked Qwen3-VL-4B layers x 2560 (= the text_dim the action stream reads)
-  hidden_size: 3072
-  num_heads: 24
-  depth: 5                   # mode blocks
-  depth_single_blocks: 28
-  depth_late_blocks: 0
-  axes_dim: [32, 32, 32, 32]
-  theta: 10000
-  mlp_ratio: 3.0
-  qkv_bias: false
-  gate_type: null
+    # what the action stream reads; checked against the built module at construction
+    # (from the native block: hidden_size / num_heads / hidden ÷ heads / depth + depth_single_blocks / context_in_dim)
+    geometry:
+      dim: 3072
+      num_heads: 24
+      head_dim: 128
+      num_layers: 33
+      text_dim: 20480
+
+    dit:                         # JointSingleSeqParams (stream wiring video / video_cond / action_cond is fixed in code)
+      vec_in_dim: 768
+      context_in_dim: 20480      # 8 stacked Qwen3-VL-4B layers x 2560 (= the text_dim the action stream reads)
+      hidden_size: 3072
+      num_heads: 24
+      depth: 5                   # mode blocks
+      depth_single_blocks: 28
+      depth_late_blocks: 0
+      axes_dim: [32, 32, 32, 32]
+      theta: 10000
+      mlp_ratio: 3.0
+      qkv_bias: false
+      gate_type: null
+
+assets:
+  video_backbone:
+    model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/flux-3-action-base  # [Required] flux-3-action-base.safetensors + video_vae.safetensors + text_encoder/
+
+training:                 # this backbone's training switches (not compared on finetune)
+  freeze: [video_backbone.text_encoder, video_backbone.vae]   # every entry must exist on the model
+  text_cache: true        # encode the dataset's prompt set once after the weights are final

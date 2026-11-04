@@ -2,7 +2,7 @@
 
 Covers ``common/weights.py`` (``load_strict`` / ``read_weights``) and the two
 ``WanBackbone`` constructors:
-  - ``from_pretrained(cfg)``: upstream weights from ``cfg.model_path`` (``init: pretrained``)
+  - ``from_pretrained(cfg, assets)``: upstream weights from ``assets.model_path`` (``init: pretrained``)
     or a random init (``init: random``, the tiny debug yaml);
   - ``from_checkpoint_dir(cfg, ckpt_dir)``: a meta shell whose tokenizer comes from the ckpt dir.
 
@@ -25,16 +25,17 @@ from openwam.model.video_backbone.common.weights import load_strict, read_weight
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
-def _compose_vb(name: str, *overrides: str):
+def _compose(name: str, *overrides: str):
     """name: video_backbone group option. overrides: extra Hydra overrides.
-    Returns: the composed, read-only ``cfg.model.video_backbone`` (DictConfig)."""
+    Returns: (``cfg.model.video_backbone``, ``cfg.assets.video_backbone``), both read-only DictConfigs."""
     from hydra import compose, initialize_config_dir
 
     with initialize_config_dir(config_dir=os.path.join(REPO, "configs"), version_base=None):
         cfg = compose("train", overrides=[f"model/video_backbone={name}", *overrides])
-    vb = cfg.model.video_backbone
+    vb, assets = cfg.model.video_backbone, cfg.assets.video_backbone
     OmegaConf.set_readonly(vb, True)
-    return vb
+    OmegaConf.set_readonly(assets, True)
+    return vb, assets
 
 
 def _with(cfg, **changes):
@@ -44,24 +45,41 @@ def _with(cfg, **changes):
     return out
 
 
-def _require_tokenizer(cfg) -> None:
-    """Skip when the umT5 tokenizer files the cfg points at are not on this machine."""
-    if not os.path.isdir(cfg.tokenizer_path):
-        pytest.skip(f"umT5 tokenizer not found at {cfg.tokenizer_path}")
+def _require_tokenizer(assets) -> None:
+    """Skip when the umT5 tokenizer files ``assets.tokenizer_path`` points at are not on this machine."""
+    if not os.path.isdir(assets.tokenizer_path):
+        pytest.skip(f"umT5 tokenizer not found at {assets.tokenizer_path}")
 
 
 @pytest.fixture(scope="module")
-def tiny_cfg():
-    cfg = _compose_vb("wan22_ti2v_tiny")
-    _require_tokenizer(cfg)
-    return cfg
+def tiny():
+    """Returns: (model.video_backbone, assets.video_backbone) of the tiny debug yaml (random init)."""
+    vb, assets = _compose("wan22_ti2v_tiny")
+    _require_tokenizer(assets)
+    return vb, assets
 
 
 @pytest.fixture(scope="module")
-def longlive_cfg():
-    cfg = _compose_vb("longlive2_robot_s")
-    _require_tokenizer(cfg)
-    return cfg
+def tiny_cfg(tiny):
+    return tiny[0]
+
+
+@pytest.fixture(scope="module")
+def tiny_assets(tiny):
+    return tiny[1]
+
+
+@pytest.fixture(scope="module")
+def longlive():
+    """Returns: (model.video_backbone, assets.video_backbone) of the LongLive yaml."""
+    vb, assets = _compose("longlive2_robot_s")
+    _require_tokenizer(assets)
+    return vb, assets
+
+
+@pytest.fixture(scope="module")
+def longlive_cfg(longlive):
+    return longlive[0]
 
 
 def _shapes(module: nn.Module) -> dict:
@@ -170,10 +188,10 @@ def test_read_weights_shards_and_pth_wrappers(tmp_path):
 # ----------------------------------------------------------------------------- WanBackbone
 
 
-def test_checkpoint_matches_pretrained_wan(tiny_cfg, tmp_path):
+def test_checkpoint_matches_pretrained_wan(tiny_cfg, tiny_assets, tmp_path):
     from openwam.model.video_backbone.wan.backbone import WanBackbone
 
-    a = WanBackbone.from_pretrained(tiny_cfg)
+    a = WanBackbone.from_pretrained(tiny_cfg, tiny_assets)
     a.save_deploy_assets(str(tmp_path))
     assert os.path.isfile(os.path.join(tmp_path, "tokenizer", "google", "umt5-xxl", "tokenizer_config.json"))
     b = WanBackbone.from_checkpoint_dir(tiny_cfg, str(tmp_path))
@@ -193,64 +211,63 @@ def test_from_checkpoint_dir_needs_tokenizer(tiny_cfg, tmp_path):
         WanBackbone.from_checkpoint_dir(tiny_cfg, str(tmp_path))
 
 
-def test_pretrained_loads_upstream_layout(tiny_cfg, tmp_path):
+def test_pretrained_loads_upstream_layout(tiny_cfg, tiny_assets, tmp_path):
     """init: pretrained reads the upstream files (DiT shards, VAE .pth + ``model.`` prefix, umT5 .pth) bitwise."""
     from openwam.model.video_backbone.wan.backbone import WanBackbone
 
-    ref = WanBackbone.from_pretrained(tiny_cfg)
+    ref = WanBackbone.from_pretrained(tiny_cfg, tiny_assets)
     _write_upstream_dir(ref, str(tmp_path / "up"))
-    cfg = _with(tiny_cfg, init="pretrained", model_path=str(tmp_path / "up"), tokenizer_path=tiny_cfg.tokenizer_path)
-    bb = WanBackbone.from_pretrained(cfg)
+    assets = _with(
+        tiny_assets, init="pretrained", model_path=str(tmp_path / "up"), tokenizer_path=tiny_assets.tokenizer_path
+    )
+    bb = WanBackbone.from_pretrained(tiny_cfg, assets)
     assert _shapes(bb) == _shapes(ref)
     assert all(torch.equal(ref.state_dict()[k], v) for k, v in bb.state_dict().items())
     assert all(p.dtype == torch.bfloat16 for p in bb.parameters())
 
 
-def test_geometry_mismatch_raises(tiny_cfg, tmp_path):
+def test_geometry_mismatch_raises(tiny_cfg, tiny_assets, tmp_path):
     from openwam.model.video_backbone.wan.backbone import WanBackbone
 
-    _write_upstream_dir(WanBackbone.from_pretrained(tiny_cfg), str(tmp_path / "up"))
-    bad_cfg = _with(
-        tiny_cfg,
-        init="pretrained",
-        model_path=str(tmp_path / "up"),
-        tokenizer_path=tiny_cfg.tokenizer_path,
-        **{"dit.num_layers": 5},
+    _write_upstream_dir(WanBackbone.from_pretrained(tiny_cfg, tiny_assets), str(tmp_path / "up"))
+    assets = _with(
+        tiny_assets, init="pretrained", model_path=str(tmp_path / "up"), tokenizer_path=tiny_assets.tokenizer_path
     )
     with pytest.raises(ValueError, match="num_layers"):
-        WanBackbone.from_pretrained(bad_cfg)
+        WanBackbone.from_pretrained(_with(tiny_cfg, **{"dit.num_layers": 5}), assets)
 
 
-def test_dit_weights_override_strips_prefix(tiny_cfg, tmp_path):
+def test_dit_weights_override_strips_prefix(tiny_cfg, tiny_assets, tmp_path):
     """dit_weights (LongLive model.pt) replaces the model_path DiT; its ``model.`` prefix is stripped."""
     from openwam.model.video_backbone.wan.backbone import WanBackbone
 
-    base = WanBackbone.from_pretrained(tiny_cfg)
+    base = WanBackbone.from_pretrained(tiny_cfg, tiny_assets)
     _write_upstream_dir(base, str(tmp_path / "up"))
-    other = WanBackbone.from_pretrained(tiny_cfg)  # a second random DiT, different values
+    other = WanBackbone.from_pretrained(tiny_cfg, tiny_assets)  # a second random DiT, different values
     torch.save({f"model.{k}": v for k, v in other.dit.state_dict().items()}, str(tmp_path / "model.pt"))
-    cfg = _with(
-        tiny_cfg,
+    assets = _with(
+        tiny_assets,
         init="pretrained",
         model_path=str(tmp_path / "up"),
-        tokenizer_path=tiny_cfg.tokenizer_path,
+        tokenizer_path=tiny_assets.tokenizer_path,
         dit_weights=str(tmp_path / "model.pt"),
         dit_weights_prefix="model.",
     )
-    bb = WanBackbone.from_pretrained(cfg)
+    bb = WanBackbone.from_pretrained(tiny_cfg, assets)
     assert all(torch.equal(other.dit.state_dict()[k], v) for k, v in bb.dit.state_dict().items())
     assert all(torch.equal(base.vae.state_dict()[k], v) for k, v in bb.vae.state_dict().items())
     # A file whose keys lack the declared prefix is rejected, not loaded half-renamed.
     torch.save(other.dit.state_dict(), str(tmp_path / "noprefix.pt"))
     with pytest.raises(ValueError, match="prefix"):
-        WanBackbone.from_pretrained(_with(cfg, dit_weights=str(tmp_path / "noprefix.pt")))
+        WanBackbone.from_pretrained(tiny_cfg, _with(assets, dit_weights=str(tmp_path / "noprefix.pt")))
 
 
-def test_longlive_text_len_both_modes(longlive_cfg, tmp_path):
+def test_longlive_text_len_both_modes(longlive, tmp_path):
     """LongLive's 128-token prompt budget comes from the cfg on the checkpoint path too (was 512 there)."""
     from openwam.model.video_backbone.wan.backbone import WanBackbone
 
-    shutil.copytree(longlive_cfg.tokenizer_path, os.path.join(tmp_path, "tokenizer", "google", "umt5-xxl"))
+    longlive_cfg, longlive_assets = longlive
+    shutil.copytree(longlive_assets.tokenizer_path, os.path.join(tmp_path, "tokenizer", "google", "umt5-xxl"))
     bb = WanBackbone.from_checkpoint_dir(longlive_cfg, str(tmp_path))
     assert bb.text_max_length == 128
     # The 5B geometry from the yaml, built as a meta shell (no weights read).
@@ -273,6 +290,8 @@ def test_required_clean_attention_checked_by_resolve_config(longlive_cfg):
 
     def _cfg(clean):
         return OmegaConf.create({
+            "project": {"seed": 0},
+            "common": {"action_dim": 48, "state_dim": 48},
             "dataloader": {"history_offsets": [-20, 0], "future_offsets": [4, 8, 12, 16], "num_frames": 33,
                            "history_sampling": "fixed", "history_window": 100,
                            "caption_dropout_p": 0.0},
@@ -295,12 +314,12 @@ def test_required_clean_attention_checked_by_resolve_config(longlive_cfg):
 def test_wan22_5b_from_pretrained_real_weights():
     from openwam.model.video_backbone.wan.backbone import WanBackbone
 
-    cfg = _compose_vb("wan22_ti2v_5b")
-    if not os.path.isdir(cfg.model_path):
-        pytest.skip(f"Wan2.2-TI2V-5B not found at {cfg.model_path}")
-    bb = WanBackbone.from_pretrained(cfg)
+    cfg, assets = _compose("wan22_ti2v_5b")
+    if not os.path.isdir(assets.model_path):
+        pytest.skip(f"Wan2.2-TI2V-5B not found at {assets.model_path}")
+    bb = WanBackbone.from_pretrained(cfg, assets)
     assert (bb.dim, bb.num_layers, bb.num_heads, bb.head_dim, bb.text_dim) == (3072, 30, 24, 128, 4096)
-    assert bb.text_max_length == 512 and bb.shift_video == 5.0
+    assert bb.text_max_length == 512 and bb.scheduler.shift == 5.0
     assert not any(p.device.type == "meta" for p in bb.parameters())
     assert all(p.dtype == torch.bfloat16 for p in bb.parameters())
 
@@ -310,12 +329,12 @@ def test_longlive_from_pretrained_real_weights():
     """from_pretrained(longlive): DiT == model.pt (prefix stripped, bf16), text budget 128."""
     from openwam.model.video_backbone.wan.backbone import WanBackbone
 
-    cfg = _compose_vb("longlive2_robot_s")
-    if not os.path.isfile(cfg.dit_weights):
-        pytest.skip(f"LongLive model.pt not found at {cfg.dit_weights}")
-    bb = WanBackbone.from_pretrained(cfg)
+    cfg, assets = _compose("longlive2_robot_s")
+    if not os.path.isfile(assets.dit_weights):
+        pytest.skip(f"LongLive model.pt not found at {assets.dit_weights}")
+    bb = WanBackbone.from_pretrained(cfg, assets)
     assert bb.text_max_length == 128
-    ref = torch.load(cfg.dit_weights, map_location="cpu", mmap=True, weights_only=True)
+    ref = torch.load(assets.dit_weights, map_location="cpu", mmap=True, weights_only=True)
     for k, v in bb.dit.state_dict().items():
         assert torch.equal(v, ref[f"model.{k}"].to(torch.bfloat16)), k
 
@@ -353,6 +372,7 @@ def _build_tiny_wan_backbone():
         tokenizer=None,
         tokenizer_dir="",
         shift_video=5.0,
+        train_timestep={"law": "grid", "weighting": "bell"},
         text_max_length=512,
     )
     return backbone, model
@@ -368,7 +388,7 @@ def _time_embedding(model, t: float):
 def test_time_modulation_single_path():
     """One layout: num_hist_latents = 2, F = 4 -> the first 2 frames' tokens carry time_embedding(0), the rest
     time_embedding(t); time_mod is time_projection of those rows, (B, L, 6, dim)."""
-    from openwam.model.video_backbone.wan.dit_forward import build_time_modulation
+    from openwam.model.video_backbone.wan.dit import build_time_modulation
 
     _, model = _build_tiny_wan_backbone()
     batch, frames, tokens_per_frame, t = 2, 4, 3, 500.0
@@ -397,7 +417,7 @@ def test_wan_prepare_takes_text_condition_and_layout():
     from omegaconf import OmegaConf
 
     from openwam.model.video_backbone.base import TextCondition
-    from openwam.model.video_backbone.wan.dit_forward import build_time_modulation
+    from openwam.model.video_backbone.wan.dit import build_time_modulation
 
     backbone, model = _build_tiny_wan_backbone()
     latents = torch.randn(1, 4, 3, 4, 4)
@@ -422,4 +442,18 @@ def test_unknown_backbone_name_raises():
     from openwam.model.video_backbone import LoadMode, build_video_backbone
 
     with pytest.raises(KeyError, match="Unknown video backbone"):
-        build_video_backbone(OmegaConf.create({"name": "nonexistent_backbone"}), LoadMode.PRETRAINED, None)
+        build_video_backbone(OmegaConf.create({"name": "nonexistent_backbone"}), LoadMode.PRETRAINED, {}, None)
+
+
+def test_build_video_backbone_mode_and_args_must_agree(tiny_cfg, tiny_assets, tmp_path):
+    """PRETRAINED reads only assets, CHECKPOINT only ckpt_dir: any other combination raises before a build."""
+    from openwam.model.video_backbone import LoadMode, build_video_backbone
+
+    with pytest.raises(ValueError, match="PRETRAINED"):
+        build_video_backbone(tiny_cfg, LoadMode.PRETRAINED, None, None)
+    with pytest.raises(ValueError, match="PRETRAINED"):
+        build_video_backbone(tiny_cfg, LoadMode.PRETRAINED, tiny_assets, str(tmp_path))
+    with pytest.raises(ValueError, match="CHECKPOINT"):
+        build_video_backbone(tiny_cfg, LoadMode.CHECKPOINT, tiny_assets, str(tmp_path))
+    with pytest.raises(ValueError, match="CHECKPOINT"):
+        build_video_backbone(tiny_cfg, LoadMode.CHECKPOINT, None, None)

@@ -33,3 +33,20 @@ def unused_io_kwargs() -> dict:
         "latents_mean": torch.zeros(48),
         "latents_std": torch.ones(48),
     }
+
+
+def edge_scalar_kwargs() -> dict:
+    """The constructor scalars configs/model/video_backbone/cosmos3_edge.yaml supplies in production.
+
+    Returns:
+        dict with ``shift_video`` (float), ``train_timestep`` (the grid / uniform law), ``use_system_prompt`` / ``prompt_templates`` / ``duration_template``
+        (bool) and ``max_text_tokens`` (int), at the edge yaml's values.
+    """
+    return {
+        "shift_video": 5.0,
+        "train_timestep": {"law": "grid", "weighting": "uniform"},
+        "use_system_prompt": False,
+        "prompt_templates": True,
+        "duration_template": True,
+        "max_text_tokens": 512,
+    }

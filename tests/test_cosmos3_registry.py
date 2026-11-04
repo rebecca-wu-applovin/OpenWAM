@@ -90,7 +90,7 @@ def test_bad_cfg_rejected_in_both_modes(change, error, match, tmp_path):
     """The yaml knobs are validated before any heavy import, whichever constructor runs."""
     cfg = _edge_cfg(**change)
     with pytest.raises(error, match=match):
-        Cosmos3EdgeVideoBackbone.from_pretrained(cfg)
+        Cosmos3EdgeVideoBackbone.from_pretrained(cfg, OmegaConf.create({"model_path": str(tmp_path)}))
     with pytest.raises(error, match=match):
         Cosmos3EdgeVideoBackbone.from_checkpoint_dir(cfg, str(tmp_path))
 
@@ -99,7 +99,9 @@ def test_nonexistent_model_path_fails_fast(tmp_path):
     # With diffusers installed this is a FileNotFoundError on the missing transformer/ subfolder;
     # without diffusers it is the install-hint ImportError. Both are acceptable fail-fast outcomes on CPU.
     with pytest.raises((FileNotFoundError, ImportError)):
-        Cosmos3EdgeVideoBackbone.from_pretrained(_edge_cfg(model_path=str(tmp_path / "nonexistent")))
+        Cosmos3EdgeVideoBackbone.from_pretrained(
+            _edge_cfg(), OmegaConf.create({"model_path": str(tmp_path / "nonexistent")})
+        )
 
 
 def test_checkpoint_dir_needs_tokenizer(tmp_path):

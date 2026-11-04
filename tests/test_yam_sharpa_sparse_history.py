@@ -13,11 +13,12 @@ import numpy as np
 import pytest
 from omegaconf import OmegaConf
 
+from tests._assets import asset_path
+
 ROOT = Path(__file__).resolve().parents[1]
 CFG = ROOT / "configs" / "dataloader" / "yam_sharpa.yaml"
-DATA = Path("/root/projects/2610_policy_model/datasets")
-SIMTELEOP = DATA / "simteleop_1004_fleet" / "dataset"
-GPT = DATA / "gpt_fleet_depth" / "dataset"
+TRAIN_CFG = ROOT / "configs" / "train.yaml"
+SIMTELEOP = Path(asset_path("OPENWAM_YAM_SHARPA_SIMTELEOP"))
 HIST = [-80, -60, -40, -20, 0]
 FUT8 = [4, 8, 12, 16, 20, 24, 28, 32]
 
@@ -37,14 +38,16 @@ def _build(history, future, **extra):
     from openwam.dataloader.yam_sharpa import MultiYamSharpaDataset
 
     cfg = OmegaConf.load(CFG)
-    cfg.sources = {"simteleop": {"dataset_dir": str(SIMTELEOP), "weight": 1.0}}
+    cfg.sources = {"simteleop": {"dataset_dir": str(SIMTELEOP), "weight": 1.0, "enabled": True}}
+    cfg.seed = 0  # the yaml interpolates ${project.seed}, absent from this dataloader-only config
     cfg.height, cfg.width = 384, 224
-    cfg.color_jitter = None
+    cfg.color_jitter.enabled = False
     cfg.normalize_mode = None
     cfg.history_offsets, cfg.future_offsets = history, future
     for key, value in extra.items():
         cfg[key] = value
-    multi = MultiYamSharpaDataset.from_config(cfg)
+    # The trainer's dataset slice: merge(common, dataloader) (common carries action_dim / state_dim).
+    multi = MultiYamSharpaDataset.from_config(OmegaConf.merge(OmegaConf.load(TRAIN_CFG).common, cfg))
     return multi.datasets[multi.names.index("simteleop")]
 
 

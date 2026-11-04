@@ -10,14 +10,16 @@ sources:
   simteleop:
     dataset_dir: /root/projects/2610_policy_model/datasets/simteleop_1004/dataset
     weight: 0.5
+    enabled: true  # false = skip this source
   gpt_rollout:
     dataset_dir: /root/projects/2610_policy_model/datasets/gpt_rollout/dataset
     weight: 0.5
-seed: 42
+    enabled: true  # false = skip this source
+seed: ${project.seed}  # the run seed (an int; resolve_config rejects null)
 
 # ── Action / proprio representation (ablation switch) ────────────────────────
-#   fingertips_abs | fingertips_rel  → 48-D:  model.architecture.action_dim=48 state_dim=48
-#   unify_abs      | unify_rel       → 80-D:  model.architecture.action_dim=80 state_dim=80
+#   fingertips_abs | fingertips_rel  → 48-D:  common.action_dim=48 common.state_dim=48
+#   unify_abs      | unify_rel       → 80-D:  common.action_dim=80 common.state_dim=80
 # unify_action / unify_action_map are derived from action_mode (do not set them).
 action_mode: fingertips_abs
 

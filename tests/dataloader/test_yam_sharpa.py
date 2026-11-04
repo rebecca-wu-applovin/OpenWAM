@@ -152,10 +152,23 @@ def _mock_decoder():
         yield
 
 
+# Color jitter off, at the strengths the yaml ships; tests that want it on pass {**_JITTER, "enabled": True}.
+_JITTER = {"enabled": False, "brightness": 0.2, "contrast": 0.2, "saturation": 0.2, "hue": 0.0}
+
+
 def _cfg(sources: dict, **overrides):
+    """A complete yam_sharpa dataloader config over synthetic sources (every key from_config requires).
+
+    Args:
+        sources: {name: (dataset_dir, weight)}. **overrides: top-level keys replacing the defaults below.
+
+    Returns:
+        DictConfig for ``build_dataset`` (= ``merge(common, dataloader)``: action_dim / state_dim default to the
+        action_mode's width, fingertips 48, unify 80).
+    """
     cfg = {
         "type": "yam_sharpa",
-        "sources": {n: {"dataset_dir": str(d), "weight": w} for n, (d, w) in sources.items()},
+        "sources": {n: {"dataset_dir": str(d), "weight": w, "enabled": True} for n, (d, w) in sources.items()},
         "action_mode": "fingertips_abs",
         "fps": 20,  # must equal the synthetic source's meta/info.json fps
         "normalize_mode": None,
@@ -169,9 +182,15 @@ def _cfg(sources: dict, **overrides):
         "history_window": 100,
         "caption_dropout_p": 0.0,
         "seed": 0,
+        "window_stride": 1,
+        "split": "train",
+        "multiview": False,
+        "normalization_stats_path": None,
+        "color_jitter": _JITTER,
     }
     cfg.update(overrides)
-    return OmegaConf.create(cfg)
+    width = 80 if str(cfg["action_mode"]).startswith("unify") else 48
+    return OmegaConf.create({"action_dim": width, "state_dim": width, **cfg})
 
 
 @pytest.fixture
@@ -286,11 +305,35 @@ def test_unknown_mode_and_unify_keys_rejected(source):
         build_dataset(_cfg({"a": (root, 1.0)}, unify_action=True), "train")
 
 
+def test_from_config_rejects_width_mismatch(source):
+    # common.action_dim / state_dim are checked against the rows the action_mode produces, before any reader.
+    root, _ = source
+    with pytest.raises(ValueError, match=r"common\.action_dim=80.*produces 48-wide"):
+        build_dataset(_cfg({"a": (root, 1.0)}, action_mode="fingertips_rel", action_dim=80), "train")
+    with pytest.raises(ValueError, match=r"common\.action_dim=48 / common\.state_dim=48 .*unify_rel.*80-wide"):
+        build_dataset(_cfg({"a": (root, 1.0)}, action_mode="unify_rel", action_dim=48, state_dim=48), "train")
+
+
 def test_fps_must_match_info_json(source):
     root, _ = source
     build_dataset(_cfg({"a": (root, 1.0)}, fps=20), "train")
     with pytest.raises(ValueError, match="meta/info.json records fps=20"):
         build_dataset(_cfg({"a": (root, 1.0)}, fps=30), "train")
+
+
+@pytest.mark.parametrize("key", ["seed", "num_frames", "sources.a.weight", "sources.a.enabled", "color_jitter.hue"])
+def test_from_config_requires_every_key(source, key):
+    # No hidden defaults: a config missing any key the dataset reads fails instead of silently using a value.
+    root, _ = source
+    # Jitter on, so its strengths are read too.
+    cfg = OmegaConf.to_container(_cfg({"a": (root, 1.0)}, color_jitter={**_JITTER, "enabled": True}))
+    *parents, leaf = key.split(".")
+    node = cfg
+    for part in parents:
+        node = node[part]
+    del node[leaf]
+    with pytest.raises(Exception, match=leaf):
+        build_dataset(OmegaConf.create(cfg), "train")
 
 
 def test_config_keys_accept_fps():
@@ -494,7 +537,7 @@ def test_color_jitter_draws_from_the_sample_rng(tmp_path):
     import random
 
     _write_source(tmp_path / "a", [60, 60])
-    ds = build_dataset(_random_cfg(tmp_path / "a", color_jitter=True), "train")
+    ds = build_dataset(_random_cfg(tmp_path / "a", color_jitter={**_JITTER, "enabled": True}), "train")
     random.seed(0)
     serial = _videos_by_index(ds, epoch=0, num_workers=0)
     random.seed(1)
@@ -528,7 +571,7 @@ def test_eval_view_turns_every_train_augmentation_off(tmp_path):
     # eval_view applies the val split's rule (_select_augmentations(train=False)): no color jitter, the fixed
     # history offsets; the training dataset keeps its augmentations.
     _write_source(tmp_path / "a", [60, 60])
-    reader = build_dataset(_random_cfg(tmp_path / "a", color_jitter=True), "train").datasets[0]
+    reader = build_dataset(_random_cfg(tmp_path / "a", color_jitter={**_JITTER, "enabled": True}), "train").datasets[0]
     assert reader._color_jitter is not None
     assert reader._draw_history_offsets == reader._random_history_offsets
     view = reader.eval_view()

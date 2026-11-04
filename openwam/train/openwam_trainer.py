@@ -2,7 +2,7 @@
 
 Call order — core skeleton only:
 
-  __init__():  seed -> build_architecture -> freeze -> init_schedulers
+  __init__():  seed -> build_architecture -> freeze
                -> [latent setup] -> log param counts
   train():     build optimizer/dataloader/scheduler -> setup output dir
                -> accelerate prepare -> (resume) load full state -> text cache
@@ -28,7 +28,7 @@ import math
 import os
 
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from openwam.dataloader.collate import Batch, collate
 from openwam.train.utils.checkpointing import (
@@ -48,7 +48,6 @@ from openwam.train.utils.seeding import per_step_seed, seed_process, wire_sample
 from openwam.train.utils.step_timer import StepTimer
 from openwam.train.utils.training_utils import (
     build_cosine_scheduler,
-    cfg_get,
     init_wandb,
     log_parameter_counts,
     reduce_step_metrics,
@@ -80,21 +79,19 @@ class OpenWAMTrainer:
         # deterministic. seed_process uses the same RANK_OFFSET rank stride as
         # per_step_seed and the launcher's seed_everything, so a process's init
         # and per-step seeds share one rank window (cudnn left to the launcher).
-        project_cfg = getattr(cfg, "project", None)
-        yaml_seed = getattr(project_cfg, "seed", None) if project_cfg is not None else None
+        # resolve_config already checked project.seed is an int.
         self._rank = int(os.environ.get("RANK", 0))
-        self._run_seed = int(yaml_seed) if yaml_seed is not None else None
-        if self._run_seed is not None:
-            seed_process(self._run_seed, rank=self._rank)
-            if self._rank == 0:
-                logger.info("Reproducible mode: cfg.project.seed=%d (rank=%d)", self._run_seed, self._rank)
+        self._run_seed = int(cfg.project.seed)
+        seed_process(self._run_seed, rank=self._rank)
+        if self._rank == 0:
+            logger.info("cfg.project.seed=%d (rank=%d)", self._run_seed, self._rank)
 
         t = cfg.training
 
         # Build architecture (creates video_backbone internally from config). The load mode is decided
         # here, once: no ckpt -> upstream pretrained weights; finetune / resume -> the checkpoint's shell
         # (same shell for both; they differ only in how its weights are filled, see ckpt_model_loader).
-        from openwam.model import build_architecture, resolve_architecture_config
+        from openwam.model import build_architecture
         from openwam.model.architectures.base import TrainOptions
         from openwam.model.video_backbone import LoadMode
 
@@ -104,60 +101,51 @@ class OpenWAMTrainer:
             use_gradient_checkpointing_offload=bool(t.use_gradient_checkpointing_offload),
             lambda_video=float(t.lambda_video),
             lambda_action=float(t.lambda_action),
+            mot_checkpoint_mixed_attn=bool(t.mot_checkpoint_mixed_attn),
         )
         # Checked here, not in TrainOptions / compute_loss: INFERENCE_ONLY legitimately has both weights 0, and only
         # a training run needs a loss with at least one term.
         if train_options.lambda_video == 0 and train_options.lambda_action == 0:
             raise ValueError("training.lambda_video and training.lambda_action are both 0: the loss has no term.")
-        finetune_path = cfg_get(t, "finetune_ckpt_path", None) or None
-        resume_path = cfg_get(t, "resume_ckpt_path", None) or None
+        # null (or "") = that mode is off.
+        finetune_path = t.finetune_ckpt_path or None
+        resume_path = t.resume_ckpt_path or None
         if finetune_path and resume_path:
             raise ValueError("finetune_ckpt_path and resume_ckpt_path are mutually exclusive; set at most one.")
         if finetune_path is not None:
             from openwam.train.utils.ckpt_model_loader import build_for_finetune
 
-            # Finetune starts a NEW run: this run's cfg.model is layered over the ckpt's and written back
-            # in place, so the architecture built here and the config save_config() writes are the same.
+            # Finetune starts a NEW run from cfg.model, which must equal the ckpt's model (checked inside), so
+            # the architecture built here and the config save_config() writes are the same.
             # Weights land here, BEFORE the freeze below.
             self.architecture = build_for_finetune(finetune_path, cfg, train_options)
-            model_cfg = cfg.model  # the merged model config, written back into cfg
         elif resume_path is not None:
             from openwam.train.utils.ckpt_model_loader import build_for_resume
 
-            # Resume continues ONE run whose config.yaml is reused untouched (ckpt config authoritative);
-            # its weights are restored by load_full_state after prepare.
-            self.architecture, ckpt_cfg = build_for_resume(resume_path, cfg, train_options)
-            model_cfg = ckpt_cfg.model
+            # Resume continues ONE run: cfg is its saved config.yaml (checked inside); its weights are
+            # restored by load_full_state after prepare.
+            self.architecture = build_for_resume(resume_path, cfg, train_options)
         else:
-            model_cfg = cfg.model
-            resolved = resolve_architecture_config(model_cfg)
+            # The architecture's slice: the shared values (action / state dims, layout) under the model block;
+            # the upstream file paths come separately (assets, not part of the model).
             self.architecture = build_architecture(
-                resolved.registry_name,
-                resolved.params,
-                layout=cfg.common.layout,
+                OmegaConf.merge(cfg.common, cfg.model),
                 mode=LoadMode.PRETRAINED,
+                assets=cfg.assets.video_backbone,
                 ckpt_dir=None,
                 train_options=train_options,
             )
-        # Single source for every model-side decision below (freeze list, text cache): the model config the
-        # architecture was built from (resume: the checkpoint's, not the live one).
-        self.model_cfg = model_cfg
         logger.info("Architecture: %s", type(self.architecture).__name__)
 
         # Device placement: skip .to(device) when initialize_model_on_cpu and a real
         # training Accelerator is present — DeepSpeed's prepare() then handles the move.
-        _init_on_cpu = bool(t.get("initialize_model_on_cpu", False))
+        _init_on_cpu = bool(t.initialize_model_on_cpu)
         if not (_init_on_cpu and self.accelerator is not None):
             self.architecture.set_dtype_device(self.architecture.dtype, self.architecture.device)
 
-        # --- Freeze: declared per-architecture in the model yaml (freeze:);
-        # freeze_modules silently skips paths absent on a given architecture.
-        freeze_list = list(getattr(self.model_cfg, "freeze", []))
-        for name in self.architecture.freeze_modules(freeze_list):
+        # --- Freeze: the backbone yaml's training.freeze; every path must exist on the model.
+        for name in self.architecture.freeze_modules(list(t.freeze)):
             logger.info("Frozen: %s", name)
-
-        # Initialize all schedulers (video + action) inside architecture
-        self.architecture.init_training_schedulers(1000)
 
         self.model = self  # self-reference some external callers expect
 
@@ -166,20 +154,23 @@ class OpenWAMTrainer:
 
     # (2) Driver — build optimizer/dataloader/scheduler -> setup dir -> accelerate prepare
     #     -> (resume) -> epoch/step loop{compute_loss -> log_step -> save} -> finish_training.
-    def train(self, num_epochs: int = None, max_steps: int = None):
-        """Run the training loop (HuggingFace Accelerate distributed).
+    def train(self) -> None:
+        """Run the training loop (HuggingFace Accelerate distributed), every knob from ``cfg.training``.
 
         Three entry modes (train.yaml finetune/resume fields): fresh, finetune warm-start
         (weights loaded at construction), or resume (load full state after prepare).
+
+        Returns:
+            None; checkpoints / logs land in the run dir.
         """
         t = self.cfg.training
-        num_epochs = num_epochs or cfg_get(t, "num_epochs", None)
-        num_epochs = int(num_epochs) if num_epochs is not None else None
-        max_steps = max_steps or getattr(t, "max_steps", None)
+        # num_epochs null = step-only training; max_steps null = no step limit.
+        num_epochs = int(t.num_epochs) if t.num_epochs is not None else None
+        max_steps = int(t.max_steps) if t.max_steps is not None else None
         batch_size = int(t.batch_size)
         grad_accum = int(t.gradient_accumulation_steps)
 
-        debug = bool(getattr(t, "debug", False))
+        debug = bool(t.debug)
         if debug:
             max_steps = 20
             save_steps_override = 10
@@ -194,11 +185,12 @@ class OpenWAMTrainer:
 
         # finetune/resume validation + architecture construction happen in
         # __init__ (self-contained ckpt-dir path); only resume needs a path here.
-        resume_path = cfg_get(t, "resume_ckpt_path", None) or None
+        resume_path = t.resume_ckpt_path or None
 
         optimizer = self.build_optimizer()
         dataloader = self.build_dataloader(batch_size)
-        max_grad_norm = float(t.max_grad_norm) if getattr(t, "max_grad_norm", None) else None
+        # 0 / null = no clipping.
+        max_grad_norm = float(t.max_grad_norm) if t.max_grad_norm else None
 
         n_proc = self.accelerator.num_processes
         steps_per_epoch = math.ceil(len(dataloader) / grad_accum)
@@ -218,11 +210,10 @@ class OpenWAMTrainer:
         if debug:
             save_steps = save_steps_override
         else:
-            save_steps = getattr(t, "save_steps", None)
-            if save_steps is not None:
-                save_steps = int(save_steps)
-        keep_last_k = int(getattr(t, "keep_last_k_ckpts", 3))
-        save_full_states_for_resume = bool(getattr(t, "save_full_states_for_resume", False))
+            # 0 / null = never save (the yaml's "disable saving").
+            save_steps = int(t.save_steps or 0)
+        keep_last_k = int(t.keep_last_k_ckpts)
+        save_full_states_for_resume = bool(t.save_full_states_for_resume)
 
         # Finetune warm-start weights were already loaded at architecture
         # construction (__init__, self-contained ckpt-dir path). Step stays 0.
@@ -230,8 +221,7 @@ class OpenWAMTrainer:
         output_path, resume_state_dir = self.setup_output_dir(debug, resume_path)
         optimizer, dataloader, scheduler = self.prepare_accelerate(optimizer, dataloader, scheduler)
 
-        if self._run_seed is not None:
-            wire_sampler_seed(dataloader, int(self._run_seed), rank=self._rank)
+        wire_sampler_seed(dataloader, self._run_seed, rank=self._rank)
 
         all_params = [p for group in optimizer.param_groups for p in group["params"]]
 
@@ -240,17 +230,17 @@ class OpenWAMTrainer:
 
         # Periodic world-model rollouts (GT | pred clips to wandb). Every rank holds one
         # fixed sample, picked before epoch 0 so the clips are comparable across vis steps.
-        vis_steps = int(cfg_get(t, "vis_steps", 0) or 0)
+        vis_steps = int(t.vis_steps or 0)  # 0 / null = off
         visualizer = None
         if vis_steps > 0 and self.dataset is not None:
             # Eval semantics (no caption dropout, fixed history, no jitter), sharing the preloaded readers.
             visualizer = TrainVisualizer(
                 self.dataset.eval_view(),
                 rank=self._rank,
-                num_samples=int(cfg_get(t, "vis_num_samples", 4)),
-                denoise_steps=int(cfg_get(t, "vis_denoise_steps", 10)),
-                fps=int(cfg_get(t, "vis_fps", 5)),
-                seed=self._run_seed if self._run_seed is not None else 42,
+                num_samples=int(t.vis_num_samples),
+                denoise_steps=int(t.vis_denoise_steps),
+                fps=int(t.vis_fps),
+                seed=self._run_seed,
             )
 
         from tqdm import tqdm
@@ -281,24 +271,16 @@ class OpenWAMTrainer:
                 logger.info("[resume] global_step=%d already complete; finishing.", global_step)
                 self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
                 return
-            if skip_first > 0 and self._run_seed is None:
-                logger.warning(
-                    "[resume] mid-epoch resume (skip_first=%d) without project.seed: DataLoader "
-                    "shuffle is non-reproducible, so the resumed epoch's batch order differs from "
-                    "the original run — samples may be silently re-fed or skipped. Set project.seed "
-                    "for faithful mid-epoch resume.",
-                    skip_first,
-                )
 
         # Text cache only now that the weights are final (prepare -> resume load_full_state -> cache, the same
         # order for every mode): on resume the text encoder holds real values only after load_full_state.
-        if bool(self.model_cfg.video_backbone.text_cache):
+        if bool(t.text_cache):
             self.build_text_cache()
 
         _step_t0 = _time.monotonic()
         # Per-phase step timing (wandb timing/*); DeepSpeed's engine.step is hooked so
         # backward and optimizer time are billed separately.
-        self._timer = StepTimer(bool(cfg_get(t, "log_step_timing", True)))
+        self._timer = StepTimer(bool(t.log_step_timing))
         self._timer.wrap_engine_step(getattr(self.accelerator.deepspeed_engine_wrapped, "engine", None))
         pbar = tqdm(total=total_steps, desc="Training", unit="step", initial=min(global_step, total_steps))
 
@@ -307,7 +289,6 @@ class OpenWAMTrainer:
         # Per-step manual_seed makes timestep + noise sampling in compute_loss
         # reproducible across runs and ZeRO stages: same (rank, step) -> same RNG,
         # different ranks at the same step keep in-batch timestep diversity.
-        # Gated on _run_seed so unseeded production runs stay fully stochastic.
         epochs = itertools.count(start_epoch) if num_epochs is None else range(start_epoch, num_epochs)
         for epoch in epochs:
             if hasattr(dataloader, "set_epoch"):
@@ -323,11 +304,10 @@ class OpenWAMTrainer:
                 epoch_iter = dataloader
             for batch in epoch_iter:
                 self._timer.mark("data")
-                if self._run_seed is not None:
-                    step_seed = per_step_seed(self._run_seed, rank=self._rank, step=global_step)
-                    torch.manual_seed(step_seed)
-                    if torch.cuda.is_available():
-                        torch.cuda.manual_seed_all(step_seed)
+                step_seed = per_step_seed(self._run_seed, rank=self._rank, step=global_step)
+                torch.manual_seed(step_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(step_seed)
                 with self.accelerator.accumulate(self.architecture):
                     losses = self.compute_loss(batch)
                     self._timer.mark("forward")
@@ -400,19 +380,25 @@ class OpenWAMTrainer:
         t = self.cfg.training
         params = build_trainable_parameters(
             self,
-            action_lr=float(t.action_lr) if getattr(t, "action_lr", None) else None,
-            video_lr=float(t.video_lr) if getattr(t, "video_lr", None) else None,
+            # null = that module uses the base learning_rate.
+            action_lr=float(t.action_lr) if t.action_lr else None,
+            video_lr=float(t.video_lr) if t.video_lr else None,
         )
-        betas = tuple(getattr(t, "adam_betas", [0.9, 0.95]))
+        betas = tuple(t.adam_betas)
         return torch.optim.AdamW(params, lr=float(t.learning_rate), weight_decay=float(t.weight_decay), betas=betas)
 
     # (4) Called by train() — build the training DataLoader (seeded generator when reproducible).
     def build_dataloader(self, batch_size: int) -> torch.utils.data.DataLoader:
         """Build the training DataLoader (standard shuffle).
 
-        When ``cfg.project.seed`` is set, wires a per-rank ``generator`` and a
-        ``worker_init_fn`` so dataset-side randomness is reproducible across
-        runs while keeping per-epoch / per-worker variation.
+        Wires a per-rank ``generator`` (from ``cfg.project.seed``) and a ``worker_init_fn`` so dataset-side
+        randomness is reproducible across runs while keeping per-epoch / per-worker variation.
+
+        Args:
+            batch_size: int, per-GPU batch size.
+
+        Returns:
+            torch DataLoader over ``self.dataset``.
         """
         t = self.cfg.training
         kwargs: dict = dict(
@@ -422,22 +408,30 @@ class OpenWAMTrainer:
             collate_fn=collate,
             pin_memory=True,
         )
-        if self._run_seed is not None:
-            from openwam.train.utils.seeding import dataloader_worker_init_fn, make_dataloader_generator
+        from openwam.train.utils.seeding import dataloader_worker_init_fn, make_dataloader_generator
 
-            kwargs["generator"] = make_dataloader_generator(self._run_seed, rank=self._rank)
-            kwargs["worker_init_fn"] = dataloader_worker_init_fn
+        kwargs["generator"] = make_dataloader_generator(self._run_seed, rank=self._rank)
+        kwargs["worker_init_fn"] = dataloader_worker_init_fn
         return torch.utils.data.DataLoader(self.dataset, **kwargs)
 
     # (5) Called by train() — linear-warmup + cosine schedule, or None (constant LR / debug).
     def build_lr_scheduler(self, optimizer, total_opt_steps: int, debug: bool = False):
-        """Linear-warmup + cosine schedule, or None (constant LR / debug)."""
+        """Linear-warmup + cosine schedule, or None (constant LR / debug).
+
+        Args:
+            optimizer: the AdamW from :meth:`build_optimizer`.
+            total_opt_steps: int, per-process optimizer steps of the run.
+            debug: bool, ``training.debug`` (forces constant LR).
+
+        Returns:
+            SequentialLR for ``training.lr_scheduler: cosine``; None for null (constant LR) or debug.
+        """
         t = self.cfg.training
         if debug:
             return None
-        if getattr(t, "lr_scheduler", None) == "cosine":
+        if t.lr_scheduler == "cosine":
             return build_cosine_scheduler(
-                optimizer, total_opt_steps=total_opt_steps, cfg=self.cfg, num_processes=self.accelerator.num_processes
+                optimizer, total_opt_steps=total_opt_steps, training_cfg=t, num_processes=self.accelerator.num_processes
             )
         return None
 
@@ -451,7 +445,7 @@ class OpenWAMTrainer:
         so a missing-state error raises on every rank without deadlocking the broadcast.
         Returns ``(output_path, resume_state_dir)``.
         """
-        base_output_path = getattr(self.cfg.training, "output_path", "./models")
+        base_output_path = self.cfg.training.output_path
         is_main = self.accelerator.is_main_process
 
         resume_state_dir = find_latest_accel_state(resume_path) if resume_path else None
@@ -471,7 +465,7 @@ class OpenWAMTrainer:
             return output_path, resume_state_dir
 
         # Fixed run dir name (e.g. wandb run name) if configured; else the launch timestamp.
-        fixed_name = getattr(self.cfg.training, "run_dir_name", None)
+        fixed_name = self.cfg.training.run_dir_name
         if fixed_name:
             # Checked on every rank (shared FS) so a clash raises everywhere instead of deadlocking the broadcast.
             existing = os.path.join(base_output_path, str(fixed_name), "config.yaml")
@@ -539,12 +533,12 @@ class OpenWAMTrainer:
         )
         return optimizer, dataloader, scheduler
 
-    # (7b) Called by train() after prepare (and the resume load) when model.video_backbone.text_cache is on.
+    # (7b) Called by train() after prepare (and the resume load) when training.text_cache is on.
     def build_text_cache(self) -> None:
         """Pre-encode the dataset's full prompt set; the frozen text encoder then sits on CPU.
 
         Input: none (uses self.dataset.all_prompts() and the unwrapped architecture's video backbone).
-        Returns: None. The backbone raises if it cannot cache (cosmos3: its yaml says text_cache: false).
+        Returns: None. The backbone raises if it cannot cache (cosmos3: its yaml says training.text_cache: false).
         """
         arch = self.architecture if self.accelerator is None else self.accelerator.unwrap_model(self.architecture)
         prompts = self.dataset.all_prompts()

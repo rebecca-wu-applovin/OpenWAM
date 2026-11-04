@@ -30,6 +30,7 @@ from tests.test_openwam_trainer import _MockVideoBackbone
 def _make_action_dit(*, dim: int = 32, num_heads: int = 4, num_layers: int = 2, action_dim: int = 7) -> ActionDiT:
     return ActionDiT(
         shift_action=5.0,
+        train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=action_dim,
         dim=dim,
         ffn_dim=dim * 2,
@@ -39,6 +40,10 @@ def _make_action_dit(*, dim: int = 32, num_heads: int = 4, num_layers: int = 2, 
         bridge_layers=tuple(range(num_layers)),
         variant="joint_self_attn",
         text_dim=dim,
+        attn_head_dim=dim // num_heads,
+        freq_dim=256,
+        max_action_len=1024,
+        eps=1e-6,
     )
 
 
@@ -88,14 +93,14 @@ def test_driver_validates_num_layers():
     vb = _MockVideoBackbone(dim=32, num_layers=4, num_heads=4)
     ab = _make_action_dit(dim=32, num_heads=4, num_layers=3)
     with pytest.raises(ValueError, match="num_layers"):
-        DualSystemMoTDriver(vb, ab, frame_mask=_fm(4))
+        DualSystemMoTDriver(vb, ab, frame_mask=_fm(4), mot_checkpoint_mixed_attn=True)
 
 
 def test_driver_validates_num_heads():
     vb = _MockVideoBackbone(dim=32, num_layers=2, num_heads=8)
     ab = _make_action_dit(dim=32, num_heads=4, num_layers=2)
     with pytest.raises(ValueError, match="num_heads"):
-        DualSystemMoTDriver(vb, ab, frame_mask=_fm(4))
+        DualSystemMoTDriver(vb, ab, frame_mask=_fm(4), mot_checkpoint_mixed_attn=True)
 
 
 def test_driver_validates_head_dim():
@@ -103,7 +108,7 @@ def test_driver_validates_head_dim():
     vb = _MockVideoBackbone(dim=32, num_layers=2, num_heads=4)
     ab = _make_action_dit(dim=64, num_heads=4, num_layers=2)
     with pytest.raises(ValueError, match="head_dim"):
-        DualSystemMoTDriver(vb, ab, frame_mask=_fm(4))
+        DualSystemMoTDriver(vb, ab, frame_mask=_fm(4), mot_checkpoint_mixed_attn=True)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +208,7 @@ def test_driver_handles_heterogeneous_hidden_dim_end_to_end():
     # Action: hidden=32, attn_hidden = 4*16 = 64 (matches video's per-head layout).
     ab = ActionDiT(
         shift_action=5.0,
+        train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=7,
         dim=32,
         ffn_dim=64,
@@ -213,6 +219,9 @@ def test_driver_handles_heterogeneous_hidden_dim_end_to_end():
         variant="joint_self_attn",
         attn_head_dim=16,
         text_dim=32,
+        freq_dim=256,
+        max_action_len=1024,
+        eps=1e-6,
     )
     ab.eval()
     # vb head_dim is 64/4=16 — matches ab.attn_head_dim. Driver should accept.

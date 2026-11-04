@@ -1,37 +1,37 @@
 """Architecture construction for finetune / resume.
 
 When ``training.finetune_ckpt_path`` or ``training.resume_ckpt_path`` is set,
-the trainer builds the architecture from that checkpoint alone, with the same
+the trainer builds the architecture from that checkpoint dir, with the same
 :func:`openwam.model.build_architecture_from_ckpt_dir` the deploy loader uses:
 the module skeletons come from the model config (yaml geometry) and the
 non-weight assets (tokenizers / processors / third-party ``config.json``) the
 backbones copied into the checkpoint dir. The original pretrained backbone
-directory (``model.video_backbone.model_path``) does not need to exist on the
-training host. The two entry points differ only in which config builds the
-shell and in how its weights are filled:
+directory (``assets.video_backbone.model_path``, not compared) need not exist on the
+training host.
 
-  - :func:`build_for_finetune`: ckpt ``model`` section + live overrides, then a
-    strict ``load_checkpoint`` of the requested / latest safetensors;
-  - :func:`build_for_resume`: the ckpt ``model`` section verbatim, storage given
-    to the meta shell (``materialize_meta``); accelerate's ``load_state`` fills
-    it after ``prepare``.
+Both paths build the shell from the launch config, after comparing it with the
+checkpoint's ``config.yaml``; nothing is merged or written back:
 
-The checkpoint's ``config.yaml`` is the RECONSTRUCTION base, not the run's
-authority. On the finetune path the ckpt's ``model`` section is layered under
-the live ``cfg.model``: every value the operator set in ``configs/`` (or on the
-CLI) wins. The merged result is written back into ``cfg.model``, so one config
-both builds the architecture and is written by ``save_config`` into the new run
-dir. Resume continues one run whose ``config.yaml`` is already on disk, so the
-ckpt config stays authoritative there and any live divergence raises
-(:func:`check_resume_cfg`).
+  - :func:`build_for_finetune` (a new run from these weights): the launch's
+    ``model`` + ``common`` (minus the derived ``common.layout``) must equal the
+    checkpoint's key by key (:func:`check_finetune_cfg`); ``training`` /
+    ``dataloader`` may differ. Then a strict ``load_checkpoint`` of the
+    requested / latest safetensors.
+  - :func:`build_for_resume` (the same run continued): ``scripts/train.py``
+    already runs the run's own config (:func:`load_resume_cfg`), and the whole
+    config is compared again here (:func:`check_resume_cfg`), so the launch
+    config IS the saved one. Storage is given to the meta shell
+    (``materialize_meta``); accelerate's ``load_state`` fills it after ``prepare``.
 """
 
 import logging
 import os
+from typing import Any
 
 from omegaconf import DictConfig, OmegaConf, open_dict
 
-from openwam.model.architectures.base import TrainOptions
+from openwam.config import cfg_get
+from openwam.model.architectures.base import BaseWAMArchitecture, TrainOptions
 from openwam.train.utils.checkpointing import find_latest_weights
 
 logger = logging.getLogger(__name__)
@@ -57,28 +57,33 @@ def _resolve_ckpt_path(source: str) -> tuple[str, str | None]:
 
 
 # ----------------------------------------------------------------------------
-# ckpt model config (base) + live model config (override)
+# config comparison (finetune: model + common; resume: the whole config)
 # ----------------------------------------------------------------------------
-
-# Keys whose live-vs-ckpt disagreement an override cannot express: each one
-# selects WHICH module classes the checkpoint's weights belong to, so overriding
-# one of these would build a skeleton of a different backbone / architecture
-# class — a state_dict topology no safetensors file matches. Value is the CLI
-# hint for the fix.
-_ARCH_IDENTITY_KEYS = (
-    ("video_backbone.name", "model/video_backbone=<ckpt value>"),
-    ("architecture.framework", "model=<ckpt value>"),
-)
 
 # Cap on a single value's printed length in the diff report: long lists (e.g. the
 # cosmos3 VAE latents_mean) would bury the keys that actually changed.
 _DIFF_VALUE_MAXLEN = 110
+# Placeholder for the side of a difference that lacks the key.
+ABSENT = "<absent>"
+# Keys a resume launch legitimately sets differently from the run's config.yaml: where to resume
+# from, and the fresh-run dir fields a resume launch drops (the run dir is resume_ckpt_path's).
+RESUME_LAUNCH_KEYS = ("training.resume_ckpt_path", "training.output_path", "training.run_dir_name")
+# Subtrees only the saved config.yaml carries: resolve_config derives the layout and writes it before save_config.
+# Derived, so finetune does not compare it either (its sources are compared, or may differ on purpose).
+SAVED_ONLY_KEYS = ("common.layout",)
 
 
 def _flatten_cfg(node, prefix: str = "") -> dict:
     """Flatten a plain-container config into ``{dotted.key: leaf}``.
 
     Lists stay leaves: per-index keys would bury the real diff.
+
+    Args:
+        node: dict (or None), a plain container from ``OmegaConf.to_container``.
+        prefix: str prepended to every key (``"model."`` etc.).
+
+    Returns:
+        dict ``{dotted.key: leaf}``; an empty dict value is a leaf.
     """
     flat: dict = {}
     for key, val in (node or {}).items():
@@ -91,109 +96,81 @@ def _flatten_cfg(node, prefix: str = "") -> dict:
 
 
 def _short(val) -> str:
+    """``repr(val)`` cut to ``_DIFF_VALUE_MAXLEN`` characters (for diff reports).
+
+    Args:
+        val: any config leaf.
+
+    Returns:
+        str, the (possibly truncated) repr.
+    """
     text = repr(val)
     return text if len(text) <= _DIFF_VALUE_MAXLEN else text[: _DIFF_VALUE_MAXLEN - 3] + "..."
-
-
-def diff_model_cfgs(ckpt_model, live_model) -> tuple[list, list, list]:
-    """Compare two ``model`` configs key-by-key.
-
-    Returns ``(overridden, live_only, ckpt_only)`` where ``overridden`` holds
-    ``(dotted_key, ckpt_value, live_value)`` for keys both sides define with
-    different values, and the other two hold ``(dotted_key, value)``.
-    """
-    base = _flatten_cfg(OmegaConf.to_container(ckpt_model, resolve=True) or {})
-    over = _flatten_cfg(OmegaConf.to_container(live_model, resolve=True) or {})
-    # Keys are unique, so tuple ordering never has to compare the values.
-    overridden = sorted((k, base[k], over[k]) for k in over if k in base and base[k] != over[k])
-    live_only = sorted((k, over[k]) for k in over if k not in base)
-    ckpt_only = sorted((k, base[k]) for k in base if k not in over)
-    return overridden, live_only, ckpt_only
-
-
-def _check_arch_identity(ckpt_model, live_model, ckpt_dir: str) -> None:
-    """Reject a live/ckpt disagreement on the keys that pick the module classes."""
-    for key, hint in _ARCH_IDENTITY_KEYS:
-        ckpt_val = OmegaConf.select(ckpt_model, key, default=None)
-        live_val = OmegaConf.select(live_model, key, default=None)
-        if ckpt_val is None or live_val is None or ckpt_val == live_val:
-            continue
-        raise ValueError(
-            f"finetune config mismatch on model.{key}: live config says {live_val!r}, "
-            f"{os.path.join(ckpt_dir, 'config.yaml')} says {ckpt_val!r}. This key selects which "
-            "module classes the checkpoint's weights belong to, so it is the one thing the live "
-            "config cannot override — the merged skeleton would match no safetensors file. Set "
-            f"`{hint}` to the checkpoint's value, or point training.finetune_ckpt_path at a "
-            "checkpoint of the architecture you want to train."
-        )
-
-
-def _log_model_cfg_diff(ckpt_dir: str, overridden: list, live_only: list, ckpt_only: list) -> None:
-    """Report the merge on the launch terminal — an override must never be silent."""
-    header = (
-        f"[finetune] model config = {os.path.join(ckpt_dir, 'config.yaml')} (base) "
-        f"+ live cfg.model (override): {len(overridden)} overridden, "
-        f"{len(live_only)} live-only, {len(ckpt_only)} ckpt-only"
-    )
-    logger.info(header)
-    # Plain print (rank-0 only; train.py silences print on other ranks) so the
-    # merge is visible on the launch terminal even when logs are drowned out.
-    print(header, flush=True)
-    for key, ckpt_val, live_val in overridden:
-        line = f"[finetune]   override  model.{key}: {_short(ckpt_val)} (ckpt) -> {_short(live_val)} (live)"
-        logger.info(line)
-        print(line, flush=True)
-    # The other two buckets are counted in the header but only spelled out at
-    # DEBUG: they are rarely actionable, and logging is not rank-gated here, so at
-    # INFO they would repeat once per rank on every launch.
-    for key, live_val in live_only:
-        logger.debug("[finetune]   live-only model.%s = %s", key, _short(live_val))
-    for key, ckpt_val in ckpt_only:
-        logger.debug("[finetune]   from-ckpt model.%s = %s", key, _short(ckpt_val))
-
-
-def merge_ckpt_model_cfg(ckpt_cfg: DictConfig, cfg: DictConfig, ckpt_dir: str) -> DictConfig:
-    """Layer the live run's ``model`` config on top of the checkpoint's.
-
-    The ckpt's ``model`` section is the BASE (the geometry the checkpoint's weights
-    were trained with). The live ``cfg.model`` is the OVERRIDE, so every value the
-    operator set wins — including an explicit ``null``, which is how
-    ``bridge_layers: null`` clears a ckpt's explicit list.
-    Keys only the ckpt has survive; keys only the live config has are added.
-
-    The merged result is written back into ``cfg.model`` so that exactly one
-    config both builds the architecture here and is written by ``save_config``
-    into the new run dir. Without the write-back the new checkpoint's
-    ``config.yaml`` would advertise values the model was never built with, and
-    deploying it would rebuild a different model than the one that trained.
-
-    Returns the merged node as it now lives in ``cfg``.
-    """
-    ckpt_model = ckpt_cfg.model
-    live_model = OmegaConf.select(cfg, "model", default=None)
-    if live_model is None:
-        return ckpt_model
-
-    _check_arch_identity(ckpt_model, live_model, ckpt_dir)
-    _log_model_cfg_diff(ckpt_dir, *diff_model_cfgs(ckpt_model, live_model))
-
-    merged = OmegaConf.merge(ckpt_model, live_model)
-    with open_dict(cfg):
-        cfg.model = merged
-    return cfg.model
-
-
-# Keys a resume launch legitimately sets differently from the run's config.yaml: where to resume
-# from, and the fresh-run dir fields a resume launch drops (the run dir is resume_ckpt_path's).
-RESUME_LAUNCH_KEYS = ("training.resume_ckpt_path", "training.output_path", "training.run_dir_name")
-# Subtrees only the saved config.yaml carries: save_assets_for_deployment writes the specs and resolve_config the
-# layout before save_config (resolve_config re-derives and checks the layout of the loaded file).
-SAVED_ONLY_KEYS = ("model.video_backbone.components", "model.video_backbone.tokenizer", "common.layout")
 
 
 def _under(key: str, prefixes: tuple) -> bool:
     """True if dotted ``key`` is one of ``prefixes`` or lies below one of them."""
     return any(key == p or key.startswith(p + ".") for p in prefixes)
+
+
+def _diff_flat(saved: dict, live: dict) -> list[tuple[str, Any, Any]]:
+    """Every key where two flat configs disagree.
+
+    Args:
+        saved: dict ``{dotted.key: leaf}``, the checkpoint's side.
+        live: dict ``{dotted.key: leaf}``, the launch's side.
+
+    Returns:
+        list of ``(dotted_key, saved_value, live_value)`` sorted by key; a side that lacks the key holds ``ABSENT``.
+    """
+    diffs = []
+    for key in sorted(saved.keys() | live.keys()):
+        s, v = saved.get(key, ABSENT), live.get(key, ABSENT)
+        if s != v:
+            diffs.append((key, s, v))
+    return diffs
+
+
+def model_identity(cfg: DictConfig) -> dict:
+    """The keys that decide what the model is: ``model`` and ``common`` minus the derived ``common.layout``.
+
+    Args:
+        cfg: DictConfig, a whole run config (a checkpoint's config.yaml or the launch config).
+
+    Returns:
+        dict ``{"model.<dotted>": leaf, "common.<dotted>": leaf}`` with interpolations evaluated (compare what the
+        values are, not how the yaml spells them); lists stay leaves. KeyError when ``model`` / ``common`` is missing.
+    """
+    flat: dict = {}
+    for section in ("model", "common"):
+        flat.update(_flatten_cfg(OmegaConf.to_container(cfg_get(cfg, section), resolve=True), prefix=f"{section}."))
+    # The layout is derived from model / dataloader keys: not a decision of its own.
+    return {k: v for k, v in flat.items() if not _under(k, SAVED_ONLY_KEYS)}
+
+
+def check_finetune_cfg(ckpt_cfg: DictConfig, live_cfg: DictConfig, path: str) -> None:
+    """Raise if a finetune launch's model / common config differs from the checkpoint's.
+
+    The shell is built from the launch config and the checkpoint's weights loaded strictly into it, so the two
+    must describe the same model; any intended model change is a new config for a new pretraining, not a finetune.
+
+    Args:
+        ckpt_cfg: DictConfig, the checkpoint's ``config.yaml``.
+        live_cfg: DictConfig, the launch config (resolved).
+        path: str, path of the checkpoint's ``config.yaml`` (for the message).
+
+    Returns:
+        None; raises ValueError listing every differing key as ``  <key>: ckpt=<v> launch=<v>``.
+    """
+    diffs = _diff_flat(model_identity(ckpt_cfg), model_identity(live_cfg))
+    if not diffs:
+        return
+    lines = "\n".join(f"  {k}: ckpt={_short(s)} launch={_short(v)}" for k, s, v in diffs)
+    raise ValueError(
+        f"[finetune] this launch's model / common config differs from {path} on {len(diffs)} key(s); the "
+        f"checkpoint's weights only fit the model they were trained as, so set these keys to the checkpoint's "
+        f"values:\n{lines}"
+    )
 
 
 def diff_resume_cfg(saved_cfg: DictConfig, live_cfg: DictConfig) -> list:
@@ -205,20 +182,16 @@ def diff_resume_cfg(saved_cfg: DictConfig, live_cfg: DictConfig) -> list:
 
     Returns:
         sorted list of ``(dotted_key, saved_value, live_value)``; a side that lacks the key holds
-        ``"<absent>"``. ``RESUME_LAUNCH_KEYS`` and saved-only ``SAVED_ONLY_KEYS`` are not differences.
+        ``ABSENT``. ``RESUME_LAUNCH_KEYS`` and saved-only ``SAVED_ONLY_KEYS`` are not differences.
     """
     # Unresolved: compare what the yaml says, not what interpolations evaluate to on this host.
-    saved = _flatten_cfg(OmegaConf.to_container(saved_cfg, resolve=False) or {})
-    live = _flatten_cfg(OmegaConf.to_container(live_cfg, resolve=False) or {})
-    absent = "<absent>"
-    diffs = []
-    for key in sorted(saved.keys() | live.keys()):
-        if _under(key, RESUME_LAUNCH_KEYS) or (key not in live and _under(key, SAVED_ONLY_KEYS)):
-            continue
-        s, v = saved.get(key, absent), live.get(key, absent)
-        if s != v:
-            diffs.append((key, s, v))
-    return diffs
+    saved = _flatten_cfg(OmegaConf.to_container(saved_cfg, resolve=False))
+    live = _flatten_cfg(OmegaConf.to_container(live_cfg, resolve=False))
+    return [
+        (k, s, v)
+        for k, s, v in _diff_flat(saved, live)
+        if not (_under(k, RESUME_LAUNCH_KEYS) or (v == ABSENT and _under(k, SAVED_ONLY_KEYS)))
+    ]
 
 
 def check_resume_cfg(saved_cfg: DictConfig, live_cfg: DictConfig, path: str) -> None:
@@ -261,54 +234,15 @@ def load_resume_cfg(live_cfg: DictConfig, resume_path: str) -> DictConfig:
     path = os.path.join(ckpt_dir, "config.yaml")
     saved = OmegaConf.load(path)
     check_resume_cfg(saved, live_cfg, path)
-    # Only the resume-location keys come from the launch.
+    # Only the resume-location keys come from the launch (written into the just-loaded file, before resolve_config).
     with open_dict(saved):
         for key in RESUME_LAUNCH_KEYS:
-            OmegaConf.update(saved, key, OmegaConf.select(live_cfg, key, default=None), force_add=True)
+            OmegaConf.update(saved, key, cfg_get(live_cfg, key), force_add=True)
     return saved
 
 
-_LAYOUT_SOURCE_KEYS = ("history_offsets", "future_offsets", "num_frames", "history_sampling", "history_window")
-
-
-def check_resume_layout(cfg: DictConfig, ckpt_cfg: DictConfig, ckpt_dir: str) -> None:
-    """Reject a resume whose live sample layout differs from the checkpoint's.
-
-    The resumed model is built from ``ckpt_cfg.common.layout`` while the training dataset is built from the live
-    ``cfg.dataloader``; a disagreement in the layout or in the values it comes from would train the checkpoint on
-    other samples without any error.
-
-    Args:
-        cfg: the live run config, resolved (``cfg.common.layout`` set by the entry point).
-        ckpt_cfg: the checkpoint's config, resolved.
-        ckpt_dir: str, the checkpoint dir (error message only).
-
-    Returns:
-        None. Raises ValueError naming every differing layout field and every differing ``_LAYOUT_SOURCE_KEYS``
-        dataloader key, each with its live and ckpt value.
-    """
-    live = OmegaConf.to_container(cfg.common.layout)
-    ckpt = OmegaConf.to_container(ckpt_cfg.common.layout)
-    # Both come from the same latent_layout(), so they have the same fields.
-    diffs = [f"common.layout.{k}: live {live[k]!r} vs ckpt {ckpt[k]!r}" for k in sorted(live) if live[k] != ckpt[k]]
-    for key in _LAYOUT_SOURCE_KEYS:
-        # Plain containers, so list values compare by content.
-        live_val = OmegaConf.to_container(cfg.dataloader)[key]
-        ckpt_val = OmegaConf.to_container(ckpt_cfg.dataloader)[key]
-        if live_val != ckpt_val:
-            diffs.append(f"dataloader.{key}: live {live_val!r} vs ckpt {ckpt_val!r}")
-    if not diffs:
-        return
-    raise ValueError(
-        f"[resume] the live sample layout differs from {os.path.join(ckpt_dir, 'config.yaml')}'s: "
-        f"{'; '.join(diffs)}. The model and its training so far follow the checkpoint's layout but the dataset is "
-        "built from the live config; set these live keys to the checkpoint's values, or start a new run with "
-        "training.finetune_ckpt_path."
-    )
-
-
 def _load_ckpt_cfg(ckpt_dir: str) -> DictConfig:
-    """Read a run dir's ``config.yaml``.
+    """Read a run dir's ``config.yaml`` as written (not resolved).
 
     Args:
         ckpt_dir: str, checkpoint (run) dir.
@@ -318,7 +252,7 @@ def _load_ckpt_cfg(ckpt_dir: str) -> DictConfig:
     """
     path = os.path.join(ckpt_dir, "config.yaml")
     ckpt_cfg = OmegaConf.load(path)
-    if OmegaConf.select(ckpt_cfg, "model", default=None) is None:
+    if "model" not in ckpt_cfg:
         raise ValueError(
             f"{path} has no `model:` section, so there is nothing to build the architecture from. Point "
             "training.finetune_ckpt_path / resume_ckpt_path at a run directory written by this trainer."
@@ -326,27 +260,25 @@ def _load_ckpt_cfg(ckpt_dir: str) -> DictConfig:
     return ckpt_cfg
 
 
-def build_for_finetune(source: str, cfg: DictConfig, train_options: TrainOptions):
-    """Warm-start: the checkpoint's architecture with the live model config on top, weights loaded strictly.
+def build_for_finetune(source: str, cfg: DictConfig, train_options: TrainOptions) -> BaseWAMArchitecture:
+    """Warm-start: the launch config's architecture (checked equal to the checkpoint's), weights loaded strictly.
 
     Args:
         source: str, ``training.finetune_ckpt_path`` (a run dir, or one ``checkpoint_step_*.safetensors`` in it).
-        cfg: the live run config, already resolved (``resolve_config``); ``cfg.model`` is replaced by the merged
-            model config (what save_config writes) and the layout is re-checked against it.
+        cfg: the launch run config, resolved and read-only; its ``model`` + ``common`` must equal the
+            checkpoint's (:func:`check_finetune_cfg`); ``merge(cfg.common, cfg.model)`` builds the shell.
         train_options: TrainOptions the trainer decided (passed to the architecture constructor).
 
     Returns:
         BaseWAMArchitecture with every weight loaded from the requested / latest safetensors.
     """
-    from openwam.config import resolve_config
     from openwam.model import build_architecture_from_ckpt_dir
 
     ckpt_dir, explicit_weights = _resolve_ckpt_path(source)
-    model_cfg = merge_ckpt_model_cfg(_load_ckpt_cfg(ckpt_dir), cfg, ckpt_dir)
-    # The merge may change model keys the layout derives from: re-resolve (checks cfg.common.layout still holds).
-    resolve_config(cfg)
+    # Compare before building: a differing model would fail the strict load only after minutes of construction.
+    check_finetune_cfg(_load_ckpt_cfg(ckpt_dir), cfg, os.path.join(ckpt_dir, "config.yaml"))
     logger.info("[finetune] building architecture from ckpt dir: %s", ckpt_dir)
-    architecture = build_architecture_from_ckpt_dir(ckpt_dir, model_cfg, cfg.common.layout, train_options)
+    architecture = build_architecture_from_ckpt_dir(ckpt_dir, OmegaConf.merge(cfg.common, cfg.model), train_options)
     weights = explicit_weights or find_latest_weights(ckpt_dir)
     # Plain print so the warm-start is visible on the launch terminal even
     # when logger output is drowned out; non-main ranks have print disabled.
@@ -356,8 +288,8 @@ def build_for_finetune(source: str, cfg: DictConfig, train_options: TrainOptions
     return architecture
 
 
-def build_for_resume(source: str, cfg: DictConfig, train_options: TrainOptions):
-    """Resume: the checkpoint's own architecture, with zeroed storage for accelerate ``load_state`` to fill.
+def build_for_resume(source: str, cfg: DictConfig, train_options: TrainOptions) -> BaseWAMArchitecture:
+    """Resume: the run's own architecture, with zeroed storage for accelerate ``load_state`` to fill.
 
     The safetensors are not read: ``load_state`` restores a strict superset (module weights incl. frozen
     params) after ``prepare``, and the latest safetensors may be truncated by a mid-save kill even though the
@@ -365,26 +297,22 @@ def build_for_resume(source: str, cfg: DictConfig, train_options: TrainOptions):
 
     Args:
         source: str, ``training.resume_ckpt_path`` (the run dir).
-        cfg: the run config, resolved; only compared with the ckpt's (any difference outside the resume-location
-            keys raises, see :func:`check_resume_cfg`).
+        cfg: the run config, resolved and read-only; any difference from the saved config.yaml outside the
+            resume-location keys raises (:func:`check_resume_cfg`), so ``merge(cfg.common, cfg.model)`` is the
+            run's own and builds the shell.
         train_options: TrainOptions the trainer decided (passed to the architecture constructor).
 
     Returns:
-        (architecture, ckpt_cfg): the BaseWAMArchitecture with real (zero) storage everywhere and the shell's real
-        buffers kept, and the resolved checkpoint config it was built from (the run's effective config: every
-        model-side decision of the resumed run reads it, never the live one).
+        BaseWAMArchitecture with real (zero) storage everywhere and the shell's real buffers kept.
     """
-    from openwam.config import resolve_config
     from openwam.model import build_architecture_from_ckpt_dir
     from openwam.model.video_backbone.common.weights import materialize_meta
 
     ckpt_dir, _explicit_weights = _resolve_ckpt_path(source)
-    ckpt_cfg = resolve_config(_load_ckpt_cfg(ckpt_dir))
-    check_resume_layout(cfg, ckpt_cfg, ckpt_dir)
     # scripts/train.py already swapped in the saved config (load_resume_cfg); this guards direct callers.
-    check_resume_cfg(ckpt_cfg, cfg, os.path.join(ckpt_dir, "config.yaml"))
+    check_resume_cfg(_load_ckpt_cfg(ckpt_dir), cfg, os.path.join(ckpt_dir, "config.yaml"))
     logger.info("[resume] building architecture from ckpt dir: %s", ckpt_dir)
-    architecture = build_architecture_from_ckpt_dir(ckpt_dir, ckpt_cfg.model, ckpt_cfg.common.layout, train_options)
+    architecture = build_architecture_from_ckpt_dir(ckpt_dir, OmegaConf.merge(cfg.common, cfg.model), train_options)
     # set_dtype_device runs before load_state and cannot copy out of meta tensors.
     materialize_meta(architecture, "cpu")
-    return architecture, ckpt_cfg
+    return architecture

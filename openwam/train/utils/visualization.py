@@ -4,10 +4,10 @@ Every ``training.vis_steps`` steps each rank denoises one fixed training sample:
 :func:`rollout_from_sample` runs ``architecture.rollout`` (the same call the deploy engine makes): the H history
 frames and prompt go through the backbone's condition path (``video_backbone.preprocess_condition``, the history
 half of ``preprocess_train``), so it works for every video backbone, and the future video latents + action chunk
-are denoised on a ``make_schedule`` grid. Rank 0 gathers them and logs
+are denoised on a ``schedule_sync`` grid. Rank 0 gathers them and logs
 ``vis/rollout_<i>`` videos (GT | prediction side by side) plus ``vis/video_mse`` /
-``vis/action_mse``. Everything the rollout touches (schedulers, RNG, train/eval
-flags, compiled-loop handle) is restored, so training continues unchanged.
+``vis/action_mse``. Everything the rollout touches (RNG, train/eval flags) is restored and the schedulers
+are never mutated, so training continues unchanged.
 
 All ranks run the rollout in lockstep, so the hook is also safe under ZeRO-3
 (parameter gathers are collective); under ZeRO-2 it simply costs every GPU the
@@ -86,7 +86,7 @@ def rollout_from_sample(arch, sample: dict, schedule, *, seed: int) -> dict:
         arch: unwrapped architecture.
         sample: one dataset sample: ``video`` H + F PIL frames, ``prompt``, ``proprio`` (H, D), ``action`` (K, A),
             ``source``.
-        schedule: (t_video, t_action) list from ``make_schedule``.
+        schedule: (t_video, t_action) list from ``schedule_sync``.
         seed: int, seeds the video and action noise.
 
     Returns: dict ``video``: the F decoded future PIL frames (``decode_future``); ``actions``: (K, A) float32
@@ -144,17 +144,11 @@ class TrainVisualizer:
             (pixels in [0, 1]),
             ``action_mse`` float and ``pred_actions`` (K, A) in normalized space, ``caption`` str.
         """
-        from openwam.model.denoise_schedule import make_schedule
+        from openwam.model.denoise_schedule import schedule_sync
 
         s = self.sample
-        schedule = make_schedule(
-            "sync",
-            video_scheduler=arch.video_scheduler,
-            action_scheduler=arch.action_scheduler,
-            num_steps=self.denoise_steps,
-            shift=arch.action_backbone.shift_action,
-            shift_video=arch.video_backbone.shift_video,
-        )
+        # Pure inference grids: the training schedulers are read, never rewritten.
+        schedule = schedule_sync(arch.video_scheduler, arch.action_scheduler, self.denoise_steps)
         # Seed the global RNG too, in case an encoder draws from it; run() restores the training RNG afterwards.
         torch.manual_seed(self.seed)
         out = rollout_from_sample(arch, dict(s), schedule, seed=self.seed)
@@ -190,17 +184,13 @@ class TrainVisualizer:
             output_path: run dir; rank 0 also keeps the clips there as ``vis/step_<N>_<i>.mp4``.
 
         Returns:
-            None. Restored afterwards: every submodule's train/eval flag, the training schedulers, the
-            torch / CUDA / numpy / python RNG states.
+            None. Restored afterwards: every submodule's train/eval flag and the torch / CUDA / numpy / python
+            RNG states.
         """
         arch = accelerator.unwrap_model(architecture)
         # The rollout flips the whole model to eval; remember each module's own flag
         # (frozen T5/VAE may be in eval while DiTs train) and restore exactly.
         modes = {m: m.training for m in arch.modules()}
-        # The rollout's set_timesteps(denoise_steps) overwrites the live training schedulers in place
-        # (1000 -> 10 timesteps; Cosmos also drops its loss weights). Snapshot and restore them, or every
-        # later step trains on only those 10 noise levels. Shallow copy is enough: set_timesteps rebinds.
-        sched_states = [(s, dict(vars(s))) for s in (arch.video_scheduler, arch.action_scheduler)]
         # RNG: the rollout seeds its own generators, but the backbones' encoders may draw from the global
         # streams; restoring them keeps the training noise / timestep draws identical to a vis-off run.
         import random
@@ -213,8 +203,6 @@ class TrainVisualizer:
             logger.warning("[vis] rank %d step %d rollout failed: %r", self.rank, global_step, e)
             result = None
         finally:
-            for s, saved in sched_states:
-                s.__dict__.update(saved) # rewrite the scheduler's state back to the original state
             for m, was_training in modes.items():
                 m.train(was_training)
             torch.set_rng_state(rng_state[0])

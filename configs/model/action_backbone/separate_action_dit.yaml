@@ -1,6 +1,13 @@
-# ActionDiT action backbone (cfg.model.action_backbone.*) for dual-system.
-# Geometry (num_layers/video_dim/num_heads/attn_head_dim) auto-resolves from the
-# video backbone; context width comes from architecture.text_dim — set neither here.
+# ActionDiT (cfg.model.action_backbone). Attention geometry and the bridge / context widths come from the
+# video backbone's geometry block; its layer count is len(range(0, geometry.num_layers, bridge_interval)).
 dim: 1024
 ffn_dim: 4096
-shift_action: 5.0   # flow-matching α-shift for the ACTION scheduler (train + deploy single source of truth)
+shift_action: 5.0      # flow-matching α-shift for the ACTION scheduler (train + deploy single source of truth)
+train_timestep: {law: grid, weighting: bell}   # uniform draw over the 1000-step shifted grid, Wan bell loss weights
+freq_dim: 256          # sinusoidal timestep embedding width
+max_action_len: 1024   # learned action position table size
+eps: 1.0e-06           # norm epsilon
+num_heads: ${..video_backbone.geometry.num_heads}
+head_dim: ${..video_backbone.geometry.head_dim}
+video_dim: ${..video_backbone.geometry.dim}
+text_dim: ${..video_backbone.geometry.text_dim}

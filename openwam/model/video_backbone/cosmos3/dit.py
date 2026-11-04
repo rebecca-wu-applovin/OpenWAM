@@ -25,7 +25,7 @@ never trained on; parity tests compare noisy frames only.
 
 from __future__ import annotations
 
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -126,8 +126,7 @@ def _und_attention_mask(und_mask: Tensor) -> Tensor:
 # the memory-efficient kernel rejects unequal q/kv head counts under
 # ``enable_gqa`` — so a mask that carries no information costs an order of
 # magnitude in time and memory. Passing ``None`` also keeps
-# ``widen_mask_for_prefix_kv`` free of a ``.all()`` device sync, which would
-# otherwise break the compiled MoT graph.
+# ``widen_mask_for_prefix_kv`` free of a ``.all()`` device sync.
 
 
 @torch.no_grad()
@@ -345,14 +344,12 @@ def run_block(
     state: BlockLoopState,
     *,
     gen_mask: Tensor,
-    block_forward: Callable[..., Tensor] = _gen_block_forward,
 ) -> BlockLoopState:
     """One gen block over the packed gen stream.
 
     Args:
         net: the Cosmos3 transformer. block_id: int. state: BlockLoopState of :func:`prepare_block_loop`.
         gen_mask: (S, S) / (B, 1, S, S) bool mask over the gen keys.
-        block_forward: the block body (eager or compiled ``_gen_block_forward``).
 
     Returns:
         ``state`` with ``hidden_states`` updated.
@@ -360,7 +357,7 @@ def run_block(
     layer = net.layers[block_id]
     k_und, v_und = state.extras["und_kv"][block_id]
     state.hidden_states = gradient_checkpoint_forward(
-        block_forward,
+        _gen_block_forward,
         state.use_gradient_checkpointing,
         state.use_gradient_checkpointing_offload,
         layer,

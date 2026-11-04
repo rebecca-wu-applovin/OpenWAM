@@ -24,13 +24,13 @@ DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "no": torch.float32}
 
 
 def load_architecture(
-    model_cfg: DictConfig, layout, ckpt_dir: str, ckpt_name: str, *, dtype: torch.dtype, device: str
+    model_cfg: DictConfig, ckpt_dir: str, ckpt_name: str, *, dtype: torch.dtype, device: str
 ) -> BaseWAMArchitecture:
     """Build the checkpoint's architecture and load its weights.
 
     Args:
-        model_cfg: the checkpoint's ``model`` config block (after ``resolve_config``).
-        layout: the checkpoint's ``common.layout`` (the latent layout ``resolve_config`` derived).
+        model_cfg: ``OmegaConf.merge(cfg.common, cfg.model)`` of the checkpoint's config (after ``resolve_config``;
+            ``common.layout`` is the latent layout it derived).
         ckpt_dir: run dir (holds the backbone deploy assets ``save_assets_for_deployment`` wrote).
         ckpt_name: ``checkpoint_step_N.safetensors`` inside ``ckpt_dir``.
         dtype: weight dtype (``DTYPES[training.mixed_precision]``).
@@ -42,7 +42,7 @@ def load_architecture(
     from openwam.model.architectures.base import INFERENCE_ONLY
 
     # The checkpoint's shell (LoadMode.CHECKPOINT), the same one finetune / resume build; deploy computes no loss.
-    architecture = build_architecture_from_ckpt_dir(ckpt_dir, model_cfg, layout, INFERENCE_ONLY)
+    architecture = build_architecture_from_ckpt_dir(ckpt_dir, model_cfg, INFERENCE_ONLY)
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     logger.info("Loading %s (%s) with dtype=%s", ckpt_path, type(architecture).__name__, dtype)
     architecture.load_checkpoint(ckpt_path)

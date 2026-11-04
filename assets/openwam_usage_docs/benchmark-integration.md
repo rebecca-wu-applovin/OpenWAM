@@ -44,8 +44,8 @@ video             list[PIL.Image], length = H + F (history frames, the current f
 prompt            str
 
 # Action and state
-# action width D must match architecture.action_dim
-# state width D_state must match architecture.state_dim
+# action width D must match common.action_dim
+# state width D_state must match common.state_dim
 action            float32 Tensor, shape (num_frames - 1, D)
 action_mask       bool Tensor, shape (num_frames - 1, D)
 proprio           float32 Tensor, shape (H, D_state), one row per history frame
@@ -113,6 +113,7 @@ Inspect one sample through the registry:
 from omegaconf import OmegaConf
 from openwam.dataloader.registry import build_dataset
 
+# The trainer passes the dataloader slice merged over the common block: merge(cfg.common, cfg.dataloader).
 config = OmegaConf.load('configs/dataloader/my_benchmark.yaml')
 dataset = build_dataset(config)
 sample = dataset[0]

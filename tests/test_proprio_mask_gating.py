@@ -174,6 +174,7 @@ def test_action_dit_rejects_per_token_timestep():
 
     dit = ActionDiT(
         shift_action=5.0,
+        train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=7,
         dim=32,
         ffn_dim=64,
@@ -182,6 +183,11 @@ def test_action_dit_rejects_per_token_timestep():
         video_dim=32,
         bridge_layers=(0,),
         variant="joint_self_attn",
+        attn_head_dim=8,
+        text_dim=4096,
+        freq_dim=256,
+        max_action_len=1024,
+        eps=1e-6,
     )
     with pytest.raises(ValueError, match="action timestep must be 1D"):
         context = torch.randn(2, 4, dit.text_dim)

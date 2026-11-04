@@ -39,9 +39,9 @@ case "${BACKBONE}" in
     # 07 sparse-history arms (weights uploaded by scripts/modal/sparse_history/upload_weights.sh).
     # LongLive = the Wan2.2 bundle + Robot-S DiT weights; GE reads VAE / T5 / tokenizer from an LTX-Video dir.
     longlive2_robot_s) BACKBONE_DIR=Wan2.2-TI2V-5B
-                       BACKBONE_EXTRA="model.video_backbone.dit_weights=/assets/video_backbone_ckpt/LongLive2.0-Robot-S/model.pt" ;;
+                       BACKBONE_EXTRA="assets.video_backbone.dit_weights=/assets/video_backbone_ckpt/LongLive2.0-Robot-S/model.pt" ;;
     ge_base_fast)      BACKBONE_DIR=Genie-Envisioner-Base-fast
-                       BACKBONE_EXTRA="model.video_backbone.ltx_path=/assets/video_backbone_ckpt/LTX-Video" ;;
+                       BACKBONE_EXTRA="assets.video_backbone.ltx_path=/assets/video_backbone_ckpt/LTX-Video" ;;
     flux3_action_base) BACKBONE_DIR=flux-3-action-base ;;
     *) echo "[run_modal] unknown BACKBONE=${BACKBONE}" >&2; exit 1 ;;
 esac
@@ -92,9 +92,9 @@ fi
 OVERRIDES="dataloader=yam_sharpa \
   dataloader.action_mode=${ACTION_MODE} \
   model=dual_system model/video_backbone=${BACKBONE} \
-  model.video_backbone.model_path=/assets/video_backbone_ckpt/${BACKBONE_DIR} \
+  assets.video_backbone.model_path=/assets/video_backbone_ckpt/${BACKBONE_DIR} \
   model.architecture.variant=joint_self_attn model.architecture.attention_mask_mode=mutual \
-  model.architecture.action_dim=${ACTION_DIM} model.architecture.state_dim=${ACTION_DIM} \
+  common.action_dim=${ACTION_DIM} common.state_dim=${ACTION_DIM} \
   project.wandb.project=${WANDB_PROJECT} \
   project.wandb.group=${WANDB_GROUP} \
   project.wandb.run_name=${WANDB_RUN_NAME} \

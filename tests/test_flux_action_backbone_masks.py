@@ -71,8 +71,12 @@ def test_text_padding_masks():
     assert m[0, 0, 6, :4].all()
 
 
+# The constructor scalars configs/model/video_backbone/flux3_action_base.yaml supplies in production.
+_FLUX_SCALARS = {"shift_video": 5.0, "train_timestep": {"law": "logit_logistic", "width": 0.75, "shift": 42.0}}
+
+
 def test_native_noise_law():
-    vb = FluxActionVideoBackbone(dit=torch.nn.Identity(), vae=torch.nn.Identity(), text_encoder=torch.nn.Identity(), text_encoder_dir="", action_cond_dim=4)
+    vb = FluxActionVideoBackbone(dit=torch.nn.Identity(), vae=torch.nn.Identity(), text_encoder=torch.nn.Identity(), text_encoder_dir="", action_cond_dim=4, **_FLUX_SCALARS)
     torch.manual_seed(0)
     ts, sig, w = vb.scheduler.sample_train(4096, device="cpu", dtype=torch.float32)
     assert ((sig > 0) & (sig <= 1)).all() and torch.allclose(ts, sig * 1000) and (w == 1).all()
@@ -95,7 +99,7 @@ def _tiny_trunk():
 
 
 def test_mot_layer_count_and_geometry():
-    vb = FluxActionVideoBackbone(dit=_tiny_trunk(), vae=torch.nn.Identity(), text_encoder=torch.nn.Identity(), text_encoder_dir="", action_cond_dim=4)
+    vb = FluxActionVideoBackbone(dit=_tiny_trunk(), vae=torch.nn.Identity(), text_encoder=torch.nn.Identity(), text_encoder_dir="", action_cond_dim=4, **_FLUX_SCALARS)
     assert vb.num_layers == _N_MODE + 2 and vb.head_dim * vb.num_heads == vb.dim
     # The frame mask must describe exactly the stream's latents.
     st = type("S", (), {"extras": {"seg_lens": SEG, "text_valid": None, "n_hist": 3}, "grid_frames": 4,

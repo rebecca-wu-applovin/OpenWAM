@@ -1,81 +1,102 @@
+# @package _global_
 # Cosmos3-Edge (4B) video backbone — NVIDIA dual-stream unified transformer
 # (causal und text stream + bidirectional gen video stream; no external text
 # encoder; modeling code vendored under openwam/model/video_backbone/cosmos3/).
 # The transformer / VAE construction kwargs are declared below (dit / vae): checked against the
 # bundle's config.json on from_pretrained, used verbatim for the checkpoint meta shell. The action-side
-# context width (text_dim = dit.hidden_size = 2048) follows. Works with
+# context width (geometry.text_dim = dit.hidden_size = 2048) is in the geometry block. Works with
 # dual_system (joint_cross_attn | joint_self_attn). The und pathway is frozen at
 # build (freeze_und below); the gen pathway is trainable by default.
 
-name: cosmos3_edge
-temporal_compression: 4   # Wan2.2 VAE (yaml contract checked against the backbone at build; the latent layout reads it)
-causal_temporal: true     # the VAE encodes frame 0 alone (yaml contract checked against the backbone at build)
-model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Cosmos3-Edge  # [Required] diffusers-style bundle root (transformer/ + vae/ + text_tokenizer/)
+model:
+  video_backbone:
+    name: cosmos3_edge
+    required_clean_attention: null   # clean_attention this backbone needs (null = any); resolve_config checks it
+    required_proprio_input: context_token  # the only model.architecture.proprio_input this backbone takes
+    temporal_compression: 4   # Wan2.2 VAE (yaml contract checked against the backbone at build; the latent layout reads it)
+    causal_temporal: true     # the VAE encodes frame 0 alone (yaml contract checked against the backbone at build)
 
-# Flow-matching α-shift for the video scheduler (train + deploy single source of
-# truth). NVIDIA's resolution-keyed train shifts are {256: 3, 480: 5, 720: 10};
-# 5.0 matches the 480p regime this repo trains at.
-shift_video: 5.0
+    # Flow-matching α-shift for the video scheduler (train + deploy single source of
+    # truth). NVIDIA's resolution-keyed train shifts are {256: 3, 480: 5, 720: 10};
+    # 5.0 matches the 480p regime this repo trains at.
+    shift_video: 5.0
+    train_timestep: {law: grid, weighting: uniform}   # uniform draw over the 1000-step shifted grid, uniform loss weights (Cosmos-Predict2.5 upstream)
 
-# Prompt handling — mirrors the native pipeline defaults.
-use_system_prompt: false
-prompt_templates: true    # duration + resolution metadata sentences in the prompt
-max_text_tokens: 512
+    # Prompt handling — mirrors the native pipeline defaults.
+    use_system_prompt: false
+    prompt_templates: true    # duration + resolution metadata sentences in the prompt
+    max_text_tokens: 512
 
-# Assumed clip frame rate for the duration sentence + vision mRoPE temporal
-# scaling (inert while it equals the model's base_fps of 24). Set the real rate
-# when known, or drop the duration sentence with prompt_duration_template=false.
-fps: 24.0
-prompt_duration_template: true
+    # Assumed clip frame rate for the duration sentence + vision mRoPE temporal
+    # scaling (inert while it equals the model's base_fps of 24). Set the real rate
+    # when known, or drop the duration sentence with prompt_duration_template=false.
+    fps: 24.0
+    prompt_duration_template: true
 
-freeze_und: true   # freeze the und (text) pathway + token embedding at build
-text_cache: false  # the text encode needs the clip's latent grid (prompt templates, vision positions): no prompt cache
+    freeze_und: true   # freeze the und (text) pathway + token embedding at build
 
-# Cosmos3OmniTransformer kwargs (the bundle's transformer/config.json minus fields the class does not take).
-dit:
-  attention_bias: false
-  attention_dropout: 0.0
-  head_dim: 128
-  hidden_size: 2048
-  intermediate_size: 9216
-  base_fps: 24
-  enable_fps_modulation: true
-  latent_channel: 48
-  unified_3d_mrope_reset_spatial_ids: true
-  unified_3d_mrope_temporal_modality_margin: 15000
-  latent_patch_size: 2
-  num_attention_heads: 16
-  num_hidden_layers: 28
-  num_key_value_heads: 8
-  patch_latent_dim: 192
-  rms_norm_eps: 1.0e-05
-  rope_theta: 100000000.0
-  action_dim: 64
-  action_gen: true
-  num_embodiment_domains: 32
-  sound_gen: false
-  timestep_scale: 0.001
-  vocab_size: 131072
-  hidden_act: relu2
-  qk_norm_for_text: false
-  use_und_k_norm_for_gen: true
-  rope_axes_dim: [24, 20, 20]
-# AutoencoderKLWan kwargs = the bundle's vae/config.json (Wan2.2-TI2V VAE); latents_mean / latents_std
-# also normalize the latents in encode / decode.
-vae:
-  base_dim: 160
-  decoder_base_dim: 256
-  dim_mult: [1, 2, 4, 4]
-  dropout: 0.0
-  in_channels: 12
-  is_residual: true
-  num_res_blocks: 2
-  out_channels: 12
-  patch_size: 2
-  scale_factor_spatial: 16
-  scale_factor_temporal: 4
-  temperal_downsample: [false, true, true]
-  attn_scales: []
-  z_dim: 48
-  latents_mean: [-0.2289, -0.0052, -0.1323, -0.2339, -0.2799, 0.0174, 0.1838, 0.1557, -0.1382, 0.0542, 0.2813, 0.0891, 0.157, -0.0098, 0.0375, -0.1825, -0.2246, -0.1207, -0.0698, 0.5109, 0.2665, -0.2108, -0.2158, 0.2502, -0.2055, -0.0322, 0.1109, 0.1567, -0.0729, 0.0899, -0.2799, -0.123, -0.0313, -0.1649, 0.0117, 0.0723, -0.2839, -0.2083, -0.052, 0.3748, 0.0152, 0.1957, 0.1433, -0.2944, 0.3573, -0.0548, -0.1681, -0.0667]
-  latents_std: [0.4765, 1.0364, 0.4514, 1.1677, 0.5313, 0.499, 0.4818, 0.5013, 0.8158, 1.0344, 0.5894, 1.0901, 0.6885, 0.6165, 0.8454, 0.4978, 0.5759, 0.3523, 0.7135, 0.6804, 0.5833, 1.4146, 0.8986, 0.5659, 0.7069, 0.5338, 0.4889, 0.4917, 0.4069, 0.4999, 0.6866, 0.4093, 0.5709, 0.6065, 0.6415, 0.4944, 0.5726, 1.2042, 0.5458, 1.6887, 0.3971, 1.06, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744]
+    # what the action stream reads; checked against the built module at construction
+    # (from the native block: dit.hidden_size / num_attention_heads / head_dim / num_hidden_layers / hidden_size)
+    geometry:
+      dim: 2048
+      num_heads: 16
+      head_dim: 128
+      num_layers: 28
+      text_dim: 2048
+
+    # Cosmos3OmniTransformer kwargs (the bundle's transformer/config.json minus fields the class does not take).
+    dit:
+      attention_bias: false
+      attention_dropout: 0.0
+      head_dim: 128
+      hidden_size: 2048
+      intermediate_size: 9216
+      base_fps: 24
+      enable_fps_modulation: true
+      latent_channel: 48
+      unified_3d_mrope_reset_spatial_ids: true
+      unified_3d_mrope_temporal_modality_margin: 15000
+      latent_patch_size: 2
+      num_attention_heads: 16
+      num_hidden_layers: 28
+      num_key_value_heads: 8
+      patch_latent_dim: 192
+      rms_norm_eps: 1.0e-05
+      rope_theta: 100000000.0
+      action_dim: 64
+      action_gen: true
+      num_embodiment_domains: 32
+      sound_gen: false
+      timestep_scale: 0.001
+      vocab_size: 131072
+      hidden_act: relu2
+      qk_norm_for_text: false
+      use_und_k_norm_for_gen: true
+      rope_axes_dim: [24, 20, 20]
+    # AutoencoderKLWan kwargs = the bundle's vae/config.json (Wan2.2-TI2V VAE); latents_mean / latents_std
+    # also normalize the latents in encode / decode.
+    vae:
+      base_dim: 160
+      decoder_base_dim: 256
+      dim_mult: [1, 2, 4, 4]
+      dropout: 0.0
+      in_channels: 12
+      is_residual: true
+      num_res_blocks: 2
+      out_channels: 12
+      patch_size: 2
+      scale_factor_spatial: 16
+      scale_factor_temporal: 4
+      temperal_downsample: [false, true, true]
+      attn_scales: []
+      z_dim: 48
+      latents_mean: [-0.2289, -0.0052, -0.1323, -0.2339, -0.2799, 0.0174, 0.1838, 0.1557, -0.1382, 0.0542, 0.2813, 0.0891, 0.157, -0.0098, 0.0375, -0.1825, -0.2246, -0.1207, -0.0698, 0.5109, 0.2665, -0.2108, -0.2158, 0.2502, -0.2055, -0.0322, 0.1109, 0.1567, -0.0729, 0.0899, -0.2799, -0.123, -0.0313, -0.1649, 0.0117, 0.0723, -0.2839, -0.2083, -0.052, 0.3748, 0.0152, 0.1957, 0.1433, -0.2944, 0.3573, -0.0548, -0.1681, -0.0667]
+      latents_std: [0.4765, 1.0364, 0.4514, 1.1677, 0.5313, 0.499, 0.4818, 0.5013, 0.8158, 1.0344, 0.5894, 1.0901, 0.6885, 0.6165, 0.8454, 0.4978, 0.5759, 0.3523, 0.7135, 0.6804, 0.5833, 1.4146, 0.8986, 0.5659, 0.7069, 0.5338, 0.4889, 0.4917, 0.4069, 0.4999, 0.6866, 0.4093, 0.5709, 0.6065, 0.6415, 0.4944, 0.5726, 1.2042, 0.5458, 1.6887, 0.3971, 1.06, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744]
+
+assets:
+  video_backbone:
+    model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Cosmos3-Edge  # [Required] diffusers-style bundle root (transformer/ + vae/ + text_tokenizer/)
+
+training:                 # this backbone's training switches (not compared on finetune)
+  freeze: [video_backbone.vae]   # every entry must exist on the model (no text_encoder: freeze_und freezes und at build)
+  text_cache: false        # the text encode needs the clip's latent grid (prompt templates, vision positions); true raises

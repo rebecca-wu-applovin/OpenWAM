@@ -6,7 +6,7 @@ yamls); ``build_video_backbone`` is the factory the architecture calls for train
 
 Every backbone has exactly two constructors, picked by the explicit :class:`LoadMode` the entry point
 (trainer / deploy loader) decided once:
-  - ``PRETRAINED`` -> ``cls.from_pretrained(cfg)``: the upstream weights (fresh training);
+  - ``PRETRAINED`` -> ``cls.from_pretrained(cfg, assets)``: the upstream weights at the ``assets`` paths (fresh training);
   - ``CHECKPOINT`` -> ``cls.from_checkpoint_dir(cfg, ckpt_dir)``: an empty shell of one of our checkpoints
     (deploy, finetune and resume alike; the caller fills the weights).
 """
@@ -50,18 +50,22 @@ def register_video_backbone(name: str):
     return _wrap
 
 
-def build_video_backbone(cfg: DictConfig, mode: LoadMode, ckpt_dir: Optional[str]) -> VideoBackbone:
+def build_video_backbone(
+    cfg: DictConfig, mode: LoadMode, assets: Optional[DictConfig], ckpt_dir: Optional[str]
+) -> VideoBackbone:
     """Build the backbone ``cfg.name`` names, with the constructor ``mode`` selects.
 
     Args:
-        cfg: ``cfg.model.video_backbone`` (DictConfig); ``cfg.name`` is the registry key.
+        cfg: ``cfg.model.video_backbone`` (DictConfig, what the model is); ``cfg.name`` is the registry key.
         mode: LoadMode, decided by the entry point (trainer: PRETRAINED without a ckpt, CHECKPOINT for
             finetune / resume; deploy: always CHECKPOINT).
+        assets: ``cfg.assets.video_backbone`` (DictConfig: upstream paths + load mode) for PRETRAINED, None for
+            CHECKPOINT (the checkpoint dir holds everything).
         ckpt_dir: str checkpoint dir for CHECKPOINT, None for PRETRAINED.
 
     Returns:
         VideoBackbone: loaded (PRETRAINED) or a meta shell to be filled by the caller (CHECKPOINT).
-        Raises KeyError for an unknown name, ValueError when ``ckpt_dir`` does not fit ``mode``.
+        Raises KeyError for an unknown name, ValueError when ``assets`` / ``ckpt_dir`` do not fit ``mode``.
     """
     name = cfg.name
     if name not in _VIDEO_BACKBONE_REGISTRY:
@@ -69,11 +73,21 @@ def build_video_backbone(cfg: DictConfig, mode: LoadMode, ckpt_dir: Optional[str
         raise KeyError(f"Unknown video backbone '{name}'. Available: {available}")
     cls = _VIDEO_BACKBONE_REGISTRY[name]
     if mode is LoadMode.PRETRAINED:
-        if ckpt_dir is not None:
-            raise ValueError(f"{name}: LoadMode.PRETRAINED reads the upstream weights; got ckpt_dir={ckpt_dir!r}")
-        return cls.from_pretrained(cfg)
+        # Upstream files: the paths come from assets, never from a checkpoint.
+        # The `is None` checks validate the args against the explicit mode; they never infer the mode.
+        if assets is None or ckpt_dir is not None:
+            raise ValueError(
+                f"{name}: LoadMode.PRETRAINED reads the upstream weights at assets.video_backbone; "
+                f"got assets={'set' if assets is not None else None}, ckpt_dir={ckpt_dir!r}"
+            )
+        return cls.from_pretrained(cfg, assets)
     if mode is LoadMode.CHECKPOINT:
-        if ckpt_dir is None:
-            raise ValueError(f"{name}: LoadMode.CHECKPOINT needs ckpt_dir (the checkpoint's assets live there)")
+        # Checkpoint shell: everything it reads lives in ckpt_dir; upstream paths would be ignored.
+        # As above, the `is None` checks only reject args that do not fit the mode.
+        if ckpt_dir is None or assets is not None:
+            raise ValueError(
+                f"{name}: LoadMode.CHECKPOINT reads only ckpt_dir (the checkpoint's assets live there); "
+                f"got ckpt_dir={ckpt_dir!r}, assets={'set' if assets is not None else None}"
+            )
         return cls.from_checkpoint_dir(cfg, ckpt_dir)
     raise ValueError(f"unknown LoadMode {mode!r}")

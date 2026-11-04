@@ -144,6 +144,7 @@ def test_action_mot_block_split_equivalence():
 
     dit = ActionDiT(
         shift_action=5.0,
+        train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=action_dim,
         dim=dim,
         ffn_dim=ffn_dim,
@@ -152,6 +153,11 @@ def test_action_mot_block_split_equivalence():
         video_dim=dim,
         bridge_layers=bridge_layers,
         variant="joint_self_attn",
+        attn_head_dim=dim // num_heads,
+        text_dim=4096,
+        freq_dim=256,
+        max_action_len=1024,
+        eps=1e-6,
     )
     dit.eval()
 
@@ -204,6 +210,7 @@ def test_action_mot_block_heterogeneous_hidden_dim():
 
     dit = ActionDiT(
         shift_action=5.0,
+        train_timestep={"law": "grid", "weighting": "bell"},
         action_dim=action_dim,
         dim=dim,
         ffn_dim=ffn_dim,
@@ -213,6 +220,10 @@ def test_action_mot_block_heterogeneous_hidden_dim():
         bridge_layers=bridge_layers,
         variant="joint_self_attn",
         attn_head_dim=attn_head_dim,
+        text_dim=4096,
+        freq_dim=256,
+        max_action_len=1024,
+        eps=1e-6,
     )
     dit.eval()
 

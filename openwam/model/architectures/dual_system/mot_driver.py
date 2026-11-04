@@ -51,7 +51,7 @@ class DualSystemMoTDriver:
         ab: "ActionDiTBackbone",
         *,
         frame_mask: Tensor,
-        mot_checkpoint_mixed_attn: bool = True,
+        mot_checkpoint_mixed_attn: bool,
     ) -> None:
         """
         Args:

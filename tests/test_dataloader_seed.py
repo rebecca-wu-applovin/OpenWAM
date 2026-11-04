@@ -76,7 +76,15 @@ def _collect_epoch(loader: DataLoader) -> list[dict[str, Any]]:
     return out
 
 
-def _build_loader(seed: int | None, num_workers: int = 2, dataset_size: int = 16) -> DataLoader:
+def _build_loader(seed: int, num_workers: int = 2, dataset_size: int = 16) -> DataLoader:
+    """A seeded DataLoader over ``_RNGSensitiveDataset``, wired like the trainer's.
+
+    Args:
+        seed: int, the run seed. num_workers: int, worker processes. dataset_size: int, number of samples.
+
+    Returns:
+        DataLoader yielding lists of per-sample dicts (batch 4, no shuffle).
+    """
     kwargs: dict = dict(
         batch_size=4,
         shuffle=False,  # disable shuffle so idx order is fixed; isolate worker-RNG behaviour
@@ -84,10 +92,10 @@ def _build_loader(seed: int | None, num_workers: int = 2, dataset_size: int = 16
         collate_fn=list,
         # Python 3.12 deprecates fork on Linux; spawn is the forward-compatible default.
         multiprocessing_context="spawn",
+        # What OpenWAMTrainer.build_dataloader always wires (project.seed is a required int).
+        generator=make_dataloader_generator(seed, rank=0),
+        worker_init_fn=dataloader_worker_init_fn,
     )
-    if seed is not None:
-        kwargs["generator"] = make_dataloader_generator(seed, rank=0)
-        kwargs["worker_init_fn"] = dataloader_worker_init_fn
     return DataLoader(_RNGSensitiveDataset(size=dataset_size), **kwargs)
 
 
@@ -207,19 +215,6 @@ def test_different_seeds_produce_different_outputs():
         1 for a, b in zip(out_42, out_43) if a["py_random"] != b["py_random"] or a["np_random"] != b["np_random"]
     )
     assert differing / len(out_42) > 0.75
-
-
-def test_no_seed_keeps_legacy_non_determinism():
-    """Without ``seed`` (the production path before this change), runs
-    should NOT be reproducible. Catches a regression where the new code
-    accidentally seeds workers even when the user didn't ask for it."""
-    out_a = _collect_epoch(_build_loader(seed=None, num_workers=2))
-    out_b = _collect_epoch(_build_loader(seed=None, num_workers=2))
-    # Some samples may collide by luck; require <75% identity.
-    identical = sum(
-        1 for a, b in zip(out_a, out_b) if a["py_random"] == b["py_random"] and a["np_random"] == b["np_random"]
-    )
-    assert identical / len(out_a) < 0.75
 
 
 # ---------------------------------------------------------------------------

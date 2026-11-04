@@ -30,22 +30,16 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 
-from openwam.model.compile_options import (
-    compile_enabled,
-    cosmos3_blocks_compile_cfg,
-    section_enabled,
-    torch_compile_kwargs,
-)
+from openwam.model.common.flow_scheduler import FlowScheduler
 from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
 from openwam.model.video_backbone.cosmos3 import dit as cosmos3_dit
 from openwam.model.video_backbone.cosmos3 import text as cosmos3_text
-from openwam.model.video_backbone.cosmos3.scheduler import Cosmos3FlowSchedulerAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -226,12 +220,13 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         context_dim: int,
         latents_mean: Tensor,
         latents_std: Tensor,
-        shift_video: float = 5.0,
-        use_system_prompt: bool = False,
-        prompt_templates: bool = True,
-        duration_template: bool = True,
+        shift_video: float,
+        train_timestep: DictConfig,
+        use_system_prompt: bool,
+        prompt_templates: bool,
+        duration_template: bool,
         clip_fps: float,
-        max_text_tokens: int = 512,
+        max_text_tokens: int,
     ) -> None:
         """Wrap built modules; use :meth:`from_pretrained` / :meth:`from_checkpoint_dir` instead.
 
@@ -241,7 +236,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             dim / num_layers / num_heads / head_dim: int gen-stream geometry (yaml ``dit``).
             context_dim: int, und hidden size (the action stream's context width).
             latents_mean / latents_std: (48,) VAE latent normalization (yaml ``vae.latents_mean`` / ``latents_std``).
-            shift_video: float, α-shift of the scheduler built here.
+            shift_video: float, α-shift of the scheduler built here. train_timestep: DictConfig, its training law.
             use_system_prompt / prompt_templates / duration_template: bool prompt knobs.
             clip_fps: float, assumed clip frame rate (yaml ``fps``). max_text_tokens: int.
         """
@@ -262,8 +257,9 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         self._num_heads = int(num_heads)
         self._head_dim = int(head_dim)
         self._context_dim = int(context_dim)
-        self._scheduler = Cosmos3FlowSchedulerAdapter(shift_video=shift_video)
-        self._shift_video = float(shift_video)
+        # Grid draw, uniform weights. Deploy rides the native linear flow ramp + shift with Euler steps, not the
+        # bundle's karras UniPC grid (see diffusers#14272).
+        self._scheduler = FlowScheduler(shift=shift_video, train_timestep=train_timestep)
 
         self._temporal_compression = _COSMOS3_TEMPORAL_COMPRESSION
         self._causal_temporal = _COSMOS3_CAUSAL_TEMPORAL
@@ -276,17 +272,15 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         self._clip_fps = float(clip_fps)
         self._max_text_tokens = int(max_text_tokens)
         self._pristine_inv_freq = self._capture_pristine_inv_freq()
-        self._gen_block_compile_enabled = False
-        self._gen_block_compile_kwargs: dict | None = None
-        self._compiled_gen_block: Callable[..., Tensor] | None = None
 
     @classmethod
-    def from_pretrained(cls, cfg: DictConfig) -> "Cosmos3EdgeVideoBackbone":
-        """Build from the diffusers-style bundle at ``cfg.model_path``.
+    def from_pretrained(cls, cfg: DictConfig, assets: DictConfig) -> "Cosmos3EdgeVideoBackbone":
+        """Build from the diffusers-style bundle at ``assets.model_path``.
 
         Args:
-            cfg: ``cfg.model.video_backbone``: ``model_path``, the ``dit`` / ``vae`` blocks the bundle must
-                match, prompt knobs, ``shift_video``.
+            cfg: ``cfg.model.video_backbone``: the ``dit`` / ``vae`` blocks the bundle must match, prompt knobs,
+                ``shift_video``.
+            assets: ``cfg.assets.video_backbone``: ``model_path`` (the bundle root).
 
         Returns:
             Cosmos3EdgeVideoBackbone on CPU (bf16; the bundle keeps ``time_embedder`` fp32). Raises ValueError
@@ -299,7 +293,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             from diffusers import AutoencoderKLWan
         except ImportError as exc:
             raise ImportError(_COSMOS3_INSTALL_HINT) from exc
-        model_path = str(cfg.model_path)
+        model_path = str(assets.model_path)
         if not os.path.isdir(os.path.join(model_path, "transformer")):
             raise FileNotFoundError(
                 f"cosmos3 model_path has no transformer/ subfolder: {model_path} (expected a diffusers-style bundle)."
@@ -394,6 +388,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             latents_mean=torch.tensor(list(cfg.vae.latents_mean), dtype=torch.float32),
             latents_std=torch.tensor(list(cfg.vae.latents_std), dtype=torch.float32),
             shift_video=float(cfg.shift_video),
+            train_timestep=cfg.train_timestep,
             use_system_prompt=bool(cfg.use_system_prompt),
             prompt_templates=bool(cfg.prompt_templates),
             duration_template=bool(cfg.prompt_duration_template),
@@ -515,11 +510,6 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         """Context width for the action stream = und hidden size (2048)."""
         return self._context_dim
 
-    @property
-    def scheduler(self):
-        """Cosmos3FlowSchedulerAdapter: the shared FlowScheduler grid (uniform weights) at ``shift_video``."""
-        return self._scheduler
-
     # ================================================================
     # Video and text IO
     # ================================================================
@@ -632,7 +622,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         # Whether any prompt is padded is host-side knowledge (Python list
         # lengths), so decide it here and hand ``None`` down when there is no
         # padding — that is what keeps SDPA on a fused kernel and keeps the
-        # compiled MoT graph free of a ``.all()`` device sync. Every B=1 request
+        # MoT loop free of a ``.all()`` device sync. Every B=1 request
         # and any uniform-length batch takes this path.
         und_mask = und_mask.to(self.device) if len(set(len(i) for i in ids)) > 1 else None
 
@@ -682,10 +672,10 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             prompts: list[str] (unused).
 
         Returns:
-            Never; raises ValueError (cosmos3 yamls set ``text_cache: false``).
+            Never; raises ValueError (cosmos3 yamls set ``training.text_cache: false``).
         """
         raise ValueError(
-            "cosmos3 encodes text per clip geometry and cannot cache it; set model.video_backbone.text_cache=false"
+            "cosmos3 encodes text per clip geometry and cannot cache it; set training.text_cache=false"
         )
 
     # ================================================================
@@ -741,24 +731,6 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             ``state`` with ``hidden_states`` updated.
         """
         gen_mask = attn_mask[..., int(state.prefix_kv_len) :]
-        # Compile only the deploy path: eval, no grad, no checkpointing, not already inside a compiled graph.
-        compile_allowed = (
-            self._gen_block_compile_enabled
-            and not self.training
-            and not torch.is_grad_enabled()
-            and not state.use_gradient_checkpointing
-            and not state.use_gradient_checkpointing_offload
-            and not torch.compiler.is_compiling()
-        )
-        if compile_allowed:
-            # Lazily compiled once; a compile / run failure propagates (no silent eager fallback, as Wan).
-            if self._compiled_gen_block is None:
-                self._compiled_gen_block = torch.compile(
-                    cosmos3_dit._gen_block_forward, **(self._gen_block_compile_kwargs or {})
-                )
-            return cosmos3_dit.run_block(
-                self.dit, block_id, state, gen_mask=gen_mask, block_forward=self._compiled_gen_block
-            )
         return cosmos3_dit.run_block(self.dit, block_id, state, gen_mask=gen_mask)
 
     def finalize(self, state: BlockLoopState) -> Tensor:
@@ -806,29 +778,6 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         mask = super().build_joint_attention_masks(frame_mask, state, s_action)[0]
         mask = widen_mask_for_prefix_kv(mask, int(state.prefix_kv_len), state.prefix_kv_mask)
         return [mask] * self.num_layers
-
-    def apply_compile_optimizations(self, compile_cfg) -> None:
-        """Enable the lazy gen-block compile for deploy (the block function, layers stay arguments).
-
-        Args:
-            compile_cfg: the deploy compile block; its ``cosmos3_blocks`` section holds the ``torch.compile`` kwargs.
-
-        Returns:
-            None. Compiling the function (not the layers) keeps the checkpoint keys unchanged.
-        """
-        # Reset first: a disabled config leaves the backbone eager.
-        self._compiled_gen_block = None
-        self._gen_block_compile_enabled = False
-        self._gen_block_compile_kwargs = None
-        if not compile_enabled(compile_cfg, default=False, strict=True):
-            return
-        # The cosmos3_blocks section may switch the gen-block compile off on its own.
-        section = cosmos3_blocks_compile_cfg(compile_cfg)
-        if not section_enabled(section, default=True):
-            return
-        self._gen_block_compile_kwargs = torch_compile_kwargs(section, default_mode="default")
-        self._gen_block_compile_enabled = True
-        logger.info("Enabled lazy Cosmos3 gen-block compile with kwargs=%s", self._gen_block_compile_kwargs)
 
     # ================================================================
     # Deploy assets

@@ -3,22 +3,16 @@
 #   joint_self_attn:  one mixed video/action self-attention per layer (MoT).
 
 defaults:
-  - video_backbone: wan22_ti2v_5b        # wan22_ti2v_5b | cosmos3_edge | cosmos3_nano
+  - video_backbone: wan22_ti2v_5b        # any configs/model/video_backbone/*.yaml (package _global_: also sets training.*)
   - action_backbone: separate_action_dit # dual-system only supports ActionDiT
   - _self_
-
-# Pretrained components kept frozen; entries missing on the active backbone are skipped.
-freeze:
-  - video_backbone.text_encoder
-  - video_backbone.vae
 
 architecture:
   framework: dual_system
   variant: joint_self_attn   # joint_self_attn | joint_cross_attn
 
-  action_dim: 80             # 80 = unified action space (unify_action=true); raw width otherwise (e.g. yam_sharpa fingertips_* = 48)
+  # action / proprio widths: common.action_dim / common.state_dim (configs/train.yaml)
   use_proprioception: true   # true = one proprio token per history frame, appended to ActionDiT's text context
-  state_dim: 80              # proprio width; required when use_proprioception=true
   # How the video backbone sees the proprio: context_token (the same appended tokens as ActionDiT) |
   # backbone_stream (the backbone embeds it in its own stream; flux, whose yaml requires it).
   proprio_input: context_token
@@ -33,10 +27,8 @@ architecture:
   # clip, 1 + (H - 2) / tc latents; needs H - 1 = 1 + tc*k). The current frame is always encoded alone.
   history_encoding: per_frame
 
-  # ActionDiT layer selection: explicit list, or null + bridge_interval (1 = every layer, 2 = every other).
-  # joint_cross_attn: which video layers feed the bridge; joint_self_attn: sizes ActionDiT.
-  bridge_layers: null
+  # ActionDiT bridge layers = range(0, video_backbone.geometry.num_layers, bridge_interval) (1 = every layer,
+  # 2 = every other). joint_cross_attn: which video layers feed the bridge; joint_self_attn: sizes ActionDiT.
   bridge_interval: 1
 
-  mot_checkpoint_mixed_attn: true  # joint_self_attn only: grad-checkpoint the mixed attention (VRAM down)
   detach_bridge: false             # joint_cross_attn only

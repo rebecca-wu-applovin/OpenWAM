@@ -1,37 +1,57 @@
+# @package _global_
 # GE-Base-fast video backbone (Genie Envisioner, AgiBot; cfg.model.video_backbone.*).
 # GE multi-view LTX DiT + LTX-Video VAE (8x temporal, 32x spatial) + LTX-Video T5.
 # Views: the vstacked canvas is split into n_view tiles (ego = GE "head" slot 0, chest = slot 1).
-# Video noise schedule is GE-native (ge/scheduler.py GEFlowScheduler.sample_train); shift_video only
+# Video training noise is GE-native (train_timestep.law ge_native); shift_video only
 # shapes the deploy grid (GE trains on the shift-1 FlowMatchEuler grid).
 
-name: ge_base_fast
-model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/GE-Base-fast   # [Required] GE_base_fast_v0.1.safetensors
-weights_file: GE_base_fast_v0.1.safetensors
-ltx_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/LTX-Video        # [Required] vae/ text_encoder/ tokenizer/
+model:
+  video_backbone:
+    name: ge_base_fast
+    required_clean_attention: null   # clean_attention this backbone needs (null = any); resolve_config checks it
+    required_proprio_input: context_token  # the only model.architecture.proprio_input this backbone takes
+    temporal_compression: 8   # LTX VAE (yaml contract checked against the backbone at build; the latent layout reads it)
+    causal_temporal: true     # the VAE encodes frame 0 alone (yaml contract checked against the backbone at build)
+    shift_video: 1.0          # deploy-grid shift; GE trains on the shift-1 FlowMatchEuler grid
+    train_timestep: {law: ge_native}   # GE flow_weighting_scheme none: uniform index into the shift-1 FlowMatchEuler grid, weight 1
+    n_view: 2                 # cameras stacked top-to-bottom in the dataloader canvas
+    text_max_length: 128      # GE get_text_conditions max_sequence_length
+    vae_sample: true          # GE get_latents samples the VAE posterior (training mode only; eval / deploy take its mode)
 
-temporal_compression: 8   # LTX VAE (yaml contract checked against the backbone at build; the latent layout reads it)
-causal_temporal: true     # the VAE encodes frame 0 alone (yaml contract checked against the backbone at build)
-shift_video: 1.0          # deploy-grid shift; GE trains on the shift-1 FlowMatchEuler grid
-n_view: 2                 # cameras stacked top-to-bottom in the dataloader canvas
-text_max_length: 128      # GE get_text_conditions max_sequence_length
-vae_sample: true          # GE get_latents samples the VAE posterior (training mode only; eval / deploy take its mode)
-text_cache: true          # trainer encodes the dataset's prompt set once after the weights are in place, T5 then on CPU
+    # what the action stream reads; checked against the built module at construction
+    # (from the native block: heads × attention_head_dim / num_attention_heads / attention_head_dim / num_layers / caption_channels)
+    geometry:
+      dim: 2048
+      num_heads: 32
+      head_dim: 64
+      num_layers: 28
+      text_dim: 4096
 
-dit:                      # LTXVideoTransformer3DModel (GE multi-view): checked by the strict weight load
-  in_channels: 128
-  out_channels: 128
-  patch_size: 1
-  patch_size_t: 1
-  num_attention_heads: 32
-  attention_head_dim: 64
-  cross_attention_dim: 2048
-  num_layers: 28
-  activation_fn: gelu-approximate
-  qk_norm: rms_norm_across_heads
-  norm_elementwise_affine: false
-  norm_eps: 1.0e-06
-  caption_channels: 4096  # T5-XXL width (= the text_dim the action stream reads)
-  attention_bias: true
-  attention_out_bias: true
-  use_view_embed: true
-  max_view: 3
+    dit:                      # LTXVideoTransformer3DModel (GE multi-view): checked by the strict weight load
+      in_channels: 128
+      out_channels: 128
+      patch_size: 1
+      patch_size_t: 1
+      num_attention_heads: 32
+      attention_head_dim: 64
+      cross_attention_dim: 2048
+      num_layers: 28
+      activation_fn: gelu-approximate
+      qk_norm: rms_norm_across_heads
+      norm_elementwise_affine: false
+      norm_eps: 1.0e-06
+      caption_channels: 4096  # T5-XXL width (= the text_dim the action stream reads)
+      attention_bias: true
+      attention_out_bias: true
+      use_view_embed: true
+      max_view: 3
+
+assets:
+  video_backbone:
+    model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/GE-Base-fast   # [Required] GE_base_fast_v0.1.safetensors
+    weights_file: GE_base_fast_v0.1.safetensors
+    ltx_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/LTX-Video        # [Required] vae/ text_encoder/ tokenizer/
+
+training:                 # this backbone's training switches (not compared on finetune)
+  freeze: [video_backbone.text_encoder, video_backbone.vae]   # every entry must exist on the model
+  text_cache: true        # encode the dataset's prompt set once after the weights are final

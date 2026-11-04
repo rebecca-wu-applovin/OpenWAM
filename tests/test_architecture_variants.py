@@ -44,8 +44,10 @@ def _build_arch(registry_name: str, cfg: dict, *, num_layers: int = WAN_NUM_LAYE
     resolves ``video_dim`` / ``num_dit_layers`` from it; here the factory returns a mock with the Wan layer count,
     so the same init code path runs (bridge layer resolution, action_backbone instantiation).
     """
+    # The ActionDiT attention geometry follows the backbone: heads / head_dim of the test cfg size the mock.
     num_heads = int(cfg.get("num_heads", 4))
-    backbone = _MockVideoBackbone(dim=WAN_VIDEO_DIM, num_layers=num_layers, num_heads=num_heads)
+    head_dim = cfg.get("head_dim")
+    backbone = _MockVideoBackbone(dim=WAN_VIDEO_DIM, num_layers=num_layers, num_heads=num_heads, head_dim=head_dim)
     arch = build_test_arch(registry_name, cfg, backbone)
     arch._device = torch.device("cpu")
     arch._dtype = torch.float32
@@ -57,7 +59,6 @@ def _count_params(module) -> int:
 
 
 def _run_compute_loss(arch):
-    arch.init_training_schedulers(1000)
     # Text context at the action backbone's text width (both streams read it).
     arch.video_backbone.context_width = arch.action_backbone.text_dim
     batch = Batch(
@@ -86,7 +87,6 @@ def test_dual_system_cross_attn_bridge_interval_1():
         "variant": "joint_cross_attn",
         "detach_bridge": True,
         "action_dim": ACTION_DIM,
-        "bridge_layers": None,
         "bridge_interval": 1,
         "dim": 256,
         "ffn_dim": 1024,
@@ -117,7 +117,6 @@ def test_dual_system_cross_attn_bridge_interval_2():
         "variant": "joint_cross_attn",
         "detach_bridge": False,
         "action_dim": ACTION_DIM,
-        "bridge_layers": None,
         "bridge_interval": 2,
         "dim": 128,
         "ffn_dim": 512,
@@ -138,47 +137,6 @@ def test_dual_system_cross_attn_bridge_interval_2():
     assert torch.isfinite(out["loss"])
 
 
-def test_dual_system_cross_attn_explicit_bridge_layers():
-    """Explicit bridge_layers list overrides interval mode and pins num_layers."""
-    explicit = (0, 5, 10, 15, 20, 25, 29)
-    cfg = {
-        "framework": "dual_system",
-        "clean_attention": "bidirectional",
-        "attention_mask_mode": "mutual",
-        "variant": "joint_cross_attn",
-        "detach_bridge": True,
-        "action_dim": ACTION_DIM,
-        "bridge_layers": list(explicit),
-        "dim": 128,
-        "ffn_dim": 512,
-        "num_heads": 4,
-    }
-    arch = _build_arch("dual_system_cross_attn", cfg)
-
-    assert arch.action_backbone.bridge_layers == explicit
-    assert len(arch.action_backbone.bridge_layers) == 7
-    assert arch.action_backbone.num_layers == 7
-
-    n_params = _count_params(arch.action_backbone)
-    print(f"\n[dual_system_cross_attn / explicit-7] action_backbone params: {n_params:,}")
-    _run_compute_loss(arch)
-
-
-@pytest.mark.parametrize("bridge_layers", [[], [0, WAN_NUM_LAYERS]])
-def test_dual_system_cross_attn_rejects_bridge_layers_outside_the_video_dit(bridge_layers):
-    """Bridge layers the video DiT never produces would leave the ActionDiT without inputs: raise at build."""
-    cfg = {
-        "variant": "joint_cross_attn",
-        "action_dim": ACTION_DIM,
-        "bridge_layers": bridge_layers,
-        "dim": 128,
-        "ffn_dim": 512,
-        "num_heads": 4,
-    }
-    with pytest.raises(ValueError, match="bridge_layers"):
-        _build_arch("dual_system_cross_attn", cfg)
-
-
 def test_dual_system_cross_attn_heterogeneous_dim():
     """cross_attn must accept ``dim != num_heads * attn_head_dim`` (FastWAM-Joint layout).
 
@@ -194,22 +152,21 @@ def test_dual_system_cross_attn_heterogeneous_dim():
         "variant": "joint_cross_attn",
         "detach_bridge": False,
         "action_dim": ACTION_DIM,
-        "bridge_layers": None,
         "bridge_interval": 1,
         # Heterogeneous: dim (1024) is NOT divisible by num_heads (24);
-        # the explicit attn_head_dim makes the attention space 24*128=3072
+        # the explicit head_dim makes the attention space 24*128=3072
         # while the residual stream stays at 1024.
         "dim": 1024,
         "ffn_dim": 4096,
         "num_heads": 24,
-        "attn_head_dim": 128,
+        "head_dim": 128,
     }
     arch = _build_arch("dual_system_cross_attn", cfg, num_layers=WAN_NUM_LAYERS)
 
     ab = arch.action_backbone
     assert ab.dim == 1024, "residual hidden dim should match cfg.dim"
     assert ab.num_heads == 24
-    assert ab.head_dim == 128, "attn_head_dim should propagate from cfg, not be inferred from dim/num_heads"
+    assert ab.head_dim == 128, "head_dim should follow the backbone's, not be inferred from dim/num_heads"
     # Q/K/V project from residual width 1024 into shared attention space 24*128=3072.
     block0 = ab.blocks[0]
     assert block0.self_attn.q.in_features == 1024
@@ -231,15 +188,14 @@ def test_dual_system_cross_attn_inherits_geometry_from_video_backbone():
     video backbone when cfg omits them (mirrors joint_self_attn). Regression
     guard for the video-backbone defaults in ``DualSystemCrossAttnArchitecture.__init__``.
     """
-    # Deliberately omit num_heads + attn_head_dim — must come from vb, not from
-    # the hard-coded fallback (num_heads=12 / attn_head_dim=dim//num_heads).
+    # Deliberately omit num_heads + head_dim — must come from vb, not from
+    # the hard-coded fallback (num_heads=12 / head_dim=dim//num_heads).
     cfg = {
         "framework": "dual_system",
         "clean_attention": "bidirectional",
         "attention_mask_mode": "mutual",
         "variant": "joint_cross_attn",
         "action_dim": ACTION_DIM,
-        "bridge_layers": None,
         "bridge_interval": 1,
         "dim": WAN_VIDEO_DIM,
         "ffn_dim": 4 * WAN_VIDEO_DIM,
@@ -278,17 +234,10 @@ def _build_self_attn_with_backbone(backbone_cls, cfg_extra=None):
 
 
 def test_text_dim_auto_derives_from_backbone():
-    """When ``text_dim`` is absent from cfg it defaults to the loaded backbone's
-    ``text_dim`` (Cosmos-Predict2.5=1024), removing the manual override footgun."""
+    """The action-side context width is the loaded backbone's ``text_dim`` (Cosmos-Predict2.5=1024)."""
     arch = _build_self_attn_with_backbone(_TextDim1024Backbone)
     assert arch.action_backbone.text_dim == 1024
     assert arch.context_dim == 1024
-
-
-def test_text_dim_explicit_cfg_wins_over_backbone():
-    """An explicit cfg ``text_dim`` still overrides the backbone-derived default."""
-    arch = _build_self_attn_with_backbone(_TextDim1024Backbone, {"text_dim": 777})
-    assert arch.action_backbone.text_dim == 777
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +256,6 @@ def test_dual_system_self_attn_bridge_interval_1():
         "attention_mask_mode": "mutual",
         "variant": "joint_self_attn",
         "action_dim": ACTION_DIM,
-        "bridge_layers": None,
         "bridge_interval": 1,
         "dim": WAN_VIDEO_DIM,
         "ffn_dim": 4 * WAN_VIDEO_DIM,
@@ -341,7 +289,6 @@ def test_dual_system_self_attn_rejects_interval_gt_1():
         "attention_mask_mode": "mutual",
         "variant": "joint_self_attn",
         "action_dim": ACTION_DIM,
-        "bridge_layers": None,
         "bridge_interval": 3,
         "dim": WAN_VIDEO_DIM,
         "ffn_dim": 4 * WAN_VIDEO_DIM,
@@ -370,7 +317,6 @@ def test_dual_system_self_attn_rejects_interval_gt_1():
                 "variant": "joint_cross_attn",
                 "detach_bridge": True,
                 "action_dim": ACTION_DIM,
-                "bridge_layers": None,
                 "bridge_interval": 1,
                 "dim": 256,
                 "ffn_dim": 1024,
@@ -386,7 +332,6 @@ def test_dual_system_self_attn_rejects_interval_gt_1():
                 "attention_mask_mode": "mutual",
                 "variant": "joint_self_attn",
                 "action_dim": ACTION_DIM,
-                "bridge_layers": None,
                 "bridge_interval": 1,
                 "dim": WAN_VIDEO_DIM,
                 "ffn_dim": 4 * WAN_VIDEO_DIM,
@@ -435,11 +380,11 @@ _BACKBONE_DUMMY_MODEL_PATH = {
 def test_framework_backbone_hydra_compose(framework, backbone):
     """Every framework × video_backbone pair must Hydra-compose cleanly via
     the field-override pattern — ``model.video_backbone.name`` AND
-    ``model.video_backbone.model_path`` overridden together — with both fields
+    ``assets.video_backbone.model_path`` overridden together — with both fields
     reaching the composed cfg unchanged.
 
     Each framework yaml selects the backbone via a Hydra group whose file ships
-    both ``name`` and ``model_path``. This test pins the field-override path
+    ``model.video_backbone.name`` and ``assets.video_backbone.model_path``. This test pins the field-override path
     used for ablations that point at an off-default weights dir, verifying the
     override reaches the composed cfg instead of silently keeping the default
     group's ``model_path``.
@@ -453,7 +398,7 @@ def test_framework_backbone_hydra_compose(framework, backbone):
     overrides = [
         f"model={framework}",
         f"model.video_backbone.name={backbone}",
-        f"model.video_backbone.model_path={dummy_model_path}",
+        f"assets.video_backbone.model_path={dummy_model_path}",
     ]
     with initialize_config_dir(config_dir=cfg_dir, version_base=None):
         cfg = compose(config_name="train", overrides=overrides)
@@ -466,9 +411,9 @@ def test_framework_backbone_hydra_compose(framework, backbone):
     assert vb.name == backbone, (
         f"{framework} × {backbone}: composed video_backbone.name={vb.name!r}, expected {backbone!r}"
     )
-    assert vb.model_path == dummy_model_path, (
-        f"{framework} × {backbone}: composed video_backbone.model_path="
-        f"{vb.model_path!r}, expected {dummy_model_path!r} — model_path CLI "
+    assert cfg.assets.video_backbone.model_path == dummy_model_path, (
+        f"{framework} × {backbone}: composed assets.video_backbone.model_path="
+        f"{cfg.assets.video_backbone.model_path!r}, expected {dummy_model_path!r} — model_path CLI "
         f"override did not reach the composed cfg"
     )
     assert cfg.model.architecture.framework == framework

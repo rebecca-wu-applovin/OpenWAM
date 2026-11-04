@@ -1,14 +1,10 @@
 """Deterministic-seeding helpers used by the OpenWAM trainer.
 
-``OpenWAMTrainer`` (dual_system path) reads
-the ``cfg.project.seed`` yaml field (or the ``OPENWAM_SEED`` env var) to opt
-in to deterministic mode. The FastWAM-style seeding intentionally does NOT
+``OpenWAMTrainer`` (dual_system path) seeds every run from the
+``cfg.project.seed`` yaml field (a required int). The FastWAM-style seeding intentionally does NOT
 touch cudnn or cuBLAS, so FSDP / fused-attention kernels stay usable. It
 reaches into the helpers below for ``make_dataloader_generator`` and
 ``dataloader_worker_init_fn`` to make dataset-side randomness reproducible.
-
-Default training behaviour (neither switch set) is unchanged so production
-runs keep their stochasticity.
 
 Helpers:
 

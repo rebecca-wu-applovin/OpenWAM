@@ -65,7 +65,7 @@ class _FakeBackbone(VideoBackbone):
 
     # --- the rest of the ABC (unused here) ---
     @classmethod
-    def from_pretrained(cls, cfg):
+    def from_pretrained(cls, cfg, assets):
         return cls()
 
     @classmethod
@@ -218,6 +218,8 @@ def _cfg(h=5, f=8, encoding="per_frame", tc=4, clean="bidirectional", va="mutual
     """A run config with the keys resolve_config reads. Returns: DictConfig."""
     return OmegaConf.create(
         {
+            "project": {"seed": 0},
+            "common": {"action_dim": 48, "state_dim": 48},
             "dataloader": {
                 "history_offsets": list(range(-h + 1, 1)),
                 "future_offsets": list(range(1, f + 1)),
@@ -234,10 +236,31 @@ def _cfg(h=5, f=8, encoding="per_frame", tc=4, clean="bidirectional", va="mutual
                     "proprio_input": "context_token",
                     **arch_extra,
                 },
-                "video_backbone": {"name": "fake", "temporal_compression": tc},
+                "video_backbone": {
+                    "name": "fake",
+                    "temporal_compression": tc,
+                    "required_clean_attention": None,
+                    "required_proprio_input": "context_token",
+                },
             },
         }
     )
+
+
+def test_resolve_config_rejects_null_seed():
+    # Every run RNG (dataset per-sample, per-step, vis sample) derives from project.seed: null is not a mode.
+    cfg = _cfg()
+    cfg.project.seed = None
+    with pytest.raises(ValueError, match="project.seed"):
+        resolve_config(cfg)
+
+
+def test_resolve_config_rejects_bool_seed():
+    # bool is an int subclass in Python; a yaml `true` is a typo, not a seed.
+    cfg = _cfg()
+    cfg.project.seed = True
+    with pytest.raises(ValueError, match="project.seed"):
+        resolve_config(cfg)
 
 
 def test_resolve_config_layout():
@@ -271,6 +294,15 @@ def test_resolve_config_layout():
         resolve_config(cfg)
     cfg.model.architecture.clean_attention = "causal"
     resolve_config(cfg)
+
+
+def test_resolve_config_freezes_whole_cfg():
+    # The run config is read-only after resolve_config: a write anywhere (not only in common.layout) raises.
+    from omegaconf.errors import ReadonlyConfigError
+
+    cfg = resolve_config(_cfg())
+    with pytest.raises(ReadonlyConfigError):
+        cfg.dataloader.num_frames = 17
 
 
 @pytest.mark.parametrize(
@@ -316,7 +348,7 @@ def test_history_window_must_cover_offsets():
     # Fixed sampling never reads the window: the fixed offsets are the layout.
     cfg.dataloader.history_sampling = "fixed"
     resolve_config(cfg)
-    # Unknown mode, or a missing key, is rejected.
+    # Unknown mode, or a missing key (OmegaConf names its full path), is rejected.
     cfg = _cfg()
     cfg.dataloader.history_sampling = "uniform"
     with pytest.raises(ValueError, match="history_sampling"):
@@ -324,7 +356,7 @@ def test_history_window_must_cover_offsets():
     for key in ("history_sampling", "history_window"):
         cfg = _cfg()
         cfg.dataloader.pop(key)
-        with pytest.raises(ValueError, match=key):
+        with pytest.raises(Exception, match=f"dataloader.{key}"):
             resolve_config(cfg)
 
 
@@ -332,7 +364,7 @@ def test_caption_dropout_p_checked():
     # Required and a probability; resolve_config is the one place it is checked (the dataset reads it as is).
     cfg = _cfg()
     cfg.dataloader.pop("caption_dropout_p")
-    with pytest.raises(ValueError, match="caption_dropout_p"):
+    with pytest.raises(Exception, match="dataloader.caption_dropout_p"):
         resolve_config(cfg)
     for bad in (-0.1, 1.5):
         cfg = _cfg()

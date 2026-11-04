@@ -273,8 +273,8 @@ def _ckpt_dir(tmp_path, *overrides):
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     base = [
         "dataloader.action_mode=fingertips_abs",
-        "model.architecture.action_dim=48",
-        "model.architecture.state_dim=48",
+        "common.action_dim=48",
+        "common.state_dim=48",
         "dataloader.history_offsets=[-40,-20,0]",
         "dataloader.height=384",
         "dataloader.width=224",

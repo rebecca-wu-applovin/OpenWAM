@@ -48,6 +48,7 @@ def _wan(text_encoder):
         tokenizer=_MockTokenizer(),
         tokenizer_dir="",
         shift_video=5.0,
+        train_timestep={"law": "grid", "weighting": "bell"},
         text_max_length=4,
     )
     vb._device = torch.device("cpu")

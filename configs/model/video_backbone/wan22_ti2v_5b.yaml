@@ -1,42 +1,66 @@
+# @package _global_
 # Wan2.2-TI2V-5B video backbone (cfg.model.video_backbone.*). Any H,W % 32 == 0.
 # The module geometry below is declared here (not inferred from the weight files): the backbone is
 # built from it on the meta device and the weights are then loaded strictly, so a wrong number fails
 # at build time. longlive2_robot_s / wan22_ti2v_tiny start from this file and override a few keys.
+# model.video_backbone = what the model is (compared on finetune); assets.video_backbone = where its
+# upstream files are and how they are loaded (not compared, not read on CHECKPOINT); training = this
+# backbone's training switches.
 
-name: wan22_ti2v_5b
-temporal_compression: 4   # VAE38 (yaml contract checked against the backbone at build; the latent layout reads it)
-causal_temporal: true     # the VAE encodes frame 0 alone (yaml contract checked against the backbone at build)
-model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Wan2.2-TI2V-5B  # [Required] upstream weights dir
-init: pretrained          # pretrained: load `weights` from model_path | random: random init (debug only, no weight files)
-weights:                  # upstream file names under model_path
-  dit: diffusion_pytorch_model*.safetensors   # glob over the shards
-  vae: Wan2.2_VAE.pth
-  text_encoder: models_t5_umt5-xxl-enc-bf16.pth
-tokenizer_path: ${.model_path}/google/umt5-xxl   # umT5 tokenizer dir read by from_pretrained (deploy reads the ckpt's copy)
-dit_weights: null         # null: DiT from model_path/weights.dit; a file path: DiT from that file instead (LongLive)
-dit_weights_prefix: ""    # key prefix stripped from dit_weights
+model:
+  video_backbone:
+    name: wan22_ti2v_5b
+    required_clean_attention: null   # clean_attention this backbone needs (null = any); resolve_config checks it
+    required_proprio_input: context_token  # the only model.architecture.proprio_input this backbone takes
+    temporal_compression: 4   # VAE38 (yaml contract checked against the backbone at build; the latent layout reads it)
+    causal_temporal: true     # the VAE encodes frame 0 alone (yaml contract checked against the backbone at build)
 
-shift_video: 5.0          # flow-matching α-shift for the video scheduler (train + deploy single source of truth)
-text_max_length: 512      # umT5 tokens per prompt
-text_cache: true          # trainer encodes the dataset's prompt set once after the weights are in place, umT5 then on CPU
+    shift_video: 5.0          # flow-matching α-shift for the video scheduler (train + deploy single source of truth)
+    train_timestep: {law: grid, weighting: bell}   # uniform draw over the 1000-step shifted grid, Wan bell loss weights
+    text_max_length: 512      # umT5 tokens per prompt
 
-dit:                      # WanModel
-  dim: 3072
-  ffn_dim: 14336
-  num_heads: 24
-  num_layers: 30
-  text_dim: 4096          # must equal text_encoder.dim (context width)
-  in_dim: 48              # = vae.z_dim
-  out_dim: 48
-  freq_dim: 256
-  eps: 1.0e-06
-  patch_size: [1, 2, 2]
-vae:                      # WanVideoVAE38
-  z_dim: 48
-  dim: 160
-text_encoder:             # WanTextEncoder (umT5-XXL encoder)
-  dim: 4096
-  dim_attn: 4096
-  dim_ffn: 10240
-  num_heads: 64
-  num_layers: 24
+    # what the action stream reads; checked against the built module at construction
+    # (from the native block: dit.dim / dit.num_heads / dim ÷ heads / dit.num_layers / dit.text_dim)
+    geometry:
+      dim: 3072
+      num_heads: 24
+      head_dim: 128
+      num_layers: 30
+      text_dim: 4096
+
+    dit:                      # WanModel
+      dim: 3072
+      ffn_dim: 14336
+      num_heads: 24
+      num_layers: 30
+      text_dim: 4096          # must equal text_encoder.dim (context width)
+      in_dim: 48              # = vae.z_dim
+      out_dim: 48
+      freq_dim: 256
+      eps: 1.0e-06
+      patch_size: [1, 2, 2]
+    vae:                      # WanVideoVAE38
+      z_dim: 48
+      dim: 160
+    text_encoder:             # WanTextEncoder (umT5-XXL encoder)
+      dim: 4096
+      dim_attn: 4096
+      dim_ffn: 10240
+      num_heads: 64
+      num_layers: 24
+
+assets:
+  video_backbone:
+    model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Wan2.2-TI2V-5B  # [Required] upstream weights dir
+    init: pretrained          # pretrained: load `weights` from model_path | random: random init (debug only, no weight files)
+    weights:                  # upstream file names under model_path
+      dit: diffusion_pytorch_model*.safetensors   # glob over the shards
+      vae: Wan2.2_VAE.pth
+      text_encoder: models_t5_umt5-xxl-enc-bf16.pth
+    tokenizer_path: ${.model_path}/google/umt5-xxl   # umT5 tokenizer dir read by from_pretrained (deploy reads the ckpt's copy)
+    dit_weights: null         # null: DiT from model_path/weights.dit; a file path: DiT from that file instead (LongLive)
+    dit_weights_prefix: ""    # key prefix stripped from dit_weights
+
+training:                 # this backbone's training switches (not compared on finetune)
+  freeze: [video_backbone.text_encoder, video_backbone.vae]   # every entry must exist on the model
+  text_cache: true        # encode the dataset's prompt set once after the weights are final
