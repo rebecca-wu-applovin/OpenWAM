@@ -19,6 +19,13 @@ Everything else is already on Modal:
 | `/runs` | `openwam-runs` | writes go **only** under `/runs/yjw/`: `norm_stats_modal/`, `outputs/` |
 | secret | `wandb-yjw` | own **public wandb.ai** `WANDB_API_KEY` → runs land in `wandb.ai/jiangwei-yu-applovin/1008_wam_training`, NOT the company server `cbf-wandb.alcfd.com` (it resolves to the internal IP 10.132.0.109 and Modal can't reach it). Local runs via `run_dual.sh` also log to wandb.ai (it sets `WANDB_BASE_URL=https://api.wandb.ai`; key from `~/.netrc`, same entity), so local and Modal arms share one project. The teammate's `wandb-secret` gets "permission denied" on `1008_wam_training`. |
 
+**Code shipping.** Every launch first uploads the checkout's code files (`openwam/ benchmarks/ scripts/ configs/`
++ root `*.sh *.toml`; `.py .sh .yaml .json .md ...` only, no tests / docs / outputs, ~1 MB) to `<run dir>/code/` on
+`openwam-runs`. The image holds no source: the container copies that `code/` dir to `/opt/openwam` and trains from
+it, so `code/` is exactly the code the run used (uncommitted edits included). A resume
+(`training.resume_ckpt_path=...`) runs the run's own `code/` again, not the local checkout: to train with new code,
+start a new run. Runs without a fixed dir (`--debug`) ship to `outputs/_code/<UTC time>/`.
+
 Inside the container `/opt/openwam/outputs` is a symlink to `/runs/yjw/outputs`. Relative
 `outputs/...` paths in `configs/train.yaml` (run dirs, checkpoints, wandb) end up on the Volume.
 The local-only absolute paths are remapped by `PATH_OVERRIDES` in `train.py`. If you pass an
@@ -99,13 +106,17 @@ Pull a run with `modal volume get openwam-runs /yjw/outputs/<group>/<index>_<run
   decode on 64 CPUs) but was not measured. Staged runs use `norm_stats_local/` because stats record
   their source paths; it is rebuilt once per action mode. Turn staging off with
   `OPENWAM_STAGE_DATA=0 bash run_modal.sh`. Every retry gets a fresh container, so it copies again.
+- **Weights are warmed with the data.** Before torchrun, every file under the `/assets/...` paths of the overrides is
+  read once in parallel (log line `[modal] warmed ...`), so the 8 ranks load the backbone from the page cache, not
+  cold from the Volume (~10 min -> ~1 min for Wan2.2-TI2V-5B, measured on `yjw/1008_our_data` 477cd51). Paths stay
+  `/assets/...`; off together with staging (`OPENWAM_STAGE_DATA=0`).
 - **Volume commits.** `train.py` commits `openwam-runs` every 10 min and once on exit.
   On preemption you can lose at most about 10 min of writes.
 - **Environment.** `requirements-frozen.txt` is a freeze of the local `.venv`, so Modal and local runs use the same versions. If the local
   venv changes, regenerate it with the command in the header of that file. The next run then
   rebuilds the image.
-- **Code is uploaded on every run.** Uncommitted local edits run too. Commit before a real run
-  so the wandb run can be traced back to a git SHA.
+- **Code is uploaded on every run** to `<run dir>/code/` (see Code shipping). Uncommitted local edits run too;
+  `code/` records them, but commit before a real run so the wandb run can also be traced back to a git SHA.
 
 ## Verified
 

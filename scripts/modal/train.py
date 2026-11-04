@@ -1,8 +1,9 @@
 """OpenWAM training on Modal (workspace axon-foundational-research, env main).
 
-Runs the unchanged ``scripts/train.sh`` inside a Modal container. The local
-checkout is mounted at /opt/openwam on every run (code edits ship without an
-image rebuild); datasets / weights / outputs come from shared Volumes.
+Runs the unchanged ``scripts/train.sh`` inside a Modal container. Before launching, the local
+checkout's code files are uploaded to <run dir>/code/ on the runs Volume; the container (whose image
+holds no source) installs exactly that copy as /opt/openwam and trains from it, so every run dir records
+the code it ran. A resume reuses the run's own code/. Datasets / weights / outputs come from shared Volumes.
 
 Usage (from the repo root):
     # smoke test: tiny random DiT, real data, 1 GPU, 5 steps, no wandb
@@ -67,13 +68,8 @@ image = (
             "HF_HOME": "/root/.cache/huggingface",
         }
     )
-    # Source last so code edits never invalidate the dependency layers.
-    .add_local_dir(
-        REPO_ROOT,
-        REMOTE_REPO,
-        ignore=[".venv", ".git", "outputs", "assets", "wandb", "**/__pycache__", "docs", "**/*.mp4", "**/logs"],
-    )
 )
+# No source in the image: every run installs its own uploaded code dir into REMOTE_REPO (see _upload_code).
 
 app = modal.App("openwam-yjw-train", image=image)
 
@@ -159,8 +155,100 @@ def _auto_resume(overrides: list[str]) -> tuple[list[str], Path | None]:
         # Earlier attempt died before its first resumable save: keep it for inspection, start fresh.
         aside = run_dir.with_name(f"{name}.failed_{time.strftime('%m_%d_%H_%M_%S')}")
         run_dir.rename(aside)
+        if (aside / "code").is_dir():  # the launch's shipped code belongs to the fresh attempt (and its retries)
+            run_dir.mkdir()
+            (aside / "code").rename(run_dir / "code")
         print(f"[modal] auto-resume: no resume state yet; moved previous attempt to {aside}", flush=True)
     return overrides, run_dir
+
+
+# Code shipped with every run: the launcher uploads these files of the local checkout to <run dir>/code/ on the
+# runs Volume, and the container runs exactly that copy (the image holds no source). Code and config files only
+# (~3.6 MB); tests / docker / outputs and the like are left out.
+CODE_DIRS = ("openwam", "benchmarks", "scripts", "configs")
+CODE_ROOT_FILES = ("*.sh", "*.toml")
+CODE_SUFFIXES = {".py", ".sh", ".yaml", ".yml", ".toml", ".json", ".txt", ".md", ".cfg", ".ini"}
+CODE_SKIP_PARTS = {"__pycache__", "logs", "outputs", "docker", "tests", "wandb", "assets"}
+CODE_MAX_FILE = 512 * 1024  # a bigger "code" file is data (e.g. a dumped json); leave it out
+
+
+def _code_files(repo: Path) -> list[Path]:
+    """The code files of a checkout that a run ships (see CODE_*).
+
+    repo: checkout root.
+    Returns: sorted file paths relative to `repo`.
+    """
+    files = {f for pattern in CODE_ROOT_FILES for f in repo.glob(pattern) if f.is_file()}
+    for top in CODE_DIRS:
+        files |= {
+            f for f in (repo / top).rglob("*")
+            if f.is_file() and not f.is_symlink() and f.suffix in CODE_SUFFIXES
+            and not CODE_SKIP_PARTS.intersection(f.relative_to(repo).parts)
+            and f.stat().st_size <= CODE_MAX_FILE
+        }
+    return sorted(f.relative_to(repo) for f in files)
+
+
+def _upload_code(overrides: list[str]) -> str:
+    """Local side: put the checkout's code on the runs Volume where this launch's run will read it from.
+
+    Fresh run with a fixed dir (training.output_path + run_dir_name): uploaded to <run dir>/code. Resume
+    (training.resume_ckpt_path): the run's own code/ is reused unchanged, so a resumed run keeps running the code it
+    started with; only a run from before code shipping gets the current checkout. No fixed dir (debug / timestamped):
+    a fresh outputs/_code/<UTC time>.
+
+    overrides: Hydra CLI tokens (path defaults merged).
+    Returns: the code dir relative to the Volume root, e.g. "yjw/outputs/<group>/<run>/code".
+    """
+    resume = _hydra_value(overrides, "training.resume_ckpt_path")
+    out, name = _hydra_value(overrides, "training.output_path"), _hydra_value(overrides, "training.run_dir_name")
+    if resume:
+        code_dir = f"{RUNS_SUBDIR}/{resume.strip('/')}/code"
+        try:
+            runs_vol.listdir(code_dir)
+            print(f"[modal] resume: running the run's own code openwam-runs:/{code_dir} (not the local checkout)")
+            return code_dir
+        except modal.exception.NotFoundError:
+            print(f"[modal] resume: {resume} has no code/ (run predates code shipping); uploading the local checkout")
+    elif out and name:
+        code_dir = f"{RUNS_SUBDIR}/{out.strip('/')}/{name}/code"
+    else:
+        code_dir = f"{RUNS_SUBDIR}/outputs/_code/{time.strftime('%Y-%m-%d_%H-%M-%S', time.gmtime())}"
+    files = _code_files(REPO_ROOT)
+    with runs_vol.batch_upload(force=True) as batch:
+        for rel in files:
+            batch.put_file(REPO_ROOT / rel, f"/{code_dir}/{rel}")
+    size = sum((REPO_ROOT / rel).stat().st_size for rel in files)
+    print(f"[modal] uploaded {len(files)} code files ({size / 1e6:.1f} MB) -> openwam-runs:/{code_dir}")
+    return code_dir
+
+
+def _install_code(code_dir: str) -> int:
+    """Container side: make REMOTE_REPO an exact copy of the uploaded code dir (the image holds no source).
+
+    code_dir: code dir relative to the runs Volume root (from _upload_code); the Volume must be reloaded already.
+    Returns: number of files installed. Raises FileNotFoundError if the dir is missing.
+    """
+    import importlib
+    import shutil
+    import sys
+
+    src = Path("/runs") / code_dir
+    if not src.is_dir():
+        raise FileNotFoundError(f"code dir {src} not on the runs Volume")
+    repo = Path(REMOTE_REPO)
+    link = repo / "outputs"
+    if link.is_symlink():  # an earlier attempt in this container linked outputs/ to the Volume: never recurse into it
+        link.unlink()
+    shutil.rmtree(repo, ignore_errors=True)
+    shutil.copytree(src, repo)
+    # REMOTE_REPO (on PYTHONPATH) did not exist when this interpreter started, so its "nothing here" finder is
+    # cached: drop it so this process can import the installed openwam (subprocesses start fresh anyway).
+    sys.path_importer_cache.pop(str(repo), None)
+    if str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
+    importlib.invalidate_caches()
+    return sum(1 for f in repo.rglob("*") if f.is_file())
 
 
 LOCAL_DATA = Path("/local_data")  # container-local disk (ephemeral_disk), wiped with the container
@@ -216,6 +304,33 @@ def _stage_data(overrides: list[str]) -> list[str]:
     return out
 
 
+def _warm_assets(overrides: list[str], workers: int = 32) -> None:
+    """Read every backbone weight file the run points at (override values under /assets/) once, in parallel.
+
+    A cold container's 8 ranks loading Wan2.2-TI2V-5B straight from the Volume took ~10 min; after one parallel
+    pass (34 GB in ~30 s) the ranks' reads come from the page cache (8 concurrent re-reads in ~45 s; measured on
+    yjw/1008_our_data, 477cd51). Paths stay /assets/..., so the saved config and deploy are unchanged.
+
+    overrides: Hydra CLI tokens. Returns: None.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    roots = {Path(tok.partition("=")[2]) for tok in overrides if tok.partition("=")[2].startswith("/assets/")}
+    files = [f for r in roots if r.exists() for f in ([r] if r.is_file() else r.rglob("*")) if f.is_file()]
+
+    def _read(f: Path) -> int:
+        """Read `f` to the end in 64 MB chunks (fills the page cache). Returns: its size in bytes."""
+        with open(f, "rb") as h:
+            while h.read(64 << 20):
+                pass
+        return f.stat().st_size
+
+    t0 = time.time()
+    with ThreadPoolExecutor(workers) as ex:
+        nbytes = sum(ex.map(_read, files))
+    print(f"[modal] warmed {len(files)} weight files ({nbytes / 1e9:.1f} GB) in {time.time() - t0:.0f} s", flush=True)
+
+
 def _kill_training(proc: subprocess.Popen) -> None:
     """SIGKILL the launched process group and any surviving scripts/train.py workers.
 
@@ -232,25 +347,36 @@ def _kill_training(proc: subprocess.Popen) -> None:
 
 
 def _run_training(
-    cmd: list[str], overrides: list[str], test_kill_after_first_state: bool = False, stage_data: bool = False
+    cmd: list[str],
+    overrides: list[str],
+    code_dir: str,
+    test_kill_after_first_state: bool = False,
+    stage_data: bool = False,
 ) -> dict:
     """Run `cmd + overrides` in the repo, outputs/ on the runs Volume, resuming its own run dir on retry.
 
     cmd: argv prefix to execute from REMOTE_REPO (train.sh / train_debug.sh invocation).
     overrides: Hydra CLI tokens (path defaults already merged).
+    code_dir: the launch's uploaded code dir, relative to the runs Volume root (_upload_code); installed as
+        REMOTE_REPO before anything runs, so training runs exactly that copy.
     test_kill_after_first_state: test hook; kill training once right after the first resume
         state is written (marker file prevents a second kill) to exercise retry + auto-resume.
-    stage_data: copy the /data/ datasets to container-local disk before training (see _stage_data).
+    stage_data: copy the /data/ datasets to container-local disk (see _stage_data) and warm the weights
+        (_warm_assets) before training.
     Returns: {"ok": bool, "msg": str}. Raises (-> Modal retry) only if this attempt made
         progress, so a deterministic crash is not retried 10 times.
     """
+    runs_vol.reload()  # see everything earlier attempts committed (and the launcher's code upload)
+    try:
+        n_files = _install_code(code_dir)
+    except FileNotFoundError as e:
+        print(f"[modal] FAILED: {e}", flush=True)
+        return {"ok": False, "msg": str(e)}  # returned, not raised: a retry would not find it either
+    print(f"[modal] running code openwam-runs:/{code_dir} ({n_files} files) as {REMOTE_REPO}", flush=True)
     # Relative `outputs/...` paths in train.yaml (run dirs, checkpoints, wandb) land on the Volume.
     out_dir = Path(f"/runs/{RUNS_SUBDIR}/outputs")
     out_dir.mkdir(parents=True, exist_ok=True)
-    link = Path(REMOTE_REPO) / "outputs"
-    if not link.exists():
-        link.symlink_to(out_dir)
-    runs_vol.reload()  # see everything earlier attempts committed
+    (Path(REMOTE_REPO) / "outputs").symlink_to(out_dir)
 
     try:
         overrides, run_dir = _auto_resume(overrides)
@@ -264,6 +390,7 @@ def _run_training(
     start_step = _latest_state_step(run_dir) if run_dir else -1
     if stage_data:
         overrides = _stage_data(overrides)
+        _warm_assets(overrides)  # same idea for the weights: no cold Volume reads by every rank
 
     # Record which GPUs this container actually got (H100 vs B200) in the run log.
     subprocess.run(["nvidia-smi", "-L"], check=False)
@@ -334,13 +461,16 @@ if modal.is_local() and (GPU_TYPE not in GPU_TYPES or GPU_COUNT not in (1, 8)):
     ephemeral_disk=512 * 1024,  # Modal minimum (524288 MiB); fits the ~137 GB staged datasets
     **COMMON,
 )
-def train(overrides: list[str], debug: bool = False, test_auto_resume: bool = False, stage_data: bool = True) -> dict:
+def train(
+    overrides: list[str], code_dir: str, debug: bool = False, test_auto_resume: bool = False, stage_data: bool = True
+) -> dict:
     """Run training on the OPENWAM_GPU_TYPE x OPENWAM_GPU_COUNT GPUs this function was defined with.
 
     overrides: Hydra CLI tokens appended after the path defaults.
+    code_dir: uploaded code dir relative to the runs Volume root (_upload_code).
     debug: True -> train_debug.sh / configs/train_debug.yaml (tiny model, 1 process, no wandb).
     test_auto_resume: kill once after the first resume state (see _run_training).
-    stage_data: copy datasets to local disk first; ignored (off) for debug runs.
+    stage_data: copy datasets to local disk and warm the weights first; ignored (off) for debug runs.
     Returns: {"ok": bool, "msg": str} from _run_training.
     """
     if debug:
@@ -348,7 +478,8 @@ def train(overrides: list[str], debug: bool = False, test_auto_resume: bool = Fa
     else:
         cmd = ["bash", "scripts/train.sh"]  # torchrun on all visible GPUs (train.sh auto-detects the count)
     return _run_training(
-        cmd, _merge_overrides(overrides), test_kill_after_first_state=test_auto_resume, stage_data=stage_data and not debug
+        cmd, _merge_overrides(overrides), code_dir, test_kill_after_first_state=test_auto_resume,
+        stage_data=stage_data and not debug,
     )
 
 
@@ -362,8 +493,10 @@ def main(overrides: str = "", debug: bool = False, test_auto_resume: bool = Fals
     Returns: None; exits non-zero if training failed without a retry.
     """
     stage = os.environ.get("OPENWAM_STAGE_DATA", "1") != "0"  # OPENWAM_STAGE_DATA=0 reads straight from the Volume
+    # Ship the code first: the container runs this uploaded copy, never the image (which holds no source).
+    code_dir = _upload_code(_merge_overrides(shlex.split(overrides)))
     print(f"[modal] requesting {GPU_TYPE}:{GPU_COUNT}, {CPU_COUNT} CPU, {MEMORY_GB} GB RAM, stage data to local disk: {stage and not debug}")
-    res = train.remote(shlex.split(overrides), debug, test_auto_resume, stage)
+    res = train.remote(shlex.split(overrides), code_dir, debug, test_auto_resume, stage)
     print(f"[modal] result: {res}")
     if not res["ok"]:
         raise SystemExit(1)
