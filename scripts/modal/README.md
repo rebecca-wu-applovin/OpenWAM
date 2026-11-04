@@ -58,7 +58,7 @@ Hydra logs get a new `hydra/<time>/` entry.
 A resume runs the run's own `config.yaml`. Its launch must compose the same config: the same `run_modal.sh` env
 (`BACKBONE`, `ACTION_MODE`, ...) and overrides as the first launch, or the arm script it came from. Only
 `resume_ckpt_path` / `output_path` / `run_dir_name` may differ. Any other difference raises before training starts
-(`ckpt_model_loader.load_resume_cfg`).
+(`openwam/train/run_mode.py::load_resume_cfg`).
 `--debug` runs still go to `outputs/debug_checkpoints/` and Hydra's default `outputs/<date>/<time>/`.
 
 Logs: `modal app logs <app id>` (find it in `modal app list` by the Modal run name), or the web UI.

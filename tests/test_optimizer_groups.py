@@ -61,7 +61,7 @@ class _FakeTrainer:
 
 
 def test_pipe_params_include_video_dit():
-    from openwam.train.utils.optimizer_groups import build_trainable_parameters
+    from openwam.train.optim import build_trainable_parameters
 
     trainer = _FakeTrainer()
     groups = build_trainable_parameters(trainer.architecture, action_lr=1e-4, video_lr=5e-5)
@@ -83,7 +83,7 @@ def test_pipe_params_include_video_dit():
 def test_other_modules_ride_base_lr_not_video_lr():
     """Non-video / non-action top-level modules (e.g. understanding_expert) must NOT
     inherit video_lr — they land in a group with no 'lr' (the optimizer base LR)."""
-    from openwam.train.utils.optimizer_groups import build_trainable_parameters
+    from openwam.train.optim import build_trainable_parameters
 
     trainer = _FakeTrainer()
     groups = build_trainable_parameters(trainer.architecture, action_lr=1e-4, video_lr=5e-5)
@@ -103,7 +103,7 @@ def test_other_modules_ride_base_lr_not_video_lr():
 def test_action_params_land_in_action_lr_group():
     """The action override LR lands on the group carrying the action backbone params —
     guards against action params being silently routed into the base/other group."""
-    from openwam.train.utils.optimizer_groups import build_trainable_parameters
+    from openwam.train.optim import build_trainable_parameters
 
     trainer = _FakeTrainer()
     groups = build_trainable_parameters(trainer.architecture, action_lr=1e-4, video_lr=5e-5)
@@ -122,7 +122,7 @@ def test_action_params_land_in_action_lr_group():
 def test_freeze_is_the_sole_gate_for_action_branch():
     """A frozen action_backbone (requires_grad=False) contributes no params —
     freeze is the single source of truth for trainability."""
-    from openwam.train.utils.optimizer_groups import build_trainable_parameters
+    from openwam.train.optim import build_trainable_parameters
 
     trainer = _FakeTrainer(lambda_action=0.0)
     # lambda_action no longer freezes anything; freeze must be explicit (as the
@@ -138,7 +138,7 @@ def test_lambda_action_zero_does_not_gate_params():
     """Regression: ``lambda_action=0`` alone must NOT drop action params or flip
     requires_grad — loss weights are decoupled from optimizer membership. Only the
     freeze list (requires_grad) decides who trains."""
-    from openwam.train.utils.optimizer_groups import build_trainable_parameters
+    from openwam.train.optim import build_trainable_parameters
 
     trainer = _FakeTrainer(lambda_action=0.0)  # not frozen
     result = build_trainable_parameters(trainer.architecture, action_lr=None, video_lr=None)
@@ -150,7 +150,7 @@ def test_lambda_action_zero_does_not_gate_params():
 
 def test_default_returns_flat_list_when_no_overrides():
     """Without LR overrides, returns the flat parameter list."""
-    from openwam.train.utils.optimizer_groups import build_trainable_parameters
+    from openwam.train.optim import build_trainable_parameters
 
     trainer = _FakeTrainer()
     result = build_trainable_parameters(trainer.architecture, action_lr=None, video_lr=None)

@@ -101,9 +101,9 @@ def _build_trainer(cfg: DictConfig):
     """
     from openwam.config import resolve_config
     from openwam.dataloader.registry import build_dataset
-    from openwam.train.openwam_trainer import OpenWAMTrainer
-    from openwam.train.utils.ckpt_model_loader import RunMode, decide_run_mode, load_resume_cfg
-    from openwam.train.utils.seeding import seed_everything
+    from openwam.train.run_mode import RunMode, decide_run_mode, load_resume_cfg
+    from openwam.train.seeding import seed_everything
+    from openwam.train.trainer import OpenWAMTrainer
 
     # Fresh / finetune / resume, decided here once; the trainer gets the decision, not the two cfg keys.
     run_mode, ckpt_path = decide_run_mode(cfg.training)

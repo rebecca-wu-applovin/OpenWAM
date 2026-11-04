@@ -10,7 +10,7 @@ override silently changed a running run. The shapes below are run 89's: on resum
 import pytest
 from omegaconf import OmegaConf
 
-from openwam.train.utils import ckpt_model_loader as cml
+from openwam.train import run_mode as cml
 
 SAVED = {
     "model": {

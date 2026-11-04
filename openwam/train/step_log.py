@@ -1,19 +1,108 @@
-"""Trainer helpers: parameter report, step budget, LR schedule, wandb, cross-rank metric reduction, per-step logging.
+"""Per-step reporting: parameter report, wandb, phase timing, cross-rank metric reduction, per-step logging.
 
-All stateless except :class:`StepLogger`, which owns the per-step sinks (progress bar, wandb, timing.jsonl, loss CSV).
+:class:`StepTimer` splits each step's wall time into phases so a slow s/step can be attributed:
+
+    data     waiting on the DataLoader iterator (incl. accelerate's H2D copy)
+    forward  architecture.compute_loss (frozen VAE / text encode + trainable forward)
+    backward loss.backward (+ ZeRO grad reduce-scatter; waits for slower ranks)
+    optim    clip + optimizer step + zero_grad (DeepSpeed engine.step)
+    other    metric all-reduce, logging, checkpoint save, vis (previous step)
+
+Each ``mark`` calls ``torch.cuda.synchronize`` so GPU work is billed to the phase that
+launched it, not to whichever later phase first blocks on it. The syncs remove a little
+CPU/GPU overlap; disable with ``training.log_step_timing=false``.
+
+:class:`StepLogger` owns the per-step sinks (progress bar, wandb, timing.jsonl, loss CSV); the rest is stateless.
 """
 
 import json
 import logging
-import math
 import os
 import time
 
 import torch
 from omegaconf import DictConfig, OmegaConf
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 logger = logging.getLogger(__name__)
+
+PHASES = ("data", "forward", "backward", "optim", "other")
+
+
+class StepTimer:
+    """Accumulates seconds per phase between consecutive ``mark`` calls."""
+
+    def __init__(self, enabled: bool):
+        """enabled: False makes every method a no-op (and ``snapshot`` returns {})."""
+        self.enabled = enabled
+        self._last = time.monotonic()
+        self._cur = dict.fromkeys(PHASES, 0.0)
+        self._prev_other = 0.0  # "other" is closed after log time, so report last step's
+
+    def mark(self, phase: str) -> None:
+        """Close the running interval and bill it to ``phase``.
+
+        phase: one of PHASES.
+        Returns: None.
+        """
+        if not self.enabled:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        now = time.monotonic()
+        self._cur[phase] += now - self._last
+        self._last = now
+
+    def end_step(self) -> None:
+        """Bill the step's tail to ``other`` and reset for the next step. Returns: None."""
+        if not self.enabled:
+            return
+        self.mark("other")
+        self._prev_other = self._cur["other"]
+        self._cur = dict.fromkeys(PHASES, 0.0)
+
+    def snapshot(self, accelerator) -> dict:
+        """This step's phase times, reduced across ranks.
+
+        accelerator: Accelerate handle; with >1 process the (world, len(PHASES)) times are gathered.
+        Returns: dict ``timing/<phase>`` = rank-mean seconds and ``timing/<phase>_max`` =
+            slowest-rank seconds (one per phase), plus ``timing/step`` = sum of the means.
+            ``other`` is the previous step's value. Empty dict if disabled.
+        """
+        if not self.enabled:
+            return {}
+        vals = [self._cur[p] for p in PHASES[:-1]] + [self._prev_other]
+        local = torch.tensor(vals, dtype=torch.float32)
+        if accelerator.num_processes > 1:
+            g = accelerator.gather(local.to(accelerator.device).reshape(1, -1)).float().cpu()  # (world, len(PHASES))
+            mean, mx = g.mean(dim=0), g.max(dim=0).values
+        else:
+            mean = mx = local
+        out = {}
+        for i, p in enumerate(PHASES):
+            out[f"timing/{p}"] = float(mean[i])
+            out[f"timing/{p}_max"] = float(mx[i])
+        out["timing/step"] = float(mean.sum())
+        return out
+
+    def wrap_engine_step(self, engine) -> None:
+        """Bill DeepSpeed's in-backward ``engine.step`` to ``optim`` instead of ``backward``.
+
+        Under DeepSpeed, ``accelerator.backward`` runs backward *and* engine.step (clip,
+        optimizer, zero_grad); without this hook both would be billed to ``backward``.
+        engine: DeepSpeedEngine (training always runs DeepSpeed, see scripts/train.py::_build_accelerator).
+        Returns: None.
+        """
+        if not self.enabled:
+            return
+        orig_step = engine.step
+
+        def step(*args, **kwargs):
+            self.mark("backward")
+            out = orig_step(*args, **kwargs)
+            self.mark("optim")  # close here, else the loop's post-backward mark absorbs the step
+            return out
+
+        engine.step = step
 
 
 def log_parameter_counts(architecture, *, is_main: bool) -> None:
@@ -49,79 +138,6 @@ def log_parameter_counts(architecture, *, is_main: bool) -> None:
         print(f"  {name:<15}: total={total / 1e6:7.1f}M  trainable={trainable / 1e6:7.1f}M")
     print(f"  Architecture  : total={arch_total / 1e6:7.1f}M  trainable={arch_train / 1e6:7.1f}M")
     print("=" * 60, flush=True)
-
-
-def plan_steps(
-    batches_per_epoch: int, grad_accum: int, num_processes: int, num_epochs: int | None, max_steps: int | None
-) -> tuple[int, int]:
-    """The run's step budget per process: micro steps (``global_step``, progress bar) and optimizer steps (LR horizon).
-
-    ``prepare()`` shards the loader to ``ceil(batches_per_epoch / num_processes)`` batches per process (accelerate's
-    even_batches), and accumulation syncs at every epoch end, so an epoch is ``ceil(that / grad_accum)`` optimizer
-    steps. ``max_steps`` counts micro steps and caps both.
-
-    Args:
-        batches_per_epoch: int, ``len(dataloader)`` BEFORE ``prepare()`` (all processes together).
-        grad_accum: int, ``training.gradient_accumulation_steps``.
-        num_processes: int, the Accelerator's process count.
-        num_epochs: int, ``training.num_epochs``; None = step-only (``max_steps`` alone stops the run).
-        max_steps: int, ``training.max_steps`` in micro steps; None = no step limit.
-
-    Returns:
-        (total_micro_steps, total_opt_steps): ints, per process. ValueError when num_epochs and max_steps are both None.
-    """
-    if num_epochs is None and max_steps is None:
-        raise ValueError(
-            "training.num_epochs and training.max_steps are both unset; "
-            "set num_epochs, or set max_steps for step-only training."
-        )
-    # Step-only: max_steps micro steps, ceil'd to optimizer steps.
-    if num_epochs is None:
-        return max_steps, math.ceil(max_steps / grad_accum)
-    micro_per_epoch = math.ceil(batches_per_epoch / num_processes)
-    opt_per_epoch = math.ceil(micro_per_epoch / grad_accum)
-    total_micro, total_opt = micro_per_epoch * num_epochs, opt_per_epoch * num_epochs
-    if max_steps is not None:
-        total_micro, total_opt = min(total_micro, max_steps), min(total_opt, math.ceil(max_steps / grad_accum))
-    return total_micro, total_opt
-
-
-def build_cosine_scheduler(
-    optimizer, *, total_opt_steps: int, training_cfg: DictConfig, num_processes: int
-) -> SequentialLR:
-    """Linear-warmup + cosine-anneal LR schedule.
-
-    total_opt_steps is in per-process optimizer steps; prepare() wraps the scheduler in
-    AcceleratedScheduler which advances it num_processes times per opt step, so scale the
-    horizons by num_processes to cancel that out.
-
-    Args:
-        optimizer: torch Optimizer whose LR the schedule drives.
-        total_opt_steps: int, per-process optimizer steps of the whole run.
-        training_cfg: ``cfg.training`` (``learning_rate``, ``warmup_ratio``, ``lr_min_ratio``).
-        num_processes: int, the Accelerator's process count.
-
-    Returns:
-        SequentialLR: LinearLR warmup then CosineAnnealingLR down to ``learning_rate * lr_min_ratio``.
-    """
-    lr = float(training_cfg.learning_rate)
-    warmup_ratio = float(training_cfg.warmup_ratio)
-    lr_min_ratio = float(training_cfg.lr_min_ratio)
-    n = max(int(num_processes), 1)
-    warmup_steps = int(total_opt_steps * warmup_ratio)
-    cosine_steps = max(total_opt_steps - warmup_steps, 1)
-    # Horizons in scheduler.step() calls: n per optimizer step under AcceleratedScheduler.
-    warmup_iters = warmup_steps * n
-    warmup_sched = LinearLR(optimizer, start_factor=1.0 / max(warmup_iters, 1), total_iters=warmup_iters)
-    cosine_sched = CosineAnnealingLR(optimizer, T_max=cosine_steps * n, eta_min=lr * lr_min_ratio)
-    scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_iters])
-    logger.info(
-        "LR scheduler: cosine | total_opt_steps=%d warmup=%d eta_min=%.2e",
-        total_opt_steps,
-        warmup_steps,
-        lr * lr_min_ratio,
-    )
-    return scheduler
 
 
 def init_wandb(cfg: DictConfig):

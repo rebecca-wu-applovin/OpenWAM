@@ -545,7 +545,7 @@ def test_color_jitter_draws_from_the_sample_rng(tmp_path):
 
 def test_visualizer_sample_has_eval_semantics(tmp_path):
     # The training visualizer's fixed sample comes from eval_view(): no caption dropout, the fixed history offsets.
-    from openwam.train.utils.visualization import TrainVisualizer
+    from openwam.train.visualization import TrainVisualizer
 
     _write_source(tmp_path / "a", [60, 60])
     train = build_dataset(_random_cfg(tmp_path / "a", caption_dropout_p=1.0), "train")

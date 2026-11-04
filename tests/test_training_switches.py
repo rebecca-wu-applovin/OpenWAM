@@ -11,7 +11,7 @@ import torch
 from omegaconf import OmegaConf
 
 from openwam.config.resolve import _check_training
-from openwam.train.utils.ckpt_model_loader import RunMode
+from openwam.train.run_mode import RunMode
 from tests._training_cfg import CHECKED_TRAINING, cpu_accelerator
 
 
@@ -57,7 +57,7 @@ def test_unknown_mixed_precision_raises_with_allowed_values():
 
 def test_zero_action_lr_is_kept():
     """action_lr: 0 is a real LR (frozen-by-LR action stream), not the base learning_rate."""
-    from openwam.train.openwam_trainer import OpenWAMTrainer
+    from openwam.train.trainer import OpenWAMTrainer
 
     trainer = OpenWAMTrainer.__new__(OpenWAMTrainer)
     action, video = torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)
@@ -75,7 +75,7 @@ def test_zero_action_lr_is_kept():
 
 def test_null_lr_scheduler_is_constant():
     """lr_scheduler null -> no scheduler (constant LR)."""
-    from openwam.train.openwam_trainer import OpenWAMTrainer
+    from openwam.train.trainer import OpenWAMTrainer
 
     trainer = OpenWAMTrainer.__new__(OpenWAMTrainer)
     trainer.cfg = OmegaConf.create({"training": {"lr_scheduler": None}})
@@ -87,7 +87,7 @@ def test_null_lr_scheduler_is_constant():
 )
 def test_trainer_passes_mixed_precision_dtype(monkeypatch, mixed_precision, dtype):
     """set_dtype_device gets DTYPES[training.mixed_precision] and the accelerator's device, nothing read off the arch."""
-    from openwam.train.openwam_trainer import OpenWAMTrainer
+    from openwam.train.trainer import OpenWAMTrainer
     from tests._layout import make_layout
 
     calls = []

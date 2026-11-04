@@ -46,7 +46,7 @@ def main() -> None:
     with initialize_config_dir(config_dir=os.path.join(REPO, "configs"), version_base=None):
         cfg = compose("train_debug", overrides=overrides)
 
-    from openwam.train.utils import checkpointing
+    from openwam.train import checkpointing
 
     if keep_state:
         # A finished run drops its accel_state dirs; keep everything so a second run can resume from step N.

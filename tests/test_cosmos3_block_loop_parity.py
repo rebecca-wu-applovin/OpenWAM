@@ -244,7 +244,7 @@ def test_rotary_inv_freq_survives_dtype_cast():
 def test_rotary_inv_freq_survives_the_trainer_call_order():
     """The real training order, which a single set_dtype_device call cannot model.
 
-    ``openwam_trainer`` calls set_dtype_device at :126, then
+    ``trainer`` calls set_dtype_device at :126, then
     ``accelerator.prepare()``, then again at :530. DeepSpeed's
     ``_configure_distributed_model`` runs ``self.module.bfloat16()`` inside
     prepare, and ``nn.Module.bfloat16()`` casts floating-point *buffers* — so a

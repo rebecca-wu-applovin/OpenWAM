@@ -7,7 +7,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from openwam.train.utils.seeding import (
+from openwam.train.seeding import (
     per_step_seed,
     seed_everything,
     seed_process,
@@ -19,7 +19,7 @@ def test_build_dataloader_reads_indices_in_order():
     loader adds no RNG of its own and a step's sample depends only on (epoch, position)."""
     from omegaconf import OmegaConf
 
-    from openwam.train.openwam_trainer import OpenWAMTrainer
+    from openwam.train.trainer import OpenWAMTrainer
 
     trainer = object.__new__(OpenWAMTrainer)
     trainer.cfg = OmegaConf.create({"training": {"dataset_num_workers": 0}})

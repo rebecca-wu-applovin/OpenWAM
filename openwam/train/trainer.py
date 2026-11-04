@@ -9,9 +9,10 @@ Call order:
                         -> StepLogger -> RunDir.save_step -> vis }
                -> finish (RunDir.finish: final weights, drop resume state; close wandb)
 
-The pieces live in ``openwam.train.utils``: the run mode and its architecture build (``ckpt_model_loader``), the
-step budget / metric reduction / per-step sinks (``training_utils``), the run dir and checkpoint files
-(``checkpointing``), seeding, step timing, optimizer groups and the training-time rollouts.
+The pieces live next to this module in ``openwam.train``: the run mode and its architecture build (``run_mode``),
+parameter groups / step budget / LR schedule (``optim``), phase timing / metric reduction / per-step sinks
+(``step_log``), the run dir and checkpoint files (``checkpointing``), seeding and the training-time
+rollouts (``visualization``).
 
 Usage (``scripts/train.py``):
     run_mode, ckpt_path = decide_run_mode(cfg.training)
@@ -29,7 +30,7 @@ from omegaconf import DictConfig
 from openwam.dataloader.collate import collate
 from openwam.dataloader.utils.normalization import normalization_on
 from openwam.model.common.dtypes import DTYPES
-from openwam.train.utils.checkpointing import (
+from openwam.train.checkpointing import (
     RunDir,
     compute_resume_position,
     create_run_dir,
@@ -39,19 +40,11 @@ from openwam.train.utils.checkpointing import (
     save_normalization_stats,
     verify_resume_normalization_stats,
 )
-from openwam.train.utils.ckpt_model_loader import RunMode, build_training_architecture
-from openwam.train.utils.optimizer_groups import build_trainable_parameters
-from openwam.train.utils.seeding import per_step_seed, seed_process
-from openwam.train.utils.step_timer import StepTimer
-from openwam.train.utils.training_utils import (
-    StepLogger,
-    build_cosine_scheduler,
-    init_wandb,
-    log_parameter_counts,
-    plan_steps,
-    reduce_step_metrics,
-)
-from openwam.train.utils.visualization import TrainVisualizer
+from openwam.train.optim import build_cosine_scheduler, build_trainable_parameters, plan_steps
+from openwam.train.run_mode import RunMode, build_training_architecture
+from openwam.train.seeding import per_step_seed, seed_process
+from openwam.train.step_log import StepLogger, StepTimer, init_wandb, log_parameter_counts, reduce_step_metrics
+from openwam.train.visualization import TrainVisualizer
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +58,7 @@ class OpenWAMTrainer:
         accelerator: HuggingFace Accelerator (DeepSpeed); construction reads its ``device`` and ``is_main_process``.
         dataset: training dataset (dataloader, rollouts, text cache, normalization stats); None only for
             construction-only tests.
-        run_mode: RunMode the entry point decided (``ckpt_model_loader.decide_run_mode``).
+        run_mode: RunMode the entry point decided (``run_mode.decide_run_mode``).
         ckpt_path: str, that mode's checkpoint source (finetune source / resumed run dir); None for FRESH.
         rank: int, this process's global rank (read once by the entry point); offsets every seed.
     """

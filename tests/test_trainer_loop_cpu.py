@@ -43,7 +43,7 @@ def _expected_lrs(total_micro: int) -> list:
     """
     from omegaconf import OmegaConf
 
-    from openwam.train.utils.training_utils import build_cosine_scheduler, plan_steps
+    from openwam.train.optim import build_cosine_scheduler, plan_steps
 
     _, total_opt = plan_steps(23 // 2 + 1, GRAD_ACCUM, 1, EPOCHS, None)
     opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=1e-2)
@@ -60,7 +60,7 @@ def _expected_lrs(total_micro: int) -> list:
 
 def _noise_sum(global_step: int, batch: int) -> float:
     """The noise compute_loss draws at a step: torch.randn after manual_seed(per_step_seed). Returns: its sum."""
-    from openwam.train.utils.seeding import per_step_seed
+    from openwam.train.seeding import per_step_seed
 
     torch.manual_seed(per_step_seed(42, rank=0, step=global_step))
     return torch.randn(batch, 4).sum().item()

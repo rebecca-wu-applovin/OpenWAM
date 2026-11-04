@@ -15,7 +15,7 @@ from omegaconf import OmegaConf
 from openwam.dataloader.collate import Batch
 from openwam.model.common.flow_scheduler import FlowScheduler
 from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
-from openwam.train.utils.ckpt_model_loader import RunMode
+from openwam.train.run_mode import RunMode
 from tests._arch import TEST_TRAIN_OPTIONS, build_test_arch
 from tests._training_cfg import cpu_accelerator
 
@@ -433,7 +433,7 @@ def test_trainer_rejects_both_lambdas_zero():
     """A training run with both loss weights 0 has no loss term: the trainer fails at construction."""
     from omegaconf import OmegaConf
 
-    from openwam.train.openwam_trainer import OpenWAMTrainer
+    from openwam.train.trainer import OpenWAMTrainer
 
     cfg = OmegaConf.create(
         {
@@ -462,7 +462,7 @@ def test_trainer_reads_training_freeze_text_cache_and_mot(monkeypatch, text_cach
 
     from omegaconf import OmegaConf
 
-    import openwam.train.openwam_trainer as trainer_mod
+    import openwam.train.trainer as trainer_mod
     from tests._layout import make_layout
 
     seen = {"frozen": [], "text_cache_calls": 0}

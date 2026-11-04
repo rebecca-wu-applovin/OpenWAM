@@ -123,7 +123,7 @@ def _latest_state_step(run_dir: Path) -> int:
     run_dir: run directory that may hold accel_state_step_<N>/ dirs (runs in the container: repo on PYTHONPATH).
     Returns: N of the newest accel_state_step_<N>/ that has trainer_state.json, else -1.
     """
-    from openwam.train.utils.checkpointing import STATE_NAME, find_latest_accel_state
+    from openwam.train.checkpointing import STATE_NAME, find_latest_accel_state
 
     state_dir = find_latest_accel_state(str(run_dir))
     return -1 if state_dir is None else int(STATE_NAME.match(Path(state_dir).name).group(1))

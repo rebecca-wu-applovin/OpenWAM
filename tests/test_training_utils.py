@@ -10,12 +10,8 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from openwam.train.utils.training_utils import (
-    StepLogger,
-    build_cosine_scheduler,
-    plan_steps,
-    reduce_step_metrics,
-)
+from openwam.train.optim import build_cosine_scheduler, plan_steps
+from openwam.train.step_log import StepLogger, reduce_step_metrics
 
 # --- reduce_step_metrics: the architecture's loss keys end to end ---
 
@@ -196,7 +192,7 @@ def test_step_logger_timing_off_and_non_main(tmp_path):
 
 
 def _old_total_opt_steps(len_loader, grad_accum, n_proc, num_epochs, max_steps):
-    """The pre-refactor LR horizon (openwam_trainer.train, before prepare), copied verbatim.
+    """The pre-refactor LR horizon (trainer.train, before prepare), copied verbatim.
 
     Args: len_loader: int, len(dataloader) before prepare; the rest as in train.yaml / the Accelerator.
     Returns: int, per-process optimizer steps.

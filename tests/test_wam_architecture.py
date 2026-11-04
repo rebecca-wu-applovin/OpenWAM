@@ -158,8 +158,8 @@ def test_openwam_trainer_uses_strategy_freeze_list(monkeypatch):
 
     from omegaconf import OmegaConf
 
-    from openwam.train.openwam_trainer import OpenWAMTrainer
-    from openwam.train.utils.ckpt_model_loader import RunMode
+    from openwam.train.run_mode import RunMode
+    from openwam.train.trainer import OpenWAMTrainer
 
     class _Arch(torch.nn.Module):
         def __init__(self):

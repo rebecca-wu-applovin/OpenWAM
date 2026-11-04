@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from openwam.train.utils import checkpointing
-from openwam.train.utils.checkpointing import (
+from openwam.train import checkpointing
+from openwam.train.checkpointing import (
     STATE_NAME,
     WEIGHTS_NAME,
     RunDir,
@@ -314,8 +314,8 @@ def _resume_trainer(tmp_path, monkeypatch, normalize_mode):
 
     from omegaconf import OmegaConf
 
-    import openwam.train.openwam_trainer as trainer_module
-    from openwam.train.utils.ckpt_model_loader import RunMode
+    import openwam.train.trainer as trainer_module
+    from openwam.train.run_mode import RunMode
 
     run_dir = tmp_path / "run"
     state_dir = run_dir / "accel_state_step_12"
@@ -364,7 +364,7 @@ def test_resume_needs_a_positive_global_step(tmp_path, monkeypatch, meta, err):
     """A resumed state at step 0 (or without a step) raises instead of silently restarting from step 0."""
     from types import SimpleNamespace
 
-    import openwam.train.openwam_trainer as trainer_module
+    import openwam.train.trainer as trainer_module
 
     monkeypatch.setattr(trainer_module, "load_full_state", lambda accelerator, state_dir: meta)
     trainer = object.__new__(trainer_module.OpenWAMTrainer)
@@ -381,7 +381,7 @@ def test_load_resume_state_maps_the_saved_step(tmp_path, monkeypatch, saved_step
     """(global_step, opt_step, start_epoch, skip) from a saved step: aligned to grad_accum, opt_step derived from it."""
     from types import SimpleNamespace
 
-    import openwam.train.openwam_trainer as trainer_module
+    import openwam.train.trainer as trainer_module
 
     meta = {"global_step": saved_step, "opt_step": 999, "epoch": 999}  # only global_step is read back
     monkeypatch.setattr(trainer_module, "load_full_state", lambda accelerator, state_dir: meta)

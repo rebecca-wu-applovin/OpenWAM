@@ -16,7 +16,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from openwam.config import resolve_config
-from openwam.train.utils import ckpt_model_loader as cml
+from openwam.train import run_mode as cml
 from tests._arch import TEST_TRAIN_OPTIONS
 from tests._training_cfg import CHECKED_TRAINING, cpu_accelerator
 
@@ -366,7 +366,7 @@ def _stub_trainer_arch(monkeypatch, frozen: dict):
 def test_trainer_finetune_freezes_from_training_freeze(tmp_path, monkeypatch):
     """The FINETUNE build in ``OpenWAMTrainer.__init__`` runs on the read-only run cfg and freezes training.freeze."""
     from openwam.model.architectures.base import TrainOptions
-    from openwam.train.openwam_trainer import OpenWAMTrainer
+    from openwam.train.trainer import OpenWAMTrainer
 
     ckpt_dir = _write_ckpt_cfg(tmp_path)
     cfg = _live_cfg(training={**TRAINER_TRAINING, "finetune_ckpt_path": ckpt_dir, "resume_ckpt_path": None})

@@ -27,7 +27,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 from openwam.config import cfg_get
 from openwam.model.architectures.base import BaseWAMArchitecture, TrainOptions
-from openwam.train.utils.checkpointing import find_latest_weights
+from openwam.train.checkpointing import find_latest_weights
 
 logger = logging.getLogger(__name__)
 

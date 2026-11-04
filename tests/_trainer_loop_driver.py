@@ -188,7 +188,7 @@ def _accelerator(kill_after_state: int | None):
 
 def _run(cfg, run_mode, ckpt_path, kill_after_state=None):
     """Train once. Returns: the trainer (after train() returned or was killed)."""
-    from openwam.train import openwam_trainer as tm
+    from openwam.train import trainer as tm
 
     tm.collate = _collate
     trainer = tm.OpenWAMTrainer(cfg, _accelerator(kill_after_state), _Dataset(), run_mode, ckpt_path, rank=0)
@@ -225,7 +225,7 @@ def main() -> None:
     import torch.distributed as dist
 
     import openwam.model
-    from openwam.train.utils.ckpt_model_loader import RunMode
+    from openwam.train.run_mode import RunMode
 
     # Every build (fresh, resume) gets the stand-in; the resume shell is filled by load_state.
     openwam.model.build_architecture = lambda *a, **k: _Arch()

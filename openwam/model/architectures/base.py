@@ -472,7 +472,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         Walks ``self.named_children()`` and returns modules that have at
         least one parameter with ``requires_grad=True``, excluding those
-        in *freeze_list*. Used by ``optimizer_groups.build_trainable_parameters``
+        in *freeze_list*. Used by ``openwam.train.optim.build_trainable_parameters``
         to source the param groups for the optimizer.
         """
         result = {}

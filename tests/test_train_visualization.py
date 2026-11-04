@@ -6,7 +6,7 @@ from PIL import Image
 
 from openwam.model.architectures.base import BaseWAMArchitecture
 from openwam.model.common.flow_scheduler import FlowScheduler
-from openwam.train.utils.visualization import TrainVisualizer
+from openwam.train.visualization import TrainVisualizer
 from tests._layout import make_layout
 
 

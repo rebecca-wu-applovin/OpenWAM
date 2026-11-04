@@ -23,7 +23,7 @@ These tests exercise the fix on CPU without any real Accelerator/DDP.
 import pytest
 import torch
 
-from openwam.train.openwam_trainer import OpenWAMTrainer
+from openwam.train.trainer import OpenWAMTrainer
 
 
 class _FakeArch:
