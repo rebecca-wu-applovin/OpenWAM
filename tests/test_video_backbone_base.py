@@ -295,10 +295,6 @@ def test_resolve_config_layout():
     stale["common"]["layout"]["num_latents"] = 9
     with pytest.raises(ValueError):
         resolve_config(OmegaConf.create(stale))
-    # The hand-written keys the layout replaced are rejected.
-    for key in ("num_history_frames", "num_proprio_tokens"):
-        with pytest.raises(ValueError):
-            resolve_config(_cfg(**{key: 5}))
     # A backbone's required clean attention (LongLive: causal) must match the architecture's.
     cfg = _cfg(clean="bidirectional")
     cfg.model.video_backbone.required_clean_attention = "causal"
@@ -315,32 +311,6 @@ def test_resolve_config_freezes_whole_cfg():
     cfg = resolve_config(_cfg())
     with pytest.raises(ReadonlyConfigError):
         cfg.dataloader.num_frames = 17
-
-
-@pytest.mark.parametrize(
-    "name, key",
-    [
-        ("fake", "caption_dropout_p"),
-        ("ge_base_fast", "seed"),
-        ("fake", "text_dropout_p"),
-        ("fake", "text_encoder_dropout"),
-        ("fake", "text_encoder_dropout_seed"),
-    ],
-)
-def test_backbone_caption_dropout_keys_rejected(name, key):
-    """The old per-backbone caption-dropout keys (GE / flux / cosmos3) are stale: dataloader.caption_dropout_p."""
-    cfg = _cfg()
-    cfg.model.video_backbone.name = name
-    cfg.model.video_backbone[key] = 0.1
-    with pytest.raises(ValueError, match="caption-dropout"):
-        resolve_config(cfg)
-
-
-def test_seed_key_is_stale_for_ge_only():
-    """``seed`` was GE's caption-dropout seed; another backbone may own a ``seed`` key."""
-    cfg = _cfg()
-    cfg.model.video_backbone.seed = 0
-    resolve_config(cfg)
 
 
 def test_history_window_must_cover_offsets():

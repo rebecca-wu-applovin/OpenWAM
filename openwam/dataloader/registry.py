@@ -31,7 +31,7 @@ def register_dataset(name: str):
     return wrapper
 
 
-def build_dataset(config, split: str = "train") -> BaseDataset:
+def build_dataset(config, split: str) -> BaseDataset:
     """Build a dataset from a config dict or DictConfig.
 
     Looks up the dataset class from ``DATASET_REGISTRY`` using ``config.type``
@@ -40,7 +40,7 @@ def build_dataset(config, split: str = "train") -> BaseDataset:
 
     Args:
         config: Dict-like config with at least a ``type`` field.
-        split: "train" or "val".
+        split: str, "train" or "val" (required: the caller states it).
 
     Returns:
         Instantiated dataset.

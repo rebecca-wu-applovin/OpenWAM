@@ -41,7 +41,7 @@ def _build_arch(variant: str, cfg: dict, *, num_layers: int = WAN_NUM_LAYERS):
     """Build an architecture under a Wan-shaped mock video backbone.
 
     The production path constructs the real Wan2.2 video backbone in ``BaseWAMArchitecture.__init__`` and
-    resolves ``video_dim`` / ``num_dit_layers`` from it; here the factory returns a mock with the Wan layer count,
+    resolves ``video_dim`` / ``num_layers`` from it; here the factory returns a mock with the Wan layer count,
     so the same init code path runs (bridge layer resolution, action_backbone instantiation).
     """
     # The ActionDiT attention geometry follows the backbone: heads / head_dim of the test cfg size the mock.

@@ -296,12 +296,10 @@ def test_decode_inverts_relative_encoding(source, mode):
     np.testing.assert_array_equal(R.decode_action(mode.replace("_rel", "_abs"), absolute, proprio), absolute)
 
 
-def test_unknown_mode_and_unify_keys_rejected(source):
+def test_unknown_mode_rejected(source):
     root, _ = source
     with pytest.raises(ValueError, match="unknown YamSharpa action_mode"):
         build_dataset(_cfg({"a": (root, 1.0)}, action_mode="joint"), "train")
-    with pytest.raises(ValueError, match="derives unify_action"):
-        build_dataset(_cfg({"a": (root, 1.0)}, unify_action=True), "train")
 
 
 def test_from_config_rejects_width_mismatch(source):
@@ -816,3 +814,11 @@ def test_vstack_layout_pastes_tiles_and_rejects_unresized_frames():
     assert (canvas[:192] == (255, 0, 0)).all() and (canvas[192:] == (0, 255, 0)).all()
     with pytest.raises(ValueError, match="expected"):
         assemble_vstack_layout({EGO: Image.new("RGB", (640, 480))}, [EGO, CHEST], out_h=384, out_w=224)
+
+
+@pytest.mark.parametrize("stride", [0, -1])
+def test_window_stride_below_one_raises(source, stride):
+    """window_stride is used as written: a value < 1 raises instead of being clamped to 1."""
+    root, _ = source
+    with pytest.raises(ValueError, match="window_stride must be >= 1"):
+        build_dataset(_cfg({"a": (root, 1.0)}, window_stride=stride), "train")

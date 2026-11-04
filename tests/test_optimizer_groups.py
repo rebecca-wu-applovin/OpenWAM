@@ -64,7 +64,7 @@ def test_pipe_params_include_video_dit():
     from openwam.train.utils.optimizer_groups import build_trainable_parameters
 
     trainer = _FakeTrainer()
-    groups = build_trainable_parameters(trainer, action_lr=1e-4, video_lr=5e-5)
+    groups = build_trainable_parameters(trainer.architecture, action_lr=1e-4, video_lr=5e-5)
     surfaced = {id(p) for g in groups for p in g["params"]}
     arch = trainer.architecture
 
@@ -86,7 +86,7 @@ def test_other_modules_ride_base_lr_not_video_lr():
     from openwam.train.utils.optimizer_groups import build_trainable_parameters
 
     trainer = _FakeTrainer()
-    groups = build_trainable_parameters(trainer, action_lr=1e-4, video_lr=5e-5)
+    groups = build_trainable_parameters(trainer.architecture, action_lr=1e-4, video_lr=5e-5)
     ue_weight = trainer.architecture.understanding_expert.weight
 
     # Lands in a base-LR group (no 'lr' override).
@@ -106,7 +106,7 @@ def test_action_params_land_in_action_lr_group():
     from openwam.train.utils.optimizer_groups import build_trainable_parameters
 
     trainer = _FakeTrainer()
-    groups = build_trainable_parameters(trainer, action_lr=1e-4, video_lr=5e-5)
+    groups = build_trainable_parameters(trainer.architecture, action_lr=1e-4, video_lr=5e-5)
     arch = trainer.architecture
 
     action_groups = [g for g in groups if g.get("lr") == 1e-4]
@@ -128,7 +128,7 @@ def test_freeze_is_the_sole_gate_for_action_branch():
     # lambda_action no longer freezes anything; freeze must be explicit (as the
     # model yaml's ``freeze:`` list does in production).
     trainer.architecture.action_backbone.requires_grad_(False)
-    groups = build_trainable_parameters(trainer, video_lr=5e-5)
+    groups = build_trainable_parameters(trainer.architecture, action_lr=None, video_lr=5e-5)
 
     surfaced = {id(p) for g in groups for p in g["params"]}
     assert id(trainer.architecture.action_backbone.proj.weight) not in surfaced
@@ -141,7 +141,7 @@ def test_lambda_action_zero_does_not_gate_params():
     from openwam.train.utils.optimizer_groups import build_trainable_parameters
 
     trainer = _FakeTrainer(lambda_action=0.0)  # not frozen
-    result = build_trainable_parameters(trainer)
+    result = build_trainable_parameters(trainer.architecture, action_lr=None, video_lr=None)
 
     surfaced = {id(p) for p in result}
     assert id(trainer.architecture.action_backbone.proj.weight) in surfaced
@@ -153,7 +153,7 @@ def test_default_returns_flat_list_when_no_overrides():
     from openwam.train.utils.optimizer_groups import build_trainable_parameters
 
     trainer = _FakeTrainer()
-    result = build_trainable_parameters(trainer)
+    result = build_trainable_parameters(trainer.architecture, action_lr=None, video_lr=None)
 
     assert isinstance(result, list)
     assert all(isinstance(p, torch.nn.Parameter) for p in result)

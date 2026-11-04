@@ -20,7 +20,6 @@ dataloader:
   action_mode: fingertips_rel
 
 training:
-  debug: false                    # true would force save@10; we want no writes at all
   num_epochs: null                # step-only
   max_steps: 5
   batch_size: 1
@@ -34,6 +33,5 @@ training:
   vis_steps: null                 # null = no world-model rollouts
 
 project:
-  output_dir: outputs/debug/${now:%Y-%m-%d_%H-%M-%S}
   wandb:
     project: null                 # null = init_wandb returns None

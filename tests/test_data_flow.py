@@ -108,7 +108,7 @@ def fake_arch():
             "dim": 64,
             "ffn_dim": 128,
             "num_heads": 4,
-            "num_dit_layers": 2,
+            "num_layers": 2,
             "text_dim": 16,
             "use_proprioception": True,
             "state_dim": 6,

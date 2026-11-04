@@ -3,7 +3,7 @@
 ``load_architecture`` builds the empty architecture through the same entry finetune / resume use
 (``build_architecture_from_ckpt_dir``), loads every weight from the checkpoint file, then moves it to the requested
 dtype / device in eval mode. ``load_norm_stats`` reads the run's ``normalization_stats.npy`` with the training loader
-(``load_stats_file``), exactly as ``YamSharpaDataset._load_stats`` does. The model holds no normalizer: the engine
+(``load_stats_file``), exactly as ``MultiYamSharpaDataset.from_config`` does. The model holds no normalizer: the engine
 normalizes with the training functions.
 """
 
@@ -64,7 +64,7 @@ def load_norm_stats(dataloader_cfg: DictConfig, ckpt_dir: str) -> tuple:
 
     path = os.path.join(ckpt_dir, "normalization_stats.npy")
     mode = str(dataloader_cfg.action_mode)
-    # Same arguments as YamSharpaDataset._load_stats: stats live in the raw (pre-unify) space.
+    # Same arguments as MultiYamSharpaDataset.from_config: stats live in the raw (pre-unify) space.
     state = load_stats_file(path, block=f"{mode}_state", dim=raw_dim(mode))
     action = load_stats_file(path, block=mode, dim=raw_dim(mode))
     return state, action

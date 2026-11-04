@@ -21,11 +21,12 @@ from openwam.model.video_backbone.common.text_cache import PromptCache
 class BlockLoopState:
     """Mutable state flowing through prepare → run_block → finalize.
 
-    Architecture may read/write ``hidden_states`` / ``time_mod`` / ``rope_freqs``
-    / ``context``; ``grid_*`` and ``extras`` are backbone-owned (read-only to it).
+    The architecture / MoT driver read and write ``hidden_states`` only; the base reads ``grid_frames`` and
+    ``prefix_kv_*``. Every other field is backbone-owned (families that keep their RoPE / modulation in
+    ``extras`` fill ``time_mod`` / ``rope_freqs`` with placeholders).
     """
 
-    # Architecture may read/write
+    # Architecture reads / writes
     hidden_states: Tensor  # (B, L, dim)
     time_mod: Tensor  # (B, 6, dim) or (B, L, 6, dim) per-token
     rope_freqs: Tensor
@@ -49,7 +50,7 @@ class BlockLoopState:
     use_gradient_checkpointing: bool = False
     use_gradient_checkpointing_offload: bool = False
 
-    # Backbone-private escape hatch (Wan also stashes dit/time_embed here)
+    # Backbone-private escape hatch (e.g. Wan's head time embedding)
     extras: dict = field(default_factory=dict)
 
 

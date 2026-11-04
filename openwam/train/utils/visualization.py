@@ -9,9 +9,9 @@ are denoised on a ``schedule_sync`` grid. Rank 0 gathers them and logs
 ``vis/action_mse``. Everything the rollout touches (RNG, train/eval flags) is restored and the schedulers
 are never mutated, so training continues unchanged.
 
-All ranks run the rollout in lockstep, so the hook is also safe under ZeRO-3
-(parameter gathers are collective); under ZeRO-2 it simply costs every GPU the
-same wall time it would otherwise spend waiting at a barrier.
+All ranks run the rollout in lockstep (ZeRO-1 / ZeRO-2 keep full parameters on
+every rank), so it simply costs every GPU the same wall time it would otherwise
+spend waiting at a barrier.
 """
 
 from __future__ import annotations

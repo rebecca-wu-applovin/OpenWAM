@@ -20,7 +20,7 @@ from omegaconf import DictConfig, OmegaConf
 
 # Force tracebacks to flush even when an exception fires inside DataLoader
 # workers / Hydra's own try-except wrapper. Without this, a silent failure
-# on rank 0 leaves the other ranks deadlocked at FSDP all-gather with no
+# on rank 0 leaves the other ranks deadlocked in a collective with no
 # clue what went wrong (observed during a mixture smoke run).
 faulthandler.enable(file=sys.stderr, all_threads=True)
 
@@ -90,27 +90,29 @@ def _build_accelerator(cfg: DictConfig):
     )
 
 
-def _train(cfg: DictConfig) -> None:
-    """Package-native training path."""
+def _build_trainer(cfg: DictConfig):
+    """Decide the run mode once, settle the run config, and build the trainer with its dataset and accelerator.
+
+    Args:
+        cfg: DictConfig, the config this launch composed (yaml defaults + CLI).
+
+    Returns:
+        OpenWAMTrainer, ready for ``train()``.
+    """
     from openwam.config import resolve_config
-
-    resume_path = cfg.training.resume_ckpt_path
-    if resume_path is not None:
-        from openwam.train.utils.ckpt_model_loader import load_resume_cfg
-
-        # A resume runs the run's own config.yaml (raises if this launch's config differs), so the
-        # dataset, trainer and wandb below are all built from what the run started with.
-        cfg = load_resume_cfg(cfg, resume_path)
-    # The one place the run config's derived values (cfg.common.layout) are computed and checked.
-    resolve_config(cfg)
-    _train_openwam(cfg)
-
-
-def _train_openwam(cfg: DictConfig) -> None:
-    """Original OpenWAM training path."""
     from openwam.dataloader.registry import build_dataset
     from openwam.train.openwam_trainer import OpenWAMTrainer
+    from openwam.train.utils.ckpt_model_loader import RunMode, decide_run_mode, load_resume_cfg
     from openwam.train.utils.seeding import seed_everything
+
+    # Fresh / finetune / resume, decided here once; the trainer gets the decision, not the two cfg keys.
+    run_mode, ckpt_path = decide_run_mode(cfg.training)
+    if run_mode is RunMode.RESUME:
+        # A resume runs the run's own config.yaml (raises if this launch's config differs), so the
+        # dataset, trainer and wandb below are all built from what the run started with.
+        cfg = load_resume_cfg(cfg, ckpt_path)
+    # The one place the run config's derived values (cfg.common.layout) are computed and checked.
+    resolve_config(cfg)
 
     # Seed Python random / numpy / torch BEFORE dataset construction so that
     # any reader-time randomness (e.g. lerobot splits) is reproducible.
@@ -124,10 +126,7 @@ def _train_openwam(cfg: DictConfig) -> None:
 
     # Build dataset via registry from its slice (common's action / state dims are checked against action_mode)
     dataset = build_dataset(OmegaConf.merge(cfg.common, cfg.dataloader), split="train")
-
-    # Build trainer and run
-    trainer = OpenWAMTrainer(cfg, accelerator=accelerator, dataset=dataset)
-    trainer.train()
+    return OpenWAMTrainer(cfg, accelerator, dataset, run_mode, ckpt_path, rank=rank)
 
 
 @hydra.main(version_base=None, config_path=str(PROJECT_ROOT / "configs"), config_name="train")
@@ -153,14 +152,14 @@ def main(cfg: DictConfig) -> None:
     sys.path.insert(0, str(PROJECT_ROOT))
 
     try:
-        _train(cfg)
+        _build_trainer(cfg).train()
     except BaseException:
         # destroy_process_group below is a collective. If only this rank
         # raised, the other ranks are still in mid-training collectives
         # (e.g. accelerate's RNG-state broadcast inside dataloader.__iter__),
         # and destroy will block forever waiting for them — masking the
-        # actual rank-0 exception. Mirror the alternate path's pre-destroy
-        # traceback print so the real error survives the deadlock.
+        # actual rank-0 exception. Print the traceback before destroy so the
+        # real error survives the deadlock.
         import traceback as _tb
 
         rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "?"))

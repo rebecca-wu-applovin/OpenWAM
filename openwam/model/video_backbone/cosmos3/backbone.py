@@ -82,12 +82,6 @@ def _check_cfg(cfg: DictConfig) -> None:
     # The clip fps scales the prompt template and the vision mRoPE time axis.
     if float(cfg.fps) <= 0.0:
         raise ValueError(f"cosmos3 fps must be > 0, got {cfg.fps!r}.")
-    if not cfg.freeze_und:
-        raise NotImplementedError(
-            "cosmos3 freeze_und=false is not supported: the und tower always runs under no_grad "
-            "(dit.run_und_tower), so its parameters can never receive gradients — the flag would silently "
-            "allocate optimizer state for weights that never train."
-        )
     # Room for the chat-template tokens around the prompt.
     if int(cfg.max_text_tokens) < 8:
         raise ValueError(f"cosmos3 max_text_tokens must be >= 8, got {cfg.max_text_tokens}.")
@@ -170,7 +164,7 @@ def _drop_lm_head(net) -> None:
     object.__setattr__(net, "lm_head", None)
 
 
-def freeze_unused_native_heads(net) -> int:
+def _freeze_unused_native_heads(net) -> int:
     """Freeze the Omni action/sound heads OpenWAM's video-backbone path never calls.
 
     Its action stream is the external ActionDiT. They stay registered children (riding the checkpoint
@@ -362,7 +356,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
 
         _drop_lm_head(net)
         # Frozen in every mode: finetune / resume build from a ckpt dir too and must not train the und tower.
-        n_heads_frozen = freeze_unused_native_heads(net)
+        n_heads_frozen = _freeze_unused_native_heads(net)
         if n_heads_frozen:
             logger.info("cosmos3: froze unused native action/sound heads (%.1fM params)", n_heads_frozen / 1e6)
         n_frozen = _freeze_und_pathway(net)
@@ -437,7 +431,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
 
         # Restore the rotary table from the build-time fp32 copy. It is NOT
         # snapshotted here: this method runs twice on the training path
-        # (openwam_trainer.py:126 and :530) with ``accelerator.prepare()`` in
+        # (``OpenWAMTrainer.__init__`` and ``OpenWAMTrainer.prepare_accelerate``) with ``accelerator.prepare()`` in
         # between, and DeepSpeed's ``_configure_distributed_model`` calls
         # ``self.module.bfloat16()``, which casts floating-point buffers. A
         # snapshot taken at the second call is therefore already rounded, and

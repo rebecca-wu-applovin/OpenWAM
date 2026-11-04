@@ -22,7 +22,7 @@ frame t, drawn from the sample's ``(seed, epoch, idx)`` RNG; val keeps ``history
 
 Width D is 48 for ``fingertips_*`` (the raw 48, identity scatter) and 80 for ``unify_*`` (raw 62 scattered by
 ``unify_action_map``): the reader's ``ACTION_REPR_DIM`` / ``ACTION_DIM``. The scatter map is derived from
-``action_mode``; a config setting ``unify_action`` / ``unify_action_map`` raises.
+``action_mode`` (there is no config key for it).
 """
 
 from __future__ import annotations
@@ -291,11 +291,11 @@ class YamSharpaDataset(LeRobotV3Reader):
         """Normalized raw action for the window.
 
         Args:
-            win: DataFrame, rows t .. t+n-1 of one episode (n <= num_frames).
+            win: DataFrame, the full window: rows t .. t+num_frames-1 of one episode (every row exists).
 
         Returns:
-            (n, D) normalized raw action; row k is the target at t+k w.r.t. anchor row 0 (``_finalize_action`` keeps
-            the first num_frames-1).
+            (num_frames, D) normalized raw action; row k is the target at t+k w.r.t. anchor row 0
+            (``_finalize_action`` keeps the first num_frames-1).
         """
         state = np.stack(win[STATE_COL].values)
         joints = np.stack(win[JOINT_COL].values)
@@ -566,7 +566,7 @@ class MultiYamSharpaDataset(BaseDataset):
     # ----- config -------------------------------------------------------------
 
     @classmethod
-    def from_config(cls, config, split: str = "train") -> "MultiYamSharpaDataset":
+    def from_config(cls, config, split: str) -> "MultiYamSharpaDataset":
         """Build all sources from ``configs/dataloader/yam_sharpa.yaml``.
 
         Args:
@@ -598,10 +598,6 @@ class MultiYamSharpaDataset(BaseDataset):
         # Shared reader kwargs: every key is required (a missing one raises); null values pass through as-is.
         kwargs: Dict[str, Any] = {key: config[key] for key in YamSharpaDataset.CONFIG_KEYS}
         kwargs["split"] = split
-        # unify_* are derived from action_mode: a config still setting them is stale.
-        for key in ("unify_action", "unify_action_map", "unify_state_map"):
-            if key in config:
-                raise ValueError(f"yam_sharpa derives {key} from action_mode; remove it from the config")
 
         # Normalization on / off is decided here, once: the readers get the (action, state) normalizer pair.
         normalize_mode, raw_path = config.normalize_mode, config.normalization_stats_path

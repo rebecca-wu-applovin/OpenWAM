@@ -66,7 +66,7 @@ model:
   video_backbone:                       # what the model is (compared on finetune)
     name: wan22_ti2v_5b                 # registry key; use the selected backbone name
     shift_video: 5.0                    # flow-matching scheduler shift
-    # Cosmos3 additionally defines fps, prompt_duration_template, and freeze_und.
+    # Cosmos3 additionally defines fps and prompt_duration_template.
 assets:
   video_backbone:                       # where the upstream files are (not compared; finetune / deploy never read it)
     model_path: /path/to/video_backbone_checkpoint  # weights or bundle root

@@ -4,8 +4,8 @@ Finetune starts a new run from a checkpoint's weights. The weights only fit the 
 the launch's ``model`` + ``common`` (minus the derived ``common.layout``) must equal the checkpoint's key by key;
 any difference raises (nothing is merged or written back). ``training`` / ``dataloader`` may differ.
 
-Resume continues one run: ``check_resume_cfg`` compares the whole config (``tests/test_resume_config_strict.py``),
-so the launch config IS the run's config and the shell is built from it. The safetensors are never read
+Resume continues one run: ``load_resume_cfg`` compares the whole config once (``check_resume_cfg``; more cases in
+``tests/test_resume_config_strict.py``), so the launch config IS the run's config and the shell is built from it. The safetensors are never read
 (accelerate's ``load_state`` fills the shell after prepare), so the shell gets storage instead.
 
 ``build_architecture_from_ckpt_dir`` is stubbed out (the real one builds a multi-GB skeleton), so these run on
@@ -243,29 +243,27 @@ def test_resume_builds_from_the_run_config(tmp_path, capture):
     assert capture["loaded"] == [], "resume must not load safetensors"
 
 
-def test_resume_rejects_a_differing_launch(tmp_path, capture):
-    """Direct callers are guarded too: a launch that differs from the saved config raises."""
+def test_resume_rejects_a_differing_launch(tmp_path):
+    """A launch that differs from the saved config raises in load_resume_cfg (before any build)."""
     ckpt_dir = _write_ckpt_cfg(tmp_path)
     cfg = _resume_cfg(tmp_path, model__architecture__clean_attention="causal")
     with pytest.raises(
         ValueError, match=r"model\.architecture\.clean_attention: saved='bidirectional' launch='causal'"
     ):
-        cml.build_for_resume(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
-    assert "model_cfg" not in capture, "the check runs before the shell is built"
+        cml.load_resume_cfg(cfg, ckpt_dir)
 
 
-def test_resume_rejects_layout_mismatch(tmp_path, capture):
+def test_resume_rejects_layout_mismatch(tmp_path):
     """The whole-config check covers the layout and the dataloader keys it comes from."""
     ckpt_dir = _write_ckpt_cfg(tmp_path)
     cfg = _resume_cfg(tmp_path, dataloader__history_offsets=[-4, 0])  # H = 2 vs the ckpt's H = 1
 
     with pytest.raises(ValueError) as err:
-        cml.build_for_resume(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
+        cml.load_resume_cfg(cfg, ckpt_dir)
 
     msg = str(err.value)
     assert "common.layout.num_hist_frames: saved=1 launch=2" in msg
     assert "dataloader.history_offsets: saved=[0] launch=[-4, 0]" in msg
-    assert "model_cfg" not in capture, "the check runs before the shell is built"
 
 
 @pytest.mark.parametrize(
@@ -277,26 +275,32 @@ def test_resume_rejects_layout_mismatch(tmp_path, capture):
         ("history_window", 50),
     ],
 )
-def test_resume_rejects_layout_source_value_change(tmp_path, capture, key, value):
+def test_resume_rejects_layout_source_value_change(tmp_path, key, value):
     """Same frame counts (same common.layout) but other dataloader values: the dataset would draw other rows than
     the ckpt was trained on, so resume raises and names the key with both values."""
     ckpt_dir = _write_ckpt_cfg(tmp_path, dataloader__history_offsets=[-8, 0])
     cfg = _resume_cfg(tmp_path, **{f"dataloader__{key}": value})
 
     with pytest.raises(ValueError, match=rf"dataloader\.{key}: saved=") as err:
-        cml.build_for_resume(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
+        cml.load_resume_cfg(cfg, ckpt_dir)
 
     assert "common.layout" not in str(err.value)
-    assert "model_cfg" not in capture, "the check runs before the shell is built"
 
 
-@pytest.mark.parametrize("build", [cml.build_for_finetune, cml.build_for_resume])
-def test_ckpt_config_without_a_model_section_raises(tmp_path, capture, build):
+@pytest.mark.parametrize(
+    "read",
+    [
+        lambda run_dir, cfg: cml.build_for_finetune(run_dir, cfg, TEST_TRAIN_OPTIONS),
+        lambda run_dir, cfg: cml.load_resume_cfg(cfg, run_dir),
+    ],
+    ids=["finetune", "resume"],
+)
+def test_ckpt_config_without_a_model_section_raises(tmp_path, capture, read):
     """Not a run dir written by this trainer — say so instead of an AttributeError."""
     OmegaConf.save(OmegaConf.create({"training": {"batch_size": 4}}), tmp_path / "config.yaml")
 
     with pytest.raises(ValueError, match="no `model:` section"):
-        build(str(tmp_path), _live_cfg(), TEST_TRAIN_OPTIONS)
+        read(str(tmp_path), _live_cfg())
 
 
 def test_build_architecture_from_ckpt_dir_uses_checkpoint_mode(tmp_path, monkeypatch):
@@ -360,7 +364,7 @@ def _stub_trainer_arch(monkeypatch, frozen: dict):
 
 
 def test_trainer_finetune_freezes_from_training_freeze(tmp_path, monkeypatch):
-    """The finetune branch of ``OpenWAMTrainer.__init__`` runs on the read-only run cfg and freezes training.freeze."""
+    """The FINETUNE build in ``OpenWAMTrainer.__init__`` runs on the read-only run cfg and freezes training.freeze."""
     from openwam.model.architectures.base import TrainOptions
     from openwam.train.openwam_trainer import OpenWAMTrainer
 
@@ -369,7 +373,9 @@ def test_trainer_finetune_freezes_from_training_freeze(tmp_path, monkeypatch):
     frozen: dict = {}
     _stub_trainer_arch(monkeypatch, frozen)
 
-    OpenWAMTrainer(cfg, accelerator=cpu_accelerator(), dataset=None)
+    run_mode, ckpt_path = cml.decide_run_mode(cfg.training)
+    assert (run_mode, ckpt_path) == (cml.RunMode.FINETUNE, ckpt_dir)
+    OpenWAMTrainer(cfg, cpu_accelerator(), None, run_mode, ckpt_path, rank=0)
 
     # The training knobs reach the constructor once, from cfg.training.
     assert frozen["train_options"] == TrainOptions(
@@ -382,16 +388,23 @@ def test_trainer_finetune_freezes_from_training_freeze(tmp_path, monkeypatch):
     assert frozen["names"] == ["video_backbone.vae"]
 
 
-def test_trainer_resume_rejects_a_differing_live_cfg(tmp_path, monkeypatch):
-    """A trainer handed a launch config that differs from the run's saved one refuses to start before any freeze."""
-    from openwam.train.openwam_trainer import OpenWAMTrainer
+@pytest.mark.parametrize(
+    "finetune, resume, want",
+    [(None, None, "FRESH"), ("ft", None, "FINETUNE"), (None, "run", "RESUME")],
+)
+def test_decide_run_mode(tmp_path, finetune, resume, want):
+    """The two ckpt-path switches decide the mode once; resume hands on the run dir, finetune the source as given."""
+    paths = {"ft": str(tmp_path / "ft"), "run": str(tmp_path)}
+    training = OmegaConf.create(
+        {"finetune_ckpt_path": paths.get(finetune), "resume_ckpt_path": paths.get(resume)}
+    )
+    run_mode, ckpt_path = cml.decide_run_mode(training)
+    assert run_mode is cml.RunMode[want]
+    assert ckpt_path == paths.get(finetune or resume)
 
-    training = {**TRAINER_TRAINING, "finetune_ckpt_path": None, "resume_ckpt_path": None}
-    ckpt_dir = _write_ckpt_cfg(tmp_path, training=training)
-    cfg = _resume_cfg(tmp_path, training__text_cache=False, training__resume_ckpt_path=ckpt_dir)
-    frozen: dict = {}
-    _stub_trainer_arch(monkeypatch, frozen)
 
-    with pytest.raises(ValueError, match=r"training\.text_cache: saved=True launch=False"):
-        OpenWAMTrainer(cfg, accelerator=None, dataset=None)
-    assert "names" not in frozen, "the check runs before any freeze"
+def test_decide_run_mode_rejects_both(tmp_path):
+    """finetune and resume are mutually exclusive."""
+    training = OmegaConf.create({"finetune_ckpt_path": str(tmp_path), "resume_ckpt_path": str(tmp_path)})
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        cml.decide_run_mode(training)

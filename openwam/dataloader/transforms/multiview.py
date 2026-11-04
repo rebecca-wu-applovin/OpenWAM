@@ -31,8 +31,8 @@ def assemble_vstack_layout(frames_by_camera: dict, camera_layout: list, out_h: i
     with :func:`resize_camera_tile` first, so the tiles are pasted as they are.
 
     Args:
-        frames_by_camera: dict ``{camera_name: PIL.Image}`` of tiles (width ``out_w``, height ``out_h / N``); a
-            missing key → black tile.
+        frames_by_camera: dict ``{camera_name: PIL.Image}`` of tiles (width ``out_w``, height ``out_h / N``), one
+            per ``camera_layout`` entry (a missing camera raises KeyError).
         camera_layout: list of N camera names, ``camera_layout[0]`` is the top tile.
         out_h, out_w: int, canvas size in pixels; ``out_h`` must be divisible by N.
 
@@ -48,9 +48,7 @@ def assemble_vstack_layout(frames_by_camera: dict, camera_layout: list, out_h: i
 
     canvas = Image.new("RGB", (out_w, out_h), (0, 0, 0))
     for i, cam in enumerate(camera_layout):
-        frame = frames_by_camera.get(cam)
-        if frame is None:
-            continue  # black tile
+        frame = frames_by_camera[cam]
         # A tile of another size would be cropped / leave black rows: resize_camera_tile was skipped.
         if frame.size != (out_w, tile_h):
             raise ValueError(f"vstack layout: tile {cam!r} is {frame.size}, expected {(out_w, tile_h)} (w, h)")

@@ -11,9 +11,13 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+# Flux's native PolicyConfig time-id convention: video latents on a contiguous 24 fps clock, proprio tokens 1 s
+# apart. Intentionally independent of the dataloader's history / future offsets (it is what the pretrained trunk
+# saw, not the clip's real timing). The ViTNorm VAE's temporal compression lives here (not in backbone.py) because
+# the video time ids need it and backbone.py imports this module.
 _TEMPORAL_COMPRESSION = 4
 _VIDEO_POSITION_FPS = 24.0  # PolicyConfig.video_position_fps: latent i sits at 4 i / 24 s
-_STATE_FPS = 1.0  # our 5 proprio frames are 1 s apart (07 layout)
+_STATE_FPS = 1.0  # proprio tokens 1 s apart (PolicyConfig convention)
 _P_STREAM = "action_cond"
 # Segment order of the video-side sequence.
 _SEGMENTS = ("txt", "video", "video_cond", _P_STREAM)
@@ -22,6 +26,14 @@ __all__ = ["build_flux_layer_masks", "build_stream_ids", "times_to_ids", "video_
 
 
 def times_to_ids(time: Tensor) -> Tensor:
+    """Seconds -> flux time ids (10 ms ticks, floored).
+
+    Args:
+        time: (N,) float times in seconds.
+
+    Returns:
+        (N,) int64 ids.
+    """
     return (time * 1000 // 10).to(dtype=torch.int64)
 
 

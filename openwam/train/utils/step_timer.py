@@ -52,7 +52,7 @@ class StepTimer:
         self._prev_other = self._cur["other"]
         self._cur = dict.fromkeys(PHASES, 0.0)
 
-    def snapshot(self, accelerator=None) -> dict:
+    def snapshot(self, accelerator) -> dict:
         """This step's phase times, reduced across ranks.
 
         accelerator: Accelerate handle; with >1 process the (world, len(PHASES)) times are gathered.
@@ -64,7 +64,7 @@ class StepTimer:
             return {}
         vals = [self._cur[p] for p in PHASES[:-1]] + [self._prev_other]
         local = torch.tensor(vals, dtype=torch.float32)
-        if accelerator is not None and accelerator.num_processes > 1:
+        if accelerator.num_processes > 1:
             g = accelerator.gather(local.to(accelerator.device).reshape(1, -1)).float().cpu()  # (world, len(PHASES))
             mean, mx = g.mean(dim=0), g.max(dim=0).values
         else:
@@ -81,10 +81,10 @@ class StepTimer:
 
         Under DeepSpeed, ``accelerator.backward`` runs backward *and* engine.step (clip,
         optimizer, zero_grad); without this hook both would be billed to ``backward``.
-        engine: DeepSpeedEngine (or None / non-DeepSpeed: no-op).
+        engine: DeepSpeedEngine (training always runs DeepSpeed, see scripts/train.py::_build_accelerator).
         Returns: None.
         """
-        if not self.enabled or engine is None or not hasattr(engine, "step"):
+        if not self.enabled:
             return
         orig_step = engine.step
 

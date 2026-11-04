@@ -21,6 +21,7 @@ _CHECKED_KEYS = (
     "max_grad_norm",
     "finetune_ckpt_path",
     "resume_ckpt_path",
+    "run_dir_name",
 )
 _training = OmegaConf.load(_TRAIN_YAML).training
 CHECKED_TRAINING = {key: _training[key] for key in _CHECKED_KEYS}

@@ -15,6 +15,7 @@ from omegaconf import OmegaConf
 from openwam.dataloader.collate import Batch
 from openwam.model.common.flow_scheduler import FlowScheduler
 from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
+from openwam.train.utils.ckpt_model_loader import RunMode
 from tests._arch import TEST_TRAIN_OPTIONS, build_test_arch
 from tests._training_cfg import cpu_accelerator
 
@@ -139,10 +140,6 @@ class _MockVideoBackbone(VideoBackbone):
         return self._head_dim
 
     @property
-    def scheduler(self):
-        return self._scheduler
-
-    @property
     def text_dim(self) -> int:
         return self._text_dim
 
@@ -261,7 +258,6 @@ _TINY_ARCH_CFG = {
     "num_layers": 2,
     "video_dim": 64,
     "text_dim": 64,
-    "num_dit_layers": 2,
 }
 
 
@@ -452,7 +448,7 @@ def test_trainer_rejects_both_lambdas_zero():
         }
     )
     with pytest.raises(ValueError, match="both 0"):
-        OpenWAMTrainer(cfg, accelerator=None, dataset=None)
+        OpenWAMTrainer(cfg, cpu_accelerator(), None, RunMode.FRESH, None, rank=0)
 
 
 class _StopTraining(Exception):
@@ -489,14 +485,15 @@ def test_trainer_reads_training_freeze_text_cache_and_mot(monkeypatch, text_cach
     monkeypatch.setattr("openwam.model.build_architecture", _fake_build)
     cfg = OmegaConf.create(
         {
-            "project": {"seed": 0},
+            # wandb off (null project): train() runs init_wandb on the main rank.
+            "project": {"seed": 0, "wandb": {"project": None}},
             "training": {
-                "finetune_ckpt_path": None, "resume_ckpt_path": None, "initialize_model_on_cpu": False,
+                "initialize_model_on_cpu": False,
                 "use_gradient_checkpointing": False, "use_gradient_checkpointing_offload": False,
                 "lambda_video": 1.0, "lambda_action": 1.0, "mot_checkpoint_mixed_attn": True,
                 "freeze": ["video_backbone.vae"], "text_cache": text_cache,
-                # train() up to the step loop (debug: no wandb).
-                "debug": True, "num_epochs": 1, "max_steps": None, "batch_size": 1, "gradient_accumulation_steps": 1,
+                # train() up to the step loop.
+                "num_epochs": 1, "max_steps": None, "batch_size": 1, "gradient_accumulation_steps": 1,
                 "max_grad_norm": None, "save_steps": None, "keep_last_k_ckpts": 1, "save_full_states_for_resume": False,
                 "vis_steps": None, "log_step_timing": False, "mixed_precision": "bf16",
             },
@@ -505,7 +502,7 @@ def test_trainer_reads_training_freeze_text_cache_and_mot(monkeypatch, text_cach
             "assets": {"video_backbone": {"model_path": "/upstream"}},
         }
     )
-    trainer = trainer_mod.OpenWAMTrainer(cfg, accelerator=cpu_accelerator(), dataset=None)
+    trainer = trainer_mod.OpenWAMTrainer(cfg, cpu_accelerator(), None, RunMode.FRESH, None, rank=0)
     assert seen["frozen"] == [["video_backbone.vae"]]
     assert seen["train_options"].mot_checkpoint_mixed_attn is True
     # The architecture gets merge(common, model): the shared dims sit next to the model blocks.
@@ -518,7 +515,7 @@ def test_trainer_reads_training_freeze_text_cache_and_mot(monkeypatch, text_cach
     monkeypatch.setattr(trainer, "build_optimizer", lambda: SimpleNamespace(param_groups=[]))
     monkeypatch.setattr(trainer, "build_dataloader", lambda batch_size: [0])
     monkeypatch.setattr(trainer, "build_lr_scheduler", lambda *a, **k: None)
-    monkeypatch.setattr(trainer, "setup_output_dir", lambda *a: ("out", None))
+    monkeypatch.setattr(trainer, "open_run_dir", lambda: (SimpleNamespace(path="out"), None))
     monkeypatch.setattr(trainer, "prepare_accelerate", lambda o, d, s: (o, d, s))
     monkeypatch.setattr(trainer, "build_text_cache", lambda: seen.__setitem__("text_cache_calls", 1))
 
@@ -625,22 +622,3 @@ def test_load_checkpoint_rejects_shape_mismatch():
         save_file(state, ckpt_path)
         with pytest.raises(ValueError, match="shape"):
             _make_tiny_arch().load_checkpoint(ckpt_path)
-
-
-def test_manage_checkpoints():
-    """manage_checkpoints should keep only the latest K files."""
-    from openwam.train.utils.checkpointing import manage_checkpoints
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Create 5 fake checkpoints
-        for i in range(1, 6):
-            path = Path(tmpdir) / f"checkpoint_step_{i * 100}.safetensors"
-            path.write_text("fake")
-
-        manage_checkpoints(tmpdir, keep_last_k=2)
-
-        remaining = sorted(Path(tmpdir).glob("checkpoint_step_*"))
-        assert len(remaining) == 2
-        names = [r.name for r in remaining]
-        assert "checkpoint_step_400.safetensors" in names
-        assert "checkpoint_step_500.safetensors" in names

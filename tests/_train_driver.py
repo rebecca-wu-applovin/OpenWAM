@@ -1,6 +1,6 @@
 """Test-only driver: one single-process training run of ``configs/train_debug.yaml``, then dump the text cache.
 
-Same path as ``scripts/train_debug.sh`` -> ``scripts/train.py`` (its accelerator, seed and dataset helpers), run
+Same path as ``scripts/train_debug.sh`` -> ``scripts/train.py`` (its ``_build_trainer``: run mode, config, dataset), run
 in a subprocess by ``tests/test_text_cache_after_resume.py`` so each run gets a fresh DeepSpeed process group.
 
 Usage (env RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT set, as train_debug.sh does):
@@ -46,18 +46,14 @@ def main() -> None:
     with initialize_config_dir(config_dir=os.path.join(REPO, "configs"), version_base=None):
         cfg = compose("train_debug", overrides=overrides)
 
-    from omegaconf import OmegaConf
-
-    from openwam.dataloader.registry import build_dataset
-    from openwam.train import openwam_trainer
-    from openwam.train.utils.seeding import seed_everything
+    from openwam.train.utils import checkpointing
 
     if keep_state:
-        # A finished run drops its accel_state dirs; keep them so a second run can resume from step N.
-        openwam_trainer.finalize_keep_weights_only = lambda *a, **k: None
+        # A finished run drops its accel_state dirs; keep everything so a second run can resume from step N.
+        checkpointing.prune_checkpoints = lambda *a, **k: None
     if stop:
-        # Stop right after the resume state of step N is written (a timeout mid-run), via the trainer's save hook.
-        save = openwam_trainer.save_full_state
+        # Stop right after the resume state of step N is written (a timeout mid-run), via the run dir's save hook.
+        save = checkpointing.save_full_state
 
         def save_then_stop(accelerator, output_path, global_step, *a, **k):
             """Same args as save_full_state; raises _Stop once step N is on disk. Returns: None."""
@@ -65,13 +61,9 @@ def main() -> None:
             if global_step == stop[0]:
                 raise _Stop
 
-        openwam_trainer.save_full_state = save_then_stop
-    from openwam.config import resolve_config
-
-    resolve_config(cfg)  # what scripts/train.py's entry does: cfg.common.layout, project.seed checked
-    seed_everything(int(cfg.project.seed), rank=0)
-    dataset = build_dataset(OmegaConf.merge(cfg.common, cfg.dataloader), split="train")
-    trainer = openwam_trainer.OpenWAMTrainer(cfg, accelerator=train._build_accelerator(cfg), dataset=dataset)
+        checkpointing.save_full_state = save_then_stop
+    # The entry point's own path: run mode decided once, resume config swapped in, resolve, seed, dataset, trainer.
+    trainer = train._build_trainer(cfg)
     try:
         trainer.train()
     except _Stop:

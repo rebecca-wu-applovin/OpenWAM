@@ -100,7 +100,7 @@ class LeRobotV3Reader:
             dataset_id: str, source name used in logs and errors.
             split: str, ``train`` / ``val`` (the info.json split; ``train`` turns the train-only augmentations on).
             num_frames: int, rows per window (the action chunk is ``num_frames - 1`` steps).
-            window_stride: int, rows between consecutive window starts.
+            window_stride: int >= 1, rows between consecutive window starts (anything smaller raises).
             min_window_len: int, the shortest episode that yields a window (every row a window reads must exist).
             height / width: int, the video canvas size.
             cameras: list[str] of N >= 1 video feature keys the reader decodes (each must be in info.features).
@@ -116,7 +116,11 @@ class LeRobotV3Reader:
         self._dataset_id = str(dataset_id)
         self._split = split
         self._num_frames = int(num_frames)
-        self._window_stride = max(1, int(window_stride))
+        if int(window_stride) < 1:
+            raise ValueError(
+                f"{self.DATASET_NAME}({self._dataset_id}): window_stride must be >= 1, got {window_stride}"
+            )
+        self._window_stride = int(window_stride)
         self._height = int(height)
         self._width = int(width)
         self._cameras = [str(c) for c in cameras]
@@ -261,8 +265,7 @@ class LeRobotV3Reader:
             train: bool, True for the train split; False for val and :meth:`eval_view`.
 
         Returns:
-            None. Sets ``_color_jitter`` (None = off). Subclasses with more train-only augmentations extend it
-            (yam_sharpa: random history).
+            None. Sets ``_color_jitter`` (None = off). Subclasses with more train-only augmentations extend it.
         """
         self._color_jitter = self._train_color_jitter if train else None
 

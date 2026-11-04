@@ -9,9 +9,6 @@ common:                  # values shared by several components; each component g
   # layout: derived by resolve_config at startup (do not set)
 
 training:
-  # --- Debug ---
-  debug: false                    # Debug mode: max_steps=20, save@10, constant LR
-
   # --- Optimizer ---
   learning_rate: 1e-4             # Base learning rate for AdamW
   adam_betas: [0.9, 0.95]         # AdamW (beta1, beta2)
@@ -75,11 +72,9 @@ training:
   dataset_num_workers: 8          # DataLoader num_workers (0 = main process)
 
   # --- Profiling ---
-  log_step_timing: true           # wandb timing/*: data/encode/forward/backward/optim/other s per step (adds cuda syncs)
+  log_step_timing: true           # wandb timing/*: data/forward/backward/optim/other s per step (adds cuda syncs)
 
 project:
-  name: openwam
-  output_dir: outputs/${now:%Y-%m-%d_%H-%M-%S}
   seed: 42
   wandb:
     project: openwam

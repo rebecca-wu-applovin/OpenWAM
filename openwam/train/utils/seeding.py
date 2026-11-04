@@ -2,9 +2,9 @@
 
 ``OpenWAMTrainer`` (dual_system path) seeds every run from the
 ``cfg.project.seed`` yaml field (a required int). The FastWAM-style seeding intentionally does NOT
-touch cudnn or cuBLAS, so FSDP / fused-attention kernels stay usable. It
-reaches into the helpers below for ``make_dataloader_generator`` and
-``dataloader_worker_init_fn`` to make dataset-side randomness reproducible.
+touch cudnn or cuBLAS, so DeepSpeed / fused-attention kernels stay usable. The
+dataset needs no loader-side seeding: it draws each sample from its own RNG keyed
+on ``(seed, epoch, index)``.
 
 Helpers:
 
@@ -12,15 +12,9 @@ Helpers:
   global RNGs for the local rank, leaving cudnn/cuBLAS untouched — the trainer
   uses it for per-process model-init seeding without disabling autotuning.
 - ``seed_everything`` is ``seed_process`` plus cudnn-deterministic + a fixed
-  cuBLAS workspace. Run once at trainer construction *before* the model and
-  dataset are built so DiT weight init becomes deterministic.
-- ``dataloader_worker_init_fn`` is the ``worker_init_fn`` for
-  ``DataLoader``; it seeds Python ``random`` and NumPy inside each worker
-  process from PyTorch's auto-derived ``info.seed`` (which advances per
-  epoch), so dataset transforms become reproducible across runs without
-  replaying identical augmentations every epoch.
-- ``make_dataloader_generator`` returns a fresh ``torch.Generator`` seeded
-  for the local rank, intended to be passed to ``DataLoader(generator=...)``.
+  cuBLAS workspace. Run once by the training entry point (``scripts/train.py``)
+  *before* the dataset and the trainer are built; the trainer's ``seed_process``
+  then makes DiT weight init deterministic.
 - ``per_step_seed`` derives a deterministic ``int`` seed from the run seed,
   the rank and a step counter; useful for ``torch.manual_seed`` calls done
   inside the forward pass when threading a generator all the way down to
@@ -54,7 +48,7 @@ def seed_process(seed: int, *, rank: int = 0) -> None:
 
     Ranks get disjoint streams via ``RANK_OFFSET`` — the same stride
     ``per_step_seed`` uses — so a process's init-time and per-step seeds share one
-    rank window. Deliberately leaves cudnn/cuBLAS alone (keeps autotuning + FSDP /
+    rank window. Deliberately leaves cudnn/cuBLAS alone (keeps autotuning + DeepSpeed /
     fused-attention compat); callers that also want deterministic matmul kernels
     use ``seed_everything`` instead.
     """
@@ -75,7 +69,7 @@ def seed_everything(seed: int, *, rank: int = 0) -> None:
     initialisation lands in deterministic territory.
 
     Note: we deliberately do *not* call ``torch.use_deterministic_algorithms``
-    because several FSDP / attention paths used in training fall back to
+    because several DeepSpeed / attention paths used in training fall back to
     non-deterministic kernels and would crash with
     ``RuntimeError: not implemented for deterministic``.  Loss reproducibility
     therefore relies on cudnn-deterministic + a fixed cuBLAS workspace, which
@@ -87,43 +81,6 @@ def seed_everything(seed: int, *, rank: int = 0) -> None:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-
-def dataloader_worker_init_fn(worker_id: int) -> None:
-    """Per-worker init function for ``DataLoader(worker_init_fn=...)``.
-
-    PyTorch already derives a per-worker seed from the main process's
-    ``base_seed`` and the worker_id, but it only seeds ``torch.manual_seed``
-    inside the worker.  This helper additionally seeds Python ``random`` and
-    NumPy with the same value so any dataset transform that reaches into
-    those RNGs is reproducible too.
-    """
-    info = torch.utils.data.get_worker_info()
-    if info is None:
-        return
-    base_seed = info.seed % (2**32 - 1)
-    random.seed(base_seed)
-    np.random.seed(base_seed)
-
-
-def make_dataloader_generator(seed: int, *, rank: int = 0) -> torch.Generator:
-    """Build a CPU ``torch.Generator`` for ``DataLoader(generator=...)``.
-
-    Each rank gets a different stream so independent ranks shuffle their
-    local indices independently while still being reproducible.
-
-    Note (accelerate multi-GPU path): ``accelerator.prepare`` registers this
-    generator as the prepared loader's ``synchronized_generator`` and
-    re-broadcasts rank 0's generator state to every rank at each epoch start,
-    so the per-rank offset does NOT diversify the epoch shuffle order there —
-    all ranks intentionally share rank 0's permutation (i.e. the one seeded
-    with ``seed`` itself) and ``BatchSamplerShard`` hands each rank a disjoint
-    slice of it. The offset still applies to loaders that are never
-    ``prepare()``-d.
-    """
-    g = torch.Generator()
-    g.manual_seed(int(seed) + RANK_OFFSET * int(rank))
-    return g
 
 
 def per_step_seed(seed: int, *, rank: int = 0, step: int = 0) -> int:

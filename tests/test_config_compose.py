@@ -88,7 +88,7 @@ def test_backbone_yaml_training_block(backbone):
     assert "text_cache" not in cfg.model.video_backbone and "freeze" not in cfg.model.video_backbone
     assert "freeze" not in cfg.model
     if backbone.startswith("cosmos3"):
-        # No text_encoder submodule (freeze_und freezes the und pathway at build); the text cannot be cached.
+        # No text_encoder submodule (the und pathway is always frozen at build); the text cannot be cached.
         assert (freeze, text_cache) == (["video_backbone.vae"], False)
     else:
         assert (freeze, text_cache) == (["video_backbone.text_encoder", "video_backbone.vae"], True)

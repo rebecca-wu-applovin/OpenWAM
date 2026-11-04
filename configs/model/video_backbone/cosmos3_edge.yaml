@@ -6,7 +6,7 @@
 # bundle's config.json on from_pretrained, used verbatim for the checkpoint meta shell. The action-side
 # context width (geometry.text_dim = dit.hidden_size = 2048) is in the geometry block. Works with
 # dual_system (joint_cross_attn | joint_self_attn). The und pathway is frozen at
-# build (freeze_und below); the gen pathway is trainable by default.
+# build (always); the gen pathway is trainable by default.
 
 model:
   video_backbone:
@@ -33,7 +33,7 @@ model:
     fps: 24.0
     prompt_duration_template: true
 
-    freeze_und: true   # freeze the und (text) pathway + token embedding at build
+    # The und (text) pathway + token embedding are always frozen at build (they run under no_grad).
 
     # what the action stream reads; checked against the built module at construction
     # (from the native block: dit.hidden_size / num_attention_heads / head_dim / num_hidden_layers / hidden_size)
@@ -98,5 +98,5 @@ assets:
     model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Cosmos3-Edge  # [Required] diffusers-style bundle root (transformer/ + vae/ + text_tokenizer/)
 
 training:                 # this backbone's training switches (not compared on finetune)
-  freeze: [video_backbone.vae]   # every entry must exist on the model (no text_encoder: freeze_und freezes und at build)
+  freeze: [video_backbone.vae]   # every entry must exist on the model (no text_encoder: the und pathway is frozen at build)
   text_cache: false        # the text encode needs the clip's latent grid (prompt templates, vision positions); true raises

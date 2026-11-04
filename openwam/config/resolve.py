@@ -38,24 +38,12 @@ UNVERIFIED_VA_MODES = ("action_sees_video", "video_sees_action", "isolated")
 # How the train split picks the history rows: always ``history_offsets``, or per sample H-1 random rows of the
 # past ``history_window`` rows + frame t. Val and deploy always use ``history_offsets``.
 HISTORY_SAMPLINGS = ("fixed", "random")
-# Hand-written architecture keys the layout replaced; a launch that still sets them is stale.
-REMOVED_ARCH_KEYS = ("num_history_frames", "num_proprio_tokens", "video_attention_mask_mode")
-# Per-backbone caption-dropout keys -> their old meaning: caption dropout moved to the dataset
-# (dataloader.caption_dropout_p, drawn from the per-sample RNG), so a config that still sets them is stale.
-REMOVED_BACKBONE_KEYS = {
-    "caption_dropout_p": "GE caption-dropout probability",
-    "text_dropout_p": "flux caption-dropout probability",
-    "text_encoder_dropout": "cosmos3 caption-dropout probability",
-    "text_encoder_dropout_seed": "cosmos3 caption-dropout RNG seed",
-}
 # training.lr_scheduler values besides null (= constant LR).
 LR_SCHEDULERS = ("cosine",)
 # Training knobs where null = off / no limit; a set value must be > 0 (0 is not a second spelling of "off").
 POSITIVE_OR_NULL_TRAINING_KEYS = ("save_steps", "vis_steps", "max_steps", "max_grad_norm")
-# Checkpoint-source keys: null = unset; "" is not a second spelling of null.
-CKPT_PATH_TRAINING_KEYS = ("finetune_ckpt_path", "resume_ckpt_path")
-# GE's generic-named ``seed`` only seeded its caption dropout; checked for GE alone (another backbone may own a seed).
-REMOVED_GE_KEYS = {"seed": "GE caption-dropout RNG seed"}
+# Path / name keys where null = unset; "" is not a second spelling of null.
+NULL_NOT_EMPTY_TRAINING_KEYS = ("finetune_ckpt_path", "resume_ckpt_path", "run_dir_name")
 
 
 def latent_layout(
@@ -248,7 +236,7 @@ def _check_training(training: DictConfig) -> None:
     Returns:
         None. KeyError for a ``mixed_precision`` outside :data:`DTYPES`; ValueError for an ``lr_scheduler`` other
         than null / cosine, a set ``save_steps`` / ``vis_steps`` / ``max_steps`` / ``max_grad_norm`` that is not
-        > 0, or a ``finetune_ckpt_path`` / ``resume_ckpt_path`` that is "".
+        > 0, or a ``finetune_ckpt_path`` / ``resume_ckpt_path`` / ``run_dir_name`` that is "".
     """
     if training.mixed_precision not in DTYPES:
         raise KeyError(
@@ -265,7 +253,7 @@ def _check_training(training: DictConfig) -> None:
         # bool is an int subclass: a yaml `true` is not a step count; a str (CLI typo) is not a number.
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
             raise ValueError(f"training.{key}={value!r}: must be > 0, or null for off / no limit")
-    for key in CKPT_PATH_TRAINING_KEYS:
+    for key in NULL_NOT_EMPTY_TRAINING_KEYS:
         if training[key] == "":
             raise ValueError(f'training.{key}="": use null to leave it unset')
 
@@ -294,28 +282,13 @@ def resolve_config(cfg: DictConfig) -> DictConfig:
 
     Returns:
         ``cfg`` itself, with ``cfg.common.layout`` set and the whole config read-only (``OmegaConf.set_readonly``,
-        interpolations unresolved; struct off so component slices can be merged). Raises ValueError when a stale
-        hand-written architecture key or a removed backbone caption-dropout key is present, an existing layout
-        disagrees with the derived one, ``project.seed`` is not an int, or a check above fails; KeyError for an
-        unknown ``training.mixed_precision``.
+        interpolations unresolved; struct off so component slices can be merged). Raises ValueError when an
+        existing layout disagrees with the derived one, ``project.seed`` is not an int, or a check above fails;
+        KeyError for an unknown ``training.mixed_precision``.
     """
     _check_seed(cfg.project)
     _check_training(cfg.training)
     arch = cfg.model.architecture
-    stale = [k for k in REMOVED_ARCH_KEYS if k in arch]
-    if stale:
-        raise ValueError(
-            f"model.architecture.{stale} were replaced by the derived cfg.common.layout / clean_attention; "
-            "remove them (the history length comes from dataloader.history_offsets alone)"
-        )
-    video_backbone = cfg.model.video_backbone
-    removed = {**REMOVED_BACKBONE_KEYS, **(REMOVED_GE_KEYS if video_backbone.name == "ge_base_fast" else {})}
-    stale = {k: meaning for k, meaning in removed.items() if k in video_backbone}
-    if stale:
-        raise ValueError(
-            f"model.video_backbone keys {stale} were removed: caption dropout is dataloader.caption_dropout_p "
-            "(the dataset drops prompts with the per-sample RNG); remove them and set that key instead"
-        )
     _check_attention(cfg.model)
     _check_bridge_interval(arch)
     _check_proprio_input(cfg.model, int(cfg.common.state_dim))

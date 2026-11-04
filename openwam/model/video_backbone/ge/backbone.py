@@ -2,7 +2,7 @@
 
 Components (all GE-native):
   * DiT: GE's multi-view LTX transformer (28 x 2048, 32 heads x 64, patch 1),
-    weights ``GE_base_fast_v0.1.safetensors``; vendored in ``ge/transformer.py``.
+    weights ``GE_base_fast_v0.1.safetensors``; vendored in ``ge/dit.py``.
   * VAE: LTX-Video ``AutoencoderKLLTXVideo`` (8x temporal causal, 32x spatial,
     128 ch), latents normalized with the VAE's ``latents_mean/std``.
   * Text: LTX-Video T5-XXL encoder, 128 tokens. Caption dropout is the dataset's

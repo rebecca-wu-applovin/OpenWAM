@@ -38,7 +38,7 @@ def _make_dual_system_self_attn_mot_fixture():
         "ffn_dim": 64,
         "num_heads": 4,
         "video_dim": 32,
-        "num_dit_layers": 2,
+        "num_layers": 2,
     }
     # 2 history + 2 future latents = the 4 one-token frames of _dual_system_self_attn_mot_states.
     backbone = _MockVideoBackbone(dim=32, num_layers=2, num_heads=4)
@@ -61,7 +61,7 @@ def _make_dual_system_cross_attn_fixture():
         "ffn_dim": 64,
         "num_heads": 4,
         "video_dim": 48,
-        "num_dit_layers": 2,
+        "num_layers": 2,
         "text_dim": 16,
     }
     arch = build_test_arch("joint_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
@@ -159,6 +159,7 @@ def test_openwam_trainer_uses_strategy_freeze_list(monkeypatch):
     from omegaconf import OmegaConf
 
     from openwam.train.openwam_trainer import OpenWAMTrainer
+    from openwam.train.utils.ckpt_model_loader import RunMode
 
     class _Arch(torch.nn.Module):
         def __init__(self):
@@ -194,8 +195,6 @@ def test_openwam_trainer_uses_strategy_freeze_list(monkeypatch):
         {
             "project": {"seed": 0},
             "training": {
-                "finetune_ckpt_path": None,
-                "resume_ckpt_path": None,
                 "initialize_model_on_cpu": False,
                 "use_gradient_checkpointing": False,
                 "use_gradient_checkpointing_offload": False,
@@ -212,7 +211,7 @@ def test_openwam_trainer_uses_strategy_freeze_list(monkeypatch):
         }
     )
 
-    trainer = OpenWAMTrainer(cfg, accelerator=cpu_accelerator(), dataset=None)
+    trainer = OpenWAMTrainer(cfg, cpu_accelerator(), None, RunMode.FRESH, None, rank=0)
     arch = holder["arch"]
 
     assert trainer.architecture is arch
@@ -234,7 +233,6 @@ def test_build_architecture_dual_system():
         "num_heads": 4,
         "num_layers": 2,
         "video_dim": 256,
-        "num_dit_layers": 2,
     }
     arch = build_test_arch("joint_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     assert arch.action_dim == 7
@@ -269,7 +267,6 @@ def test_dual_system_prepare_and_extract():
         "num_heads": 4,
         "num_layers": 2,
         "video_dim": 128,
-        "num_dit_layers": 2,
     }
     arch = build_test_arch("joint_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     arch.eval()
@@ -309,7 +306,7 @@ def test_dual_system_bridge_interval_resolves():
         "num_heads": 4,
         "video_dim": 128,
         "bridge_interval": 2,
-        "num_dit_layers": 30,
+        "num_layers": 30,
     }
     arch = build_test_arch("joint_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     assert arch.bridge_layers == tuple(range(0, 30, 2))
@@ -529,7 +526,7 @@ def test_dual_system_joint_self_attn_pre_post_attn_round_trip():
         "ffn_dim": 64,
         "num_heads": 4,
         "video_dim": 32,
-        "num_dit_layers": 1,
+        "num_layers": 1,
     }
     arch = build_test_arch("joint_self_attn", cfg, stub_backbone(cfg), layout=make_layout())
     arch.eval()
@@ -569,7 +566,7 @@ def test_dual_system_joint_cross_attn_no_per_layer_state():
         "ffn_dim": 128,
         "num_heads": 4,
         "video_dim": 128,
-        "num_dit_layers": 2,  # every layer of the 2-layer stub backbone
+        "num_layers": 2,  # every layer of the 2-layer stub backbone
     }
     arch = build_test_arch("joint_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
 
@@ -606,7 +603,7 @@ def test_dual_system_joint_cross_attn_passes_appended_proprio_context_to_action(
         "ffn_dim": 64,
         "num_heads": 4,
         "video_dim": 32,
-        "num_dit_layers": 1,
+        "num_layers": 1,
         "use_proprioception": True,
         "state_dim": 7,
         "text_dim": 16,
@@ -660,7 +657,7 @@ def test_dual_system_detached_joint_cross_attn_blocks_grad_to_video():
         "ffn_dim": 128,
         "num_heads": 4,
         "video_dim": 128,
-        "num_dit_layers": 1,
+        "num_layers": 1,
     }
     arch = build_test_arch("joint_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     # detach is owned by the architecture; the action backbone has no such flag.
@@ -698,7 +695,7 @@ def test_dual_system_joint_self_attn_creates_dit_state():
         "ffn_dim": 64,
         "num_heads": 4,
         "video_dim": 32,
-        "num_dit_layers": 2,
+        "num_layers": 2,
     }
     arch = build_test_arch("joint_self_attn", cfg, stub_backbone(cfg), layout=make_layout())
 
@@ -723,7 +720,7 @@ def test_build_architecture_injects_framework_variant_and_detach_option():
         "ffn_dim": 128,
         "num_heads": 4,
         "video_dim": 128,
-        "num_dit_layers": 2,
+        "num_layers": 2,
     }
     arch = build_test_arch("joint_cross_attn", cfg, stub_backbone(cfg), layout=make_layout())
     from openwam.model.architectures.dual_system import DualSystemCrossAttnArchitecture
@@ -747,7 +744,7 @@ def test_dual_system_self_attn_state_is_action_dit_state():
         "ffn_dim": 64,
         "num_heads": 4,
         "video_dim": 32,
-        "num_dit_layers": 2,
+        "num_layers": 2,
     }
     arch = build_test_arch("joint_self_attn", cfg, stub_backbone(cfg), layout=make_layout())
     context, context_mask = _action_context(arch.action_backbone, 1)

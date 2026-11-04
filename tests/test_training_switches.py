@@ -11,6 +11,7 @@ import torch
 from omegaconf import OmegaConf
 
 from openwam.config.resolve import _check_training
+from openwam.train.utils.ckpt_model_loader import RunMode
 from tests._training_cfg import CHECKED_TRAINING, cpu_accelerator
 
 
@@ -39,6 +40,7 @@ def test_defaults_pass():
         ("save_steps", "abc"),  # a CLI typo: ValueError naming the key, not a bare TypeError
         ("finetune_ckpt_path", ""),
         ("resume_ckpt_path", ""),
+        ("run_dir_name", ""),  # would put the run into output_path itself
     ],
 )
 def test_bad_value_raises(key, value):
@@ -113,7 +115,7 @@ def test_trainer_passes_mixed_precision_dtype(monkeypatch, mixed_precision, dtyp
             "assets": {"video_backbone": {"model_path": "/upstream"}},
         }
     )
-    OpenWAMTrainer(cfg, accelerator=cpu_accelerator(), dataset=None)
+    OpenWAMTrainer(cfg, cpu_accelerator(), None, RunMode.FRESH, None, rank=0)
     # Placed on the accelerator's device: the trainer invents no device either.
     assert calls == [(dtype, torch.device("cpu"))]
 

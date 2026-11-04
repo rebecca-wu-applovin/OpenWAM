@@ -118,17 +118,15 @@ def _hydra_value(tokens: list[str], key: str) -> str | None:
 
 
 def _latest_state_step(run_dir: Path) -> int:
-    """Highest step with a *complete* resume state in `run_dir` (same rule as find_latest_accel_state).
+    """Highest step with a *complete* resume state in `run_dir` (the trainer's own find_latest_accel_state).
 
-    run_dir: run directory that may hold accel_state_step_<N>/ dirs.
+    run_dir: run directory that may hold accel_state_step_<N>/ dirs (runs in the container: repo on PYTHONPATH).
     Returns: N of the newest accel_state_step_<N>/ that has trainer_state.json, else -1.
     """
-    steps = [
-        int(d.name.rsplit("_", 1)[1])
-        for d in run_dir.glob("accel_state_step_*")
-        if (d / "trainer_state.json").is_file()
-    ]
-    return max(steps, default=-1)
+    from openwam.train.utils.checkpointing import STATE_NAME, find_latest_accel_state
+
+    state_dir = find_latest_accel_state(str(run_dir))
+    return -1 if state_dir is None else int(STATE_NAME.match(Path(state_dir).name).group(1))
 
 
 def _auto_resume(overrides: list[str]) -> tuple[list[str], Path | None]:

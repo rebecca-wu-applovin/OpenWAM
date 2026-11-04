@@ -83,7 +83,6 @@ def test_double_registration_raises():
     [
         ({"max_text_tokens": 2}, ValueError, "max_text_tokens"),
         ({"fps": 0}, ValueError, "fps"),
-        ({"freeze_und": False}, NotImplementedError, "freeze_und"),
     ],
 )
 def test_bad_cfg_rejected_in_both_modes(change, error, match, tmp_path):

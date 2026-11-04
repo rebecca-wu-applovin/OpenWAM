@@ -97,8 +97,8 @@ def _flux_dit(geometry: DictConfig, action_cond_dim: int, dtype: torch.dtype) ->
         torch.set_default_dtype(prev)
 
 
-def build_flux_dit(
-    path: str, geometry: DictConfig, *, action_cond_dim: int, head_seed: int = 0, dtype: torch.dtype = torch.bfloat16
+def _build_flux_dit(
+    path: str, geometry: DictConfig, *, action_cond_dim: int, head_seed: int, dtype: torch.dtype
 ) -> JointSingleSeq:
     """JointSingleSeq with streams video / video_cond / action_cond, loaded from the action-base trunk.
 
@@ -114,9 +114,12 @@ def build_flux_dit(
         dtype: parameter dtype.
 
     Returns:
-        JointSingleSeq in eval mode on CPU. Raises ValueError when the file does not match ``geometry``.
+        JointSingleSeq in eval mode on CPU. Raises ValueError (``load_strict``) when the file does not match
+        ``geometry``.
     """
     from safetensors import safe_open
+
+    from openwam.model.video_backbone.common.weights import load_strict
 
     model = _flux_dit(geometry, action_cond_dim, dtype)
     # Remap the file's keys to our streams: action_prediction_cond -> action_cond; drop other robots' heads.
@@ -131,28 +134,19 @@ def build_flux_dit(
             elif len(parts) >= 3 and parts[1] == "action_prediction":
                 continue  # the trunk's action-prediction stream is replaced by OpenWAM's ActionDiT
             sd[".".join(parts)] = f.get_tensor(key)
-    # A geometry the file does not have shows up as missing / unexpected keys or a shape mismatch.
-    expected = model.state_dict()
-    bad_shapes = [k for k, v in sd.items() if k in expected and tuple(v.shape) != tuple(expected[k].shape)]
-    if bad_shapes:
-        raise ValueError(f"flux trunk does not match the yaml dit={dict(geometry)}: shape mismatch on {bad_shapes[:6]}")
-    res = model.load_state_dict({k: v.to(dtype) for k, v in sd.items()}, strict=False)
-    fresh = {
-        f"emb_in.{_P_STREAM}.weight",
-        f"final_layer.{_P_STREAM}.linear.weight",
-        f"final_layer.{_P_STREAM}.adaLN_modulation.1.weight",
-    }
-    if set(res.missing_keys) - fresh or res.unexpected_keys:
-        raise ValueError(
-            f"flux trunk does not match the yaml dit={dict(geometry)}: missing "
-            f"{sorted(set(res.missing_keys) - fresh)[:6]}, unexpected {res.unexpected_keys[:6]}"
-        )
+    sd = {k: v.to(dtype) for k, v in sd.items()}
     # Reference init of a fresh embodiment head (wiring.fresh_head_state_dict): xavier input, zero output.
     gen = torch.Generator().manual_seed(head_seed)
     weight = torch.empty(model.hidden_size, int(action_cond_dim))
     nn.init.xavier_uniform_(weight, generator=gen)
+    sd[f"emb_in.{_P_STREAM}.weight"] = weight.to(dtype)
+    # The two output weights the file lacks start at zero (the whole P output head is zeroed below).
+    expected = model.state_dict()
+    for key in (f"final_layer.{_P_STREAM}.linear.weight", f"final_layer.{_P_STREAM}.adaLN_modulation.1.weight"):
+        sd[key] = torch.zeros_like(expected[key])
+    # A geometry the file does not have shows up as missing / unexpected keys or a shape mismatch.
+    load_strict(model, sd, assign=False)
     with torch.no_grad():
-        model.emb_in[_P_STREAM].weight.copy_(weight.to(dtype))
         for p in model.final_layer[_P_STREAM].parameters():
             p.zero_()
     model.eval()
@@ -166,7 +160,7 @@ def _flux_vae_params():
     return ViTNormInferenceParams(chunked_encode=False, decoder_max_t=8)
 
 
-def build_flux_vae(path: str) -> nn.Module:
+def _build_flux_vae(path: str) -> nn.Module:
     """Frozen ViTNorm video VAE (``ViTNormInference``, bf16) from ``video_vae.safetensors``.
 
     Args:
@@ -249,10 +243,14 @@ class FluxActionVideoBackbone(VideoBackbone):
 
         root = str(assets.model_path)
         # Built in this order (trunk, VAE): their random inits are part of the training seed stream.
-        dit = build_flux_dit(
-            f"{root}/flux-3-action-base.safetensors", cfg.dit, action_cond_dim=int(cfg.action_cond_dim), head_seed=0
+        dit = _build_flux_dit(
+            f"{root}/flux-3-action-base.safetensors",
+            cfg.dit,
+            action_cond_dim=int(cfg.action_cond_dim),
+            head_seed=0,
+            dtype=torch.bfloat16,
         )
-        vae = build_flux_vae(f"{root}/video_vae.safetensors")
+        vae = _build_flux_vae(f"{root}/video_vae.safetensors")
         text_dir = os.path.join(root, _TEXT_ENCODER_SUBDIR)
         return cls._assemble(cfg, dit, vae, Qwen3VLEmbedder.from_pretrained(text_dir), text_dir)
 
@@ -473,9 +471,8 @@ class FluxActionVideoBackbone(VideoBackbone):
             raise ValueError(
                 f"flux proprio must be (B, {layout.num_proprio_tokens}, {self.state_dim}), got {tuple(proprio.shape)}"
             )
-        prop = proprio
         # One P token per history frame; tokens embed in the latent dtype.
-        n_prop = prop.shape[1]
+        n_prop = proprio.shape[1]
         dtype = latents.dtype
         dev = latents.device
 
@@ -487,7 +484,7 @@ class FluxActionVideoBackbone(VideoBackbone):
             "txt": dit.txt_in(ctx.to(dtype)),
             "video": dit.emb_in["video"](fut_tok),
             "video_cond": dit.emb_in["video_cond"](hist_tok),
-            _P_STREAM: dit.emb_in[_P_STREAM](prop.to(dtype)),
+            _P_STREAM: dit.emb_in[_P_STREAM](proprio.to(dtype)),
         }
         seg_lens = {k: int(v.shape[1]) for k, v in x.items()}
 
@@ -716,6 +713,4 @@ class FluxActionVideoBackbone(VideoBackbone):
 
 __all__ = [
     "FluxActionVideoBackbone",
-    "build_flux_dit",
-    "build_flux_vae",
 ]

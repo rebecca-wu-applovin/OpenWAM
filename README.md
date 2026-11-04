@@ -159,14 +159,17 @@ Wan2.2-TI2V-5B video backbone, and the Mutual attention mask.
    [`run_modal.sh`](run_modal.sh) (Modal) wrap the same overrides; extra Hydra overrides are appended:
 
    ~~~bash
-   bash run_dual.sh training.debug=true
+   WANDB_GROUP=debug WANDB_RUN_NAME=debug bash run_dual.sh \
+       training.max_steps=20 training.save_steps=10 training.lr_scheduler=null
    ~~~
 
-   training.debug=true runs 20 steps, saves at steps 10 and 20, and uses a
-   constant learning rate. Check the run output, then drop it for normal
-   training. Training defaults and CLI overrides are defined in
-   [`configs/train.yaml`](configs/train.yaml). Outputs use training.output_path,
-   whose default is `outputs/openwam_checkpoints`.
+   These overrides run 20 steps, save at steps 10 and 20, and use a constant
+   learning rate; the run logs to the wandb group `debug`. Check the run output,
+   then drop them for normal training. Training defaults and CLI overrides are
+   defined in [`configs/train.yaml`](configs/train.yaml). Outputs use
+   training.output_path, whose default is `outputs/openwam_checkpoints`. For a
+   single-GPU, tiny random model you can step through in a debugger, use
+   `bash scripts/train_debug.sh` ([`configs/train_debug.yaml`](configs/train_debug.yaml)).
 
 4. Serve the debug checkpoint to sim-policy-eval (one server per GPU, K = actions executed per plan; the canvas
    size and frame count come from the checkpoint's own config):

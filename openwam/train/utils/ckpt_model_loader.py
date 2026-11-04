@@ -1,29 +1,24 @@
-"""Architecture construction for finetune / resume.
+"""Run mode (fresh / finetune / resume) and the training architecture each mode builds.
 
-When ``training.finetune_ckpt_path`` or ``training.resume_ckpt_path`` is set,
-the trainer builds the architecture from that checkpoint dir, with the same
-:func:`openwam.model.build_architecture_from_ckpt_dir` the deploy loader uses:
-the module skeletons come from the model config (yaml geometry) and the
-non-weight assets (tokenizers / processors / third-party ``config.json``) the
-backbones copied into the checkpoint dir. The original pretrained backbone
-directory (``assets.video_backbone.model_path``, not compared) need not exist on the
-training host.
+``scripts/train.py`` decides the mode once (:func:`decide_run_mode`) from ``training.finetune_ckpt_path`` /
+``training.resume_ckpt_path`` and hands ``(run_mode, ckpt_path)`` to the trainer, which builds its architecture with
+:func:`build_training_architecture`:
 
-Both paths build the shell from the launch config, after comparing it with the
-checkpoint's ``config.yaml``; nothing is merged or written back:
+  - FRESH: the upstream pretrained backbone weights (``assets.video_backbone``).
+  - FINETUNE (:func:`build_for_finetune`, a new run from these weights): the launch's ``model`` + ``common`` (minus
+    the derived ``common.layout``) must equal the checkpoint's key by key (:func:`check_finetune_cfg`);
+    ``training`` / ``dataloader`` may differ. Then a strict ``load_checkpoint`` of the requested / latest safetensors.
+  - RESUME (:func:`build_for_resume`, the same run continued): ``scripts/train.py`` already runs the run's own
+    config (:func:`load_resume_cfg`, which compares the whole config once), so the launch config IS the saved one.
+    Storage is given to the meta shell (``materialize_meta``); accelerate's ``load_state`` fills it after ``prepare``.
 
-  - :func:`build_for_finetune` (a new run from these weights): the launch's
-    ``model`` + ``common`` (minus the derived ``common.layout``) must equal the
-    checkpoint's key by key (:func:`check_finetune_cfg`); ``training`` /
-    ``dataloader`` may differ. Then a strict ``load_checkpoint`` of the
-    requested / latest safetensors.
-  - :func:`build_for_resume` (the same run continued): ``scripts/train.py``
-    already runs the run's own config (:func:`load_resume_cfg`), and the whole
-    config is compared again here (:func:`check_resume_cfg`), so the launch
-    config IS the saved one. Storage is given to the meta shell
-    (``materialize_meta``); accelerate's ``load_state`` fills it after ``prepare``.
+Finetune / resume build the shell with the same :func:`openwam.model.build_architecture_from_ckpt_dir` the deploy
+loader uses: module skeletons from the model config (yaml geometry), non-weight assets (tokenizers / processors /
+third-party ``config.json``) from the checkpoint dir, so the original pretrained backbone directory
+(``assets.video_backbone.model_path``) need not exist on the training host. Nothing is merged or written back.
 """
 
+import enum
 import logging
 import os
 from typing import Any
@@ -71,6 +66,35 @@ def _resume_dir(source: str) -> str:
             "accel_state_step_*). To start a new run from a weights file use training.finetune_ckpt_path."
         )
     return source
+
+
+class RunMode(enum.Enum):
+    """How a training run starts: from upstream weights, from a checkpoint's weights, or continuing a run."""
+
+    FRESH = "fresh"
+    FINETUNE = "finetune"
+    RESUME = "resume"
+
+
+def decide_run_mode(training: DictConfig) -> tuple[RunMode, str | None]:
+    """The run mode and its checkpoint source, decided once from the two ckpt-path switches (null = off).
+
+    Args:
+        training: ``cfg.training`` (``finetune_ckpt_path``, ``resume_ckpt_path``; resolve_config rejects "").
+
+    Returns:
+        (run_mode, ckpt_path): FRESH with None; FINETUNE with the finetune source (a run dir or one
+        ``checkpoint_step_*.safetensors`` in it); RESUME with the run dir (ValueError when it is not a directory).
+        ValueError when both switches are set.
+    """
+    finetune_path, resume_path = training.finetune_ckpt_path, training.resume_ckpt_path
+    if finetune_path is not None and resume_path is not None:
+        raise ValueError("finetune_ckpt_path and resume_ckpt_path are mutually exclusive; set at most one.")
+    if finetune_path is not None:
+        return RunMode.FINETUNE, str(finetune_path)
+    if resume_path is not None:
+        return RunMode.RESUME, _resume_dir(str(resume_path))
+    return RunMode.FRESH, None
 
 
 # ----------------------------------------------------------------------------
@@ -233,7 +257,7 @@ def check_resume_cfg(saved_cfg: DictConfig, live_cfg: DictConfig, path: str) -> 
     )
 
 
-def load_resume_cfg(live_cfg: DictConfig, resume_path: str) -> DictConfig:
+def load_resume_cfg(live_cfg: DictConfig, run_dir: str) -> DictConfig:
     """The config a resume runs with: the run's saved ``config.yaml``, which the launch must match.
 
     A resume continues ONE run, so every section (model, training, dataloader, project) comes from
@@ -242,14 +266,13 @@ def load_resume_cfg(live_cfg: DictConfig, resume_path: str) -> DictConfig:
 
     Args:
         live_cfg: DictConfig, the config this launch composed.
-        resume_path: str, ``training.resume_ckpt_path`` (the run dir; anything else raises ValueError).
+        run_dir: str, the run dir :func:`decide_run_mode` returned for RESUME.
 
     Returns:
         DictConfig, the saved config with the ``RESUME_LAUNCH_KEYS`` taken from ``live_cfg``.
     """
-    ckpt_dir = _resume_dir(resume_path)
-    path = os.path.join(ckpt_dir, "config.yaml")
-    saved = OmegaConf.load(path)
+    path = os.path.join(run_dir, "config.yaml")
+    saved = _load_ckpt_cfg(run_dir)
     check_resume_cfg(saved, live_cfg, path)
     # Only the resume-location keys come from the launch (written into the just-loaded file, before resolve_config).
     with open_dict(saved):
@@ -305,7 +328,7 @@ def build_for_finetune(source: str, cfg: DictConfig, train_options: TrainOptions
     return architecture
 
 
-def build_for_resume(source: str, cfg: DictConfig, train_options: TrainOptions) -> BaseWAMArchitecture:
+def build_for_resume(run_dir: str, cfg: DictConfig, train_options: TrainOptions) -> BaseWAMArchitecture:
     """Resume: the run's own architecture, with zeroed storage for accelerate ``load_state`` to fill.
 
     The safetensors are not read: ``load_state`` restores a strict superset (module weights incl. frozen
@@ -313,10 +336,9 @@ def build_for_resume(source: str, cfg: DictConfig, train_options: TrainOptions) 
     run is still recoverable from its accel state.
 
     Args:
-        source: str, ``training.resume_ckpt_path`` (the run dir; anything else raises ValueError).
-        cfg: the run config, resolved and read-only; any difference from the saved config.yaml outside the
-            resume-location keys raises (:func:`check_resume_cfg`), so ``merge(cfg.common, cfg.model)`` is the
-            run's own and builds the shell.
+        run_dir: str, the run dir :func:`decide_run_mode` returned for RESUME.
+        cfg: the run config from :func:`load_resume_cfg` (already compared with the saved config.yaml), resolved
+            and read-only; ``merge(cfg.common, cfg.model)`` builds the shell.
         train_options: TrainOptions the trainer decided (passed to the architecture constructor).
 
     Returns:
@@ -325,11 +347,41 @@ def build_for_resume(source: str, cfg: DictConfig, train_options: TrainOptions) 
     from openwam.model import build_architecture_from_ckpt_dir
     from openwam.model.video_backbone.common.weights import materialize_meta
 
-    ckpt_dir = _resume_dir(source)
-    # scripts/train.py already swapped in the saved config (load_resume_cfg); this guards direct callers.
-    check_resume_cfg(_load_ckpt_cfg(ckpt_dir), cfg, os.path.join(ckpt_dir, "config.yaml"))
-    logger.info("[resume] building architecture from ckpt dir: %s", ckpt_dir)
-    architecture = build_architecture_from_ckpt_dir(ckpt_dir, OmegaConf.merge(cfg.common, cfg.model), train_options)
+    logger.info("[resume] building architecture from ckpt dir: %s", run_dir)
+    architecture = build_architecture_from_ckpt_dir(run_dir, OmegaConf.merge(cfg.common, cfg.model), train_options)
     # set_dtype_device runs before load_state and cannot copy out of meta tensors.
     materialize_meta(architecture, "cpu")
     return architecture
+
+
+def build_training_architecture(
+    run_mode: RunMode, ckpt_path: str | None, cfg: DictConfig, train_options: TrainOptions
+) -> BaseWAMArchitecture:
+    """The architecture a training run starts from, per run mode (the one place the mode picks the build).
+
+    Args:
+        run_mode: RunMode from :func:`decide_run_mode`.
+        ckpt_path: str, that mode's checkpoint source (None for FRESH).
+        cfg: the run config, resolved and read-only.
+        train_options: TrainOptions the trainer decided (passed to the architecture constructor).
+
+    Returns:
+        BaseWAMArchitecture: FRESH = upstream pretrained weights; FINETUNE = the checkpoint's weights loaded;
+        RESUME = zeroed storage for ``load_state``. Weights land before the trainer's freeze.
+    """
+    if run_mode is RunMode.FINETUNE:
+        return build_for_finetune(ckpt_path, cfg, train_options)
+    if run_mode is RunMode.RESUME:
+        return build_for_resume(ckpt_path, cfg, train_options)
+    from openwam.model import build_architecture
+    from openwam.model.video_backbone import LoadMode
+
+    # The architecture's slice: the shared values (action / state dims, layout) under the model block;
+    # the upstream file paths come separately (assets, not part of the model).
+    return build_architecture(
+        OmegaConf.merge(cfg.common, cfg.model),
+        mode=LoadMode.PRETRAINED,
+        assets=cfg.assets.video_backbone,
+        ckpt_dir=None,
+        train_options=train_options,
+    )

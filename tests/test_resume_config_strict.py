@@ -109,8 +109,8 @@ def test_every_difference_is_listed(tmp_path):
     assert "training.batch_size" in str(err.value) and "project.seed" in str(err.value)
 
 
-def test_trainer_guard_accepts_the_swapped_config(tmp_path):
-    """check_resume_cfg (the trainer's guard) passes on what load_resume_cfg returns."""
+def test_swapped_config_matches_the_saved_one(tmp_path):
+    """check_resume_cfg passes on what load_resume_cfg returns (the swapped config is the run's own)."""
     run_dir = _run_dir(tmp_path)
     cfg = cml.load_resume_cfg(_launch(run_dir), run_dir)
     cml.check_resume_cfg(OmegaConf.load(tmp_path / "config.yaml"), cfg, "config.yaml")
@@ -126,12 +126,9 @@ def test_changed_assets_raise(tmp_path):
 
 
 def test_a_weights_file_is_not_a_resume_source(tmp_path):
-    """resume_ckpt_path names the run dir: a file inside it raises at load_resume_cfg, before any build."""
-    run_dir = _run_dir(tmp_path)
+    """resume_ckpt_path names the run dir: a file inside it raises when the run mode is decided, before any build."""
     weights = tmp_path / "checkpoint_step_10.safetensors"
     weights.write_bytes(b"")
+    training = OmegaConf.create({"finetune_ckpt_path": None, "resume_ckpt_path": str(weights)})
     with pytest.raises(ValueError, match="finetune_ckpt_path"):
-        cml.load_resume_cfg(_launch(str(weights)), str(weights))
-    # build_for_resume (direct callers) applies the same rule.
-    with pytest.raises(ValueError, match="not a directory"):
-        cml.build_for_resume(str(weights), _launch(run_dir), None)
+        cml.decide_run_mode(training)

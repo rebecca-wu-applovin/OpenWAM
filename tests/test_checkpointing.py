@@ -8,13 +8,18 @@ from pathlib import Path
 
 import pytest
 
+from openwam.train.utils import checkpointing
 from openwam.train.utils.checkpointing import (
+    STATE_NAME,
+    WEIGHTS_NAME,
+    RunDir,
     compute_resume_position,
-    finalize_keep_weights_only,
     find_latest_accel_state,
     find_latest_weights,
+    latest_resume_state,
+    list_steps,
     load_full_state,
-    manage_checkpoints,
+    prune_checkpoints,
     save_full_state,
     save_normalization_stats,
     verify_resume_normalization_stats,
@@ -92,14 +97,33 @@ def test_resume_position_already_aligned_unchanged():
     assert compute_resume_position(12, 100, 4) == (0, 12, 12)
 
 
-# --- finalize_keep_weights_only ---
+# --- list_steps: the one checkpoint-name parser ---
 
 
-def test_finalize_keeps_configured_recent_weights_and_removes_all_state(tmp_path):
+def test_list_steps_parses_sorts_and_skips_malformed(tmp_path):
+    """Numeric sort (not lexicographic), exact names only; a missing dir has no entries."""
+    for name in ("checkpoint_step_900.safetensors", "checkpoint_step_1000.safetensors", "checkpoint_step_x.safetensors",
+                 "checkpoint_step_5.safetensors.tmp", "accel_state_step_7"):
+        (tmp_path / name).write_text("x")
+    assert [step for step, _ in list_steps(str(tmp_path), WEIGHTS_NAME)] == [900, 1000]
+    assert list_steps(str(tmp_path), STATE_NAME) == [(7, str(tmp_path / "accel_state_step_7"))]
+    assert list_steps(str(tmp_path / "missing"), WEIGHTS_NAME) == []
+
+
+def test_latest_resume_state_without_a_usable_state_raises(tmp_path):
+    _make_accel_state(tmp_path, 100, marker=False)
+    with pytest.raises(FileNotFoundError, match="save_full_states_for_resume"):
+        latest_resume_state(str(tmp_path))
+
+
+# --- prune_checkpoints: the finished run (keep_states=0) ---
+
+
+def test_prune_finished_run_keeps_recent_weights_and_removes_all_state(tmp_path):
     for s in (100, 200, 300, 400):
         (tmp_path / f"checkpoint_step_{s}.safetensors").write_text("x")
         _make_accel_state(tmp_path, s, marker=True)
-    finalize_keep_weights_only(str(tmp_path), keep_last_k=3)
+    prune_checkpoints(str(tmp_path), keep_weights=3, keep_states=0)
     remaining = sorted(p.name for p in tmp_path.iterdir())
     assert remaining == [
         "checkpoint_step_200.safetensors",
@@ -108,26 +132,81 @@ def test_finalize_keeps_configured_recent_weights_and_removes_all_state(tmp_path
     ]
 
 
-def test_finalize_default_keeps_only_final_weight(tmp_path):
-    for s in (100, 200, 300):
-        (tmp_path / f"checkpoint_step_{s}.safetensors").write_text("x")
-    finalize_keep_weights_only(str(tmp_path))
-    remaining = sorted(p.name for p in tmp_path.iterdir())
-    assert remaining == ["checkpoint_step_300.safetensors"]
+# --- prune_checkpoints: per-step save, weights + accel_state in lockstep ---
 
 
-# --- manage_checkpoints: weights + accel_state pruned in lockstep ---
-
-
-def test_manage_checkpoints_prunes_accel_state_in_lockstep(tmp_path):
+def test_prune_in_lockstep(tmp_path):
     for s in (100, 200, 300):
         (tmp_path / f"checkpoint_step_{s}.safetensors").write_text("x")
         _make_accel_state(tmp_path, s, marker=True)
-    manage_checkpoints(str(tmp_path), keep_last_k=2)
+    prune_checkpoints(str(tmp_path), keep_weights=2, keep_states=2)
     weights = sorted(p.name for p in tmp_path.glob("checkpoint_step_*"))
     states = sorted(p.name for p in tmp_path.glob("accel_state_step_*"))
     assert weights == ["checkpoint_step_200.safetensors", "checkpoint_step_300.safetensors"]
     assert states == ["accel_state_step_200", "accel_state_step_300"]
+
+
+def test_prune_orders_steps_numerically(tmp_path):
+    """Step 1000 is newer than step 900 (a string sort would drop it)."""
+    for s in (900, 1000):
+        (tmp_path / f"checkpoint_step_{s}.safetensors").write_text("x")
+    prune_checkpoints(str(tmp_path), keep_weights=1, keep_states=1)
+    assert [p.name for p in tmp_path.iterdir()] == ["checkpoint_step_1000.safetensors"]
+
+
+# --- RunDir: per-step save + finish ---
+
+
+class _SaveRecorder:
+    """Stands in for save_weights / save_full_state: writes the file / dir they would, records the call."""
+
+    def __init__(self, monkeypatch):
+        self.calls = []
+        monkeypatch.setattr(checkpointing, "save_weights", self.weights)
+        monkeypatch.setattr(checkpointing, "save_full_state", self.state)
+
+    def weights(self, accelerator, architecture, output_path, global_step, *, final):
+        """Same args as save_weights; writes an empty weights file."""
+        self.calls.append(("weights", global_step, final))
+        Path(output_path, f"checkpoint_step_{global_step}.safetensors").write_text("x")
+
+    def state(self, accelerator, output_path, global_step, opt_step, epoch):
+        """Same args as save_full_state; writes a complete (marked) state dir."""
+        self.calls.append(("state", global_step, opt_step, epoch))
+        _make_accel_state(Path(output_path), global_step, marker=True)
+
+
+def test_run_dir_saves_on_the_save_steps_boundary_and_prunes_in_lockstep(tmp_path, monkeypatch):
+    rec = _SaveRecorder(monkeypatch)
+    run_dir = RunDir(str(tmp_path), save_steps=2, keep_last_k=2, save_full_states=True)
+    for step in range(1, 8):
+        run_dir.save_step(_FakeAccelerator(), None, step, step, 0)
+    assert rec.calls == [(kind, s, *rest) for s in (2, 4, 6) for kind, *rest in (("weights", False), ("state", s, 0))]
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "accel_state_step_4",
+        "accel_state_step_6",
+        "checkpoint_step_4.safetensors",
+        "checkpoint_step_6.safetensors",
+    ]
+    # Finish: final weights, every resume state dropped, k weights kept.
+    run_dir.finish(_FakeAccelerator(), None, 7)
+    assert rec.calls[-1] == ("weights", 7, True)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["checkpoint_step_6.safetensors", "checkpoint_step_7.safetensors"]
+
+
+def test_run_dir_without_full_states_writes_weights_only(tmp_path, monkeypatch):
+    rec = _SaveRecorder(monkeypatch)
+    RunDir(str(tmp_path), save_steps=1, keep_last_k=1, save_full_states=False).save_step(_FakeAccelerator(), None, 3, 3, 0)
+    assert rec.calls == [("weights", 3, False)]
+
+
+def test_run_dir_with_saving_off_writes_nothing(tmp_path, monkeypatch):
+    """save_steps null: no periodic save and no final weights."""
+    rec = _SaveRecorder(monkeypatch)
+    run_dir = RunDir(str(tmp_path), save_steps=None, keep_last_k=1, save_full_states=True)
+    run_dir.save_step(_FakeAccelerator(), None, 5, 5, 0)
+    run_dir.finish(_FakeAccelerator(), None, 5)
+    assert rec.calls == [] and list(tmp_path.iterdir()) == []
 
 
 # --- save/load_full_state metadata round-trip + atomic completion marker ---
@@ -236,6 +315,7 @@ def _resume_trainer(tmp_path, monkeypatch, normalize_mode):
     from omegaconf import OmegaConf
 
     import openwam.train.openwam_trainer as trainer_module
+    from openwam.train.utils.ckpt_model_loader import RunMode
 
     run_dir = tmp_path / "run"
     state_dir = run_dir / "accel_state_step_12"
@@ -249,28 +329,33 @@ def _resume_trainer(tmp_path, monkeypatch, normalize_mode):
         lambda output_dir, stats_path: calls.append((output_dir, stats_path)),
     )
     trainer = object.__new__(trainer_module.OpenWAMTrainer)
+    trainer.run_mode, trainer.ckpt_path = RunMode.RESUME, str(run_dir)
     trainer.cfg = OmegaConf.create(
-        {"training": {"output_path": str(tmp_path / "unused")}, "dataloader": {"normalize_mode": normalize_mode}}
+        {
+            "training": {"save_steps": 5, "keep_last_k_ckpts": 2, "save_full_states_for_resume": True},
+            "dataloader": {"normalize_mode": normalize_mode},
+        }
     )
     trainer.accelerator = SimpleNamespace(is_main_process=True)
     trainer.dataset = SimpleNamespace(normalization_stats_path="/stats/yam_sharpa_fingertips_rel.npy")
     return trainer, run_dir, calls
 
 
-def test_setup_output_dir_verifies_stats_before_reusing_resume_run(tmp_path, monkeypatch):
+def test_open_run_dir_verifies_stats_before_reusing_resume_run(tmp_path, monkeypatch):
     trainer, run_dir, calls = _resume_trainer(tmp_path, monkeypatch, "min-max")
 
-    output_path, resume_state_dir = trainer.setup_output_dir(debug=False, resume_path=str(run_dir))
+    opened, resume_state_dir = trainer.open_run_dir()
 
-    assert output_path == str(run_dir)
+    assert opened.path == str(run_dir)
+    assert (opened.save_steps, opened.keep_last_k, opened.save_full_states) == (5, 2, True)
     assert resume_state_dir == str(run_dir / "accel_state_step_12")
     assert calls == [(str(run_dir), "/stats/yam_sharpa_fingertips_rel.npy")]
 
 
-def test_setup_output_dir_skips_the_stats_check_when_the_config_turns_normalization_off(tmp_path, monkeypatch):
+def test_open_run_dir_skips_the_stats_check_when_the_config_turns_normalization_off(tmp_path, monkeypatch):
     """normalize_mode null decides it (not a missing dataset attribute)."""
     trainer, run_dir, calls = _resume_trainer(tmp_path, monkeypatch, None)
-    trainer.setup_output_dir(debug=False, resume_path=str(run_dir))
+    trainer.open_run_dir()
     assert calls == []
 
 
@@ -285,4 +370,21 @@ def test_resume_needs_a_positive_global_step(tmp_path, monkeypatch, meta, err):
     trainer = object.__new__(trainer_module.OpenWAMTrainer)
     trainer.accelerator = SimpleNamespace(is_main_process=True)
     with pytest.raises(err):
-        trainer.resume_if_configured(str(tmp_path), dataloader=[0] * 10, grad_accum=1)
+        trainer.load_resume_state(str(tmp_path), batches_per_epoch=10, grad_accum=1)
+
+
+@pytest.mark.parametrize(
+    "saved_step, bpe, grad_accum, want",
+    [(25, 10, 1, (25, 25, 2, 5)), (10, 100, 4, (8, 2, 0, 8)), (16, 10, 4, (14, 3, 1, 4))],
+)
+def test_load_resume_state_maps_the_saved_step(tmp_path, monkeypatch, saved_step, bpe, grad_accum, want):
+    """(global_step, opt_step, start_epoch, skip) from a saved step: aligned to grad_accum, opt_step derived from it."""
+    from types import SimpleNamespace
+
+    import openwam.train.openwam_trainer as trainer_module
+
+    meta = {"global_step": saved_step, "opt_step": 999, "epoch": 999}  # only global_step is read back
+    monkeypatch.setattr(trainer_module, "load_full_state", lambda accelerator, state_dir: meta)
+    trainer = object.__new__(trainer_module.OpenWAMTrainer)
+    trainer.accelerator = SimpleNamespace(is_main_process=True)
+    assert trainer.load_resume_state(str(tmp_path), batches_per_epoch=bpe, grad_accum=grad_accum) == want

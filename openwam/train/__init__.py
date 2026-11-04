@@ -1,7 +1,1 @@
-from openwam.train.openwam_trainer import OpenWAMTrainer
-from openwam.train.utils.optimizer_groups import build_trainable_parameters
-
-__all__ = [
-    "OpenWAMTrainer",
-    "build_trainable_parameters",
-]
+"""OpenWAM training: the trainer (``openwam_trainer``) and its helpers (``utils``); import the submodules directly."""

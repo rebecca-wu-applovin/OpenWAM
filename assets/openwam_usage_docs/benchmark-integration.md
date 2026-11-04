@@ -22,7 +22,7 @@ from openwam.dataloader.registry import register_dataset
 @register_dataset('my_benchmark')
 class MyBenchmarkDataset(BaseDataset):
     @classmethod
-    def from_config(cls, config, split='train'):
+    def from_config(cls, config, split):
         return cls(dataset_dir=config.dataset_dir, split=split)
 
     def __len__(self): ...
@@ -35,7 +35,7 @@ class MyBenchmarkDataset(BaseDataset):
     # And an attribute: normalization_stats_path (str, or None with normalization off), copied into checkpoints.
 ~~~
 
-Import the module before calling `build_dataset(config)`. Every registered class implements the abstract `from_config`, `set_epoch`, `all_prompts` and `eval_view`; built-in readers are imported by the registry.
+Import the module before calling `build_dataset(config, split)`. Every registered class implements the abstract `from_config`, `set_epoch`, `all_prompts` and `eval_view`; built-in readers are imported by the registry.
 
 ### Return the canonical sample
 
@@ -118,7 +118,7 @@ from openwam.dataloader.registry import build_dataset
 
 # The trainer passes the dataloader slice merged over the common block: merge(cfg.common, cfg.dataloader).
 config = OmegaConf.load('configs/dataloader/my_benchmark.yaml')
-dataset = build_dataset(config)
+dataset = build_dataset(config, "train")
 sample = dataset[0]
 print(len(dataset), sample['action'].shape, sample['video'])
 ~~~

@@ -37,8 +37,9 @@ ARCH_DEFAULTS = {
     "state_dim": 0,
     "action_dim": 0,
 }
-# Stub video backbone geometry (flat test keys ``stub_backbone`` reads; head_dim None = video_dim / num_heads).
-STUB_GEOMETRY = {"video_dim": 64, "num_heads": 4, "head_dim": None, "text_dim": 4096, "num_dit_layers": 2}
+# Stub video backbone geometry (flat test keys ``stub_backbone`` reads, named as the yaml ``geometry`` block except
+# ``video_dim`` (flat ``dim`` is the ActionDiT width); head_dim None = video_dim / num_heads).
+STUB_GEOMETRY = {"video_dim": 64, "num_heads": 4, "head_dim": None, "text_dim": 4096, "num_layers": 2}
 # Test keys that land in each block of the model slice (the rest of the flat keys size the stub backbone).
 _ARCH_KEYS = (
     "framework", "variant", "clean_attention", "attention_mask_mode", "proprio_input", "use_proprioception",
@@ -123,7 +124,7 @@ def stub_backbone(cfg: dict):
     g = {**STUB_GEOMETRY, **cfg}
     return _MockVideoBackbone(
         dim=int(g["video_dim"]),
-        num_layers=int(g["num_dit_layers"]),
+        num_layers=int(g["num_layers"]),
         num_heads=int(g["num_heads"]),
         head_dim=g["head_dim"],
         text_dim=int(g["text_dim"]),

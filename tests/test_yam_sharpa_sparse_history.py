@@ -47,7 +47,7 @@ def _build(history, future, **extra):
     for key, value in extra.items():
         cfg[key] = value
     # The trainer's dataset slice: merge(common, dataloader) (common carries action_dim / state_dim).
-    multi = MultiYamSharpaDataset.from_config(OmegaConf.merge(OmegaConf.load(TRAIN_CFG).common, cfg))
+    multi = MultiYamSharpaDataset.from_config(OmegaConf.merge(OmegaConf.load(TRAIN_CFG).common, cfg), "train")
     return multi.datasets[multi.names.index("simteleop")]
 
 

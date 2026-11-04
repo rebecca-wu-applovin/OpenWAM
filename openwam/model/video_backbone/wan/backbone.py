@@ -154,8 +154,6 @@ class WanBackbone(VideoBackbone):
         self._tokenizer = tokenizer
         self._tokenizer_dir = tokenizer_dir
         self._scheduler = FlowScheduler(shift=shift_video, train_timestep=train_timestep)
-        self._device = torch.device("cuda")
-        self._dtype = torch.bfloat16
         self.text_max_length = int(text_max_length)
         # Wan native contract: VAE 4× temporal compression + causal first-frame token.
         self._temporal_compression, self._causal_temporal = 4, True
@@ -251,34 +249,29 @@ class WanBackbone(VideoBackbone):
     # ================================================================
 
     @property
-    def _dit(self):
-        """The WanModel (alias of ``self.dit`` the geometry properties read)."""
-        return self.dit
-
-    @property
     def dim(self) -> int:
         """DiT hidden width (3072 for TI2V-5B)."""
-        return int(self._dit.dim)
+        return int(self.dit.dim)
 
     @property
     def num_layers(self) -> int:
         """Number of DiT blocks."""
-        return len(self._dit.blocks)
+        return len(self.dit.blocks)
 
     @property
     def num_heads(self) -> int:
         """Self-attention heads per block."""
-        return int(self._dit.blocks[0].num_heads)
+        return int(self.dit.blocks[0].num_heads)
 
     @property
     def head_dim(self) -> int:
         """Per-head width, dim / num_heads."""
-        return int(self._dit.dim) // self.num_heads
+        return int(self.dit.dim) // self.num_heads
 
     @property
     def text_dim(self) -> int:
         """Raw text-context width the DiT's text embedding takes (= yaml ``dit.text_dim``)."""
-        return int(self._dit.text_embedding[0].in_features)
+        return int(self.dit.text_embedding[0].in_features)
 
     # ================================================================
     # Video and text IO
@@ -404,11 +397,8 @@ class WanBackbone(VideoBackbone):
             .to(hidden_states.device)
         )
 
-        # Wan keeps the DiT and the head's time embedding in extras for run_block / finalize.
-        extras = {
-            "dit": dit,
-            "time_embed": time_embed,  # Wan head time embedding; consumed in finalize()
-        }
+        # Wan keeps the head's time embedding in extras for finalize.
+        extras = {"time_embed": time_embed}
         return BlockLoopState(
             hidden_states=hidden_states,
             time_mod=time_modulation,
@@ -432,7 +422,7 @@ class WanBackbone(VideoBackbone):
         Returns:
             ``state`` with ``hidden_states`` updated.
         """
-        block = state.extras["dit"].blocks[block_id]
+        block = self.dit.blocks[block_id]
         # DiTBlock(x, context, t_mod, freqs, cross-attn mask, self-attn mask).
         state.hidden_states = gradient_checkpoint_forward(
             block,
@@ -456,10 +446,8 @@ class WanBackbone(VideoBackbone):
         Returns:
             (B, 48, T_lat, h, w) predicted velocity.
         """
-        dit = state.extras["dit"]
-        hidden_states = dit.head(state.hidden_states, state.extras["time_embed"])
-
-        hidden_states = dit.unpatchify(hidden_states, (state.grid_frames, state.grid_height, state.grid_width))
+        hidden_states = self.dit.head(state.hidden_states, state.extras["time_embed"])
+        hidden_states = self.dit.unpatchify(hidden_states, (state.grid_frames, state.grid_height, state.grid_width))
         return hidden_states
 
     def pre_attn_at_layer(self, layer_id: int, state: BlockLoopState) -> Tuple[Tensor, Tensor, Tensor, tuple]:
@@ -471,7 +459,7 @@ class WanBackbone(VideoBackbone):
         Returns:
             q, k, v (B, S, dim) each and the post tuple :meth:`post_attn_at_layer` consumes.
         """
-        block = state.extras["dit"].blocks[layer_id]
+        block = self.dit.blocks[layer_id]
         return block.pre_attn(state.hidden_states, state.time_mod, state.rope_freqs)
 
     def post_attn_at_layer(
@@ -486,7 +474,7 @@ class WanBackbone(VideoBackbone):
         Returns:
             ``state`` with ``hidden_states`` updated.
         """
-        block = state.extras["dit"].blocks[layer_id]
+        block = self.dit.blocks[layer_id]
         state.hidden_states = block.post_attn(attn_out, post_state, state.context, self._cross_attn_mask(state))
         return state
 

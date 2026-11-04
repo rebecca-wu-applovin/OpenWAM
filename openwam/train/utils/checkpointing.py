@@ -1,6 +1,5 @@
 """Checkpoint save / load / management utilities."""
 
-import glob as _glob
 import logging
 import os
 import re
@@ -11,15 +10,14 @@ logger = logging.getLogger(__name__)
 # --- Deploy assets (write-once) ---
 
 
-def save_config(output_dir: str, cfg):
-    """Save Hydra DictConfig as config.yaml in the checkpoint directory.
+def save_config(output_dir: str, cfg) -> None:
+    """Save the run config as ``config.yaml`` in a fresh run dir (create_run_dir refused an existing one).
 
-    Only written once (skipped if the file already exists).
+    Args:
+        output_dir: str, the run dir.
+        cfg: DictConfig, the resolved run config.
     """
     config_path = os.path.join(output_dir, "config.yaml")
-    if os.path.exists(config_path):
-        return
-    os.makedirs(output_dir, exist_ok=True)
     from omegaconf import OmegaConf
 
     OmegaConf.save(cfg, config_path)
@@ -184,33 +182,45 @@ def load_full_state(accelerator, state_dir: str) -> dict:
 
 # --- Discovery (locate latest step) ---
 
+# One name rule per kind: weights files and resume-state dirs, ``<prefix><step>`` with an int step.
+WEIGHTS_NAME = re.compile(r"^checkpoint_step_(\d+)\.safetensors$")
+STATE_NAME = re.compile(r"^accel_state_step_(\d+)$")
 
-def step_num(path: str, prefix: str = "checkpoint_step_") -> int:
-    m = re.search(rf"{prefix}(\d+)", path)
-    return int(m.group(1)) if m else 0
+
+def list_steps(run_dir: str, name: re.Pattern) -> list[tuple[int, str]]:
+    """Every entry of ``run_dir`` whose name matches ``name``, by step (the one checkpoint-name parser).
+
+    Args:
+        run_dir: str, a run dir (a missing dir has no entries).
+        name: compiled pattern with the step as group 1 (:data:`WEIGHTS_NAME` or :data:`STATE_NAME`).
+
+    Returns:
+        list of ``(step, path)`` sorted by step ascending; names that do not match (malformed steps) are skipped.
+    """
+    if not os.path.isdir(run_dir):
+        return []
+    found = []
+    for entry in os.listdir(run_dir):
+        m = name.match(entry)
+        if m is not None:
+            found.append((int(m.group(1)), os.path.join(run_dir, entry)))
+    return sorted(found)
 
 
 def find_latest_weights(run_dir: str) -> str:
-    """Return the highest-step ``checkpoint_step_N.safetensors`` in *run_dir*.
+    """Return the highest-step ``checkpoint_step_N.safetensors`` in *run_dir* (the finetune source).
 
-    Used by the finetune path. Malformed names are skipped; step-0-only triggers
-    a warning (likely a crash before the first real save).
+    Args:
+        run_dir: str, a run dir.
+
+    Returns:
+        str, the file's path. FileNotFoundError when there is none; a step-0-only dir logs a warning (likely a
+        crash before the first real save).
     """
-    files = _glob.glob(os.path.join(run_dir, "checkpoint_step_*.safetensors"))
-    if not files:
-        raise FileNotFoundError(f"No checkpoint_step_*.safetensors found in {run_dir}")
-    step_re = re.compile(r"checkpoint_step_(\d+)\.safetensors$")
-    numbered: list[tuple[int, str]] = []
-    for f in files:
-        m = step_re.search(os.path.basename(f))
-        if m is not None:
-            numbered.append((int(m.group(1)), f))
-        else:
-            logger.warning("Skipping malformed checkpoint name: %s", f)
-    if not numbered:
+    weights = list_steps(run_dir, WEIGHTS_NAME)
+    if not weights:
         raise FileNotFoundError(f"No file in {run_dir} matches checkpoint_step_<int>.safetensors")
-    numbered.sort(key=lambda p: p[0])
-    latest_step, latest_path = numbered[-1]
+    latest_step, latest_path = weights[-1]
     if latest_step == 0:
         logger.warning("Latest checkpoint in %s is step 0 (%s); verify before finetune.", run_dir, latest_path)
     return latest_path
@@ -224,20 +234,17 @@ def find_latest_accel_state(run_dir: str) -> str | None:
     (possibly large / sharded) state finished writing. DeepSpeed's ``save_state``
     writes a ``pytorch_model/`` dir and no ``random_states_*.pkl``, so the marker —
     not RNG files — is the completion signal. Half-written dirs lack it and are skipped.
+
+    Args:
+        run_dir: str, a run dir.
+
+    Returns:
+        str path of the state dir, or None when no usable state exists.
     """
-    if not run_dir or not os.path.isdir(run_dir):
-        return None
-    best: tuple[int, str] | None = None
-    for name in os.listdir(run_dir):
-        if not name.startswith("accel_state_step_"):
-            continue
-        state_dir = os.path.join(run_dir, name)
-        if not os.path.isfile(os.path.join(state_dir, "trainer_state.json")):
-            continue
-        step = step_num(name, "accel_state_step_")
-        if best is None or step > best[0]:
-            best = (step, state_dir)
-    return best[1] if best else None
+    usable = [
+        path for _, path in list_steps(run_dir, STATE_NAME) if os.path.isfile(os.path.join(path, "trainer_state.json"))
+    ]
+    return usable[-1] if usable else None
 
 
 # --- Resume position (pure math) ---
@@ -260,57 +267,142 @@ def compute_resume_position(global_step: int, batches_per_epoch: int, grad_accum
     return start_epoch, skip, aligned_global_step
 
 
-# --- Retention / finalize (prune) ---
+# --- Retention (prune) ---
 
 
-def manage_checkpoints(output_dir: str, keep_last_k: int):
-    """Keep only the most recent *keep_last_k* checkpoints.
+def prune_checkpoints(run_dir: str, keep_weights: int, keep_states: int) -> None:
+    """Keep the newest ``keep_weights`` weights files and ``keep_states`` resume-state dirs; delete the rest.
 
-    Prunes ``checkpoint_step_*`` (weights, files) and ``accel_state_step_*``
-    (resume state, dirs) in lockstep so a kept weights file always retains its
-    sibling state dir.
+    Rank-0 only (the caller guards). Per-step saves prune both lines with the same k, so a kept weights file keeps
+    its sibling state dir; the finished run passes ``keep_states=0`` (no resume state survives a finished run).
+
+    Args:
+        run_dir: str, the run dir.
+        keep_weights: int, how many ``checkpoint_step_*.safetensors`` to keep (highest steps).
+        keep_states: int, how many ``accel_state_step_*`` dirs to keep (highest steps).
     """
     import shutil
 
-    files = _glob.glob(os.path.join(output_dir, "checkpoint_step_*"))
-    files.sort(key=lambda p: step_num(p, "checkpoint_step_"))
-    while len(files) > keep_last_k:
-        old = files.pop(0)
-        if os.path.isfile(old):
-            os.remove(old)
-            logger.info("Removed old checkpoint: %s", old)
-
-    state_dirs = [p for p in _glob.glob(os.path.join(output_dir, "accel_state_step_*")) if os.path.isdir(p)]
-    state_dirs.sort(key=lambda p: step_num(p, "accel_state_step_"))
-    while len(state_dirs) > keep_last_k:
-        old = state_dirs.pop(0)
+    weights = list_steps(run_dir, WEIGHTS_NAME)
+    for _, path in weights[: max(0, len(weights) - keep_weights)]:
+        os.remove(path)
+        logger.info("Removed old checkpoint: %s", path)
+    states = list_steps(run_dir, STATE_NAME)
+    for _, path in states[: max(0, len(states) - keep_states)]:
+        # A failed state delete costs disk only; it must not kill the run.
         try:
-            shutil.rmtree(old)
-            logger.info("Removed old accelerate state dir: %s", old)
+            shutil.rmtree(path)
+            logger.info("Removed accelerate state dir: %s", path)
         except OSError as e:
-            logger.warning("Failed to remove old accelerate state dir %s: %s", old, e)
+            logger.warning("Failed to remove accelerate state dir %s: %s", path, e)
 
 
-def finalize_keep_weights_only(output_dir: str, keep_last_k: int = 1):
-    """Training-complete cleanup: drop all resume state, keep recent weights.
+# --- Run dir (create / reuse, per-step save, finish) ---
 
-    Removes every ``accel_state_step_*`` dir and every ``checkpoint_step_*.safetensors``
-    except the most recent *keep_last_k*. Rank-0 only — caller must guard.
+
+def create_run_dir(accelerator, base_output_path: str, run_dir_name: str | None, write_assets) -> str:
+    """Create a fresh run dir on rank 0 (writing its deploy assets there) and broadcast its path to every rank.
+
+    Args:
+        accelerator: the Accelerator (``is_main_process``).
+        base_output_path: str, ``training.output_path``.
+        run_dir_name: str, ``training.run_dir_name``; None = the launch timestamp.
+        write_assets: callable(run_dir: str) -> None, run on rank 0 in the new dir (config, stats, backbone assets).
+
+    Returns:
+        str, the run dir (same on every rank). FileExistsError (on every rank) when a fixed name already holds a run.
     """
-    import shutil
+    import torch.distributed as dist
 
-    for d in _glob.glob(os.path.join(output_dir, "accel_state_step_*")):
-        if os.path.isdir(d):
-            try:
-                shutil.rmtree(d)
-                logger.info("Removed accelerate state dir: %s", d)
-            except OSError as e:
-                logger.warning("Failed to remove accelerate state dir %s: %s", d, e)
+    if run_dir_name is not None:
+        # Checked on every rank (shared FS) so a clash raises everywhere instead of deadlocking the broadcast.
+        existing = os.path.join(base_output_path, str(run_dir_name), "config.yaml")
+        if os.path.exists(existing):
+            raise FileExistsError(
+                f"training.run_dir_name={run_dir_name}: {existing} already exists; pick a new run name "
+                f"(or use training.resume_ckpt_path to continue that run)."
+            )
+    # Every rank finishes the clash check before rank 0 writes config.yaml below; otherwise a slower
+    # rank sees rank 0's fresh config.yaml and raises (Modal runs 88/90, 2026-10-16).
+    dist.barrier()
 
-    files = _glob.glob(os.path.join(output_dir, "checkpoint_step_*.safetensors"))
-    files.sort(key=lambda p: step_num(p, "checkpoint_step_"))
-    num_to_remove = max(0, len(files) - keep_last_k)
-    for old in files[:num_to_remove]:
-        if os.path.isfile(old):
-            os.remove(old)
-            logger.info("Removed old checkpoint after training completion: %s", old)
+    path_list = [None]
+    if accelerator.is_main_process:
+        from datetime import datetime
+
+        name = str(run_dir_name) if run_dir_name is not None else datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        path_list[0] = os.path.join(base_output_path, name)
+        os.makedirs(path_list[0], exist_ok=True)
+        write_assets(path_list[0])
+    dist.broadcast_object_list(path_list, src=0)
+    logger.info("Checkpoints will be saved to %s", path_list[0])
+    return path_list[0]
+
+
+def latest_resume_state(run_dir: str) -> str:
+    """The state a resume continues from: the run dir's latest usable ``accel_state_step_*``.
+
+    Args:
+        run_dir: str, the resumed run dir (every rank resolves it independently on the shared FS).
+
+    Returns:
+        str, the state dir. FileNotFoundError when the run has no usable state.
+    """
+    state_dir = find_latest_accel_state(run_dir)
+    if state_dir is None:
+        raise FileNotFoundError(
+            f"resume_ckpt_path={run_dir} has no usable accel_state_step_*; full states "
+            f"are only written when training.save_full_states_for_resume=true (and a finished run drops "
+            f"them) — use finetune_ckpt_path to warm-start from weights instead."
+        )
+    logger.info("[resume] reusing run dir %s (state=%s)", run_dir, os.path.basename(state_dir))
+    return state_dir
+
+
+class RunDir:
+    """One run's output dir and its save policy: periodic weights (+ resume state) with pruning, final weights.
+
+    Args:
+        path: str, the run dir (from :func:`create_run_dir`, or the resumed run dir).
+        save_steps: int, save every N micro steps; None = never save (no final weights either).
+        keep_last_k: int, weights files (and resume states) kept by the rolling prune.
+        save_full_states: bool, also write the resumable accel state at each save.
+    """
+
+    def __init__(self, path: str, *, save_steps: int | None, keep_last_k: int, save_full_states: bool):
+        self.path = path
+        self.save_steps = save_steps
+        self.keep_last_k = keep_last_k
+        self.save_full_states = save_full_states
+
+    def save_step(self, accelerator, architecture, global_step: int, opt_step: int, epoch: int) -> None:
+        """At every ``save_steps`` boundary: weights, then the full state (if on), then prune both lines in lockstep.
+
+        Args:
+            accelerator: the Accelerator (every rank enters; full-state saving is collective).
+            architecture: the prepared (wrapped) architecture.
+            global_step: int, micro steps done (> 0).
+            opt_step: int, optimizer steps done.
+            epoch: int, current epoch.
+        """
+        if self.save_steps is None or global_step % self.save_steps != 0:
+            return
+        save_weights(accelerator, architecture, self.path, global_step, final=False)
+        if self.save_full_states:
+            save_full_state(accelerator, self.path, global_step, opt_step, epoch)
+        if accelerator.is_main_process:
+            prune_checkpoints(self.path, self.keep_last_k, self.keep_last_k)
+
+    def finish(self, accelerator, architecture, global_step: int) -> None:
+        """Every exit of a finished run: final weights (unless saving is off), drop all resume state, keep k weights.
+
+        Args:
+            accelerator: the Accelerator (every rank enters; it barriers before the prune).
+            architecture: the prepared (wrapped) architecture.
+            global_step: int, the last micro step.
+        """
+        if self.save_steps is not None:
+            save_weights(accelerator, architecture, self.path, global_step, final=True)
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            prune_checkpoints(self.path, self.keep_last_k, 0)

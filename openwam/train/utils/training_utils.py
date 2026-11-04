@@ -1,11 +1,13 @@
-"""Stateless trainer helpers.
+"""Trainer helpers: parameter report, step budget, LR schedule, wandb, cross-rank metric reduction, per-step logging.
 
-Pure compute / IO with no training state: parameter reporting,
-LR scheduling, wandb, cross-rank reduction, debug-CSV writing.
+All stateless except :class:`StepLogger`, which owns the per-step sinks (progress bar, wandb, timing.jsonl, loss CSV).
 """
 
+import json
 import logging
+import math
 import os
+import time
 
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -47,6 +49,41 @@ def log_parameter_counts(architecture, *, is_main: bool) -> None:
         print(f"  {name:<15}: total={total / 1e6:7.1f}M  trainable={trainable / 1e6:7.1f}M")
     print(f"  Architecture  : total={arch_total / 1e6:7.1f}M  trainable={arch_train / 1e6:7.1f}M")
     print("=" * 60, flush=True)
+
+
+def plan_steps(
+    batches_per_epoch: int, grad_accum: int, num_processes: int, num_epochs: int | None, max_steps: int | None
+) -> tuple[int, int]:
+    """The run's step budget per process: micro steps (``global_step``, progress bar) and optimizer steps (LR horizon).
+
+    ``prepare()`` shards the loader to ``ceil(batches_per_epoch / num_processes)`` batches per process (accelerate's
+    even_batches), and accumulation syncs at every epoch end, so an epoch is ``ceil(that / grad_accum)`` optimizer
+    steps. ``max_steps`` counts micro steps and caps both.
+
+    Args:
+        batches_per_epoch: int, ``len(dataloader)`` BEFORE ``prepare()`` (all processes together).
+        grad_accum: int, ``training.gradient_accumulation_steps``.
+        num_processes: int, the Accelerator's process count.
+        num_epochs: int, ``training.num_epochs``; None = step-only (``max_steps`` alone stops the run).
+        max_steps: int, ``training.max_steps`` in micro steps; None = no step limit.
+
+    Returns:
+        (total_micro_steps, total_opt_steps): ints, per process. ValueError when num_epochs and max_steps are both None.
+    """
+    if num_epochs is None and max_steps is None:
+        raise ValueError(
+            "training.num_epochs and training.max_steps are both unset; "
+            "set num_epochs, or set max_steps for step-only training."
+        )
+    # Step-only: max_steps micro steps, ceil'd to optimizer steps.
+    if num_epochs is None:
+        return max_steps, math.ceil(max_steps / grad_accum)
+    micro_per_epoch = math.ceil(batches_per_epoch / num_processes)
+    opt_per_epoch = math.ceil(micro_per_epoch / grad_accum)
+    total_micro, total_opt = micro_per_epoch * num_epochs, opt_per_epoch * num_epochs
+    if max_steps is not None:
+        total_micro, total_opt = min(total_micro, max_steps), min(total_opt, math.ceil(max_steps / grad_accum))
+    return total_micro, total_opt
 
 
 def build_cosine_scheduler(
@@ -119,62 +156,156 @@ def init_wandb(cfg: DictConfig):
     return run
 
 
-def reduce_step_metrics(accelerator, losses: dict, grad_norm) -> dict:
-    """Reduce loss/grad_norm across ranks (mean); single-process fast path."""
-    loss = losses["total"]
-
-    def _f(v):
-        return v.item() if isinstance(v, torch.Tensor) else float(v)
-
-    if accelerator is not None and accelerator.num_processes > 1:
-        local = torch.tensor(
-            [
-                loss.detach().float().item(),
-                _f(losses["video"]),
-                _f(losses["action"]),
-                grad_norm.item(),
-            ],
-            device=loss.device,
-            dtype=torch.float32,
-        ).reshape(1, -1)
-        g = accelerator.gather(local).mean(dim=0)
-        return {
-            "loss_total": g[0].item(),
-            "loss_video": g[1].item(),
-            "loss_action": g[2].item(),
-            "grad_norm": g[3].item(),
-        }
-    return {
-        "loss_total": loss.detach().item(),
-        "loss_video": _f(losses["video"]),
-        "loss_action": _f(losses["action"]),
-        "grad_norm": grad_norm.item(),
-    }
+# The architecture's loss keys (compute_loss), kept end to end: reduction, progress bar, wandb, CSV.
+LOSS_KEYS = ("loss", "loss_video", "loss_action")
 
 
-def write_debug_loss_row(
-    output_path,
-    *,
-    labels,
-    metrics,
-    global_step,
-    opt_step,
-    epoch,
-    lr,
-    steps_per_sec,
-) -> None:
-    """Append one row to debug_loss_history.csv (writes the header on first call).
+def reduce_step_metrics(accelerator, losses: dict, grad_norm: torch.Tensor) -> dict:
+    """One step's losses and grad norm as floats, averaged over ranks (a collective when there are several).
 
-    Loss columns follow ``labels`` = ``[(display_name, metrics_key)]``.
+    Args:
+        accelerator: the Accelerator (``num_processes``, ``gather``).
+        losses: dict of 0-dim tensors from ``compute_loss`` with the :data:`LOSS_KEYS`.
+        grad_norm: 0-dim tensor, the clipped-step grad norm (0 on non-sync / unclipped steps).
+
+    Returns:
+        dict ``{loss, loss_video, loss_action, grad_norm}`` of Python floats (rank means).
     """
-    loss_log_path = os.path.join(output_path, "debug_loss_history.csv")
-    write_header = not os.path.exists(loss_log_path)
-    label_cols = ",".join(f"loss_{name}" for name, _ in labels)
-    label_vals = ",".join(f"{metrics[key]:.10g}" for _, key in labels)
-    with open(loss_log_path, "a", encoding="utf-8") as f:
-        if write_header:
-            f.write(f"step,opt_step,epoch,loss,loss_video,{label_cols},grad_norm,lr,steps_per_sec\n")
-        f.write(
-            f"{global_step},{opt_step},{epoch},{metrics['loss_total']:.10g},{metrics['loss_video']:.10g},{label_vals},"
-            f"{metrics['grad_norm']:.10g},{lr:.10g},{steps_per_sec:.10g}\n"
-        )
+    values = [losses[key].detach().float().item() for key in LOSS_KEYS] + [grad_norm.item()]
+    if accelerator.num_processes > 1:
+        local = torch.tensor(values, device=losses["loss"].device, dtype=torch.float32).reshape(1, -1)
+        # (world, 4) -> rank mean per column.
+        values = accelerator.gather(local).mean(dim=0).tolist()
+    return dict(zip((*LOSS_KEYS, "grad_norm"), values))
+
+
+def _drop_rows_after(path: str, step: int, header_lines: int, row_step) -> None:
+    """Rewrite a per-step log file keeping its header and only the rows of steps <= ``step``.
+
+    Args:
+        path: str, ``loss_history.csv`` or ``timing.jsonl``; a missing file is left missing.
+        step: int, the last step whose row stays.
+        header_lines: int, leading lines that are not step rows (1 for the CSV, 0 for jsonl).
+        row_step: callable(line: str) -> int, the step a row belongs to.
+    """
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    kept = lines[:header_lines] + [line for line in lines[header_lines:] if row_step(line) <= step]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("".join(line + "\n" for line in kept))
+
+
+class StepLogger:
+    """Reports each training step to every sink: progress bar (all ranks), wandb, ``<run>/timing.jsonl`` and
+    ``<run>/loss_history.csv`` (main rank).
+
+    Args:
+        total_steps: int, per-process micro steps of the run (progress-bar total).
+        initial_step: int, global_step the loop starts at (0, or the resumed step).
+        wandb_run: the wandb Run, or None (wandb off / non-main rank).
+        run_path: str, the run dir.
+        is_main: bool, this process writes the files.
+        samples_per_step: int, batch_size * num_processes (for performance/samples_per_sec).
+        log_timing: bool, ``training.log_step_timing``: phase times go to the bar and timing.jsonl.
+    """
+
+    # Progress-bar label -> StepTimer phase.
+    _BAR_PHASES = (("data", "data"), ("fwd", "forward"), ("bwd", "backward"), ("opt", "optim"), ("oth", "other"))
+
+    def __init__(
+        self,
+        *,
+        total_steps: int,
+        initial_step: int,
+        wandb_run,
+        run_path: str,
+        is_main: bool,
+        samples_per_step: int,
+        log_timing: bool,
+    ):
+        from tqdm import tqdm
+
+        self._pbar = tqdm(total=total_steps, desc="Training", unit="step", initial=min(initial_step, total_steps))
+        self._wandb_run = wandb_run
+        self._run_path = run_path
+        self._is_main = is_main
+        self._samples_per_step = samples_per_step
+        self._log_timing = log_timing
+        # steps/sec is measured between consecutive log() calls.
+        self._last = time.monotonic()
+        if is_main:
+            # A resumed run re-trains the steps after initial_step: their earlier rows go, so each step has one row.
+            # (A fresh run dir has neither file yet.)
+            _drop_rows_after(
+                os.path.join(run_path, "loss_history.csv"), initial_step, 1, lambda line: int(line.split(",")[0])
+            )
+            _drop_rows_after(
+                os.path.join(run_path, "timing.jsonl"), initial_step, 0, lambda line: json.loads(line)["step"]
+            )
+
+    def log(self, metrics: dict, *, global_step: int, opt_step: int, epoch: int, lr: float, timing: dict) -> None:
+        """Report one step.
+
+        Args:
+            metrics: dict from :func:`reduce_step_metrics` (``loss``, ``loss_video``, ``loss_action``, ``grad_norm``).
+            global_step: int, micro steps done (wandb step).
+            opt_step: int, optimizer steps done.
+            epoch: int, current epoch.
+            lr: float, the first param group's learning rate.
+            timing: dict from ``StepTimer.snapshot`` (``timing/<phase>[_max]`` seconds; empty when timing is off).
+        """
+        now = time.monotonic()
+        steps_per_sec = 1.0 / max(now - self._last, 1e-9)
+        self._last = now
+
+        postfix = {
+            "loss": f"{metrics['loss']:.4f}",
+            "video": f"{metrics['loss_video']:.4f}",
+            "action": f"{metrics['loss_action']:.4f}",
+            "lr": f"{lr:.2e}",
+            "epoch": epoch,
+        }
+        if self._log_timing:
+            # Rank-mean phase seconds, so plain stdout logs (local / Modal) show the split too.
+            postfix.update({short: f"{timing[f'timing/{phase}']:.2f}" for short, phase in self._BAR_PHASES})
+        self._pbar.set_postfix(postfix)
+        self._pbar.update(1)
+
+        if self._wandb_run is not None:
+            log_dict = {f"train/{key}": metrics[key] for key in (*LOSS_KEYS, "grad_norm")}
+            log_dict["train/lr"] = lr
+            log_dict["performance/steps_per_sec"] = steps_per_sec
+            log_dict["performance/samples_per_sec"] = steps_per_sec * self._samples_per_step
+            self._wandb_run.log({**log_dict, **timing}, step=global_step)
+
+        if not self._is_main:
+            return
+        # Same phase times as a file so runs on different wandb servers (local vs Modal) compare offline.
+        if self._log_timing:
+            with open(os.path.join(self._run_path, "timing.jsonl"), "a") as f:
+                f.write(json.dumps({"step": global_step, **timing}) + "\n")
+        self._write_loss_row(metrics, global_step, opt_step, epoch, lr, steps_per_sec)
+
+    def _write_loss_row(
+        self, metrics: dict, global_step: int, opt_step: int, epoch: int, lr: float, steps_per_sec: float
+    ) -> None:
+        """Append one row to ``<run>/loss_history.csv`` (header on first write; a resumed run appends).
+
+        Args:
+            metrics: dict from :func:`reduce_step_metrics`.
+            global_step / opt_step / epoch: ints, the step's position.
+            lr: float, learning rate; steps_per_sec: float, measured rate.
+        """
+        path = os.path.join(self._run_path, "loss_history.csv")
+        write_header = not os.path.exists(path)
+        with open(path, "a", encoding="utf-8") as f:
+            if write_header:
+                f.write("step,opt_step,epoch,loss,loss_video,loss_action,grad_norm,lr,steps_per_sec\n")
+            values = ",".join(f"{metrics[key]:.10g}" for key in (*LOSS_KEYS, "grad_norm"))
+            f.write(f"{global_step},{opt_step},{epoch},{values},{lr:.10g},{steps_per_sec:.10g}\n")
+
+    def close(self) -> None:
+        """Close the progress bar (wandb is closed by the trainer's finish)."""
+        self._pbar.close()

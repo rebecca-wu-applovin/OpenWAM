@@ -37,6 +37,8 @@ __all__ = [
     "VideoBackbone",
     "WanBackbone",
     "Cosmos3EdgeVideoBackbone",
+    "GEBaseFastVideoBackbone",
+    "FluxActionVideoBackbone",
     "build_video_backbone",
     "register_video_backbone",
     "_VIDEO_BACKBONE_REGISTRY",

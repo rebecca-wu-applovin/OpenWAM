@@ -293,10 +293,10 @@ def test_rotary_inv_freq_recomputed_when_build_is_already_cast():
 
 
 def test_freeze_unused_native_heads():
-    from openwam.model.video_backbone.cosmos3.backbone import freeze_unused_native_heads
+    from openwam.model.video_backbone.cosmos3.backbone import _freeze_unused_native_heads
 
     net = _build(dict(MINI, action_gen=True, action_dim=4, num_embodiment_domains=3))
-    frozen = freeze_unused_native_heads(net)
+    frozen = _freeze_unused_native_heads(net)
     expected = sum(p.numel() for p in net.action_proj_in.parameters())
     expected += sum(p.numel() for p in net.action_proj_out.parameters())
     expected += net.action_modality_embed.numel()

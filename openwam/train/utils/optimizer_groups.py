@@ -3,23 +3,30 @@
 from __future__ import annotations
 
 
-def build_trainable_parameters(model, *, action_lr=None, video_lr=None):
-    """Bucket every trainable top-level param by owner, then build optimizer groups:
+def build_trainable_parameters(architecture, *, action_lr: float | None, video_lr: float | None):
+    """Bucket every trainable top-level param by owner, then build optimizer groups.
 
-    - ``video_backbone`` → optional ``video_lr``
-    - ``action_backbone`` → optional ``action_lr``
-    - every other trainable top-level module → the optimizer base ``learning_rate``,
-      never a per-group override.
+    - ``video_backbone`` → ``video_lr`` (None = the optimizer base ``learning_rate``)
+    - ``action_backbone`` → ``action_lr`` (None = the base LR)
+    - every other trainable top-level module → the base LR, never a per-group override.
 
     Source of truth: ``BaseWAMArchitecture.get_trainable_modules()`` (top-level
     children that hold at least one ``requires_grad`` param). Only ``requires_grad``
-    params are collected, so the model yaml ``freeze:`` list — which flips
+    params are collected, so the ``training.freeze`` list — which flips
     ``requires_grad`` — is the single gate for trainability; frozen params never
-    reach the optimizer. With no per-group LR override, returns a flat param list;
-    otherwise returns groups.
+    reach the optimizer.
+
+    Args:
+        architecture: BaseWAMArchitecture whose trainable params are grouped.
+        action_lr: float LR of the ActionDiT params, or None for the base LR.
+        video_lr: float LR of the video backbone params, or None for the base LR.
+
+    Returns:
+        With both LRs None, a flat list of params (action, video, other order); otherwise a list of AdamW param
+        group dicts (``params`` plus ``lr`` where set), empty groups left out.
     """
     action_params, video_params, other_params = [], [], []
-    for mod_name, mod in model.architecture.get_trainable_modules().items():
+    for mod_name, mod in architecture.get_trainable_modules().items():
         if mod_name == "video_backbone":
             bucket = video_params
         elif mod_name == "action_backbone":
