@@ -30,7 +30,6 @@ class _FakeArch:
     """Stand-in for a WAM architecture: records the helper calls."""
 
     def __init__(self):
-        self.dtype = torch.float32
         self.set_dtype_device_calls = []
         self.move_frozen_calls = []
 
@@ -72,6 +71,8 @@ def _make_trainer(*, wrap):
     bypassing the heavy ``__init__`` (no cfg / weights / dataset needed)."""
     trainer = OpenWAMTrainer.__new__(OpenWAMTrainer)
     trainer.architecture = _FakeArch()
+    # The dtype __init__ resolves from training.mixed_precision (prepare_accelerate passes it down).
+    trainer._dtype = torch.float32
     trainer.accelerator = _FakeAccelerator(wrap=wrap)
     return trainer
 

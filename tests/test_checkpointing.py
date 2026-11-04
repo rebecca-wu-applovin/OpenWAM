@@ -16,6 +16,7 @@ from openwam.train.utils.checkpointing import (
     load_full_state,
     manage_checkpoints,
     save_full_state,
+    save_normalization_stats,
     verify_resume_normalization_stats,
 )
 
@@ -155,143 +156,81 @@ def test_full_state_meta_round_trip(tmp_path):
     assert load_full_state(acc, str(state_dir)) == {"global_step": 42, "opt_step": 10, "epoch": 3}
 
 
-# --- verify_resume_normalization_stats ---
+def test_load_full_state_without_trainer_state_raises(tmp_path):
+    """A state dir without its completion marker is not resumable: no step-0 default."""
+    with pytest.raises(FileNotFoundError, match="trainer_state.json"):
+        load_full_state(_FakeAccelerator(), str(tmp_path))
 
 
-def test_verify_resume_normalization_stats_noop_without_dataset_path(tmp_path):
-    class _Dataset:
-        normalization_stats_path = None
+# --- save / verify_resume_normalization_stats ---
 
-    verify_resume_normalization_stats(str(tmp_path), _Dataset())
+
+def _transform(v: float = 0.0) -> dict:
+    """v: offset of every vector. Returns: one stats block with all six (3,) float32 vectors."""
+    import numpy as np
+
+    return {k: np.full(3, v, dtype=np.float32) for k in ("mean", "std", "min", "max", "q01", "q99")}
+
+
+def _stats_pair(tmp_path, data_payload, ckpt_payload):
+    """Write the dataset's stats file and the run dir's copy. Returns: (run_dir, dataset stats path) as str."""
+    import numpy as np
+
+    src = tmp_path / "dataset_stats.npy"
+    run = tmp_path / "run"
+    run.mkdir()
+    np.save(src, data_payload)
+    if ckpt_payload is not None:
+        np.save(run / "normalization_stats.npy", ckpt_payload)
+    return str(run), str(src)
+
+
+def test_save_normalization_stats_copies_the_file(tmp_path):
+    """The run dir gets the dataset's stats file byte for byte."""
+    run, src = _stats_pair(tmp_path, {"fingertips_rel": _transform()}, None)
+    save_normalization_stats(run, src)
+    assert (Path(run) / "normalization_stats.npy").read_bytes() == Path(src).read_bytes()
 
 
 def test_verify_resume_normalization_stats_missing_checkpoint_artifact(tmp_path):
-    import numpy as np
-
-    src = tmp_path / "dataset_stats.npy"
-    np.save(src, {"eef": {"min": np.zeros(2)}})
-    (tmp_path / "run").mkdir()
-
-    class _Dataset:
-        normalization_stats_path = str(src)
-
+    run, src = _stats_pair(tmp_path, {"fingertips_rel": _transform()}, None)
     with pytest.raises(FileNotFoundError, match="finetune_ckpt_path"):
-        verify_resume_normalization_stats(str(tmp_path / "run"), _Dataset())
+        verify_resume_normalization_stats(run, src)
 
 
 def test_verify_resume_normalization_stats_mismatch(tmp_path):
-    import numpy as np
-
-    src = tmp_path / "dataset_stats.npy"
-    dst_dir = tmp_path / "run"
-    dst_dir.mkdir()
-    np.save(src, {"eef": {"min": np.zeros(2, dtype=np.float32)}})
-    np.save(dst_dir / "normalization_stats.npy", {"eef": {"min": np.ones(2, dtype=np.float32)}})
-
-    class _Dataset:
-        normalization_stats_path = str(src)
-
+    run, src = _stats_pair(tmp_path, {"fingertips_rel": _transform(0.0)}, {"fingertips_rel": _transform(1.0)})
     with pytest.raises(ValueError, match="finetune_ckpt_path"):
-        verify_resume_normalization_stats(str(dst_dir), _Dataset())
+        verify_resume_normalization_stats(run, src)
 
 
 def test_verify_resume_normalization_stats_match(tmp_path):
-    import numpy as np
-
-    payload = {"eef": {"min": np.arange(3, dtype=np.float32), "max": np.arange(3, dtype=np.float32) + 1}}
-    src = tmp_path / "dataset_stats.npy"
-    dst_dir = tmp_path / "run"
-    dst_dir.mkdir()
-    np.save(src, payload)
-    np.save(dst_dir / "normalization_stats.npy", payload)
-
-    class _Dataset:
-        normalization_stats_path = str(src)
-
-    verify_resume_normalization_stats(str(dst_dir), _Dataset())
+    payload = {"fingertips_rel": _transform(), "fingertips_rel_state": _transform(2.0)}
+    run, src = _stats_pair(tmp_path, payload, payload)
+    verify_resume_normalization_stats(run, src)
 
 
 def test_verify_resume_normalization_stats_rejects_allclose_only_match(tmp_path):
     import numpy as np
 
-    src = tmp_path / "dataset_stats.npy"
-    dst_dir = tmp_path / "run"
-    dst_dir.mkdir()
-    np.save(src, {"eef": {"min": np.ones(2, dtype=np.float32)}})
+    ckpt = {"fingertips_rel": _transform(1.0)}
     # np.allclose accepts this delta at values near 1, but strict resume must not.
-    np.save(
-        dst_dir / "normalization_stats.npy",
-        {"eef": {"min": np.ones(2, dtype=np.float32) + np.float32(1e-6)}},
-    )
-
-    class _Dataset:
-        normalization_stats_path = str(src)
-
+    ckpt["fingertips_rel"]["min"] = ckpt["fingertips_rel"]["min"] + np.float32(1e-6)
+    run, src = _stats_pair(tmp_path, {"fingertips_rel": _transform(1.0)}, ckpt)
     with pytest.raises(ValueError, match="finetune_ckpt_path"):
-        verify_resume_normalization_stats(str(dst_dir), _Dataset())
+        verify_resume_normalization_stats(run, src)
 
 
-def test_verify_resume_normalization_stats_accepts_legacy_reduced_checkpoint(tmp_path):
-    import numpy as np
-
-    transform = {
-        "mean": np.zeros(3, dtype=np.float32),
-        "std": np.ones(3, dtype=np.float32),
-        "min": -np.ones(3, dtype=np.float32),
-        "max": np.ones(3, dtype=np.float32),
-        "q01": -np.ones(3, dtype=np.float32),
-        "q99": np.ones(3, dtype=np.float32),
-    }
-    full = {
-        "eef": {
-            **transform,
-            "q50": [0.0, 0.0, 0.0],
-            "action_rows": 100,
-            "state_rows": 100,
-            "gripper_convention": "minus1_closed_plus1_open",
-            "representation": "absolute_eef10",
-        }
-    }
-    src = tmp_path / "dataset_stats.npy"
-    dst_dir = tmp_path / "run"
-    dst_dir.mkdir()
-    np.save(src, full)
-    np.save(dst_dir / "normalization_stats.npy", {"eef": transform})
-
-    class _Dataset:
-        normalization_stats_path = str(src)
-
-    verify_resume_normalization_stats(str(dst_dir), _Dataset())
-
-
-def test_verify_resume_normalization_stats_rejects_shared_semantic_mismatch(tmp_path):
-    import numpy as np
-
-    transform = {
-        "mean": np.zeros(2, dtype=np.float32),
-        "std": np.ones(2, dtype=np.float32),
-        "min": -np.ones(2, dtype=np.float32),
-        "max": np.ones(2, dtype=np.float32),
-        "q01": -np.ones(2, dtype=np.float32),
-        "q99": np.ones(2, dtype=np.float32),
-    }
-    src = tmp_path / "dataset_stats.npy"
-    dst_dir = tmp_path / "run"
-    dst_dir.mkdir()
-    np.save(src, {"eef": {**transform, "representation": "absolute_eef10"}})
-    np.save(
-        dst_dir / "normalization_stats.npy",
-        {"eef": {**transform, "representation": "relative_eef10"}},
-    )
-
-    class _Dataset:
-        normalization_stats_path = str(src)
-
+def test_verify_resume_normalization_stats_rejects_any_extra_or_missing_field(tmp_path):
+    """No legacy-payload tolerance: an old run whose copy differs in any field resumes nowhere (it adapts to us)."""
+    full = {"fingertips_rel": {**_transform(), "yam_sharpa_meta": "x"}}
+    run, src = _stats_pair(tmp_path, full, {"fingertips_rel": _transform()})
     with pytest.raises(ValueError, match="finetune_ckpt_path"):
-        verify_resume_normalization_stats(str(dst_dir), _Dataset())
+        verify_resume_normalization_stats(run, src)
 
 
-def test_setup_output_dir_verifies_stats_before_reusing_resume_run(tmp_path, monkeypatch):
+def _resume_trainer(tmp_path, monkeypatch, normalize_mode):
+    """A trainer shell with a resumable run dir. Returns: (trainer, run_dir, recorded verify calls)."""
     from types import SimpleNamespace
 
     from omegaconf import OmegaConf
@@ -307,15 +246,43 @@ def test_setup_output_dir_verifies_stats_before_reusing_resume_run(tmp_path, mon
     monkeypatch.setattr(
         trainer_module,
         "verify_resume_normalization_stats",
-        lambda output_dir, dataset: calls.append((output_dir, dataset)),
+        lambda output_dir, stats_path: calls.append((output_dir, stats_path)),
     )
     trainer = object.__new__(trainer_module.OpenWAMTrainer)
-    trainer.cfg = OmegaConf.create({"training": {"output_path": str(tmp_path / "unused")}})
+    trainer.cfg = OmegaConf.create(
+        {"training": {"output_path": str(tmp_path / "unused")}, "dataloader": {"normalize_mode": normalize_mode}}
+    )
     trainer.accelerator = SimpleNamespace(is_main_process=True)
-    trainer.dataset = object()
+    trainer.dataset = SimpleNamespace(normalization_stats_path="/stats/yam_sharpa_fingertips_rel.npy")
+    return trainer, run_dir, calls
+
+
+def test_setup_output_dir_verifies_stats_before_reusing_resume_run(tmp_path, monkeypatch):
+    trainer, run_dir, calls = _resume_trainer(tmp_path, monkeypatch, "min-max")
 
     output_path, resume_state_dir = trainer.setup_output_dir(debug=False, resume_path=str(run_dir))
 
     assert output_path == str(run_dir)
-    assert resume_state_dir == str(state_dir)
-    assert calls == [(str(run_dir), trainer.dataset)]
+    assert resume_state_dir == str(run_dir / "accel_state_step_12")
+    assert calls == [(str(run_dir), "/stats/yam_sharpa_fingertips_rel.npy")]
+
+
+def test_setup_output_dir_skips_the_stats_check_when_the_config_turns_normalization_off(tmp_path, monkeypatch):
+    """normalize_mode null decides it (not a missing dataset attribute)."""
+    trainer, run_dir, calls = _resume_trainer(tmp_path, monkeypatch, None)
+    trainer.setup_output_dir(debug=False, resume_path=str(run_dir))
+    assert calls == []
+
+
+@pytest.mark.parametrize("meta, err", [({"global_step": 0, "opt_step": 0, "epoch": 0}, ValueError), ({}, KeyError)])
+def test_resume_needs_a_positive_global_step(tmp_path, monkeypatch, meta, err):
+    """A resumed state at step 0 (or without a step) raises instead of silently restarting from step 0."""
+    from types import SimpleNamespace
+
+    import openwam.train.openwam_trainer as trainer_module
+
+    monkeypatch.setattr(trainer_module, "load_full_state", lambda accelerator, state_dir: meta)
+    trainer = object.__new__(trainer_module.OpenWAMTrainer)
+    trainer.accelerator = SimpleNamespace(is_main_process=True)
+    with pytest.raises(err):
+        trainer.resume_if_configured(str(tmp_path), dataloader=[0] * 10, grad_accum=1)

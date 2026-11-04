@@ -29,9 +29,9 @@ training:
   zero_stage: 2
   use_gradient_checkpointing: false
   mot_checkpoint_mixed_attn: false   # no recompute -> backward is easier to follow
-  save_steps: 0                   # 0 = never save (also skips the final save)
+  save_steps: null                # null = never save (also skips the final save)
   output_path: outputs/debug_checkpoints   # run dir still gets config.yaml + tokenizer (~21MB); keep it away from real runs
-  vis_steps: 0                    # no world-model rollouts
+  vis_steps: null                 # null = no world-model rollouts
 
 project:
   output_dir: outputs/debug/${now:%Y-%m-%d_%H-%M-%S}

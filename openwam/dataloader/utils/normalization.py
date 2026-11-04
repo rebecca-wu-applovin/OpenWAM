@@ -1,103 +1,80 @@
-"""Shared in-reader normalization helpers.
+"""In-reader normalization: the stats file, the forward map (training + deploy proprio) and its inverse (deploy actions).
 
-Hosts ``apply_normalization``, the pure function form of RoboCOIN's
-private ``_normalize_array``. Lifted out so OXE readers can share the same
-min-max / z-score / null code paths, including quantile normalization.
-
-Each reader keeps its own ``self._normalization_stats`` dict (loaded at
-__init__ from a per-dataset stats json) and calls ``apply_normalization``
-per ``_getitem_impl`` invocation. The function is stateless: returns the
-input untouched whenever ``stats is None`` or ``mode`` is one of the
-``no-op`` aliases.
+``dataloader.normalize_mode`` is ``null`` (off) or one of :data:`NORMALIZE_MODES`; :func:`normalization_on` is the one
+place that reads it. A stats file holds one block per ``action_mode`` key, each with all six vectors of
+:data:`STAT_KEYS` (``yam_sharpa_stats_computation`` writes them); a missing block or field raises.
 """
 
 from __future__ import annotations
 
 import functools
 import json
-import logging
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+# The modes a stats file can drive; null (None) turns normalization off.
+NORMALIZE_MODES = ("min-max", "z-score", "quantile")
 
-_NO_OP_MODES = (None, "none", "null")
-
-# The six stat vectors every materialized stats dict carries.
+# The six stat vectors every stats block carries.
 STAT_KEYS = ("mean", "std", "min", "max", "q01", "q99")
 
-# rot6d dims within the two EEF stat layouts:
-#   10-D single-arm  [pos(0:3), rot6d(3:9), grip(9)]                 (OXE)
-#   20-D bimanual    [L_pos, L_rot6d(3:9), L_grip, R_pos, R_rot6d(13:19), R_grip]  (RoboCOIN)
-# rot6d entries are rotation-matrix basis components: already bounded in [-1, 1]
-# and geometrically COUPLED (two unit 3-vectors). Per-dim affine normalization
-# would scale each of the 6 independently — breaking the unit-norm structure and
-# reweighting the rotation regression loss across dims, which is geometrically
-# meaningless. The stats-computation scripts therefore pin these dims to
-# identity (:func:`pin_rot6d_identity`) and :func:`materialize_eef_stats` warns
-# when it loads a stats file that predates the pinning.
-ROT6D_DIMS_ARM10 = (3, 4, 5, 6, 7, 8)
-ROT6D_DIMS_EEF20 = (3, 4, 5, 6, 7, 8, 13, 14, 15, 16, 17, 18)
-_ROT6D_DIMS_BY_WIDTH = {10: ROT6D_DIMS_ARM10, 20: ROT6D_DIMS_EEF20}
-
-# Identity stat values that make every normalize mode a pass-through.
+# Identity stat values that make every normalize mode a pass-through (rot6d dims, see pin_rot6d_identity).
 _ROT6D_IDENTITY = {"min": -1.0, "max": 1.0, "q01": -1.0, "q99": 1.0, "mean": 0.0, "std": 1.0}
 
-# Which materialized fields the active mode actually consumes (for the
-# stale-stats warning: only complain about fields that would distort data).
-_MODE_IDENTITY_FIELDS = {
-    "quantile": ("q01", "q99"),
-    "min-max": ("min", "max"),
-    "z-score": ("mean", "std"),
-}
+# Shared division-by-zero floor of ``apply_normalization`` and its inverse
+# ``invert_normalization`` (deploy), so the two directions agree on near-zero-range
+# dims. (The compute-time degenerate-dim handling in the stats-computation
+# script is a separate concern with its own threshold.)
+NORM_EPS = 1e-6
+
+
+def normalization_on(normalize_mode: Optional[str]) -> bool:
+    """Whether the config turns normalization on.
+
+    Args:
+        normalize_mode: ``dataloader.normalize_mode``: None (yaml ``null``) or one of :data:`NORMALIZE_MODES`.
+
+    Returns:
+        bool, True for a mode, False for None. Any other value raises ValueError.
+    """
+    if normalize_mode is None:
+        return False
+    if normalize_mode not in NORMALIZE_MODES:
+        raise ValueError(f"normalize_mode={normalize_mode!r}: expected null or one of {NORMALIZE_MODES}")
+    return True
 
 
 def pin_rot6d_identity(stats: dict, dims: Sequence[int]) -> None:
-    """In-place: force the rot6d dims of a flat EEF stats dict to identity.
+    """In-place: force the rot6d dims of a flat stats block to identity.
 
     min=-1 / max=1 (min-max identity), q01=-1 / q99=1 (quantile identity),
     mean=0 / std=1 (z-score identity) → normalization is a pass-through on rot6d
     under EVERY mode, so the rotation representation reaches the model unchanged.
-    pos / gripper dims are left untouched.
+    rot6d entries are already bounded in [-1, 1] and coupled (two unit 3-vectors), so a per-dim affine map would
+    break their structure. Used by the stats-computation script.
 
-    Shared by the OXE (``dims=ROT6D_DIMS_ARM10``) and RoboCOIN
-    (``dims=ROT6D_DIMS_EEF20``) stats-computation scripts.
+    Args:
+        stats: dict of (D,) arrays keyed by :data:`STAT_KEYS` (modified in place).
+        dims: the rot6d dim indices of this layout.
     """
     for key, val in _ROT6D_IDENTITY.items():
         for i in dims:
             stats[key][i] = val
 
 
-# Shared division-by-zero floor of ``apply_normalization`` and its inverse
-# ``invert_normalization`` (deploy), so the two directions agree on near-zero-range
-# dims. (The compute-time degenerate-dim handling in the *_compute_stats.py
-# scripts is a separate concern with its own threshold.)
-NORM_EPS = 1e-6
-
-
-def apply_normalization(
-    arr: np.ndarray,
-    stats: Optional[dict],
-    mode: Optional[str],
-) -> np.ndarray:
+def apply_normalization(arr: np.ndarray, stats: dict, mode: str) -> np.ndarray:
     """Normalize ``arr`` according to ``mode`` using ``stats``.
 
     Args:
         arr: ``(..., D)`` float array. Last axis must match the stats vectors'
             length; broadcasting handles arbitrary leading dims.
-        stats: dict carrying at least ``mean``, ``std``, ``min``, ``max`` (each
-            ``(D,)`` ndarray). For ``quantile`` mode, also requires ``q01`` and
-            ``q99``. ``None`` short-circuits to passthrough.
-        mode: one of ``"min-max"``, ``"z-score"``, ``"quantile"``, or any of
-            the no-op aliases (``None`` / ``"none"`` / ``"null"``). Unknown
-            modes also pass through unchanged — matches the original
-            ``_normalize_array`` behaviour.
+        stats: dict of ``(D,)`` float32 arrays keyed by :data:`STAT_KEYS`, as :func:`load_stats_file` returns them.
+        mode: one of :data:`NORMALIZE_MODES`; anything else raises ValueError.
 
     Returns:
-        Normalized array of the same shape and dtype, or ``arr`` itself
-        when the call is a no-op.
+        ``(..., D)`` normalized array.
 
     Modes:
         * ``min-max``: ``clip((arr - min) / (max - min) * 2 - 1, -1, 1)``.
@@ -107,40 +84,19 @@ def apply_normalization(
         * ``z-score``: ``(arr - mean) / std`` with std floored at 1e-6.
           Unbounded by design (standardization), so NOT clipped.
         * ``quantile``: ``clip((arr - q01) / (q99 - q01) * 2 - 1, -1, 1)``.
-          Robust to outliers (Fractal has a y-axis action range of [-5.5, 22.09]
-          which would compress 99% of values into a tiny window under
-          min-max). Quantile clips the outliers to the boundary.
-
-    The min-max / z-score implementations are bit-identical to the original
-    ``robocoin.RoboCOINDataset._normalize_array``.
+          Robust to outliers; values beyond the quantiles clip to the boundary.
     """
-    if stats is None or mode in _NO_OP_MODES:
-        return arr
     if mode == "z-score":
         mean = stats["mean"]
         std = np.maximum(stats["std"], NORM_EPS)
         return (arr - mean) / std
-    if mode == "min-max":
-        mn = stats["min"]
-        mx = stats["max"]
-        scale = np.maximum(mx - mn, NORM_EPS)
-        scaled = ((arr - mn) / scale) * 2.0 - 1.0
-        # Clip to [-1, 1] (consistent with quantile): values within the training
-        # [min, max] map into the band; out-of-distribution values are clamped to
-        # the boundary instead of extrapolating to large magnitudes.
+    if mode in ("min-max", "quantile"):
+        lo, hi = (stats["min"], stats["max"]) if mode == "min-max" else (stats["q01"], stats["q99"])
+        scale = np.maximum(hi - lo, NORM_EPS)
+        scaled = ((arr - lo) / scale) * 2.0 - 1.0
+        # Clip to [-1, 1]: out-of-distribution values clamp to the boundary instead of extrapolating.
         return np.clip(scaled, -1.0, 1.0)
-    if mode == "quantile":
-        if "q01" not in stats or "q99" not in stats:
-            raise KeyError(
-                "quantile normalization requires stats['q01'] and stats['q99']; "
-                "rerun the OXE compute_stats script to populate quantile fields."
-            )
-        q01 = stats["q01"]
-        q99 = stats["q99"]
-        scale = np.maximum(q99 - q01, NORM_EPS)
-        scaled = ((arr - q01) / scale) * 2.0 - 1.0
-        return np.clip(scaled, -1.0, 1.0)
-    return arr
+    raise ValueError(f"apply_normalization: unknown normalize_mode={mode!r} (one of {NORMALIZE_MODES})")
 
 
 def invert_normalization(arr: np.ndarray, stats: dict, mode: str) -> np.ndarray:
@@ -171,118 +127,38 @@ def invert_normalization(arr: np.ndarray, stats: dict, mode: str) -> np.ndarray:
     raise ValueError(f"invert_normalization: no inverse for normalize_mode={mode!r}")
 
 
-def materialize_eef_stats(
-    raw: dict,
-    mode: Optional[str],
-    *,
-    dim: int,
-    strict_minmax: bool,
-    source_hint: str = "",
-    force_rot6d_identity: bool = False,
-) -> dict:
-    """Validate + materialize an in-reader normalization stats dict.
+def load_stats_file(path: str | Path, *, block: str, dim: int) -> dict:
+    """Load one block of a stats file (``.json`` / ``.npy``).
 
-    Shared by the OXE readers (per-dataset ``meta/eef_stats.json``, 10-D,
-    ``strict_minmax=True``) and RoboCOIN (per-robot-type
-    ``stats_<robot>.json`` ``eef`` subdict, 20-D, ``strict_minmax=False``).
-
-    Validates that the field(s) the active ``mode`` needs are present, then
-    returns a dict with all six stat vectors as float32 arrays (absent
-    optional fields filled with neutral defaults).
+    The raw read is cached per process (multi-source datasets and every DataLoader worker read the file once);
+    each call returns fresh arrays.
 
     Args:
-        raw: raw stats dict (already drilled to the eef level for RoboCOIN).
-        mode: ``"min-max"`` | ``"z-score"`` | ``"quantile"``.
-        dim: stat-vector length (10 single-arm OXE, 20 bimanual RoboCOIN).
-        strict_minmax: when True, read ``min``/``max`` via direct indexing —
-            raises ``KeyError`` if absent regardless of mode (preserves the OXE
-            ``_load_eef_stats`` behavior). When False, fall back to neutral
-            defaults (preserves RoboCOIN ``_load_stats`` behavior).
-        source_hint: appended to the missing-field error for actionable guidance.
-        force_rot6d_identity: pin the canonical rot6d slots to identity at load
-            time. Readers whose action contract forbids rot6d normalization set
-            this even though current generators already emit pinned files; this
-            makes the loader safe against stale or hand-edited stats.
-    """
-    required = ("min", "max")
-    if mode == "z-score":
-        required = ("mean", "std")
-    if mode == "quantile":
-        required = ("q01", "q99")
-    missing = [k for k in required if k not in raw]
-    if missing:
-        raise KeyError(f"missing field(s) {missing} required by normalize_mode={mode!r}. {source_hint}".strip())
-    if strict_minmax:
-        mn = np.array(raw["min"], dtype=np.float32)
-        mx = np.array(raw["max"], dtype=np.float32)
-    else:
-        mn = np.array(raw.get("min", [-1.0] * dim), dtype=np.float32)
-        mx = np.array(raw.get("max", [1.0] * dim), dtype=np.float32)
-    out = {
-        "min": mn,
-        "max": mx,
-        "mean": np.array(raw.get("mean", [0.0] * dim), dtype=np.float32),
-        "std": np.array(raw.get("std", [1.0] * dim), dtype=np.float32),
-        "q01": np.array(raw.get("q01", [-1.0] * dim), dtype=np.float32),
-        "q99": np.array(raw.get("q99", [1.0] * dim), dtype=np.float32),
-    }
+        path: the stats file; it holds a mapping ``{block: {mean, std, min, max, q01, q99}, ...}``.
+        block: the block key (yam_sharpa: ``<action_mode>`` for the action, ``<action_mode>_state`` for the proprio).
+        dim: the stat-vector length D.
 
-    rot6d_dims = _ROT6D_DIMS_BY_WIDTH.get(dim)
-    if force_rot6d_identity and rot6d_dims is not None:
-        pin_rot6d_identity(out, rot6d_dims)
-
-    # Stale-stats guard: the rot6d identity pin normally happens at
-    # stats-GENERATION time,
-    # so a stats file written by a pre-pin script silently keeps the distorted
-    # per-dim rot6d normalization. Warn (don't raise — --no-rot6d-identity is a
-    # legitimate escape hatch) when the mode-relevant fields aren't identity.
-    fields = _MODE_IDENTITY_FIELDS.get(mode)
-    if rot6d_dims is not None and fields is not None:
-        idx = list(rot6d_dims)
-        if any(not np.allclose(out[f][idx], _ROT6D_IDENTITY[f], atol=1e-6) for f in fields):
-            logger.warning(
-                "rot6d dims %s of this stats file are not identity under mode=%r — the file "
-                "likely predates rot6d identity pinning and normalization WILL distort the "
-                "rotation representation. Rerun the matching *_stats_computation script. %s",
-                idx,
-                mode,
-                source_hint,
-            )
-
-    return out
-
-
-def load_stats_file(
-    path: str | Path,
-    *,
-    action_mode: Optional[str],
-    normalize_mode: Optional[str],
-    dim: int,
-) -> dict:
-    """Load, materialize, and validate a training-time stats file (``.json``/``.npy``).
-
-    Shared by the LeRobot v3 readers whose stats-computation scripts emit either
-    a flat stats mapping or one nested per ``action_mode``. The raw read is
-    cached per process (multi-bucket datasets and every DataLoader worker read
-    the file once); materialization runs per call so each caller owns its arrays.
+    Returns:
+        dict of ``(D,)`` float32 arrays keyed by :data:`STAT_KEYS`. A missing file, block or field, or a vector of
+        another length, raises.
     """
     resolved = Path(path).expanduser().resolve()
-    raw = _load_raw_stats(str(resolved), action_mode)
-    stats = materialize_eef_stats(
-        dict(raw),
-        normalize_mode,
-        dim=dim,
-        strict_minmax=False,
-        source_hint=f"{resolved}:{action_mode}",
-    )
+    raw = _load_raw_stats(str(resolved))
+    if block not in raw:
+        raise KeyError(f"normalization stats {resolved} have no block {block!r} (blocks: {sorted(raw)})")
+    missing = [key for key in STAT_KEYS if key not in raw[block]]
+    if missing:
+        raise KeyError(f"normalization stats {resolved}:{block} miss field(s) {missing}; rebuild the stats file")
+    stats = {key: np.array(raw[block][key], dtype=np.float32) for key in STAT_KEYS}
     bad = {key: stats[key].shape for key in STAT_KEYS if stats[key].shape != (dim,)}
     if bad:
-        raise ValueError(f"normalization stats vectors must have shape ({dim},), got {bad}")
+        raise ValueError(f"normalization stats {resolved}:{block} vectors must have shape ({dim},), got {bad}")
     return stats
 
 
 @functools.lru_cache(maxsize=8)
-def _load_raw_stats(path: str, action_mode: Optional[str]) -> Mapping:
+def _load_raw_stats(path: str) -> Mapping:
+    """path: str, resolved stats file. Returns: the file's top-level mapping (cached; callers must not mutate it)."""
     stats_path = Path(path)
     if not stats_path.is_file():
         raise FileNotFoundError(stats_path)
@@ -292,10 +168,6 @@ def _load_raw_stats(path: str, action_mode: Optional[str]) -> Mapping:
         raw = np.load(stats_path, allow_pickle=True).item()
     if not isinstance(raw, Mapping):
         raise ValueError(f"normalization stats must contain a mapping, got {type(raw).__name__}")
-    if action_mode and action_mode in raw:
-        return raw[action_mode]
-    if not any(key in raw for key in STAT_KEYS):
-        raise KeyError(f"normalization stats {stats_path} do not contain action_mode={action_mode!r}")
     return raw
 
 
@@ -303,10 +175,9 @@ __all__ = [
     "apply_normalization",
     "invert_normalization",
     "load_stats_file",
-    "materialize_eef_stats",
+    "normalization_on",
     "pin_rot6d_identity",
-    "ROT6D_DIMS_ARM10",
-    "ROT6D_DIMS_EEF20",
+    "NORMALIZE_MODES",
     "NORM_EPS",
     "STAT_KEYS",
 ]

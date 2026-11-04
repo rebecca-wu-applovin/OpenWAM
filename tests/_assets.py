@@ -18,16 +18,17 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _VIDEO_BACKBONES = PROJECT_ROOT / "assets" / "video_backbone_ckpt"
-# yam_sharpa LeRobot v3 sources (the training smoke tests read real episodes). Tests read the 1004 snapshot;
-# configs/dataloader/yam_sharpa.yaml keeps the training default (datasets/).
-_DATASETS = Path("/root/projects/2610_policy_model/datasets_1004")
+# yam_sharpa LeRobot v3 sources (the training smoke tests read real episodes). Tests read the 1028 snapshot;
+# configs/dataloader/yam_sharpa.yaml keeps the training default (datasets/). 1028 has no gpt source: the default
+# OPENWAM_YAM_SHARPA_GPT path does not exist and the GPU test that needs it skips unless the env var points to one.
+_DATASETS = Path("/root/projects/2610_policy_model/datasets_1028")
 
 # canonical env var -> (legacy env vars, default location written by the downloader)
 _ASSETS: dict[str, tuple[tuple[str, ...], Path]] = {
     "OPENWAM_WAN22_TI2V_5B": (("WAN22_TI2V_5B", "WAN_TI2V_5B_PATH"), _VIDEO_BACKBONES / "Wan2.2-TI2V-5B"),
     "OPENWAM_COSMOS3_EDGE": (("COSMOS3_EDGE_ASSET_PATH",), _VIDEO_BACKBONES / "Cosmos3-Edge"),
     "OPENWAM_COSMOS3_NANO": (("COSMOS3_NANO_ASSET_PATH",), _VIDEO_BACKBONES / "Cosmos3-Nano"),
-    "OPENWAM_YAM_SHARPA_SIMTELEOP": ((), _DATASETS / "simteleop_1004_fleet" / "dataset"),
+    "OPENWAM_YAM_SHARPA_SIMTELEOP": ((), _DATASETS / "simteleop_1028" / "dataset"),
     "OPENWAM_YAM_SHARPA_GPT": ((), _DATASETS / "gpt_fleet_depth" / "dataset"),
 }
 

@@ -31,6 +31,8 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from openwam.dataloader.collate import Batch, collate
+from openwam.dataloader.utils.normalization import normalization_on
+from openwam.model.common.dtypes import DTYPES
 from openwam.train.utils.checkpointing import (
     compute_resume_position,
     finalize_keep_weights_only,
@@ -44,7 +46,7 @@ from openwam.train.utils.checkpointing import (
     verify_resume_normalization_stats,
 )
 from openwam.train.utils.optimizer_groups import build_trainable_parameters
-from openwam.train.utils.seeding import per_step_seed, seed_process, wire_sampler_seed
+from openwam.train.utils.seeding import per_step_seed, seed_process
 from openwam.train.utils.step_timer import StepTimer
 from openwam.train.utils.training_utils import (
     build_cosine_scheduler,
@@ -107,10 +109,10 @@ class OpenWAMTrainer:
         # a training run needs a loss with at least one term.
         if train_options.lambda_video == 0 and train_options.lambda_action == 0:
             raise ValueError("training.lambda_video and training.lambda_action are both 0: the loss has no term.")
-        # null (or "") = that mode is off.
-        finetune_path = t.finetune_ckpt_path or None
-        resume_path = t.resume_ckpt_path or None
-        if finetune_path and resume_path:
+        # null = that mode is off (resolve_config rejects "").
+        finetune_path = t.finetune_ckpt_path
+        resume_path = t.resume_ckpt_path
+        if finetune_path is not None and resume_path is not None:
             raise ValueError("finetune_ckpt_path and resume_ckpt_path are mutually exclusive; set at most one.")
         if finetune_path is not None:
             from openwam.train.utils.ckpt_model_loader import build_for_finetune
@@ -137,11 +139,15 @@ class OpenWAMTrainer:
             )
         logger.info("Architecture: %s", type(self.architecture).__name__)
 
+        # The weight / batch dtype, decided once from cfg (resolve_config checked the key); both
+        # set_dtype_device calls (here and prepare_accelerate) use it.
+        self._dtype = DTYPES[str(t.mixed_precision)]
         # Device placement: skip .to(device) when initialize_model_on_cpu and a real
         # training Accelerator is present — DeepSpeed's prepare() then handles the move.
         _init_on_cpu = bool(t.initialize_model_on_cpu)
         if not (_init_on_cpu and self.accelerator is not None):
-            self.architecture.set_dtype_device(self.architecture.dtype, self.architecture.device)
+            # The accelerator's device, the same (dtype, device) prepare_accelerate passes again after prepare.
+            self.architecture.set_dtype_device(self._dtype, self.accelerator.device)
 
         # --- Freeze: the backbone yaml's training.freeze; every path must exist on the model.
         for name in self.architecture.freeze_modules(list(t.freeze)):
@@ -177,7 +183,7 @@ class OpenWAMTrainer:
             logger.info("DEBUG mode: max_steps=20, save@10, constant LR")
 
         # num_epochs=null means step-only training: max_steps is the sole stop condition.
-        if num_epochs is None and not max_steps:
+        if num_epochs is None and max_steps is None:
             raise ValueError(
                 "training.num_epochs and training.max_steps are both unset; "
                 "set num_epochs, or set max_steps for step-only training."
@@ -185,23 +191,23 @@ class OpenWAMTrainer:
 
         # finetune/resume validation + architecture construction happen in
         # __init__ (self-contained ckpt-dir path); only resume needs a path here.
-        resume_path = t.resume_ckpt_path or None
+        resume_path = t.resume_ckpt_path
 
         optimizer = self.build_optimizer()
         dataloader = self.build_dataloader(batch_size)
-        # 0 / null = no clipping.
-        max_grad_norm = float(t.max_grad_norm) if t.max_grad_norm else None
+        # null = no clipping (resolve_config checked a set value is > 0).
+        max_grad_norm = None if t.max_grad_norm is None else float(t.max_grad_norm)
 
         n_proc = self.accelerator.num_processes
         steps_per_epoch = math.ceil(len(dataloader) / grad_accum)
         # max_steps counts micro-steps (global_step); convert to optimizer steps for the LR horizon.
-        max_opt_steps = math.ceil(max_steps / grad_accum) if max_steps else None
+        max_opt_steps = None if max_steps is None else math.ceil(max_steps / grad_accum)
         if num_epochs is not None:
             # prepare() shards the dataloader ~1/n_proc; fold that in so total_opt_steps is the
             # per-process optimizer steps the loop actually runs (same unit as max_opt_steps).
             steps_per_epoch = math.ceil(steps_per_epoch / n_proc)
             total_opt_steps = steps_per_epoch * num_epochs
-            if max_opt_steps:
+            if max_opt_steps is not None:
                 total_opt_steps = min(total_opt_steps, max_opt_steps)
         else:
             total_opt_steps = max_opt_steps
@@ -210,8 +216,8 @@ class OpenWAMTrainer:
         if debug:
             save_steps = save_steps_override
         else:
-            # 0 / null = never save (the yaml's "disable saving").
-            save_steps = int(t.save_steps or 0)
+            # null = never save (the yaml's "disable saving").
+            save_steps = None if t.save_steps is None else int(t.save_steps)
         keep_last_k = int(t.keep_last_k_ckpts)
         save_full_states_for_resume = bool(t.save_full_states_for_resume)
 
@@ -221,8 +227,6 @@ class OpenWAMTrainer:
         output_path, resume_state_dir = self.setup_output_dir(debug, resume_path)
         optimizer, dataloader, scheduler = self.prepare_accelerate(optimizer, dataloader, scheduler)
 
-        wire_sampler_seed(dataloader, self._run_seed, rank=self._rank)
-
         all_params = [p for group in optimizer.param_groups for p in group["params"]]
 
         is_main = self.accelerator is None or self.accelerator.is_main_process
@@ -230,9 +234,9 @@ class OpenWAMTrainer:
 
         # Periodic world-model rollouts (GT | pred clips to wandb). Every rank holds one
         # fixed sample, picked before epoch 0 so the clips are comparable across vis steps.
-        vis_steps = int(t.vis_steps or 0)  # 0 / null = off
+        vis_steps = None if t.vis_steps is None else int(t.vis_steps)  # null = off
         visualizer = None
-        if vis_steps > 0 and self.dataset is not None:
+        if vis_steps is not None:
             # Eval semantics (no caption dropout, fixed history, no jitter), sharing the preloaded readers.
             visualizer = TrainVisualizer(
                 self.dataset.eval_view(),
@@ -247,7 +251,7 @@ class OpenWAMTrainer:
 
         if num_epochs is not None:
             total_steps = len(dataloader) * num_epochs
-            if max_steps:
+            if max_steps is not None:
                 total_steps = min(total_steps, max_steps)
         else:
             total_steps = max_steps
@@ -265,7 +269,7 @@ class OpenWAMTrainer:
                 resume_state_dir, dataloader, grad_accum
             )
             already_done = (num_epochs is not None and start_epoch >= num_epochs) or (
-                max_steps and global_step >= max_steps
+                max_steps is not None and global_step >= max_steps
             )
             if already_done:
                 logger.info("[resume] global_step=%d already complete; finishing.", global_step)
@@ -291,10 +295,9 @@ class OpenWAMTrainer:
         # different ranks at the same step keep in-batch timestep diversity.
         epochs = itertools.count(start_epoch) if num_epochs is None else range(start_epoch, num_epochs)
         for epoch in epochs:
-            if hasattr(dataloader, "set_epoch"):
-                dataloader.set_epoch(epoch)
-            if hasattr(self.dataset, "set_epoch"):
-                self.dataset.set_epoch(epoch)
+            # Both are required: the prepared loader re-seeds its shuffle, the dataset re-draws its samples.
+            dataloader.set_epoch(epoch)
+            self.dataset.set_epoch(epoch)
             # On the resumed epoch, skip the batches already consumed before the checkpoint.
             if epoch == start_epoch and skip_first > 0:
                 from accelerate import skip_first_batches
@@ -353,7 +356,7 @@ class OpenWAMTrainer:
 
                 # save_steps: write the weights line (+ the resumable full state when
                 # save_full_states_for_resume=true), then prune in lockstep.
-                if save_steps and global_step > 0 and global_step % save_steps == 0:
+                if save_steps is not None and global_step > 0 and global_step % save_steps == 0:
                     save_weights(self.accelerator, self.architecture, output_path, global_step, final=False)
                     if save_full_states_for_resume:
                         save_full_state(self.accelerator, output_path, global_step, opt_step, epoch)
@@ -366,7 +369,7 @@ class OpenWAMTrainer:
 
                 self._timer.end_step()  # bills metric reduce / logging / save / vis to "other"
 
-                if max_steps and global_step >= max_steps:
+                if max_steps is not None and global_step >= max_steps:
                     pbar.close()
                     self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
                     return
@@ -380,9 +383,9 @@ class OpenWAMTrainer:
         t = self.cfg.training
         params = build_trainable_parameters(
             self,
-            # null = that module uses the base learning_rate.
-            action_lr=float(t.action_lr) if t.action_lr else None,
-            video_lr=float(t.video_lr) if t.video_lr else None,
+            # null = that module uses the base learning_rate; a number (0 included) is used as written.
+            action_lr=None if t.action_lr is None else float(t.action_lr),
+            video_lr=None if t.video_lr is None else float(t.video_lr),
         )
         betas = tuple(t.adam_betas)
         return torch.optim.AdamW(params, lr=float(t.learning_rate), weight_decay=float(t.weight_decay), betas=betas)
@@ -429,11 +432,12 @@ class OpenWAMTrainer:
         t = self.cfg.training
         if debug:
             return None
-        if t.lr_scheduler == "cosine":
-            return build_cosine_scheduler(
-                optimizer, total_opt_steps=total_opt_steps, training_cfg=t, num_processes=self.accelerator.num_processes
-            )
-        return None
+        # null = constant LR; resolve_config allows only null / cosine.
+        if t.lr_scheduler is None:
+            return None
+        return build_cosine_scheduler(
+            optimizer, total_opt_steps=total_opt_steps, training_cfg=t, num_processes=self.accelerator.num_processes
+        )
 
     # (6) Called by train() — locate/create the run dir and resolve the resume state dir.
     def setup_output_dir(self, debug: bool, resume_path: str | None) -> tuple[str, str | None]:
@@ -448,8 +452,8 @@ class OpenWAMTrainer:
         base_output_path = self.cfg.training.output_path
         is_main = self.accelerator.is_main_process
 
-        resume_state_dir = find_latest_accel_state(resume_path) if resume_path else None
-        if resume_path and resume_state_dir is None:
+        resume_state_dir = None if resume_path is None else find_latest_accel_state(resume_path)
+        if resume_path is not None and resume_state_dir is None:
             raise FileNotFoundError(
                 f"resume_ckpt_path={resume_path} has no usable accel_state_step_*; full states "
                 f"are only written when training.save_full_states_for_resume=true (and a finished run drops "
@@ -458,10 +462,9 @@ class OpenWAMTrainer:
         if resume_state_dir is not None:
             output_path = os.path.dirname(resume_state_dir)
             logger.info("[resume] reusing run dir %s (state=%s)", output_path, os.path.basename(resume_state_dir))
-            # Keep the checkpoint-dir deploy artifact; refuse resume when it
-            # diverges from the dataset transform (legacy or regenerated stats).
-            if self.dataset is not None:
-                verify_resume_normalization_stats(output_path, self.dataset)
+            # Keep the run dir's deploy stats; refuse the resume when they differ from the dataset's in any way.
+            if normalization_on(self.cfg.dataloader.normalize_mode):
+                verify_resume_normalization_stats(output_path, self.dataset.normalization_stats_path)
             return output_path, resume_state_dir
 
         # Fixed run dir name (e.g. wandb run name) if configured; else the launch timestamp.
@@ -492,8 +495,8 @@ class OpenWAMTrainer:
             # source ckpt dir on finetune), then config + action stats.
             self.architecture.save_assets_for_deployment(output_path)
             save_config(output_path, self.cfg)
-            if self.dataset is not None:
-                save_normalization_stats(output_path, self.dataset)
+            if normalization_on(self.cfg.dataloader.normalize_mode):
+                save_normalization_stats(output_path, self.dataset.normalization_stats_path)
         else:
             output_path = None
         path_list = [output_path] if is_main else [None]
@@ -524,7 +527,7 @@ class OpenWAMTrainer:
         # path is ever reintroduced.
         arch = self.accelerator.unwrap_model(self.architecture)
         # Propagate device down through architecture; frozen modules (T5/VAE) idempotent move.
-        arch.set_dtype_device(arch.dtype, self.accelerator.device)
+        arch.set_dtype_device(self._dtype, self.accelerator.device)
         arch.move_frozen_to_device(self.accelerator.device)
         logger.info(
             "architecture wrapped (%s), device=%s",
@@ -555,7 +558,10 @@ class OpenWAMTrainer:
         if is_main:
             logger.info("[resume] loading Accelerate state from %s", resume_state_dir)
         meta = load_full_state(self.accelerator, resume_state_dir)
-        global_step = int(meta.get("global_step", 0))
+        global_step = int(meta["global_step"])
+        # A state is only saved after a step, so a resumed step 0 means a broken trainer_state.json.
+        if global_step <= 0:
+            raise ValueError(f"[resume] {resume_state_dir}/trainer_state.json has global_step={global_step}; expected > 0")
         # Align global_step to the grad_accum boundary skip was floored to, then derive
         # opt_step from it — otherwise floored-off batches re-train and per-step seeds
         # (keyed on global_step) drift. No-op at grad_accum=1.
@@ -688,19 +694,19 @@ class OpenWAMTrainer:
         self,
         output_path: str,
         global_step: int,
-        save_steps,
+        save_steps: int | None,
         keep_last_k: int,
         is_main: bool,
         wandb_run,
     ) -> None:
         """Unified teardown for every exit path: final weights, drop resume state, close wandb.
 
-        Falsy ``save_steps`` = a profiling/no-write run, so no final artifact (matches the
+        ``save_steps`` None (null) = a profiling/no-write run, so no final artifact (matches the
         periodic-save gating). After the final weights land, ``finalize_keep_weights_only``
         removes every ``accel_state_step_*`` and retains the configured number of recent
         weight checkpoints (rank-0, post-barrier).
         """
-        if save_steps:
+        if save_steps is not None:
             save_weights(self.accelerator, self.architecture, output_path, global_step, final=True)
         self.accelerator.wait_for_everyone()
         if is_main:

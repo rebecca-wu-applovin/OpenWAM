@@ -78,8 +78,8 @@ def _build_accelerator(cfg: DictConfig):
         zero_stage=int(t.zero_stage),
         gradient_accumulation_steps=grad_accum,
         # DeepSpeed clips internally with this value (the loop's clip_grad_norm_ only reads
-        # back the norm under DeepSpeed); single source = training.max_grad_norm, 0.0 = off.
-        gradient_clipping=float(max_grad_norm) if max_grad_norm else 0.0,
+        # back the norm under DeepSpeed); single source = training.max_grad_norm, null = off (DeepSpeed's 0.0).
+        gradient_clipping=0.0 if max_grad_norm is None else float(max_grad_norm),
         offload_optimizer_device=str(t.offload_optimizer_device),
     )
 
@@ -95,7 +95,7 @@ def _train(cfg: DictConfig) -> None:
     from openwam.config import resolve_config
 
     resume_path = cfg.training.resume_ckpt_path
-    if resume_path:
+    if resume_path is not None:
         from openwam.train.utils.ckpt_model_loader import load_resume_cfg
 
         # A resume runs the run's own config.yaml (raises if this launch's config differs), so the

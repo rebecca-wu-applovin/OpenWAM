@@ -47,10 +47,9 @@ if [[ -z "${RESUME_PATH}" ]]; then
     WANDB_RUN_NAME="$(next_run_index)_${WANDB_RUN_NAME}"
     RUN_DIR_OVERRIDE=(training.run_dir_name="${WANDB_RUN_NAME}")
 else
-    # Resuming (run dir, or a .safetensors inside it): a resume must launch the run's saved config, so no new
+    # Resuming a run dir: a resume must launch the run's saved config, so no new
     # index and the wandb name is the run dir's name again; run_dir_name / output_path stay at their defaults.
     RUN_DIR="${RESUME_PATH%/}"
-    [[ "${RUN_DIR}" == *.safetensors ]] && RUN_DIR="$(dirname "${RUN_DIR}")"
     WANDB_RUN_NAME="${RUN_DIR##*/}"
     RUN_DIR_OVERRIDE=()
 fi

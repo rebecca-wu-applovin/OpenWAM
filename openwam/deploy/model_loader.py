@@ -19,9 +19,6 @@ from openwam.model.architectures.base import BaseWAMArchitecture
 
 logger = logging.getLogger(__name__)
 
-# training.mixed_precision -> the dtype the weights are served in (training leaves this to accelerate).
-DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "no": torch.float32}
-
 
 def load_architecture(
     model_cfg: DictConfig, ckpt_dir: str, ckpt_name: str, *, dtype: torch.dtype, device: str
@@ -33,7 +30,7 @@ def load_architecture(
             ``common.layout`` is the latent layout it derived).
         ckpt_dir: run dir (holds the backbone deploy assets ``save_assets_for_deployment`` wrote).
         ckpt_name: ``checkpoint_step_N.safetensors`` inside ``ckpt_dir``.
-        dtype: weight dtype (``DTYPES[training.mixed_precision]``).
+        dtype: weight dtype (``openwam.model.common.dtypes.DTYPES[training.mixed_precision]``).
         device: e.g. ``"cuda:0"``.
     Returns:
         the architecture on ``device`` in ``dtype``, eval mode, every weight from the checkpoint.
@@ -66,8 +63,8 @@ def load_norm_stats(dataloader_cfg: DictConfig, ckpt_dir: str) -> tuple:
     from openwam.dataloader.utils.yam_sharpa_repr import raw_dim
 
     path = os.path.join(ckpt_dir, "normalization_stats.npy")
-    mode, norm = str(dataloader_cfg.action_mode), str(dataloader_cfg.normalize_mode)
+    mode = str(dataloader_cfg.action_mode)
     # Same arguments as YamSharpaDataset._load_stats: stats live in the raw (pre-unify) space.
-    state = load_stats_file(path, action_mode=f"{mode}_state", normalize_mode=norm, dim=raw_dim(mode))
-    action = load_stats_file(path, action_mode=mode, normalize_mode=norm, dim=raw_dim(mode))
+    state = load_stats_file(path, block=f"{mode}_state", dim=raw_dim(mode))
+    action = load_stats_file(path, block=mode, dim=raw_dim(mode))
     return state, action

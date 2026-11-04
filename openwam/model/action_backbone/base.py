@@ -118,8 +118,6 @@ class ActionDiTBackbone(nn.Module, ABC):
         *,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
     ) -> ActionState:
         """MoT coupling: embed the actions and build the per-layer state the driver threads through the blocks.
 
@@ -128,7 +126,6 @@ class ActionDiTBackbone(nn.Module, ABC):
             timestep: (B,) or (1,) action diffusion timestep.
             context: (B, L, text_dim) raw text/proprio context, or None.
             context_mask: (B, L) bool, True = attend, or None.
-            use_gradient_checkpointing / use_gradient_checkpointing_offload: bool (the driver checkpoints itself).
 
         Returns:
             ActionState whose ``payload`` holds the (B, T_action, dim) action hidden state and its modulation.

@@ -1,17 +1,17 @@
 """Closed-loop sim eval of every checkpoint of an OpenWAM yam_sharpa training run, on Modal (16 x L40S per scene set).
 
-``sim-policy-eval watch --model openwam`` (the sibling sim-policy-eval checkout) runs in a CPU coordinator: it waits
-for each ``checkpoint_step_N.safetensors`` the trainer (scripts/modal/train.py) writes to the runs Volume, starts
-OpenWAM's own policy server on it (benchmarks/simeval/serve.py, this checkout), evaluates the scene set (default:
-every ID scene, i.e. the 540 the task verifier grades plus 40 ungradable) split over ``--shards`` ``shard_worker``
-GPUs (default 16 L40S, each with its own server and ``--workers`` evaluate processes; ``--shards 0``: one container
-does everything), and logs the success rate to the training
-run's W&B project and group as a run ``<run>_simeval`` (x axis ``train_step``). After ``TRAINING_DONE`` (written by
-train.py on success) it evaluates the final set and stops. Its supervisor (sim-policy-eval watch/supervisor.py)
-reloads the runs Volume between evaluations, commits the results, and respawns the watch before Modal's 24 h cap.
+``sim-policy-eval watch`` (the sibling sim-policy-eval checkout) runs in a CPU coordinator. It lists the run's complete
+``checkpoint_step_N.safetensors`` with OpenWAM's ``benchmarks/simeval/list_ckpts.py``, serves each one with OpenWAM's
+``benchmarks/simeval/server/serve.py`` over the benchmark's ``sim_policy_v1`` protocol (interface ``openwam_v1``),
+evaluates the scene set (default: every ID scene, i.e. the 540 the task verifier grades plus 40 ungradable) split
+over ``--shards`` ``shard_worker`` GPUs (default 16 L40S, each with its own server and ``--workers`` evaluate
+processes; ``--shards 0``: one container does everything), and logs the success rate to the training run's W&B
+project and group as a run ``<run>_simeval`` (x axis ``train_step``). After ``TRAINING_DONE`` (written by train.py on
+success) it evaluates the final set and stops. Its supervisor (sim-policy-eval watch/supervisor.py) reloads the runs
+Volume between evaluations, commits the results, and respawns the watch before Modal's 24 h cap.
 
-Everything the watch needs from the run is read ONCE, here, from the run's ``config.yaml``: the action
-representation (-> interface ``openwam_<action_mode>_v1``) and the W&B project / group / run name.
+The only thing read from the run here is the W&B project / group of its ``config.yaml``; the server reads the rest
+(action mode, canvas, history) from the same file, and its spec tells the client.
 
     modal deploy scripts/modal/simeval_watch.py                               # after every code change (both repos)
     modal run scripts/modal/simeval_watch.py::smoke --run <group>/<index>_<name> [--step N] [--shards 2]   # 3 scenes
@@ -48,6 +48,11 @@ WATCH_HARD_S = 24 * 3600 - 40 * 60           # kill a running evaluation before 
 DONE_MARKER = "TRAINING_DONE"                # train.py, on a successful finish
 CONFIG_POLL_S = 60                           # a watch launched with its training run polls for the run's config.yaml
 CONFIG_WAIT_S = 3 * 3600                     # ... this long (image build + queueing for GPUs), then gives up
+# The OpenWAM side of the watch, relative to REMOTE_REPO (benchmarks/simeval/README.md).
+INTERFACE = "openwam_v1"                     # sim-policy-eval configs/interfaces/openwam_v1.yaml
+LIST_CKPTS = "benchmarks/simeval/list_ckpts.py"
+SERVER = "benchmarks/simeval/server/serve.py"
+STEPS_PER_PLAN = 20                          # K: must equal openwam_v1's execution.execute (the client checks the spec)
 
 runs_vol = modal.Volume.from_name("openwam-runs")
 assets_vol = modal.Volume.from_name("openwam-assets")                 # backbone weights the run's config points at
@@ -96,61 +101,50 @@ app = modal.App(APP, image=image)
 
 
 def run_settings(run: str) -> dict:
-    """What the watch needs from a training run, read once from its config.yaml.
+    """What the watch needs from a training run, read once from its config.yaml. Blocks until the trainer has written
+    (and committed) that file, so a watch can be launched together with its training run (run_modal.sh does).
 
     Args:
         run: run dir relative to /runs/yjw/outputs, e.g. ``1013_action_repr_ablation/00012_unify_abs``.
     Returns:
-        dict: run_dir (Path), name (the run dir's name = its W&B run id), interface (``openwam_<action_mode>_v1``),
-        wandb_project, wandb_group.
-    """
-    from omegaconf import OmegaConf
-
-    run_dir = Path(RUNS, RUNS_SUBDIR, "outputs", run)
-    cfg_file = run_dir / "config.yaml"
-    if not cfg_file.is_file():
-        raise FileNotFoundError(f"{cfg_file}: no such run (or the trainer has not written its config yet)")
-    cfg = OmegaConf.load(cfg_file)
-    # Required keys of every run config: a missing one raises with its full path.
-    if cfg.dataloader.type != "yam_sharpa":
-        raise ValueError(f"{run}: dataloader.type {cfg.dataloader.type!r}, not yam_sharpa")
-    return {"run_dir": run_dir, "name": run_dir.name,
-            "interface": f"openwam_{cfg.dataloader.action_mode}_v1",
-            "wandb_project": cfg.project.wandb.project,
-            "wandb_group": cfg.project.wandb.group}
-
-
-def wait_for_config(run: str) -> None:
-    """Block until the trainer has written (and committed) the run's config.yaml, so a watch can be launched together
-    with its training run (run_modal.sh does) instead of after it.
-
-    Args:
-        run: run dir relative to /runs/yjw/outputs.
-    Returns: None once the file is visible and parses; raises TimeoutError after CONFIG_WAIT_S.
+        dict: run_dir (Path), name (the run dir's name = its W&B run id), wandb_project, wandb_group.
+        Raises TimeoutError when config.yaml is not readable within CONFIG_WAIT_S.
     """
     import time
 
     from omegaconf import OmegaConf
 
-    def ready(cfg_file: Path) -> bool:
-        """True when the file exists and is valid YAML (a file caught mid-commit reads as NUL bytes)."""
-        try:
-            return cfg_file.is_file() and OmegaConf.load(cfg_file) is not None
-        except Exception:  # noqa: BLE001  (partial file: try again after the next reload)
-            return False
-
-    cfg_file = Path(RUNS, RUNS_SUBDIR, "outputs", run, "config.yaml")
+    run_dir = Path(RUNS, RUNS_SUBDIR, "outputs", run)
+    cfg_file = run_dir / "config.yaml"
     deadline = time.monotonic() + CONFIG_WAIT_S
-    while not ready(cfg_file):
+    while True:
+        try:
+            cfg = OmegaConf.load(cfg_file) if cfg_file.is_file() else None
+        except Exception:  # noqa: BLE001  (a file caught mid-commit reads as NUL bytes: try after the next reload)
+            cfg = None
+        if cfg is not None:
+            break
         if time.monotonic() > deadline:
             raise TimeoutError(f"{cfg_file}: not readable within {CONFIG_WAIT_S} s (did the training run start?)")
         print(f"[simeval] waiting for {cfg_file} (poll every {CONFIG_POLL_S} s)", flush=True)
         time.sleep(CONFIG_POLL_S)
         runs_vol.reload()   # the mount only shows files committed after the last reload
+    # Required keys of every run config: a missing one raises with its full path.
+    # The servers serve yam_sharpa runs only: fail here, not once per checkpoint.
+    if cfg.dataloader.type != "yam_sharpa":
+        raise ValueError(f"{run}: dataloader.type {cfg.dataloader.type!r}, not yam_sharpa")
+    return {"run_dir": run_dir, "name": run_dir.name,
+            "wandb_project": cfg.project.wandb.project,
+            "wandb_group": cfg.project.wandb.group}
 
 
 def watch_command(settings: dict, intermediate: str, final: str, workers: int, extra: list[str]) -> list[str]:
     """The ``sim-policy-eval watch`` argv for one run.
+
+    Checkpoints come from ``list_ckpts.py`` (it applies SETTLE_S and the safetensors integrity check, and appends
+    ``deploy.policy.steps_per_plan=K`` for the server); every server is ``serve.py`` under this image's python, in
+    REMOTE_REPO. ``--no-check-server``: sim-policy-eval's conformance check speaks the old WebSocket protocol, not
+    ``sim_policy_v1`` (the client's own spec check runs at every connect).
 
     Args:
         settings: run_settings(); intermediate / final: scene sets (``split=id``, ``none``...); workers: parallel
@@ -158,10 +152,12 @@ def watch_command(settings: dict, intermediate: str, final: str, workers: int, e
     Returns:
         argv list.
     """
+    list_ckpts = (f"{sys.executable} {LIST_CKPTS} {settings['run_dir']} --steps-per-plan {STEPS_PER_PLAN} "
+                  f"--settle-s {SETTLE_S}")
     cmd = [f"{SIM_EVAL}/.venv/bin/python", "-m", "sim_policy_eval.cli", "--configs", f"{SIM_EVAL}/configs", "watch",
-           "--model", "openwam", "--interface", settings["interface"], "--run-dir", str(settings["run_dir"]),
-           "--openwam-root", REMOTE_REPO, "--server-python", sys.executable, "--results", RESULTS,
-           "--scenes-dir", f"{SCENES}/scenes", "--settle-s", str(SETTLE_S), "--done-marker", DONE_MARKER,
+           "--list-ckpts", list_ckpts, "--interface", INTERFACE, "--server", SERVER, "--no-check-server",
+           "--run-dir", str(settings["run_dir"]), "--openwam-root", REMOTE_REPO, "--server-python", sys.executable,
+           "--results", RESULTS, "--scenes-dir", f"{SCENES}/scenes", "--done-marker", DONE_MARKER,
            "--intermediate", intermediate, "--final", final, "--workers", str(workers), "--judge", "off",
            "--video-per-base", str(VIDEO_PER_BASE)]
     if settings["wandb_project"]:
@@ -184,15 +180,16 @@ def _run_watch(run: str, intermediate: str, final: str, workers: int, shards: in
     Returns:
         the watch's exit code (0 = finished).
     """
+    import shlex
+
     sys.path.insert(0, f"{SIM_EVAL}/src/sim_policy_eval/watch")   # stdlib only: importable from this python
     from supervisor import SYNC_FAILED, WATCH_STOP, supervise
 
     runs_vol.reload()
-    wait_for_config(run)   # returns at once if the run exists (always true on a respawn)
-    settings = run_settings(run)
+    settings = run_settings(run)   # returns at once if the run exists (always true on a respawn)
     per_machine = ["--remote-shards", str(shards), "--shard-workers", str(workers)] if shards else []
     cmd = watch_command(settings, intermediate, final, workers, per_machine + list(extra))
-    print(f"[simeval] attempt {attempt}: {' '.join(cmd)}", flush=True)
+    print(f"[simeval] attempt {attempt}: {shlex.join(cmd)}", flush=True)
 
     def run_shards(payload: dict) -> list[dict]:
         calls = [shard_worker.spawn(spec) for spec in payload["specs"]]   # all shards at once

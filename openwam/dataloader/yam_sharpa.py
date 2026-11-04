@@ -20,14 +20,15 @@ A window is only drawn where every future / action row exists. ``history_samplin
 only) replaces the fixed history offsets per sample by H-1 random rows of the past ``history_window`` rows plus
 frame t, drawn from the sample's ``(seed, epoch, idx)`` RNG; val keeps ``history_offsets`` (the layout deploy serves).
 
-Width D is 48 for ``fingertips_*`` (``unify_action`` off) and 80 for
-``unify_*`` (raw 62 scattered by ``UNIFY_ACTION_MAP``). The unify switch is
-derived from ``action_mode``; do not set ``unify_action`` in the config.
+Width D is 48 for ``fingertips_*`` (unify off) and 80 for ``unify_*`` (raw 62
+scattered by ``unify_action_map``). The unify switch and map are derived from
+``action_mode``; a config setting ``unify_action`` / ``unify_action_map`` raises.
 """
 
 from __future__ import annotations
 
 import copy
+import functools
 import logging
 import os
 import time
@@ -39,7 +40,7 @@ import torch
 
 from openwam.dataloader.bases import BaseDataset, LeRobotV3Reader
 from openwam.dataloader.transforms.multiview import assemble_vstack_layout
-from openwam.dataloader.utils.normalization import apply_normalization, load_stats_file
+from openwam.dataloader.utils.normalization import apply_normalization, load_stats_file, normalization_on
 from openwam.dataloader.utils.sparse_history import history_rows, sample_history_offsets
 from openwam.dataloader.utils.video_io import decode_video_frames as _decode_video_frames
 from openwam.dataloader.utils.yam_sharpa_repr import (
@@ -100,6 +101,11 @@ def _read_stats_meta(path: Path) -> Optional[dict]:
     return payload.get("yam_sharpa_meta") if isinstance(payload, dict) else None
 
 
+def _identity(rows: np.ndarray) -> np.ndarray:
+    """rows: (..., D) raw rows. Returns: the same rows (the normalizer slot when normalization is off)."""
+    return rows
+
+
 def _validate_sparse_offsets(
     history_offsets: Sequence[int], future_offsets: Sequence[int]
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -132,13 +138,9 @@ class YamSharpaDataset(LeRobotV3Reader):
 
     DATASET_NAME = "YamSharpa"
 
-    # The dataloader keys every reader is built from (all required). unify_* are derived from action_mode, so they
-    # are not accepted from config; target_camera is unused (camera_layout picks the cameras).
-    CONFIG_KEYS: ClassVar[Tuple[str, ...]] = tuple(
-        k
-        for k in LeRobotV3Reader.CONFIG_KEYS
-        if k not in ("unify_action", "unify_action_map", "unify_state_map", "target_camera")
-    ) + (
+    # The dataloader keys every reader is built from (all required). target_camera is unused (camera_layout picks
+    # the cameras).
+    CONFIG_KEYS: ClassVar[Tuple[str, ...]] = tuple(k for k in LeRobotV3Reader.CONFIG_KEYS if k != "target_camera") + (
         "action_mode",
         "fps",
         "normalization_stats_path",
@@ -179,12 +181,10 @@ class YamSharpaDataset(LeRobotV3Reader):
             history_window: int, rows back the random history may reach (100 = 5 s at 20 Hz); unused when fixed.
             **kwargs: forwarded to :class:`LeRobotV3Reader` (num_frames, height, width, split, ...).
         """
-        for key in ("unify_action", "unify_action_map", "unify_state_map"):
-            if kwargs.pop(key, None) is not None:
-                raise ValueError(f"YamSharpa derives {key} from action_mode; remove it from the config")
         self.action_mode = validate_repr(action_mode)
-        self._source_stats_path = str(normalization_stats_path) if normalization_stats_path else None
-        self._state_normalization_stats: Optional[dict] = None  # filled by _load_stats
+        self._source_stats_path = normalization_stats_path
+        # Raw rows -> model rows: identity when normalization is off; _load_stats binds the stats when it is on.
+        self._normalize_action = self._normalize_state = _identity
         self._layout_cams = [str(c) for c in camera_layout]
         self._history_offsets, self._future_offsets = _validate_sparse_offsets(history_offsets, future_offsets)
         # Read by _select_augmentations, which the base __init__ calls.
@@ -197,11 +197,10 @@ class YamSharpaDataset(LeRobotV3Reader):
         super().__init__(
             dataset_dir=dataset_dir,
             camera_layout=self._layout_cams,
-            # camera_layout picks the cameras; the proprio unify map is the action's (None).
+            # camera_layout picks the cameras; the action_mode decides unify (proprio shares the action's map).
             target_camera=None,
             unify_action=is_unify(self.action_mode),
             unify_action_map=unify_action_map(self.action_mode),
-            unify_state_map=None,
             **kwargs,
         )
         # The config's data rate is what deploy serves at: it must be the recorded one.
@@ -254,7 +253,7 @@ class YamSharpaDataset(LeRobotV3Reader):
 
     def _post_init(self, info: dict) -> None:
         """Fail fast if the dataset schema differs from what the representations assume."""
-        features = info.get("features", {}) or {}
+        features = info["features"]
         expected = {
             STATE_COL: POSE48_DIM,
             ACTION_COL: POSE48_DIM,
@@ -263,7 +262,9 @@ class YamSharpaDataset(LeRobotV3Reader):
             CAM_POSE_COL: CAM_POSE_DIM,
         }
         for col, dim in expected.items():
-            shape = tuple((features.get(col) or {}).get("shape", ()))
+            if col not in features:
+                raise KeyError(f"YamSharpa({self._dataset_id}): feature {col!r} not in info.features")
+            shape = tuple(features[col]["shape"])
             if shape != (dim,):
                 raise ValueError(f"YamSharpa({self._dataset_id}): feature {col!r} must have shape [{dim}], got {shape}")
         missing = [c for c in self._layout_cams if c not in features]
@@ -275,33 +276,25 @@ class YamSharpaDataset(LeRobotV3Reader):
                 f"YamSharpa: height={self._height} must split evenly over {len(self._layout_cams)} cameras"
             )
 
-    def _load_stats(self, info: dict) -> Optional[dict]:
-        """Load action stats (returned) and proprio stats (``_state`` block) from the pooled file.
+    def _load_stats(self, info: dict) -> None:
+        """Bind the action and proprio normalization to the pooled stats file (normalization on only).
+
+        Args:
+            info: dict, the parsed ``meta/info.json`` (unused: the pooled file covers every source).
 
         Returns:
-            dict of (D,) arrays {mean, std, min, max, q01, q99} for the action, or None if normalization is off.
+            None. Sets ``_normalize_action`` (``<action_mode>`` block) and ``_normalize_state``
+            (``<action_mode>_state`` block); a missing file / block / field raises.
         """
-        if not self._normalize_mode or self._normalize_mode in ("none", "null"):
-            return None
-        if not self._source_stats_path or not Path(self._source_stats_path).is_file():
-            raise FileNotFoundError(
-                f"YamSharpa({self._dataset_id}): normalize_mode={self._normalize_mode!r} needs the pooled stats "
-                f"file {self._source_stats_path!r} (MultiYamSharpaDataset.from_config builds it)."
-            )
         dim = self._raw_action_dim
-        self._state_normalization_stats = load_stats_file(
-            self._source_stats_path,
-            action_mode=f"{self.action_mode}_state",
-            normalize_mode=self._normalize_mode,
-            dim=dim,
-        )
+        action = load_stats_file(self._source_stats_path, block=self.action_mode, dim=dim)
+        state = load_stats_file(self._source_stats_path, block=f"{self.action_mode}_state", dim=dim)
+        self._normalize_action = functools.partial(apply_normalization, stats=action, mode=self._normalize_mode)
+        self._normalize_state = functools.partial(apply_normalization, stats=state, mode=self._normalize_mode)
         # The pooled file is also the deploy artifact copied into checkpoints.
         self.normalization_stats_path = self._source_stats_path
-        return load_stats_file(
-            self._source_stats_path, action_mode=self.action_mode, normalize_mode=self._normalize_mode, dim=dim
-        )
 
-    def _action_20d(self, win) -> np.ndarray:
+    def _action_rows(self, win) -> np.ndarray:
         """Normalized raw action for the window.
 
         Args:
@@ -324,7 +317,7 @@ class YamSharpaDataset(LeRobotV3Reader):
             target_setpoints56=np.stack(win[SETPOINT_COL].values),
             target_cam16=cam,
         )
-        return apply_normalization(raw, self._normalization_stats, self._normalize_mode)
+        return self._normalize_action(raw)
 
     # ----- sample ---------------------------------------------------------------
 
@@ -349,7 +342,7 @@ class YamSharpaDataset(LeRobotV3Reader):
         # Action rows t .. t+num_frames-1 always exist (see _min_window_len).
         win = table.slice(ep_row0 + offset, self._num_frames).to_pandas()
         prompt = self._resolve_prompt(row, win)
-        action, action_mask = self._finalize_action(self._action_20d(win), self._num_frames)
+        action, action_mask = self._finalize_action(self._action_rows(win), self._num_frames)
 
         # This sample's offsets (fixed, or drawn first in random mode); rows then clamp to the episode start
         # (repeat the first frame), the same rule deploy uses.
@@ -393,7 +386,7 @@ class YamSharpaDataset(LeRobotV3Reader):
             np.stack(hist[CAM_POSE_COL].values),
             anchor_cam16,
         )
-        return apply_normalization(raw, self._state_normalization_stats, self._normalize_mode)
+        return self._normalize_state(raw)
 
     # ----- video: cameras stacked top-to-bottom ------------------------------
 
@@ -615,10 +608,8 @@ class MultiYamSharpaDataset(BaseDataset):
             if key in config:
                 raise ValueError(f"yam_sharpa derives {key} from action_mode; remove it from the config")
 
-        # null normalize_mode = no normalization (the reader's own string check).
-        normalize_mode = config.normalize_mode
         stats_path = None
-        if normalize_mode and str(normalize_mode).lower() not in ("none", "null"):
+        if normalization_on(config.normalize_mode):
             raw_path = config.normalization_stats_path
             if not raw_path:
                 raise ValueError("yam_sharpa: normalization_stats_path is required when normalization is on")

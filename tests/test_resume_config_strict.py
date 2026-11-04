@@ -123,3 +123,15 @@ def test_changed_assets_raise(tmp_path):
     launch = _launch(run_dir, assets__video_backbone__model_path="/host_b/Wan2.2-TI2V-5B")
     with pytest.raises(ValueError, match=r"assets\.video_backbone\.model_path: saved=.* launch='/host_b/"):
         cml.load_resume_cfg(launch, run_dir)
+
+
+def test_a_weights_file_is_not_a_resume_source(tmp_path):
+    """resume_ckpt_path names the run dir: a file inside it raises at load_resume_cfg, before any build."""
+    run_dir = _run_dir(tmp_path)
+    weights = tmp_path / "checkpoint_step_10.safetensors"
+    weights.write_bytes(b"")
+    with pytest.raises(ValueError, match="finetune_ckpt_path"):
+        cml.load_resume_cfg(_launch(str(weights)), str(weights))
+    # build_for_resume (direct callers) applies the same rule.
+    with pytest.raises(ValueError, match="not a directory"):
+        cml.build_for_resume(str(weights), _launch(run_dir), None)

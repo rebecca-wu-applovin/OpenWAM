@@ -1,5 +1,5 @@
 """Hard merge gate: ``pre_attn_at_layer + attention + post_attn_at_layer`` must
-produce numerically identical output to ``DiTBlock.forward`` / ``SelfAttnActionDiTBlock.forward``.
+produce numerically identical output to ``DiTBlock.forward`` / ``_self_attn_block_reference`` (the action block in one pass).
 
 The split is the foundation of the joint self-attention path. If it diverges
 from the plain block forward, every test that uses ``run_block`` silently keeps working while the new path quietly
@@ -17,7 +17,7 @@ from openwam.model.video_backbone.wan.dit import DiTBlock, precompute_freqs_cis_
 
 def _attention_single_stream(q, k, v, num_heads):
     """Standalone attention matching what DiTBlock.self_attn.attn does internally."""
-    from openwam.model.video_backbone.wan.dit import flash_attention
+    from openwam.model.common.attention import flash_attention
 
     return flash_attention(q, k, v, num_heads=num_heads)
 
@@ -130,13 +130,31 @@ def test_wan_dit_block_split_equivalence():
     )
 
 
+def _self_attn_block_reference(block, x, t_mod, freqs):
+    """The whole SelfAttnActionDiTBlock in one pass (no context): the reference the split path must equal.
+
+    Args:
+        block: SelfAttnActionDiTBlock. x: (B, S, dim) hidden state. t_mod: (B, 6, dim) modulation.
+        freqs: (S, head_dim / 2) complex RoPE table.
+
+    Returns:
+        (B, S, dim): x + gated self-attention, then + gated FFN (AdaLN-modulated, as the block's halves do).
+    """
+    chunks = (block.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = chunks
+    attn_input = block.self_attn_norm(x) * (1 + scale_msa) + shift_msa
+    x = block.gate(x, gate_msa, block.self_attn(attn_input, freqs=freqs))
+    mlp_input = block.ffn_norm(x) * (1 + scale_mlp) + shift_mlp
+    return block.gate(x, gate_mlp, block.ffn(mlp_input))
+
+
 # ---------------------------------------------------------------------------
 # Action SelfAttnActionDiTBlock equivalence — drives the ActionDiT(joint_self_attn) path.
 # ---------------------------------------------------------------------------
 
 
 def test_action_mot_block_split_equivalence():
-    """ActionDiT pre_attn + attention + post_attn ≡ SelfAttnActionDiTBlock.forward (no context)."""
+    """ActionDiT pre_attn + attention + post_attn ≡ _self_attn_block_reference (no context)."""
     torch.manual_seed(0)
     action_dim, dim, num_heads, ffn_dim = 7, 32, 4, 64
     B, S = 2, 5
@@ -176,8 +194,8 @@ def test_action_mot_block_split_equivalence():
         freqs = payload.action_freqs.clone()
 
         block: SelfAttnActionDiTBlock = dit.blocks[0]
-        # SelfAttnActionDiTBlock.forward with context=None: self-attn norm/proj + RoPE + FFN.
-        out_ref = block(x_init, context=None, t_mod=t_mod, freqs=freqs)
+        # The one-pass reference, context=None: self-attn norm/proj + RoPE + FFN.
+        out_ref = _self_attn_block_reference(block, x_init, t_mod, freqs)
 
     # Split: ActionDiT pre/post_attn_at_layer round-trip with single-stream attention
     with torch.no_grad():
@@ -191,7 +209,7 @@ def test_action_mot_block_split_equivalence():
         out_split = astate2.payload.x_action
 
     assert torch.allclose(out_ref, out_split, atol=0, rtol=0), (
-        f"ActionDiT split disagrees with SelfAttnActionDiTBlock.forward; max diff = {(out_ref - out_split).abs().max().item()}"
+        f"ActionDiT split disagrees with _self_attn_block_reference; max diff = {(out_ref - out_split).abs().max().item()}"
     )
 
 
@@ -199,7 +217,7 @@ def test_action_mot_block_heterogeneous_hidden_dim():
     """FastWAM-Joint-style: action hidden_dim=32 but Q/K/V live in num_heads*attn_head_dim=64.
 
     The split (pre_attn + SDPA + post_attn) must still equal the standalone
-    SelfAttnActionDiTBlock.forward at atol=0. This is the regression gate for the
+    _self_attn_block_reference at atol=0. This is the regression gate for the
     heterogeneous-hidden refactor.
     """
     torch.manual_seed(0)
@@ -244,7 +262,7 @@ def test_action_mot_block_heterogeneous_hidden_dim():
         x_init = payload.x_action.clone()
         t_mod = payload.t_mod.clone()
         freqs = payload.action_freqs.clone()
-        out_ref = block(x_init, context=None, t_mod=t_mod, freqs=freqs)
+        out_ref = _self_attn_block_reference(block, x_init, t_mod, freqs)
 
         context, context_mask = _masked_action_context(dit, B)
         astate2 = dit.prepare_state(actions, timestep, context=context, context_mask=context_mask)
@@ -258,6 +276,6 @@ def test_action_mot_block_heterogeneous_hidden_dim():
         out_split = astate2.payload.x_action
 
     assert torch.allclose(out_ref, out_split, atol=0, rtol=0), (
-        f"heterogeneous-hidden split disagrees with SelfAttnActionDiTBlock.forward; "
+        f"heterogeneous-hidden split disagrees with _self_attn_block_reference; "
         f"max diff = {(out_ref - out_split).abs().max().item()}"
     )

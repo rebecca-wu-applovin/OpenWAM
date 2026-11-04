@@ -14,7 +14,8 @@ Latent layout of one sample (H history frames, the last one is the current frame
 
 It also runs the cross-block checks (attention keys, proprio routing, random-history window) and validates the
 dataloader's sampling keys (``history_sampling`` / ``history_window`` / ``caption_dropout_p``) in this one place: the
-dataset reads them without re-checking.
+dataset reads them without re-checking. The ``training`` switches (mixed_precision, lr_scheduler, the null-means-off
+step / clip knobs, the checkpoint-source paths) are checked here too, so the trainer reads them as written.
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ from __future__ import annotations
 from typing import Sequence
 
 from omegaconf import DictConfig, OmegaConf, open_dict
+
+from openwam.model.common.dtypes import DTYPES
 
 HISTORY_ENCODINGS = ("per_frame", "clip")
 CLEAN_ATTENTIONS = ("bidirectional", "causal")
@@ -44,6 +47,12 @@ REMOVED_BACKBONE_KEYS = {
     "text_encoder_dropout": "cosmos3 caption-dropout probability",
     "text_encoder_dropout_seed": "cosmos3 caption-dropout RNG seed",
 }
+# training.lr_scheduler values besides null (= constant LR).
+LR_SCHEDULERS = ("cosine",)
+# Training knobs where null = off / no limit; a set value must be > 0 (0 is not a second spelling of "off").
+POSITIVE_OR_NULL_TRAINING_KEYS = ("save_steps", "vis_steps", "max_steps", "max_grad_norm")
+# Checkpoint-source keys: null = unset; "" is not a second spelling of null.
+CKPT_PATH_TRAINING_KEYS = ("finetune_ckpt_path", "resume_ckpt_path")
 # GE's generic-named ``seed`` only seeded its caption dropout; checked for GE alone (another backbone may own a seed).
 REMOVED_GE_KEYS = {"seed": "GE caption-dropout RNG seed"}
 
@@ -206,6 +215,37 @@ def _check_seed(project: DictConfig) -> None:
         )
 
 
+def _check_training(training: DictConfig) -> None:
+    """Check the ``training`` switches, so the trainer reads them as written (null is the only "off").
+
+    Args:
+        training: ``cfg.training``.
+
+    Returns:
+        None. KeyError for a ``mixed_precision`` outside :data:`DTYPES`; ValueError for an ``lr_scheduler`` other
+        than null / cosine, a set ``save_steps`` / ``vis_steps`` / ``max_steps`` / ``max_grad_norm`` that is not
+        > 0, or a ``finetune_ckpt_path`` / ``resume_ckpt_path`` that is "".
+    """
+    if training.mixed_precision not in DTYPES:
+        raise KeyError(
+            f"training.mixed_precision={training.mixed_precision!r}; allowed values: {sorted(DTYPES)}"
+        )
+    if training.lr_scheduler is not None and training.lr_scheduler not in LR_SCHEDULERS:
+        raise ValueError(
+            f"training.lr_scheduler={training.lr_scheduler!r}; allowed: {list(LR_SCHEDULERS)} or null (constant LR)"
+        )
+    for key in POSITIVE_OR_NULL_TRAINING_KEYS:
+        value = training[key]
+        if value is None:
+            continue
+        # bool is an int subclass: a yaml `true` is not a step count; a str (CLI typo) is not a number.
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ValueError(f"training.{key}={value!r}: must be > 0, or null for off / no limit")
+    for key in CKPT_PATH_TRAINING_KEYS:
+        if training[key] == "":
+            raise ValueError(f'training.{key}="": use null to leave it unset')
+
+
 def _check_caption_dropout(dl: DictConfig) -> None:
     """Check ``dataloader.caption_dropout_p`` (the dataset reads it without re-checking).
 
@@ -232,9 +272,11 @@ def resolve_config(cfg: DictConfig) -> DictConfig:
         ``cfg`` itself, with ``cfg.common.layout`` set and the whole config read-only (``OmegaConf.set_readonly``,
         interpolations unresolved; struct off so component slices can be merged). Raises ValueError when a stale
         hand-written architecture key or a removed backbone caption-dropout key is present, an existing layout
-        disagrees with the derived one, ``project.seed`` is not an int, or a check above fails.
+        disagrees with the derived one, ``project.seed`` is not an int, or a check above fails; KeyError for an
+        unknown ``training.mixed_precision``.
     """
     _check_seed(cfg.project)
+    _check_training(cfg.training)
     arch = cfg.model.architecture
     stale = [k for k in REMOVED_ARCH_KEYS if k in arch]
     if stale:

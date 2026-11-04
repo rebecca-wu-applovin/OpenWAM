@@ -118,3 +118,11 @@ class TestRoundTrip:
         unified[:, dst] = known
         recovered = unmap_from_unify(unified, dst)
         np.testing.assert_array_equal(recovered, known)
+
+
+def test_parse_unify_spec_takes_plain_lists_only():
+    """No type guessing: a config container is the caller's to convert, so a ListConfig is rejected like any non-list."""
+    from omegaconf import OmegaConf
+
+    with pytest.raises(ValueError, match="non-empty list"):
+        parse_unify_spec(OmegaConf.create(["0-1"]), 4)

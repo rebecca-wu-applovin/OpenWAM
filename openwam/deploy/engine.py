@@ -90,7 +90,8 @@ class InferenceEngine:
             InferenceEngine on ``cfg.deploy.server.device``.
         """
         from openwam.dataloader.utils.yam_sharpa_repr import raw_dim
-        from openwam.deploy.model_loader import DTYPES, load_architecture, load_norm_stats
+        from openwam.deploy.model_loader import load_architecture, load_norm_stats
+        from openwam.model.common.dtypes import DTYPES
         from openwam.model.denoise_schedule import make_schedule, normalize_denoise_config
 
         dl, dep = cfg.dataloader, cfg.deploy

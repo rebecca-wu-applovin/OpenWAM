@@ -122,9 +122,8 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
             action_timestep,
             context=action_text.context,
             context_mask=action_text.context_mask,
-            use_gradient_checkpointing=use_gradient_checkpointing,
-            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         )
+        # The driver checkpoints each layer itself (the action state is built once, outside the loop).
         vstate, astate = driver.run_joint_loop(
             vstate,
             astate,

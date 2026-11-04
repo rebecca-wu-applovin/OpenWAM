@@ -1,6 +1,5 @@
 """Tests for WAM Architecture registry and implementations."""
 
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +18,7 @@ from tests._arch import (
     stub_backbone,
 )
 from tests._layout import make_layout
+from tests._training_cfg import cpu_accelerator
 
 
 def _action_context(ab, batch_size: int, seq_len: int = 4):
@@ -201,6 +201,7 @@ def test_openwam_trainer_uses_strategy_freeze_list(monkeypatch):
                 "mot_checkpoint_mixed_attn": False,
                 "freeze": ["aux_backbone.inner"],
                 "text_cache": False,
+                "mixed_precision": "bf16",
             },
             "model": {"architecture": {"framework": "dual_system", "variant": "joint_self_attn"}},
             "common": {"action_dim": 7, "state_dim": 7, "layout": make_layout()},
@@ -208,7 +209,7 @@ def test_openwam_trainer_uses_strategy_freeze_list(monkeypatch):
         }
     )
 
-    trainer = OpenWAMTrainer(cfg, accelerator=None, dataset=None)
+    trainer = OpenWAMTrainer(cfg, accelerator=cpu_accelerator(), dataset=None)
     arch = holder["arch"]
 
     assert trainer.architecture is arch
@@ -373,31 +374,6 @@ def test_action_self_attention_rope_breaks_permutation_equivariance():
     )
     # And RoPE output must differ from no-freqs output on the same input.
     assert not torch.allclose(out_rope, out_plain, atol=1e-5)
-
-
-def test_action_flash_attention_backend_falls_back_to_sdpa_on_cpu(monkeypatch):
-    """Flash-style ActionDiT backends are CUDA-only; CPU unit tests need SDPA."""
-    import types
-
-    from openwam.model.action_backbone import components
-
-    def _cuda_only_flash_attn(*args, **kwargs):
-        raise AssertionError("flash_attn_func should not receive CPU tensors")
-
-    monkeypatch.setitem(
-        sys.modules,
-        "flash_attn",
-        types.SimpleNamespace(flash_attn_func=_cuda_only_flash_attn),
-    )
-
-    fn = components._try_flash_attn_2()
-    assert fn is not None
-    q = torch.randn(1, 2, 3, 4)
-    k = torch.randn(1, 2, 3, 4)
-    v = torch.randn(1, 2, 3, 4)
-
-    out = fn(q, k, v)
-    assert out.shape == q.shape
 
 
 def test_action_dit_joint_cross_attn_uses_rope():

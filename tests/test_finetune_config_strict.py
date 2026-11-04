@@ -18,6 +18,7 @@ from omegaconf import OmegaConf
 from openwam.config import resolve_config
 from openwam.train.utils import ckpt_model_loader as cml
 from tests._arch import TEST_TRAIN_OPTIONS
+from tests._training_cfg import CHECKED_TRAINING, cpu_accelerator
 
 # Minimal stand-in for a saved run's config.yaml: the backbone geometry block plus the keys resolve_config reads.
 CKPT_CFG = {
@@ -55,6 +56,7 @@ CKPT_CFG = {
         "caption_dropout_p": 0.0,
     },
     "training": {
+        **CHECKED_TRAINING,
         "batch_size": 24,
         "learning_rate": 1e-4,
         "freeze": ["video_backbone.vae"],
@@ -103,7 +105,7 @@ def _live_cfg(**patch):
     Returns:
         DictConfig, resolved and read-only as the training entry hands it on.
     """
-    cfg = OmegaConf.create({**CKPT_CFG, "training": {"batch_size": 4, "learning_rate": 1e-4}, "project": {"seed": 42}})
+    cfg = OmegaConf.create({**CKPT_CFG, "training": {**CHECKED_TRAINING, "batch_size": 4, "learning_rate": 1e-4}, "project": {"seed": 42}})
     for dotted, val in patch.items():
         OmegaConf.update(cfg, dotted.replace("__", "."), val, force_add=True)
     OmegaConf.set_struct(cfg, True)
@@ -317,6 +319,7 @@ def test_build_architecture_from_ckpt_dir_uses_checkpoint_mode(tmp_path, monkeyp
 
 # The training keys OpenWAMTrainer.__init__ reads.
 TRAINER_TRAINING = {
+    **CHECKED_TRAINING,
     "initialize_model_on_cpu": False,
     "lambda_video": 1.0,
     "lambda_action": 1.0,
@@ -366,7 +369,7 @@ def test_trainer_finetune_freezes_from_training_freeze(tmp_path, monkeypatch):
     frozen: dict = {}
     _stub_trainer_arch(monkeypatch, frozen)
 
-    OpenWAMTrainer(cfg, accelerator=None, dataset=None)
+    OpenWAMTrainer(cfg, accelerator=cpu_accelerator(), dataset=None)
 
     # The training knobs reach the constructor once, from cfg.training.
     assert frozen["train_options"] == TrainOptions(

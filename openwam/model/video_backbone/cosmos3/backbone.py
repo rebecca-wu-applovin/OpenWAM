@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Tuple
 
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -147,9 +147,9 @@ def _freeze_und_pathway(net) -> int:
             for p in getattr(layer, name).parameters():
                 p.requires_grad_(False)
                 frozen += p.numel()
-        # Not every variant has every und attention child (e.g. k_norm_und_for_gen is Edge-only).
+        # The vendor sets k_norm_und_for_gen to None unless its config enables it (Edge); every other child exists.
         for name in _UND_PATHWAY_ATTN_CHILDREN:
-            child = getattr(layer.self_attn, name, None)
+            child = getattr(layer.self_attn, name)
             if child is not None:
                 for p in child.parameters():
                     p.requires_grad_(False)
@@ -166,9 +166,8 @@ def _drop_lm_head(net) -> None:
     Returns:
         None.
     """
-    if hasattr(net, "lm_head") and net.lm_head is not None:
-        delattr(net, "lm_head")
-        object.__setattr__(net, "lm_head", None)
+    delattr(net, "lm_head")
+    object.__setattr__(net, "lm_head", None)
 
 
 def freeze_unused_native_heads(net) -> int:
@@ -183,19 +182,18 @@ def freeze_unused_native_heads(net) -> int:
     Returns:
         int, number of frozen parameter elements.
     """
+    # The vendor builds each head only when its config switch is on.
+    heads = []
+    if net.config.action_gen:
+        heads += [net.action_proj_in, net.action_proj_out, net.action_modality_embed]
+    if net.config.sound_gen:
+        heads += [net.audio_proj_in, net.audio_proj_out, net.audio_modality_embed]
     frozen = 0
-    # Modules first (absent on some variants), then the bare embedding parameters.
-    for name in ("action_proj_in", "action_proj_out", "audio_proj_in", "audio_proj_out"):
-        child = getattr(net, name, None)
-        if child is not None:
-            for p in child.parameters():
-                p.requires_grad_(False)
-                frozen += p.numel()
-    for name in ("action_modality_embed", "audio_modality_embed"):
-        param = getattr(net, name, None)
-        if param is not None:
-            param.requires_grad_(False)
-            frozen += param.numel()
+    for head in heads:
+        # A module's parameters, or the bare modality-embedding parameter itself.
+        for p in head.parameters() if isinstance(head, torch.nn.Module) else [head]:
+            p.requires_grad_(False)
+            frozen += p.numel()
     return frozen
 
 
@@ -396,7 +394,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             max_text_tokens=int(cfg.max_text_tokens),
         )
 
-    def _capture_pristine_inv_freq(self) -> Optional[Tensor]:
+    def _capture_pristine_inv_freq(self) -> Tensor:
         """Keep an fp32 copy of the rotary table that no dtype cast can reach.
 
         Held as a plain attribute, deliberately: ``nn.Module._apply`` walks
@@ -412,21 +410,12 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         non-fp32 at construction (a caller that pre-cast the net), since a
         rounded snapshot would be worse than the exact closed form.
         """
-        rope = getattr(self.dit, "rotary_emb", None)
-        inv_freq = getattr(rope, "inv_freq", None) if rope is not None else None
-        # Tiny test shells have no rotary table.
-        if inv_freq is None:
-            return None
+        inv_freq = self.dit.rotary_emb.inv_freq
         # The normal case: copy the fp32 table as it is.
         if inv_freq.dtype == torch.float32:
             return inv_freq.detach().to(device="cpu", copy=True)
         # Pre-cast net: recompute the exact table from the config.
-        cfg = getattr(self.dit, "config", None)
-        head_dim = getattr(cfg, "head_dim", None)
-        rope_theta = getattr(cfg, "rope_theta", None)
-        if head_dim is None or rope_theta is None:
-            logger.warning("cosmos3_edge: rotary inv_freq is %s at build and cannot be recomputed.", inv_freq.dtype)
-            return None
+        head_dim, rope_theta = self.dit.config.head_dim, self.dit.config.rope_theta
         logger.warning(
             "cosmos3_edge: rotary inv_freq was already %s at build; recomputing the fp32 table from config.",
             inv_freq.dtype,
@@ -461,9 +450,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         # fp32 phases, 6.6 rad max) while leaving the text positions intact.
         # Cosmos3VLTextRotaryEmbedding runs the position matmul in fp32 with
         # autocast disabled, but that protects the product, not the table.
-        rope = getattr(self.dit, "rotary_emb", None)
-        if rope is not None and self._pristine_inv_freq is not None:
-            rope.register_buffer("inv_freq", self._pristine_inv_freq.to(device=device), persistent=False)
+        self.dit.rotary_emb.register_buffer("inv_freq", self._pristine_inv_freq.to(device=device), persistent=False)
 
         # The timestep-embedding MLP. Upstream lists it in
         # ``_keep_in_fp32_modules``, and this pin holds wherever OpenWAM owns
@@ -477,9 +464,7 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
         # is identical and only the projection's arithmetic precision differs.
         # Left pinned rather than dropped because the paths where it does hold
         # are the ones that serve the checkpoint.
-        te = getattr(self.dit, "time_embedder", None)
-        if te is not None:
-            te.to(dtype=torch.float32)
+        self.dit.time_embedder.to(dtype=torch.float32)
 
     # ================================================================
     # Geometry

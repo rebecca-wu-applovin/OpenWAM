@@ -13,30 +13,27 @@ finalization; the sample itself (which rows, which frames) is the subclass's
 
 Subclass surface
 ----------------
-Class attributes:
+Class / instance attributes:
   * ``DATASET_NAME``        — log / error label.
   * ``NEEDED_COLS``         — parquet columns the reader consumes.
   * ``HEAD_CAMERA`` / ``LEFT_WRIST_CAMERA`` / ``RIGHT_WRIST_CAMERA`` — used by
     the default :meth:`_resolve_cameras`.
-  * ``ACTION_DIM_MASK``     — per-dim validity mask (``LEFT_ARM_DIM_MASK`` for
-    single-arm OXE; ``None`` = all dims valid, for bimanual RoboCOIN).
-  * ``PROPRIO_DIM_MASK``    — optional state-specific validity mask; ``None``
-    inherits ``ACTION_DIM_MASK`` for backward compatibility.
-  * ``ACTION_DIM``          — per-step action/proprio width (20 = EEF).
+  * ``ACTION_DIM``          — per-step raw action / proprio width (required; set before ``super().__init__``).
   * ``PROMPT_FILE_REQUIRED``— default :meth:`_load_prompts` behavior on a
     missing ``tasks.parquet`` (True = raise, False = empty map).
-  * ``STATS_FILENAME`` / ``STATS_DIM`` / ``STATS_STRICT_MINMAX`` — the default :meth:`_load_stats`.
 
-Hooks (override as needed; defaults cover the common case):
+Every raw dim is valid; with ``unify_action`` on, exactly the unified slots the map fills are.
+
+Required hooks: ``_getitem_impl``, ``_load_stats``, ``_action_rows``.
+Optional hooks (defaults cover the common case):
   * ``_resolve_cameras(info)``     — (head, left_wrist, right_wrist).
   * ``_add_data_offsets(eps)``     — set ``eps['_data_row_offset']``.
   * ``_train_min_window_len()``    — min episode length for a train window.
   * ``_load_prompts()``            — populate the prompt lookup.
   * ``_resolve_prompt(row, win)``  — per-sample prompt text.
-  * ``_load_stats(info)``          — return in-reader normalization stats / None.
-  * ``_getitem_impl(idx, rng)``    — build one sample (required); ``rng`` is the caller's per-sample generator.
-  * ``_action_20d(win)``           — normalized (..., 20) action payload,
-    or ``None`` to emit zeros (video-only / disabled supervision).
+  * ``_load_stats(info)``          — (required) load the stats the reader normalizes with (normalization on).
+  * ``_getitem_impl(idx, rng)``    — (required) build one sample; ``rng`` is the caller's per-sample generator.
+  * ``_action_rows(win)``          — (required) normalized ``(n, ACTION_DIM)`` raw action of a window.
   * ``_post_init(info)``           — one-time per-dataset setup.
 """
 
@@ -53,11 +50,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from openwam.dataloader.transforms.video import VideoColorJitter
-from openwam.dataloader.utils.eef import (
-    EEF_DIM,
-    build_action_mask_2d,
-    build_proprio_mask_2d,
-)
 from openwam.dataloader.utils.lerobotv3 import (
     apply_info_splits,
     compute_file_local_offsets,
@@ -65,7 +57,7 @@ from openwam.dataloader.utils.lerobotv3 import (
     load_episodes_parquet,
     parse_info_json,
 )
-from openwam.dataloader.utils.normalization import materialize_eef_stats
+from openwam.dataloader.utils.normalization import normalization_on
 from openwam.dataloader.utils.unify_action import UNIFY_DIM, map_to_unify, parse_unify_spec
 
 logger = logging.getLogger(__name__)
@@ -107,22 +99,10 @@ class LeRobotV3Reader:
     HEAD_CAMERA: ClassVar[Optional[str]] = None
     LEFT_WRIST_CAMERA: ClassVar[Optional[str]] = None
     RIGHT_WRIST_CAMERA: ClassVar[Optional[str]] = None
-    ACTION_DIM_MASK: ClassVar[Optional[np.ndarray]] = None
-    # Optional proprio-specific raw-dimension mask.  ``None`` preserves the
-    # historical contract by inheriting ``ACTION_DIM_MASK``; readers whose
-    # action/state schemas differ may set an instance value in
-    # ``_resolve_cameras``.
-    PROPRIO_DIM_MASK: ClassVar[Optional[np.ndarray]] = None
-    ACTION_DIM: ClassVar[int] = EEF_DIM
+    # The raw action / proprio width: no default, every reader states its own.
+    ACTION_DIM: ClassVar[int]
     # Prompts come from meta/tasks.parquet (index = text, "task_index" column = int).
     PROMPT_FILE_REQUIRED: ClassVar[bool] = True
-    # In-reader normalization stats: when STATS_FILENAME is set, the default
-    # ``_load_stats`` loads ``meta/<STATS_FILENAME>`` (a flat stats dict) with
-    # the given dim / min-max strictness (OXE single-arm = 10-D, strict).
-    # RoboCOIN overrides ``_load_stats`` for its dynamic per-robot-type path.
-    STATS_FILENAME: ClassVar[Optional[str]] = None
-    STATS_DIM: ClassVar[int] = EEF_DIM
-    STATS_STRICT_MINMAX: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -139,22 +119,22 @@ class LeRobotV3Reader:
         dataset_id: str,
         target_camera: Optional[str],
         unify_action: bool,
-        unify_action_map: Optional[Any],
-        unify_state_map: Optional[Any],
+        unify_action_map: Optional[List],
         color_jitter: Any,
     ):
         """Every argument is required; the caller states each value (None where the feature is off).
 
         Args:
             dataset_dir: str, LeRobot v3 root. num_frames / window_stride / height / width: ints, clip geometry.
-            split: str, ``train`` / ``val``. multiview: bool. normalize_mode: str or None (no in-reader norm).
+            split: str, ``train`` / ``val``. multiview: bool. normalize_mode: str, or None = no in-reader
+                normalization (:func:`~openwam.dataloader.utils.normalization.normalization_on`).
             camera_layout: list[str] camera keys top-to-bottom, or None (the reader's default cameras).
             dataset_id: str, source name used in logs and errors.
             target_camera: str camera key to read alone, or None (``camera_layout`` / defaults pick cameras).
             unify_action: bool, scatter the raw ACTION_DIM-wide action / proprio into the global UNIFY_DIM-wide
-                vector and mark only the mapped dims valid.
-            unify_action_map: unify spec (``openwam.dataloader.utils.unify_action``), or None = raw dims in order.
-            unify_state_map: the proprio's unify spec, or None = same as ``unify_action_map``.
+                vector and mark only the mapped dims valid. The subclass decides it (yam_sharpa: from action_mode).
+            unify_action_map: list, the unify spec (``openwam.dataloader.utils.unify_action``) of action and proprio
+                when ``unify_action`` is on; None when it is off.
             color_jitter: DictConfig ``{enabled, brightness, contrast, saturation, hue}``, applied consistently
                 across a clip's frames and only on the train split.
 
@@ -169,7 +149,9 @@ class LeRobotV3Reader:
         self._width = int(width)
         self._split = split
         self._multiview = bool(multiview)
-        self._normalize_mode = normalize_mode  # null / "none" = no in-reader normalization
+        self._normalize_mode = normalize_mode
+        # The one read of normalize_mode: on → _load_stats runs (and must find its stats).
+        self._normalize = normalization_on(normalize_mode)
         self._target_camera = target_camera
         self._camera_layout_param = list(camera_layout) if camera_layout else None
 
@@ -189,53 +171,33 @@ class LeRobotV3Reader:
 
         # ── unified action space ──────────────────────────────────────────
         # _raw_action_dim is what this reader's action / proprio payloads emit
-        # (the class ACTION_DIM). When unify is on, the public ACTION_DIM (and
-        # thus the finalized action/proprio width + downstream model action_dim)
-        # becomes unify_dim, and _finalize_* scatters raw -> unified via
-        # _unify_dst_index. Off (default) → raw layout kept.
-        # Instance attr (not type(self).ACTION_DIM) so a subclass can override the
-        # raw action width per bucket BEFORE super().__init__ — RoboCOIN sets a
-        # wider raw dim (pose + dexterous-hand fingers) for dex-hand buckets under
-        # unify. Defaults to the class ACTION_DIM, so existing readers are unchanged.
+        # (ACTION_DIM). When unify is on, the public ACTION_DIM (and thus the
+        # finalized action/proprio width + downstream model action_dim) becomes
+        # UNIFY_DIM, _finalize_* scatter raw -> unified via _unify_dst_index, and
+        # exactly the mapped slots are valid. Off → raw layout, every dim valid.
         self._raw_action_dim = int(self.ACTION_DIM)
         self._unify = bool(unify_action)
-        self._unify_dim = int(UNIFY_DIM)
-        self._unify_dst_index: Optional[np.ndarray] = None
-        self._unify_state_dst_index: Optional[np.ndarray] = None
         if self._unify:
-            if unify_action_map is None:
-                # No spec → identity map: raw dims 0..raw_dim-1 in order.
-                # Single-list form (top-level ints), NOT [[...]] which the
-                # parser would read as one malformed src->dst pair.
-                spec = list(range(self._raw_action_dim))
-            else:
-                spec = unify_action_map
-            self._unify_dst_index = parse_unify_spec(spec, self._unify_dim)
-            state_spec = unify_state_map if unify_state_map is not None else spec
-            self._unify_state_dst_index = parse_unify_spec(state_spec, self._unify_dim)
-            if self._unify_state_dst_index.shape[0] != self._raw_action_dim:
-                raise ValueError(
-                    f"{self.DATASET_NAME} unify_state_map maps "
-                    f"{self._unify_state_dst_index.shape[0]} source dims but this reader emits "
-                    f"{self._raw_action_dim}-D state"
-                )
+            self._unify_dst_index = parse_unify_spec(unify_action_map, UNIFY_DIM)
             if self._unify_dst_index.shape[0] != self._raw_action_dim:
                 raise ValueError(
                     f"{self.DATASET_NAME}({self._dataset_id}): unify_action_map maps "
                     f"{self._unify_dst_index.shape[0]} source dims but this reader emits "
                     f"{self._raw_action_dim}-D action. They must match."
                 )
-            # Instance attr shadows the class ACTION_DIM so finalized payloads,
-            # the action_dim property, and the model action head are all unify_dim.
-            self.ACTION_DIM = self._unify_dim
+            # Instance attr shadows ACTION_DIM so finalized payloads, the action_dim property and the model
+            # action head are all UNIFY_DIM.
+            self.ACTION_DIM = UNIFY_DIM
+            self._dim_mask = np.zeros(UNIFY_DIM, dtype=bool)
+            self._dim_mask[self._unify_dst_index] = True
+        else:
+            if unify_action_map is not None:
+                raise ValueError(f"{self.DATASET_NAME}: unify_action_map given with unify_action off")
+            self._dim_mask = np.ones(self._raw_action_dim, dtype=bool)
 
         # Deploy denormalizer artifact path: the stats file the trainer copies into checkpoints
         # (yam_sharpa's _load_stats sets it to the pooled file; None otherwise).
         self.normalization_stats_path: Optional[str] = None
-
-        # Rate-limited failure counter for sample().
-        self._fail_count = 0
-        self._fail_log_every = 100
 
         # ── info.json ─────────────────────────────────────────────────────
         info = parse_info_json(self._dataset_dir)
@@ -304,41 +266,11 @@ class LeRobotV3Reader:
 
         # ── prompts + per-dataset normalization stats (hooks) ─────────────
         self._load_prompts()
-        self._normalization_stats = self._load_stats(info)
+        if self._normalize:
+            self._load_stats(info)
 
         # ── subclass hook ─────────────────────────────────────────────────
         self._post_init(info)
-
-        # ── unified per-dim validity mask (static) ────────────────────────
-        # Honors the raw ACTION_DIM_MASK: single-arm OXE zero-pads
-        # the right-arm half of the 20-D EEF, which must stay masked out even
-        # after the scatter — a unified slot is valid iff its source raw dim
-        # was valid. Built HERE (not in the unify block above) because a
-        # reader's instance ACTION_DIM_MASK may be set in _resolve_cameras
-        # (some readers set it per-embodiment), which runs after that block.
-        self._unify_dim_mask: Optional[np.ndarray] = None
-        self._unify_proprio_dim_mask: Optional[np.ndarray] = None
-        if self._unify:
-            self._unify_dim_mask = np.zeros(self._unify_dim, dtype=bool)
-            action_raw_mask = self.ACTION_DIM_MASK
-            if action_raw_mask is None:
-                self._unify_dim_mask[self._unify_dst_index] = True
-            else:
-                self._unify_dim_mask[self._unify_dst_index] = np.asarray(action_raw_mask, dtype=bool)
-
-            # Most LeRobot sources expose action and proprio in the same raw
-            # schema, so an unset proprio mask inherits the action mask.  A
-            # source may override this when a field exists only on one stream
-            # (for example, a commanded mobile-base velocity with no measured
-            # state velocity).
-            proprio_raw_mask = self.PROPRIO_DIM_MASK
-            if proprio_raw_mask is None:
-                proprio_raw_mask = action_raw_mask
-            self._unify_proprio_dim_mask = np.zeros(self._unify_dim, dtype=bool)
-            if proprio_raw_mask is None:
-                self._unify_proprio_dim_mask[self._unify_state_dst_index] = True
-            else:
-                self._unify_proprio_dim_mask[self._unify_state_dst_index] = np.asarray(proprio_raw_mask, dtype=bool)
 
         logger.info(
             "%s(%s, %s): %d eps, %d windows, fps=%.1f, multiview=%s, normalize=%s",
@@ -386,9 +318,8 @@ class LeRobotV3Reader:
     def _resolve_cameras(self, info: dict) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """Resolve (head, left_wrist, right_wrist) camera keys.
 
-        Default: a single ``target_camera`` if set (EgoDex-style), else the
-        class-level ``HEAD_CAMERA`` / ``LEFT_WRIST_CAMERA`` / ``RIGHT_WRIST_CAMERA``
-        (OXE-style). RoboCOIN overrides to resolve by info.features priority.
+        Default: a single ``target_camera`` if set, else the class-level ``HEAD_CAMERA`` / ``LEFT_WRIST_CAMERA`` /
+        ``RIGHT_WRIST_CAMERA``. yam_sharpa overrides it to map its ``camera_layout``.
         """
         if self._target_camera is not None:
             return (self._target_camera, None, None)
@@ -510,40 +441,27 @@ class LeRobotV3Reader:
             )
         return text
 
-    def _load_stats(self, info: dict) -> Optional[dict]:
-        """Load ``meta/<STATS_FILENAME>`` stats when declared, else None.
+    def _load_stats(self, info: dict) -> None:
+        """Load the stats the reader normalizes with (subclass hook; called only when normalization is on).
 
-        Default covers the OXE per-dataset ``eef_stats.json`` (flat dict).
-        RoboCOIN overrides for its dynamic per-robot-type stats path.
+        Args:
+            info: dict, the parsed ``meta/info.json``.
+
+        Returns:
+            None; the subclass keeps the stats it needs. A missing stats file raises.
         """
-        if self.STATS_FILENAME is None:
-            return None
-        if not self._normalize_mode or self._normalize_mode in ("none", "null"):
-            return None
-        stats_path = self._dataset_dir / "meta" / self.STATS_FILENAME
-        if not stats_path.exists():
-            raise FileNotFoundError(
-                f"normalize_mode={self._normalize_mode!r} but {stats_path} is missing. "
-                f"Run the matching compute_stats script for {self.DATASET_NAME}, or set normalize_mode=null."
-            )
-        if stats_path.suffix == ".npy":
-            raw = np.load(stats_path, allow_pickle=True).item()
-        else:
-            import json
+        raise NotImplementedError(f"{type(self).__name__} must implement _load_stats")
 
-            with open(stats_path) as f:
-                raw = json.load(f)
-        return materialize_eef_stats(
-            raw,
-            self._normalize_mode,
-            dim=self.STATS_DIM,
-            strict_minmax=self.STATS_STRICT_MINMAX,
-            source_hint=str(stats_path),
-        )
+    def _action_rows(self, win: pd.DataFrame) -> np.ndarray:
+        """Normalized raw action of a window (subclass hook).
 
-    def _action_20d(self, win: pd.DataFrame) -> Optional[np.ndarray]:
-        """Return normalized ``(actual_raw_len, ACTION_DIM)`` action, or None (disabled)."""
-        return None
+        Args:
+            win: DataFrame, the window's rows (n of them).
+
+        Returns:
+            (n, raw ACTION_DIM) float32; :meth:`_finalize_action` keeps the first ``num_frames - 1``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} must implement _action_rows")
 
     def _post_init(self, info: dict) -> None:
         """Optional one-time per-dataset setup (e.g. Fractal quat sanity check)."""
@@ -631,7 +549,7 @@ class LeRobotV3Reader:
         return view
 
     def sample(self, idx: int, rng: np.random.Generator) -> dict:
-        """One sample; on a read failure retries the next window (up to ``_GETITEM_MAX_RETRIES`` times).
+        """One sample; on a failure logs a warning and retries the next window (up to ``_GETITEM_MAX_RETRIES`` times).
 
         Args:
             idx: int in [0, len).
@@ -645,19 +563,19 @@ class LeRobotV3Reader:
             try:
                 return self._getitem_impl(idx, rng)
             except Exception as e:
+                # Every failure is logged (one bad sample must not stop a run, but it must not be silent either).
+                logger.warning(
+                    "%s(%s): sample idx=%d failed on attempt %d/%d: %r",
+                    self.DATASET_NAME,
+                    self._dataset_id,
+                    idx,
+                    attempt + 1,
+                    _GETITEM_MAX_RETRIES,
+                    e,
+                )
                 if attempt == _GETITEM_MAX_RETRIES - 1:
                     raise
-                self._fail_count += 1
-                if self._fail_count == 1 or self._fail_count % self._fail_log_every == 0:
-                    logger.warning(
-                        "%s(%s): %d cumulative __getitem__ failures (latest: idx=%d, %s, attempt=%d)",
-                        self.DATASET_NAME,
-                        self._dataset_id,
-                        self._fail_count,
-                        idx,
-                        type(e).__name__,
-                        attempt,
-                    )
+                # Retry with the next window (same rng).
                 idx = (idx + 1) % max(1, len(self))
         raise RuntimeError("unreachable")
 
@@ -675,44 +593,30 @@ class LeRobotV3Reader:
 
     # ----- action / proprio finalization -----------------------------------
 
-    def _finalize_action(self, action_20d: Optional[np.ndarray], actual_raw_len: int) -> Tuple[np.ndarray, np.ndarray]:
+    def _finalize_action(self, action_rows: np.ndarray, actual_raw_len: int) -> Tuple[np.ndarray, np.ndarray]:
         """Pad an action payload to ``(T_action, ACTION_DIM)`` + build its 2-D mask.
 
-        ``action_20d is None`` → all-zero action + all-False mask (video-only
-        / disabled supervision). When unify is on, the raw ``_raw_action_dim``
-        payload is scattered into ``unify_dim`` slots (mask follows the mapped
-        dims) — this happens AFTER normalization (``action_20d`` is already
-        normalized by ``_action_20d``).
+        Args:
+            action_rows: (n, raw ACTION_DIM) normalized action (:meth:`_action_rows`).
+            actual_raw_len: int, rows of the window that exist.
+
+        Returns:
+            action (T_action, ACTION_DIM) float32 (zero past the episode end; scattered into UNIFY_DIM slots
+            after normalization when unify is on) and mask (T_action, ACTION_DIM) bool: True at the supervised
+            steps' valid dims.
         """
         T_action = self._num_frames - 1
-        width = self._raw_action_dim  # fill at raw width first; unify-scatter below
-        action = np.zeros((T_action, width), dtype=np.float32)
-        n_valid = 0
-        n_supervised = 0
-        if action_20d is not None:
-            n_valid = min(actual_raw_len, T_action)
-            if n_valid > 0:
-                action[:n_valid] = action_20d[:n_valid]
-            # Steps with a REAL supervised target. Default == n_valid (row-aligned
-            # readers); a reader that shifts the target +1 frame overrides
-            # _n_supervised_action_steps so its clamped final boundary step is masked.
-            n_supervised = min(self._n_supervised_action_steps(actual_raw_len), T_action)
-
+        action = np.zeros((T_action, self._raw_action_dim), dtype=np.float32)
+        n_valid = min(actual_raw_len, T_action)
+        action[:n_valid] = action_rows[:n_valid]
+        # Steps with a REAL supervised target. Default == n_valid (row-aligned
+        # readers); a reader that shifts the target +1 frame overrides
+        # _n_supervised_action_steps so its clamped final boundary step is masked.
+        n_supervised = min(self._n_supervised_action_steps(actual_raw_len), T_action)
         if self._unify:
-            # (T, raw) -> (T, unify_dim). The dim mask is the precomputed
-            # ACTION_DIM_MASK-honoring one (map_to_unify's own mask would mark
-            # every mapped slot valid, leaking single-arm right-arm padding).
-            action, _ = map_to_unify(action, self._unify_dst_index, self._unify_dim)
-            dim_mask = self._unify_dim_mask
-        else:
-            dim_mask = self.ACTION_DIM_MASK
-
-        action_mask = build_action_mask_2d(
-            T_action=T_action,
-            action_dim=self.ACTION_DIM,
-            n_valid_time=n_supervised,
-            dim_mask=dim_mask,
-        )
+            action, _ = map_to_unify(action, self._unify_dst_index, UNIFY_DIM)
+        action_mask = np.zeros((T_action, self.ACTION_DIM), dtype=bool)
+        action_mask[:n_supervised] = self._dim_mask
         return action, action_mask
 
     def _n_supervised_action_steps(self, actual_raw_len: int) -> int:
@@ -736,27 +640,13 @@ class LeRobotV3Reader:
 
         Returns:
             proprio (H, ACTION_DIM) float32 and mask (H, ACTION_DIM) bool (the same per-dim validity on every
-            row). When unify is on, the raw proprio is scattered into ``unify_dim`` slots (same map as the
+            row). When unify is on, the raw proprio is scattered into ``UNIFY_DIM`` slots (same map as the
             action), after normalization.
         """
         proprio = np.asarray(proprio_rows, dtype=np.float32)
         if self._unify:
-            # Same scatter as action, but honor the proprio-specific mask when
-            # the source's action/state field availability differs.
-            proprio, _ = map_to_unify(proprio, self._unify_state_dst_index, self._unify_dim)
-            dim_mask = self._unify_proprio_dim_mask
-        else:
-            dim_mask = self.PROPRIO_DIM_MASK
-            if dim_mask is None:
-                dim_mask = self.ACTION_DIM_MASK
-
-        mask = build_proprio_mask_2d(
-            action_dim=self.ACTION_DIM,
-            enabled=True,
-            dim_mask=dim_mask,
-        )
-        # (1, D) dim mask -> one copy per proprio row.
-        return proprio, np.repeat(mask, len(proprio), axis=0)
+            proprio, _ = map_to_unify(proprio, self._unify_dst_index, UNIFY_DIM)
+        return proprio, np.repeat(self._dim_mask[None], len(proprio), axis=0)
 
     # ----- metadata ---------------------------------------------------------
 
@@ -764,7 +654,8 @@ class LeRobotV3Reader:
     def action_dim(self) -> int:
         return self.ACTION_DIM
 
-    # Reader keys a dataset's ``from_config`` may forward (yam_sharpa filters and extends them).
+    # Reader keys a dataset's ``from_config`` may forward (yam_sharpa filters and extends them). The unify switch
+    # and map are not among them: the subclass derives them.
     CONFIG_KEYS: ClassVar[Tuple[str, ...]] = (
         "num_frames",
         "window_stride",
@@ -774,9 +665,6 @@ class LeRobotV3Reader:
         "normalize_mode",
         "target_camera",
         "camera_layout",
-        "unify_action",
-        "unify_action_map",
-        "unify_state_map",
         "color_jitter",
     )
 

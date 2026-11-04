@@ -16,6 +16,7 @@ from openwam.dataloader.collate import Batch
 from openwam.model.common.flow_scheduler import FlowScheduler
 from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
 from tests._arch import TEST_TRAIN_OPTIONS, build_test_arch
+from tests._training_cfg import cpu_accelerator
 
 # ---------------------------------------------------------------------------
 # Mock pipeline: replaces WanVideoPipeline to avoid loading ~20GB of weights
@@ -496,15 +497,15 @@ def test_trainer_reads_training_freeze_text_cache_and_mot(monkeypatch, text_cach
                 "freeze": ["video_backbone.vae"], "text_cache": text_cache,
                 # train() up to the step loop (debug: no wandb).
                 "debug": True, "num_epochs": 1, "max_steps": None, "batch_size": 1, "gradient_accumulation_steps": 1,
-                "max_grad_norm": None, "save_steps": 0, "keep_last_k_ckpts": 1, "save_full_states_for_resume": False,
-                "vis_steps": 0, "log_step_timing": False,
+                "max_grad_norm": None, "save_steps": None, "keep_last_k_ckpts": 1, "save_full_states_for_resume": False,
+                "vis_steps": None, "log_step_timing": False, "mixed_precision": "bf16",
             },
             "model": {"architecture": {"framework": "dual_system", "variant": "joint_self_attn"}},
             "common": {"action_dim": 7, "state_dim": 7, "layout": make_layout()},
             "assets": {"video_backbone": {"model_path": "/upstream"}},
         }
     )
-    trainer = trainer_mod.OpenWAMTrainer(cfg, accelerator=None, dataset=None)
+    trainer = trainer_mod.OpenWAMTrainer(cfg, accelerator=cpu_accelerator(), dataset=None)
     assert seen["frozen"] == [["video_backbone.vae"]]
     assert seen["train_options"].mot_checkpoint_mixed_attn is True
     # The architecture gets merge(common, model): the shared dims sit next to the model blocks.
@@ -519,7 +520,6 @@ def test_trainer_reads_training_freeze_text_cache_and_mot(monkeypatch, text_cach
     monkeypatch.setattr(trainer, "build_lr_scheduler", lambda *a, **k: None)
     monkeypatch.setattr(trainer, "setup_output_dir", lambda *a: ("out", None))
     monkeypatch.setattr(trainer, "prepare_accelerate", lambda o, d, s: (o, d, s))
-    monkeypatch.setattr(trainer_mod, "wire_sampler_seed", lambda *a, **k: None)
     monkeypatch.setattr(trainer, "build_text_cache", lambda: seen.__setitem__("text_cache_calls", 1))
 
     def _stop(*a, **k):

@@ -39,10 +39,10 @@ from omegaconf import DictConfig
 from openwam.model.action_backbone.base import ActionDiTBackbone
 from openwam.model.action_backbone.components import (
     RMSNorm,
-    get_attention_fn,
     precompute_freqs_cis_1d,
     rope_apply_1d,
 )
+from openwam.model.common.attention import flash_attention
 from openwam.model.common.flow_scheduler import FlowScheduler
 from openwam.model.grad_checkpoint import gradient_checkpoint_forward
 
@@ -115,8 +115,9 @@ class ActionSelfAttention(nn.Module):
         if freqs is not None:
             q = rope_apply_1d(q, freqs)
             k = rope_apply_1d(k, freqs)
-        x = get_attention_fn()(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=self.num_heads)
+        # the shared dispatcher takes packed heads (B, S, H*D) and returns the same layout
+        q, k, v = (rearrange(t, "b n s d -> b s (n d)") for t in (q, k, v))
+        x = flash_attention(q, k, v, num_heads=self.num_heads)
         return self.o(x)
 
 
@@ -161,16 +162,10 @@ class BridgeCrossAttention(nn.Module):
         k = self.norm_k(self.k(x_video))
         v = self.v(x_video)
 
-        q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
-        if ctx_mask is None:
-            x = get_attention_fn()(q, k, v)
-        else:
-            if ctx_mask.dim() == 3:
-                ctx_mask = ctx_mask.unsqueeze(1)
-            x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
-        x = rearrange(x, "b n s d -> b s (n d)", n=self.num_heads)
+        # (B, Sq, Skv) mask -> (B, 1, Sq, Skv) so it broadcasts over heads; a mask forces SDPA in flash_attention
+        if ctx_mask is not None and ctx_mask.dim() == 3:
+            ctx_mask = ctx_mask.unsqueeze(1)
+        x = flash_attention(q, k, v, num_heads=self.num_heads, attn_mask=ctx_mask)
         return self.o(x)
 
 
@@ -260,10 +255,8 @@ class SelfAttnActionDiTBlock(nn.Module):
     mixed self-attention and FFN are AdaLN-modulated by the action diffusion
     timestep; context cross-attention is not timestep-gated.
 
-    The block's ``forward()`` is intentionally functional: it is **not**
-    used in the joint self-attention path (the driver calls the sub-modules
-    directly). It exists as a fallback for unit tests and equivalence
-    checks against the video DiT block.
+    There is no ``forward``: :class:`ActionDiT` (``pre_attn_at_layer`` / ``post_attn_at_layer``) calls the
+    sub-modules directly.
     """
 
     def __init__(
@@ -301,25 +294,6 @@ class SelfAttnActionDiTBlock(nn.Module):
 
     def gate(self, x: torch.Tensor, gate: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         return x + gate * residual
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        context: Optional[torch.Tensor],
-        t_mod: torch.Tensor,
-        freqs: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Reference forward used in equivalence tests; not invoked by the MoT driver."""
-        chunks = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = chunks
-
-        attn_input = self.self_attn_norm(x) * (1 + scale_msa) + shift_msa
-        x = self.gate(x, gate_msa, self.self_attn(attn_input, freqs=freqs))
-        if context is not None:
-            x = x + self.cross_attn(self.context_attn_norm(x), context)
-        mlp_input = self.ffn_norm(x) * (1 + scale_mlp) + shift_mlp
-        x = self.gate(x, gate_mlp, self.ffn(mlp_input))
-        return x
 
 
 class ActionDiT(ActionDiTBackbone):
@@ -496,16 +470,14 @@ class ActionDiT(ActionDiTBackbone):
         # FastWAM-compatible simple action decoder; no AdaLN and no zero init.
         self.action_decoder = nn.Linear(dim, action_dim)
 
-    def _sync_rope_freqs_device(self) -> None:
-        if not isinstance(getattr(self, "freqs", None), torch.Tensor):
-            return
-        ref = next(self.parameters(), None)
-        if ref is not None and self.freqs.device != ref.device:
-            self.freqs = self.freqs.to(device=ref.device)
-
     def _apply(self, fn, recurse=True):
+        """Module ``_apply`` (``.to`` / ``.cuda`` / ...), then move the RoPE table to the parameters' device.
+
+        ``freqs`` is a plain complex attribute, not a buffer (a dtype cast must not touch it), so it follows the
+        device here. Args / Returns: as :meth:`torch.nn.Module._apply`.
+        """
         module = super()._apply(fn, recurse=recurse)
-        self._sync_rope_freqs_device()
+        self.freqs = self.freqs.to(device=self.action_decoder.weight.device)
         return module
 
     # ------------------------------------------------------------------
@@ -734,8 +706,6 @@ class ActionDiT(ActionDiTBackbone):
         *,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
-        use_gradient_checkpointing: bool = False,  # noqa: ARG002 — driver handles ckpt itself
-        use_gradient_checkpointing_offload: bool = False,  # noqa: ARG002
     ) -> "ActionState":
         """MoT coupling: embed the actions and build the per-layer state the driver threads through the blocks.
 
@@ -744,7 +714,6 @@ class ActionDiT(ActionDiTBackbone):
             timestep: (B,) or (1,) action diffusion timestep.
             context: (B, L, text_dim) raw text/proprio context (required for ``joint_self_attn``), or None.
             context_mask: (B, L) bool, True = attend, or None.
-            use_gradient_checkpointing / use_gradient_checkpointing_offload: bool, unused (the driver checkpoints).
 
         Returns:
             ActionState whose ``payload`` is an :class:`ActionDiTState` (x_action (B, T_action, dim), modulation,

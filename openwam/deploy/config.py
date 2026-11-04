@@ -11,6 +11,8 @@ from pathlib import Path
 
 from omegaconf import DictConfig, OmegaConf
 
+from openwam.dataloader.utils.normalization import normalization_on
+
 DEPLOY_YAML = Path(__file__).resolve().parents[2] / "configs" / "deploy.yaml"
 
 
@@ -68,7 +70,7 @@ def check_deploy(cfg: DictConfig) -> None:
     if not dl.multiview or dl.multiview_layout != "vstack":
         raise ValueError(f"deploy composes the vstack canvas only, got multiview={dl.multiview} "
                          f"multiview_layout={dl.multiview_layout!r}")
-    if dl.normalize_mode in (None, "none", "null"):
+    if not normalization_on(dl.normalize_mode):
         raise ValueError("deploy needs a normalized checkpoint (dataloader.normalize_mode)")
     # Older checkpoints were trained without fps: required, never defaulted.
     if "fps" not in dl or dl.fps is None:

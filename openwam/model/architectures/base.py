@@ -167,8 +167,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
         self.frame_mask = build_frame_mask(self.layout, str(arch.clean_attention), str(arch.attention_mask_mode))
         # How the video backbone gets the proprio (validated by resolve_config); build_contexts applies it.
         self.proprio_input = str(arch.proprio_input)
-        self._device = torch.device("cuda")
-        self._dtype = torch.bfloat16
+        # Unset until the owner (trainer / deploy) calls set_dtype_device: the architecture never picks its own.
+        self._device: Optional[torch.device] = None
+        self._dtype: Optional[torch.dtype] = None
 
         self.video_backbone: "VideoBackbone" = self._build_video_backbone(cfg.video_backbone, mode, assets, ckpt_dir)
 
@@ -346,14 +347,25 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
     @property
     def device(self) -> torch.device:
+        """torch.device set by :meth:`set_dtype_device`; raises RuntimeError before the first call."""
+        if self._device is None:
+            raise RuntimeError("architecture device is unset: call set_dtype_device(dtype, device) first")
         return self._device
 
     @property
     def dtype(self) -> torch.dtype:
+        """torch.dtype set by :meth:`set_dtype_device` (training.mixed_precision); raises RuntimeError before it."""
+        if self._dtype is None:
+            raise RuntimeError("architecture dtype is unset: call set_dtype_device(dtype, device) first")
         return self._dtype
 
     def set_dtype_device(self, dtype: torch.dtype, device: torch.device) -> None:
-        """Dispatch to each backbone — they own their own dtype/device handling."""
+        """Record the run's dtype / device and dispatch to each backbone (they own their own handling).
+
+        Args:
+            dtype: torch.dtype, ``DTYPES[training.mixed_precision]`` (trainer) or the deploy dtype.
+            device: torch.device the modules move to.
+        """
         self._dtype = dtype
         self._device = device
         # The proprio modules exist only under use_proprioception (declared None otherwise).

@@ -23,6 +23,7 @@ from openwam.config import latent_layout, resolve_config
 from openwam.model.architectures.utils.mask_modes import build_frame_mask
 from openwam.model.video_backbone.base import BlockLoopState, TextCondition, VideoBackbone
 from openwam.model.video_backbone.common.text_cache import PromptCache
+from tests._training_cfg import CHECKED_TRAINING
 
 TC = 4  # temporal compression of the fake VAE
 SC = 8  # spatial compression of the fake VAE
@@ -219,6 +220,7 @@ def _cfg(h=5, f=8, encoding="per_frame", tc=4, clean="bidirectional", va="mutual
     return OmegaConf.create(
         {
             "project": {"seed": 0},
+            "training": CHECKED_TRAINING,
             "common": {"action_dim": 48, "state_dim": 48},
             "dataloader": {
                 "history_offsets": list(range(-h + 1, 1)),

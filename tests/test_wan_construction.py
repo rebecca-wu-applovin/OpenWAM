@@ -287,10 +287,12 @@ def test_required_clean_attention_checked_by_resolve_config(longlive_cfg):
     from omegaconf import OmegaConf
 
     from openwam.config import resolve_config
+    from tests._training_cfg import CHECKED_TRAINING
 
     def _cfg(clean):
         return OmegaConf.create({
             "project": {"seed": 0},
+            "training": CHECKED_TRAINING,
             "common": {"action_dim": 48, "state_dim": 48},
             "dataloader": {"history_offsets": [-20, 0], "future_offsets": [4, 8, 12, 16], "num_frames": 33,
                            "history_sampling": "fixed", "history_window": 100,

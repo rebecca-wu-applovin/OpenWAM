@@ -696,8 +696,8 @@ def test_from_config_builds_reuses_and_guards_stats(source, tmp_path):
     a = s["action"].numpy()
     assert (np.abs(a) <= 1.0 + 1e-6).all()
     # relative action and absolute proprio use separate blocks
-    act = load_stats_file(path, action_mode="fingertips_rel", normalize_mode="min-max", dim=48)
-    st = load_stats_file(path, action_mode="fingertips_rel_state", normalize_mode="min-max", dim=48)
+    act = load_stats_file(path, block="fingertips_rel", dim=48)
+    st = load_stats_file(path, block="fingertips_rel_state", dim=48)
     assert not np.allclose(act["max"], st["max"])
     # a file built for another configuration is never silently reused
     other = _cfg(

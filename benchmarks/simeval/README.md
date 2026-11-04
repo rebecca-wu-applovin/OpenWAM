@@ -74,7 +74,8 @@ execution:
 
 Watcher: `watch --interface openwam_v1 --list-ckpts "<openwam python> benchmarks/simeval/list_ckpts.py <run> --steps-per-plan 20"
 --server benchmarks/simeval/server/serve.py --server-python <openwam python> --openwam-root <OpenWAM> --no-check-server`
-(K must match the profile's `execute`).
+(K must match the profile's `execute`; `--no-check-server`: sim-policy-eval's conformance check speaks the old
+WebSocket protocol). On Modal, `scripts/modal/simeval_watch.py` builds exactly this command (`watch_command`).
 
 ## Verification
 

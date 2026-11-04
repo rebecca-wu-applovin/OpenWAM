@@ -1,9 +1,8 @@
 """Map heterogeneous per-robot action vectors into a unified action space.
 
-Different robots emit different raw action layouts (Wuji 54-D joint, OXE
-single-arm EEF, ...). To train one model over a
-shared action head, each dataset declares — in its yaml — which raw dims map to
-which slots of a single unified space of width ``UNIFY_DIM``. This module is the
+Different robots emit different raw action layouts. To train one model over a
+shared action head, each dataset declares which raw dims map to which slots of
+a single unified space of width ``UNIFY_DIM`` (yam_sharpa: ``yam_sharpa_repr.unify_action_map``). This module is the
 pure-mechanism layer for that:
 
   * :func:`parse_unify_spec`   — yaml spec → a ``dst_index`` array
@@ -91,25 +90,6 @@ def _expand_ranges(tokens: Token) -> List[int]:
     return out
 
 
-def _coerce_spec(spec):
-    """Normalize an OmegaConf ``ListConfig`` to a plain (possibly nested) list.
-
-    Dataloader configs reach the readers as OmegaConf containers —
-    ``scripts/train.py`` passes ``cfg.dataloader`` straight into
-    ``build_dataset`` without ``to_container`` — so ``unify_action_map`` arrives
-    as a ``ListConfig``, which is **not** a ``list``/``tuple`` and would be
-    rejected below. Convert recursively (also unwraps the nested paired form).
-    No-op for plain lists or when OmegaConf isn't installed.
-    """
-    try:
-        from omegaconf import ListConfig, OmegaConf
-    except Exception:
-        return spec
-    if isinstance(spec, ListConfig):
-        return OmegaConf.to_container(spec, resolve=True)
-    return spec
-
-
 def _is_paired(spec: Sequence) -> bool:
     """Paired form iff every top-level element is itself a list/tuple."""
     return all(isinstance(el, (list, tuple)) for el in spec)
@@ -131,7 +111,7 @@ def parse_unify_spec(spec: Sequence, unify_dim: int = UNIFY_DIM) -> np.ndarray:
         ValueError: on any malformed / out-of-range / overlapping / non-covering
             spec, with a message pointing at the offending part.
     """
-    spec = _coerce_spec(spec)  # OmegaConf ListConfig (Hydra-loaded yaml) -> plain list
+    # A plain list / tuple only: the caller converts any config container first (nothing here guesses its type).
     if not isinstance(spec, (list, tuple)) or len(spec) == 0:
         raise ValueError(f"unify spec must be a non-empty list, got {spec!r}")
 
@@ -197,7 +177,7 @@ def map_to_unify(
             action`` and all other slots 0 (same dtype as ``action``).
           * ``dim_mask`` is ``(unify_dim,)`` bool, True exactly at ``dst_index``.
             This is the per-dim validity mask; the time axis is handled
-            elsewhere (e.g. ``build_action_mask_2d``).
+            elsewhere (the reader's ``_finalize_action``).
     """
     action = np.asarray(action)
     n = dst_index.shape[0]

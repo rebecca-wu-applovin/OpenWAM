@@ -13,7 +13,7 @@ The driver owns no parameters — a plain Python class, absent from ``state_dict
 from __future__ import annotations
 
 import copy
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -133,27 +133,40 @@ class DualSystemMoTDriver:
         When ``use_gradient_checkpointing`` is enabled (and the action
         backbone is in training mode), the entire pre→mixed→post triplet
         runs under :func:`torch.utils.checkpoint.checkpoint`, mirroring
-        what the other architectures get from ``vb.run_block``. The inner
-        per-layer ``mot_checkpoint_mixed_attn`` is suppressed in that mode
-        to avoid nested-checkpoint waste — the outer wrapper already
-        recomputes mixed attention.
+        what the other architectures get from ``vb.run_block``, with a plain
+        mixed attention inside (the outer wrapper already recomputes it).
+        Otherwise ``mot_checkpoint_mixed_attn`` (training only) checkpoints
+        just the mixed attention.
         """
+        # The one place the checkpointing choice is made: which wrapper, and which mixed attention runs inside.
         if use_gradient_checkpointing and self.ab.training:
             return self._step_checkpointed(
                 layer_id, vstate, astate, attn_mask=attn_mask, offload=use_gradient_checkpointing_offload
             )
-        return self._step_impl(layer_id, vstate, astate, attn_mask=attn_mask)
+        if self.mot_checkpoint_mixed_attn and self.ab.training:
+            return self._step_impl(layer_id, vstate, astate, attn_mask, self._checkpointed_mixed_attention)
+        return self._step_impl(layer_id, vstate, astate, attn_mask, self._mixed_attention)
+
+    def _checkpointed_mixed_attention(
+        self, q_cat: Tensor, k_cat: Tensor, v_cat: Tensor, attn_mask: Optional[Tensor]
+    ) -> Tensor:
+        """:meth:`_mixed_attention` under ``torch.utils.checkpoint`` (same inputs / output; activations recomputed)."""
+        return torch.utils.checkpoint.checkpoint(
+            self._mixed_attention, q_cat, k_cat, v_cat, attn_mask, use_reentrant=False
+        )
 
     def _step_impl(
         self,
         layer_id: int,
         vstate: "BlockLoopState",
         astate: "ActionState",
-        attn_mask: Optional[Tensor] = None,
-        *,
-        suppress_inner_attn_ckpt: bool = False,
+        attn_mask: Optional[Tensor],
+        mixed_attention: Callable[[Tensor, Tensor, Tensor, Optional[Tensor]], Tensor],
     ) -> Tuple["BlockLoopState", "ActionState"]:
         """Unwrapped per-layer body. See :meth:`step` for the public entry point.
+
+        ``mixed_attention`` is :meth:`_mixed_attention` or :meth:`_checkpointed_mixed_attention`, chosen by
+        :meth:`step` (same math either way).
 
         INVARIANT (consumed by :meth:`_step_checkpointed`): this method must
         only reassign the two layer-varying tensor fields ``vstate.hidden_states`` and
@@ -193,12 +206,7 @@ class DualSystemMoTDriver:
         # passes it in for every layer. _step_impl does NOT rebuild the mask
         # itself; any direct caller must pass the same pre-built mask.
 
-        if self.mot_checkpoint_mixed_attn and ab.training and not suppress_inner_attn_ckpt:
-            mixed = torch.utils.checkpoint.checkpoint(
-                self._mixed_attention, q_cat, k_cat, v_cat, attn_mask, use_reentrant=False
-            )
-        else:
-            mixed = self._mixed_attention(q_cat, k_cat, v_cat, attn_mask)
+        mixed = mixed_attention(q_cat, k_cat, v_cat, attn_mask)
 
         attn_v, attn_a = mixed.split([s_video, s_action], dim=1)
         vstate = vb.post_attn_at_layer(layer_id, vstate, attn_v.contiguous(), vpost)
@@ -243,7 +251,7 @@ class DualSystemMoTDriver:
             local_astate.payload = local_payload
             local_vstate.hidden_states = vx
             local_payload.x_action = ax
-            self._step_impl(layer_id, local_vstate, local_astate, attn_mask=attn_mask, suppress_inner_attn_ckpt=True)
+            self._step_impl(layer_id, local_vstate, local_astate, attn_mask, self._mixed_attention)
             return local_vstate.hidden_states, local_payload.x_action
 
         vx0 = vstate.hidden_states

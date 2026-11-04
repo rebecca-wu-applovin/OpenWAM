@@ -7,13 +7,6 @@ import re
 
 logger = logging.getLogger(__name__)
 
-_NORMALIZATION_TRANSFORM_KEYS = ("mean", "std", "min", "max", "q01", "q99")
-_NORMALIZATION_SEMANTIC_KEYS = (
-    "representation",
-    "osc_position_scale",
-    "osc_rotation_scale",
-)
-
 
 # --- Deploy assets (write-once) ---
 
@@ -33,44 +26,33 @@ def save_config(output_dir: str, cfg):
     logger.info("Saved config to %s", config_path)
 
 
-def save_normalization_stats(output_dir: str, dataset) -> None:
-    """Copy the dataset's resolved action-stats .npy into the checkpoint dir.
+def save_normalization_stats(output_dir: str, stats_path: str) -> None:
+    """Copy the dataset's stats file into the run dir as ``normalization_stats.npy`` (the deploy artifact).
 
-    Written once (skipped if ``normalization_stats.npy`` already exists). Silently
-    no-ops when the dataset has no stats path. The copied file preserves the nested
-    ``{"joint": ..., "eef": ...}`` schema so deployment can pick the sub-dict
-    matching the saved config's ``action_mode``.
+    The caller decides from ``dataloader.normalize_mode`` that normalization is on; the file keeps its
+    ``{<action_mode>: ..., <action_mode>_state: ...}`` blocks, which deploy reads by the saved config's action_mode.
+
+    Args:
+        output_dir: str, the run dir.
+        stats_path: str, the dataset's pooled stats file (``dataset.normalization_stats_path``).
     """
     import shutil
 
     dst = os.path.join(output_dir, "normalization_stats.npy")
-    if os.path.exists(dst):
-        logger.info(
-            "[normalizer] normalization_stats.npy already present in checkpoint dir: %s (skip copy)",
-            dst,
-        )
-        return
-    src = getattr(dataset, "normalization_stats_path", None)
-    if not src:
-        logger.info(
-            "[normalizer] Dataset has no normalization_stats_path (normalization likely disabled); "
-            "nothing copied into checkpoint dir."
-        )
-        return
-    if not os.path.exists(src):
-        logger.warning(
-            "[normalizer] Dataset reports normalization_stats_path=%s but file does not exist; "
-            "nothing copied into checkpoint dir.",
-            src,
-        )
-        return
     os.makedirs(output_dir, exist_ok=True)
-    shutil.copyfile(src, dst)
-    logger.info("[normalizer] Copied action stats into checkpoint dir:\n  src: %s\n  dst: %s", src, dst)
+    shutil.copyfile(stats_path, dst)
+    logger.info("[normalizer] Copied the stats into the run dir:\n  src: %s\n  dst: %s", stats_path, dst)
 
 
 def _normalization_stats_values_equal(left, right) -> bool:
-    """Deep equality for nested normalization_stats.npy payloads."""
+    """Exact deep equality of two stats payloads (nested dicts / lists of arrays and scalars).
+
+    Args:
+        left, right: the two loaded payloads.
+
+    Returns:
+        bool, True iff they have the same keys, shapes and values (floats bit-equal, NaN == NaN).
+    """
     import numpy as np
 
     if isinstance(left, dict) and isinstance(right, dict):
@@ -79,112 +61,56 @@ def _normalization_stats_values_equal(left, right) -> bool:
         return all(_normalization_stats_values_equal(left[key], right[key]) for key in left)
     if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
         return len(left) == len(right) and all(_normalization_stats_values_equal(a, b) for a, b in zip(left, right))
-    left_arr = np.asarray(left) if isinstance(left, np.ndarray) or isinstance(right, np.ndarray) else None
-    if left_arr is not None:
-        right_arr = np.asarray(right)
+    if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+        left_arr, right_arr = np.asarray(left), np.asarray(right)
         if left_arr.shape != right_arr.shape:
             return False
-        if np.issubdtype(left_arr.dtype, np.floating) or np.issubdtype(right_arr.dtype, np.floating):
-            # Strict resume must preserve the exact transform. Tolerant
-            # comparison can accept small regenerated-stat differences even
-            # though restored weights and optimizer state were trained in the
-            # original coordinates.
-            return bool(np.array_equal(left_arr, right_arr, equal_nan=True))
-        return bool(np.array_equal(left_arr, right_arr))
+        # Strict resume must preserve the exact transform: the restored weights and optimizer state were trained in
+        # the original coordinates, so no tolerance.
+        floating = np.issubdtype(left_arr.dtype, np.floating) or np.issubdtype(right_arr.dtype, np.floating)
+        return bool(np.array_equal(left_arr, right_arr, equal_nan=floating))
     return left == right
 
 
-def _normalization_transforms_equal(left, right) -> bool:
-    """Compare effective transforms while allowing full-vs-legacy payloads.
+def verify_resume_normalization_stats(output_dir: str, stats_path: str) -> None:
+    """Fail fast when a resumed run's stats copy differs from the dataset's stats file in any way.
 
-    Older checkpoints contain only the six vectors deployment consumes, while
-    unified dataset artifacts may additionally carry quantiles, row counts and
-    provenance.  Those extra fields do not change normalization coordinates.
-    Semantic markers remain strict whenever both sides provide them; a legacy
-    reduced checkpoint legitimately has none.
-    """
-    if not isinstance(left, dict) or not isinstance(right, dict):
-        return False
-    left_modes = {
-        key: value
-        for key, value in left.items()
-        if isinstance(value, dict) and any(field in value for field in _NORMALIZATION_TRANSFORM_KEYS)
-    }
-    right_modes = {
-        key: value
-        for key, value in right.items()
-        if isinstance(value, dict) and any(field in value for field in _NORMALIZATION_TRANSFORM_KEYS)
-    }
-    if not left_modes or left_modes.keys() != right_modes.keys():
-        return False
-    for mode in left_modes:
-        left_stats = left_modes[mode]
-        right_stats = right_modes[mode]
-        for field in _NORMALIZATION_TRANSFORM_KEYS:
-            if (field in left_stats) != (field in right_stats):
-                return False
-            if field in left_stats and not _normalization_stats_values_equal(left_stats[field], right_stats[field]):
-                return False
-        for field in _NORMALIZATION_SEMANTIC_KEYS:
-            if field in left_stats and field in right_stats:
-                if not _normalization_stats_values_equal(left_stats[field], right_stats[field]):
-                    return False
-    return True
+    A resume keeps the run dir's ``normalization_stats.npy``; if it differs from what the dataset normalizes with,
+    training would continue in other coordinates than the restored weights. Old runs whose copy differs (other
+    fields, other layout) are not special-cased: rebuild their copy or warm-start with ``finetune_ckpt_path``.
 
-
-def verify_resume_normalization_stats(output_dir: str, dataset) -> None:
-    """Fail fast when a resumed run's deploy stats diverge from the dataset's.
-
-    Strict resume reuses the checkpoint-directory ``normalization_stats.npy``
-    rather than refreshing it from the dataset. If that artifact is missing,
-    unreadable, or its effective six-vector transform differs from the dataset,
-    training would normalize with one transform while deployment kept another —
-    and restored weights/optimizer state remain in the old coordinates. A legacy
-    reduced artifact is accepted when those vectors match the unified full file;
-    shared semantic markers are still compared strictly. Direct the user to
-    ``finetune_ckpt_path`` instead of silently continuing or replacing.
+    Args:
+        output_dir: str, the resumed run dir.
+        stats_path: str, the dataset's pooled stats file (normalization on; the caller decides from the config).
     """
     import pickle
 
     import numpy as np
 
-    src = getattr(dataset, "normalization_stats_path", None)
-    if not src:
-        return
-
     dst = os.path.join(output_dir, "normalization_stats.npy")
     if not os.path.isfile(dst):
         raise FileNotFoundError(
-            f"resume blocked: {dst} is missing while the dataset reports "
-            f"normalization_stats_path={src}. Use finetune_ckpt_path to warm-start "
-            "with freshly copied stats, or restore the run's normalization_stats.npy."
+            f"resume blocked: {dst} is missing while the dataset normalizes with {stats_path}. Use "
+            "finetune_ckpt_path to warm-start with freshly copied stats, or restore the run's normalization_stats.npy."
         )
-    if not os.path.isfile(src):
-        raise FileNotFoundError(
-            f"resume blocked: dataset normalization_stats_path={src} does not exist "
-            f"while comparing against checkpoint artifact {dst}."
-        )
-
     try:
         ckpt_payload = np.load(dst, allow_pickle=True).item()
-        data_payload = np.load(src, allow_pickle=True).item()
+        data_payload = np.load(stats_path, allow_pickle=True).item()
     except (OSError, ValueError, EOFError, pickle.UnpicklingError) as exc:
         raise ValueError(
             f"resume blocked: failed to read normalization stats for comparison "
-            f"(checkpoint={dst}, dataset={src}): {exc}. "
+            f"(checkpoint={dst}, dataset={stats_path}): {exc}. "
             "Use finetune_ckpt_path to warm-start instead of resume_ckpt_path."
         ) from exc
 
-    if not _normalization_stats_values_equal(ckpt_payload, data_payload) and not _normalization_transforms_equal(
-        ckpt_payload, data_payload
-    ):
+    if not _normalization_stats_values_equal(ckpt_payload, data_payload):
         raise ValueError(
             "resume blocked: checkpoint normalization_stats.npy does not match the "
-            f"dataset stats at {src}. Restored weights/optimizer were trained under "
+            f"dataset stats at {stats_path}. Restored weights/optimizer were trained under "
             "different normalization coordinates than the current dataset transform. "
             "Use finetune_ckpt_path to warm-start instead of resume_ckpt_path.\n"
             f"  checkpoint: {dst}\n"
-            f"  dataset:    {src}"
+            f"  dataset:    {stats_path}"
         )
 
 
@@ -243,16 +169,17 @@ def save_full_state(accelerator, output_path: str, global_step: int, opt_step: i
 def load_full_state(accelerator, state_dir: str) -> dict:
     """Restore optimizer/scheduler/RNG/model from ``state_dir`` (call AFTER prepare).
 
-    Returns the ``trainer_state.json`` contents (global_step / opt_step / epoch).
+    Returns the ``trainer_state.json`` contents (global_step / opt_step / epoch); a missing file raises.
     """
     import json
 
-    accelerator.load_state(state_dir)
+    # trainer_state.json is the state's completion marker (written last): no marker, no resume.
     meta_path = os.path.join(state_dir, "trainer_state.json")
-    if os.path.isfile(meta_path):
-        with open(meta_path) as f:
-            return json.load(f)
-    return {"global_step": 0, "opt_step": 0, "epoch": 0}
+    if not os.path.isfile(meta_path):
+        raise FileNotFoundError(f"{meta_path} is missing: {state_dir} is not a complete training state")
+    accelerator.load_state(state_dir)
+    with open(meta_path) as f:
+        return json.load(f)
 
 
 # --- Discovery (locate latest step) ---

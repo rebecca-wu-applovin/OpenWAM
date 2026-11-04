@@ -16,7 +16,7 @@ training:
   learning_rate: 1e-4             # Base learning rate for AdamW
   adam_betas: [0.9, 0.95]         # AdamW (beta1, beta2)
   weight_decay: 0.01              # AdamW weight decay
-  max_grad_norm: 1.0              # Gradient clipping max norm
+  max_grad_norm: 1.0              # Gradient clipping max norm (> 0; null = no clipping)
 
   # --- Schedule ---
   num_epochs: 2                   # Total training epochs (null = step-only, driven solely by max_steps)
@@ -30,7 +30,7 @@ training:
   lr_min_ratio: 0.01              # Minimum LR as fraction of learning_rate
 
   # --- Per-module LR (null = use base learning_rate) ---
-  action_lr: null                 # Override LR for action model parameters
+  action_lr: null                 # Override LR for action model parameters (a number, 0 included, is used as is)
   video_lr: null                  # Override LR for video backbone parameters
 
   # --- DeepSpeed / precision ---
@@ -56,13 +56,13 @@ training:
   # --- Checkpoint ---
   output_path: outputs/openwam_checkpoints            # Base directory for checkpoint output (relative to the launch cwd)
   run_dir_name: null              # Run dir under output_path (null = launch timestamp); must not already hold a run
-  save_steps: 5000                # Save checkpoint every N steps (0 or null = disable saving)
+  save_steps: 5000                # Save checkpoint every N steps (> 0; null = disable saving)
   save_full_states_for_resume: false  # Also save resumable full state (optimizer/scheduler/RNG) at each save;
                                       # required for training.resume_ckpt_path, costs extra disk per checkpoint
   keep_last_k_ckpts: 2         # Rolling window: keep only the last K checkpoints
 
   # --- Training-time world-model rollouts (wandb vis/*; clips also in <run>/vis/) ---
-  vis_steps: 5000                 # Render every N steps (+ once at step 1); 0 or null = off
+  vis_steps: 5000                 # Render every N steps (+ once at step 1); > 0, null = off
   vis_num_samples: 4              # Rollouts logged per vis step (one fixed training sample per rank)
   vis_denoise_steps: 10           # Euler steps per rollout (deploy default)
   vis_fps: 5                      # Clip playback fps (dataset fps / future frame spacing: 20 / 4)

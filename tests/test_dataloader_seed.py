@@ -33,7 +33,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset
 
 from openwam.train.utils.seeding import (
     dataloader_worker_init_fn,
@@ -218,211 +218,24 @@ def test_different_seeds_produce_different_outputs():
 
 
 # ---------------------------------------------------------------------------
-# 4. DistributedSampler.seed wiring (the post-prepare patch in trainer)
+# 4. The trainer's DataLoader shuffles with the run seed (decided in build_dataloader, nothing patched later)
 # ---------------------------------------------------------------------------
 
 
-def test_distributed_sampler_seed_takes_effect():
-    """The post-``prepare`` patch sets ``sampler.seed = cfg.project.seed``.
-    Verify a DistributedSampler honours that and that ``set_epoch`` still
-    produces a different permutation for each epoch."""
-    ds = _RNGSensitiveDataset(size=64)
-    sampler_a = DistributedSampler(ds, num_replicas=1, rank=0, shuffle=True, seed=0)
-    sampler_b = DistributedSampler(ds, num_replicas=1, rank=0, shuffle=True, seed=0)
+def test_build_dataloader_shuffles_with_the_run_seed():
+    """build_dataloader gives the RandomSampler the per-rank generator of cfg.project.seed: the one place the
+    shuffle order is seeded (accelerate re-broadcasts that generator after prepare)."""
+    from omegaconf import OmegaConf
 
-    # Same default seed=0 => identical permutations.
-    sampler_a.set_epoch(0)
-    sampler_b.set_epoch(0)
-    assert list(sampler_a) == list(sampler_b)
+    from openwam.train.openwam_trainer import OpenWAMTrainer
 
-    # Patch sampler_b.seed (this mirrors what the trainer does after prepare).
-    sampler_b.seed = 42
-    sampler_b.set_epoch(0)
-    sampler_a.set_epoch(0)
-    perm_default = list(sampler_a)
-    perm_patched = list(sampler_b)
-    assert perm_default != perm_patched, "Patching sampler.seed had no effect on permutation"
-
-    # Same seed=42, two different epochs => different permutations (the
-    # ``seed + epoch`` mechanism from PyTorch DistributedSampler).
-    sampler_b.set_epoch(0)
-    perm_epoch0 = list(sampler_b)
-    sampler_b.set_epoch(1)
-    perm_epoch1 = list(sampler_b)
-    assert perm_epoch0 != perm_epoch1, "set_epoch did not advance the shuffle permutation"
-
-
-def test_distributed_sampler_seed_reproduces_across_constructions():
-    """Two DistributedSamplers built with the same patched seed must yield
-    bit-exact identical permutations for matching epochs."""
-    ds = _RNGSensitiveDataset(size=64)
-    sampler_a = DistributedSampler(ds, num_replicas=1, rank=0, shuffle=True, seed=0)
-    sampler_b = DistributedSampler(ds, num_replicas=1, rank=0, shuffle=True, seed=0)
-    sampler_a.seed = 42
-    sampler_b.seed = 42
-
-    for epoch in range(3):
-        sampler_a.set_epoch(epoch)
-        sampler_b.set_epoch(epoch)
-        assert list(sampler_a) == list(sampler_b), f"Epoch {epoch} permutations diverged"
-
-
-# ---------------------------------------------------------------------------
-# 5. _wire_sampler_seed helper — production path + warn fallback
-#
-# These guard the "silent failure" Issue 1 from the review: if the prepared
-# DataLoader doesn't expose a sampler with a ``.seed`` attribute, the user
-# must see a WARNING, not a successful-looking log line.
-# ---------------------------------------------------------------------------
-
-
-class _FakeSamplerWithSeed:
-    def __init__(self, seed: int = 0):
-        self.seed = seed
-
-
-class _FakeSamplerNoSeed:
-    """Mirrors e.g. a non-shuffled sampler or some accelerate wrappers that
-    don't expose a per-instance seed attribute."""
-
-
-class _FakeDataLoader:
-    def __init__(self, sampler=None, batch_sampler=None):
-        self.sampler = sampler
-        self.batch_sampler = batch_sampler
-
-
-class _FakeBatchSampler:
-    def __init__(self, sampler):
-        self.sampler = sampler
-
-
-def test_wire_sampler_seed_patches_top_level_sampler(caplog: pytest.LogCaptureFixture):
-    """Happy path: dataloader.sampler exposes ``seed`` -> patched, INFO logged."""
-    import logging
-
-    from openwam.train.utils.seeding import wire_sampler_seed
-
-    sampler = _FakeSamplerWithSeed(seed=0)
-    dataloader = _FakeDataLoader(sampler=sampler)
-    with caplog.at_level(logging.INFO, logger="openwam.train.utils.seeding"):
-        wire_sampler_seed(dataloader, run_seed=42)
-    assert sampler.seed == 42
-    assert any("wired to cfg.project.seed" in rec.message for rec in caplog.records)
-    assert not any(rec.levelno >= logging.WARNING for rec in caplog.records)
-
-
-def test_wire_sampler_seed_falls_through_to_batch_sampler(caplog: pytest.LogCaptureFixture):
-    """When ``dataloader.sampler`` is None, the helper falls back to
-    ``dataloader.batch_sampler.sampler``. Mirrors accelerate's wrapping."""
-    import logging
-
-    from openwam.train.utils.seeding import wire_sampler_seed
-
-    inner = _FakeSamplerWithSeed(seed=0)
-    dataloader = _FakeDataLoader(sampler=None, batch_sampler=_FakeBatchSampler(inner))
-    with caplog.at_level(logging.INFO, logger="openwam.train.utils.seeding"):
-        wire_sampler_seed(dataloader, run_seed=7)
-    assert inner.seed == 7
-    assert not any(rec.levelno >= logging.WARNING for rec in caplog.records)
-
-
-def test_wire_sampler_seed_warns_when_no_sampler_with_seed(caplog: pytest.LogCaptureFixture):
-    """CORE Issue 1 guard: if neither sampler nor batch_sampler.sampler exposes
-    ``.seed``, the helper must WARN — otherwise the user gets shuffle order
-    pinned to the upstream default while believing project.seed took effect."""
-    import logging
-
-    from openwam.train.utils.seeding import wire_sampler_seed
-
-    # Case A: sampler exists but lacks ``.seed`` (e.g. plain RandomSampler).
-    dataloader = _FakeDataLoader(sampler=_FakeSamplerNoSeed())
-    with caplog.at_level(logging.WARNING, logger="openwam.train.utils.seeding"):
-        wire_sampler_seed(dataloader, run_seed=42)
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert warnings, "Expected a WARNING when sampler has no .seed attribute"
-    assert "_FakeSamplerNoSeed" in warnings[-1].message
-    caplog.clear()
-
-    # Case B: no sampler at all (e.g. IterableDataset).
-    dataloader = _FakeDataLoader(sampler=None, batch_sampler=None)
-    with caplog.at_level(logging.WARNING, logger="openwam.train.utils.seeding"):
-        wire_sampler_seed(dataloader, run_seed=42)
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert warnings, "Expected a WARNING when sampler is None"
-    assert "None" in warnings[-1].message
-
-
-def test_wire_sampler_seed_with_real_distributed_sampler(caplog: pytest.LogCaptureFixture):
-    """End-to-end sanity: a real PyTorch DistributedSampler wired by the
-    helper produces the same epoch-0 permutation as one constructed with the
-    target seed directly. Guards against accidental drift between the helper
-    and what users would get if they passed seed=N to DistributedSampler."""
-    import logging
-
-    from openwam.train.utils.seeding import wire_sampler_seed
-
-    ds = _RNGSensitiveDataset(size=32)
-    wired_sampler = DistributedSampler(ds, num_replicas=1, rank=0, shuffle=True, seed=0)
-    dataloader = _FakeDataLoader(sampler=wired_sampler)
-
-    with caplog.at_level(logging.INFO, logger="openwam.train.utils.seeding"):
-        wire_sampler_seed(dataloader, run_seed=42)
-
-    reference = DistributedSampler(ds, num_replicas=1, rank=0, shuffle=True, seed=42)
-    wired_sampler.set_epoch(0)
-    reference.set_epoch(0)
-    assert list(wired_sampler) == list(reference)
-
-
-def test_wire_sampler_seed_accepts_generator_driven_random_sampler(caplog: pytest.LogCaptureFixture):
-    """Production path: accelerate's prepared loader carries a vestigial
-    SequentialSampler on ``.sampler`` while the real generator-driven
-    RandomSampler sits at ``.batch_sampler.batch_sampler.sampler``. When that
-    generator was seeded by make_dataloader_generator(run_seed, rank), the
-    helper must recognize it (INFO) and must NOT warn."""
-    import logging
-
-    from openwam.train.utils.seeding import RANK_OFFSET, make_dataloader_generator, wire_sampler_seed
-
-    ds = list(range(64))
-    rank = 2
-    inner_sampler = torch.utils.data.RandomSampler(ds, generator=make_dataloader_generator(42, rank=rank))
-    inner_batch = torch.utils.data.BatchSampler(inner_sampler, batch_size=8, drop_last=False)
-
-    class _FakeShard:  # mirrors accelerate.BatchSamplerShard
-        def __init__(self, batch_sampler):
-            self.batch_sampler = batch_sampler
-
-    dataloader = _FakeDataLoader(
-        sampler=torch.utils.data.SequentialSampler(ds),  # torch's vestigial default
-        batch_sampler=_FakeShard(inner_batch),
-    )
-    with caplog.at_level(logging.INFO, logger="openwam.train.utils.seeding"):
-        wire_sampler_seed(dataloader, run_seed=42, rank=rank)
-    assert any("already follows cfg.project.seed" in rec.message for rec in caplog.records)
-    assert not any(rec.levelno >= logging.WARNING for rec in caplog.records)
-    assert inner_sampler.generator.initial_seed() == 42 + RANK_OFFSET * rank
-
-
-def test_wire_sampler_seed_warns_on_foreign_generator(caplog: pytest.LogCaptureFixture):
-    """A generator NOT seeded from run_seed (e.g. accelerate injecting a
-    randomly-seeded one when none was passed) must still trigger the warning —
-    shuffle order would not follow cfg.project.seed."""
-    import logging
-
-    from openwam.train.utils.seeding import wire_sampler_seed
-
-    ds = list(range(64))
-    foreign = torch.Generator()
-    foreign.manual_seed(123456789)
-    sampler = torch.utils.data.RandomSampler(ds, generator=foreign)
-    dataloader = _FakeDataLoader(sampler=sampler)
-    with caplog.at_level(logging.WARNING, logger="openwam.train.utils.seeding"):
-        wire_sampler_seed(dataloader, run_seed=42, rank=0)
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert warnings, "Expected a WARNING for a generator not derived from run_seed"
-    assert "RandomSampler" in warnings[-1].message
+    trainer = object.__new__(OpenWAMTrainer)
+    trainer.cfg = OmegaConf.create({"training": {"dataset_num_workers": 0}})
+    trainer.dataset = list(range(10))
+    trainer._run_seed, trainer._rank = 42, 3
+    dl = trainer.build_dataloader(batch_size=2)
+    assert isinstance(dl.sampler, torch.utils.data.RandomSampler)
+    assert dl.sampler.generator.initial_seed() == make_dataloader_generator(42, rank=3).initial_seed()
 
 
 # ---------------------------------------------------------------------------

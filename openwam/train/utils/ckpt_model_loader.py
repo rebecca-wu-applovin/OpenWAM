@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_ckpt_path(source: str) -> tuple[str, str | None]:
-    """Split a finetune / resume source.
+    """Split a finetune source.
 
     Args:
         source: str, a checkpoint dir or one of its ``checkpoint_step_*.safetensors`` files.
@@ -54,6 +54,23 @@ def _resolve_ckpt_path(source: str) -> tuple[str, str | None]:
             raise FileNotFoundError(f"Explicit checkpoint weights file does not exist: {source}")
         return os.path.dirname(os.path.abspath(source)), os.path.abspath(source)
     return source, None
+
+
+def _resume_dir(source: str) -> str:
+    """Check a resume source names a run dir (resume always continues from the latest accel state in it).
+
+    Args:
+        source: str, ``training.resume_ckpt_path``.
+
+    Returns:
+        str, the run dir (unchanged). Raises ValueError when it is not an existing directory.
+    """
+    if not os.path.isdir(source):
+        raise ValueError(
+            f"training.resume_ckpt_path={source!r} is not a directory: resume continues a run dir (its latest "
+            "accel_state_step_*). To start a new run from a weights file use training.finetune_ckpt_path."
+        )
+    return source
 
 
 # ----------------------------------------------------------------------------
@@ -225,12 +242,12 @@ def load_resume_cfg(live_cfg: DictConfig, resume_path: str) -> DictConfig:
 
     Args:
         live_cfg: DictConfig, the config this launch composed.
-        resume_path: str, ``training.resume_ckpt_path`` (run dir, or a safetensors file inside it).
+        resume_path: str, ``training.resume_ckpt_path`` (the run dir; anything else raises ValueError).
 
     Returns:
         DictConfig, the saved config with the ``RESUME_LAUNCH_KEYS`` taken from ``live_cfg``.
     """
-    ckpt_dir, _ = _resolve_ckpt_path(resume_path)
+    ckpt_dir = _resume_dir(resume_path)
     path = os.path.join(ckpt_dir, "config.yaml")
     saved = OmegaConf.load(path)
     check_resume_cfg(saved, live_cfg, path)
@@ -296,7 +313,7 @@ def build_for_resume(source: str, cfg: DictConfig, train_options: TrainOptions) 
     run is still recoverable from its accel state.
 
     Args:
-        source: str, ``training.resume_ckpt_path`` (the run dir).
+        source: str, ``training.resume_ckpt_path`` (the run dir; anything else raises ValueError).
         cfg: the run config, resolved and read-only; any difference from the saved config.yaml outside the
             resume-location keys raises (:func:`check_resume_cfg`), so ``merge(cfg.common, cfg.model)`` is the
             run's own and builds the shell.
@@ -308,7 +325,7 @@ def build_for_resume(source: str, cfg: DictConfig, train_options: TrainOptions) 
     from openwam.model import build_architecture_from_ckpt_dir
     from openwam.model.video_backbone.common.weights import materialize_meta
 
-    ckpt_dir, _explicit_weights = _resolve_ckpt_path(source)
+    ckpt_dir = _resume_dir(source)
     # scripts/train.py already swapped in the saved config (load_resume_cfg); this guards direct callers.
     check_resume_cfg(_load_ckpt_cfg(ckpt_dir), cfg, os.path.join(ckpt_dir, "config.yaml"))
     logger.info("[resume] building architecture from ckpt dir: %s", ckpt_dir)

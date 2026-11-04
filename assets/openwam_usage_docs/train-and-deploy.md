@@ -135,7 +135,7 @@ training:
   # Start a new run from existing weights
   finetune_ckpt_path: /path/to/base_checkpoint
 
-  # Continue a run with its saved optimizer and scheduler state
+  # Continue a run with its saved optimizer and scheduler state (the run dir; a weights file raises)
   resume_ckpt_path: null
   save_full_states_for_resume: true
 ~~~
