@@ -259,8 +259,7 @@ def load_stats_metadata(path: str | Path, *, action_mode: Optional[str]) -> Mapp
     """Return the RAW stats mapping so callers can read non-stat-vector fields.
 
     ``load_stats_file`` materializes only the six stat vectors; readers that
-    persist a provenance/convention marker alongside them (e.g. LIBERO's
-    ``gripper_convention``) read it through here. Shares ``_load_raw_stats``'s
+    persist a provenance/convention marker alongside them read it through here. Shares ``_load_raw_stats``'s
     per-process cache, so this costs no extra I/O when the stats file has
     already been loaded.
 

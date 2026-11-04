@@ -1,8 +1,7 @@
 """Architecture-side helpers shared across WAM frameworks.
 
 Bridge-layer resolution, latent-mask downsampling, and the video
-tokens-per-frame derivation used by the MoT drivers and the SingleSystem
-mask builder.
+tokens-per-frame derivation used by the MoT drivers.
 """
 
 from __future__ import annotations
@@ -53,7 +52,7 @@ def downsample_video_mask_to_latent(
         frame and excluded from loss; the returned mask covers tail latent
         steps only (shape ``T_latent_tail = ceil((T_video - 1) / k)``). This
         matches the Wan loss path which trims pred/target via ``[:, :, 1:]``.
-      - ``skip_first=False`` (Cosmos T2V, no first-frame conditioning): all
+      - ``skip_first=False`` (T2V, no first-frame conditioning): all
         latents — including latent[0] — are predicted, so the mask must
         include frame 0 too (shape ``T_latent = 1 + T_latent_tail``).
 

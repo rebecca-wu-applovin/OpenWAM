@@ -96,7 +96,6 @@ huggingface-hub==1.30.0
     # via
     #   accelerate
     #   diffusers
-    #   timm
     #   tokenizers
     #   transformers
 hydra-core==1.3.6
@@ -303,7 +302,6 @@ pyyaml==6.0.3
     #   huggingface-hub
     #   omegaconf
     #   pre-commit
-    #   timm
     #   transformers
     #   wandb
 regex==2026.9.10
@@ -326,7 +324,6 @@ safetensors==0.8.0
     #   openwam (pyproject.toml)
     #   accelerate
     #   diffusers
-    #   timm
     #   transformers
 scipy==1.18.1
     # via openwam (pyproject.toml)
@@ -350,8 +347,6 @@ starlette==1.6.0
     # via fastapi
 sympy==1.14.0
     # via torch
-timm==1.0.29
-    # via openwam (pyproject.toml)
 tokenizers==0.23.2
     # via transformers
 torch==2.7.1+cu128
@@ -360,7 +355,6 @@ torch==2.7.1+cu128
     #   openwam (pyproject.toml)
     #   accelerate
     #   deepspeed
-    #   timm
     #   torchaudio
     #   torchvision
 torchaudio==2.7.1+cu128
@@ -371,7 +365,6 @@ torchvision==0.22.1+cu128
     # via
     #   -c docker/constraints-cu128.txt
     #   openwam (pyproject.toml)
-    #   timm
 tqdm==4.70.0
     # via
     #   openwam (pyproject.toml)

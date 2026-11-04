@@ -7,15 +7,10 @@ import pytest
 import torch
 from einops import rearrange
 
-from openwam.model.video_backbone.flux_action.backbone import (
-    _N_MODE,
-    FluxActionVideoBackbone,
-    build_flux_layer_masks,
-    build_stream_ids,
-    video_time_ids,
-)
-from openwam.model.video_backbone.flux_action.positional import batched_prc_action, batched_prc_txt, batched_prc_vid
-from openwam.model.video_backbone.flux_action.transformer import JointSingleSeq, JointSingleSeqParams
+from openwam.model.video_backbone.flux.backbone import _N_MODE, FluxActionVideoBackbone
+from openwam.model.video_backbone.flux.masks import build_flux_layer_masks, build_stream_ids, video_time_ids
+from openwam.model.video_backbone.flux.positional import batched_prc_action, batched_prc_txt, batched_prc_vid
+from openwam.model.video_backbone.flux.dit import JointSingleSeq, JointSingleSeqParams
 
 SEG = {"txt": 4, "video": 6, "video_cond": 9, "action_cond": 3}  # T, F, H, P token counts
 SA = 2  # OpenWAM action tokens

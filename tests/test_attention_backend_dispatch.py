@@ -50,7 +50,7 @@ def _install_fake_flash_attn_2(monkeypatch, vdit, kernel):
 
 def test_wan_dit_falls_back_to_sdpa_on_cpu(monkeypatch):
     """CPU tensors must never reach the fused kernel."""
-    import openwam.model.video_backbone.wan.models.dit as vdit
+    import openwam.model.video_backbone.wan.dit as vdit
 
     def _reject(*args, **kwargs):
         raise AssertionError("fused kernel must not receive CPU tensors")
@@ -69,7 +69,7 @@ def test_wan_dit_falls_back_to_sdpa_on_cpu(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_wan_dit_falls_back_to_sdpa_for_cuda_fp32(monkeypatch):
     """fp32 is rejected by the fused kernels even on CUDA."""
-    import openwam.model.video_backbone.wan.models.dit as vdit
+    import openwam.model.video_backbone.wan.dit as vdit
 
     def _reject(*args, **kwargs):
         raise AssertionError("fused kernel must not receive fp32 tensors")
@@ -88,7 +88,7 @@ def test_wan_dit_falls_back_to_sdpa_for_cuda_fp32(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_wan_dit_keeps_fused_path_for_cuda_half(monkeypatch):
     """The guard must not cost us the fast path it is protecting."""
-    import openwam.model.video_backbone.wan.models.dit as vdit
+    import openwam.model.video_backbone.wan.dit as vdit
 
     calls = []
 
@@ -181,7 +181,7 @@ def test_shared_core_attention_forward_runs_on_cpu(monkeypatch):
 
 
 def test_fused_backend_name_follows_availability(monkeypatch):
-    import openwam.model.video_backbone.wan.models.dit as vdit
+    import openwam.model.video_backbone.wan.dit as vdit
 
     for flag in ("FLASH_ATTN_3_AVAILABLE", "FLASH_ATTN_2_AVAILABLE", "SAGE_ATTN_AVAILABLE"):
         monkeypatch.setattr(vdit, flag, False)
@@ -199,7 +199,7 @@ def test_fused_backend_name_follows_availability(monkeypatch):
 
 def test_diagnostics_do_not_claim_a_backend_unconditionally(monkeypatch, caplog):
     """The report must not read as 'flash_attention_2' on a run that uses SDPA."""
-    import openwam.model.video_backbone.wan.models.dit as vdit
+    import openwam.model.video_backbone.wan.dit as vdit
     from openwam.deploy.server import _log_attention_backends
 
     monkeypatch.setattr(vdit, "FLASH_ATTN_2_AVAILABLE", True)

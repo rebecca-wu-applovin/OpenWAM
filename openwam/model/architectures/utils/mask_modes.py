@@ -147,21 +147,17 @@ def build_cross_modal_attention_mask(
     video_tokens_per_frame: int,
     mode: str,
     device: torch.device,
-    n_readonly_tail: int = 0,
     num_clean_frames: int = 1,
 ) -> torch.Tensor:
-    """Build the ``[video, action, tail]`` bool attention mask (True = visible).
+    """Build the ``[video, action]`` bool attention mask (True = visible).
 
     - v<->v: ``video_backbone.build_video_to_video_mask`` (driven by
       ``video_attention_mask_mode``)
     - a<->a: True
     - v<->a: per ``mode`` (see :func:`fill_cross_modal_va_blocks`)
-    - read-only ``tail`` (tri-system understanding tokens / single-system state
-      tokens, structurally the same): video and action see the tail; the tail
-      sees only itself and never video/action.
     """
     validate_attention_mask_mode(mode)
-    total = s_video + s_action + int(n_readonly_tail)
+    total = s_video + s_action
     mask = torch.zeros((total, total), dtype=torch.bool, device=device)
 
     if num_clean_frames > 1:
@@ -191,11 +187,6 @@ def build_cross_modal_attention_mask(
         video_tokens_per_frame=video_tokens_per_frame,
         num_clean_frames=num_clean_frames,
     )
-
-    if n_readonly_tail:
-        tail_start = a_end
-        mask[:tail_start, tail_start:] = True  # video + action see the tail
-        mask[tail_start:, tail_start:] = True  # the tail sees only itself
     return mask
 
 

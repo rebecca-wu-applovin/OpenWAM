@@ -14,31 +14,19 @@ def test_import_data_base():
     assert hasattr(BaseDataset, "__len__")
 
 
-def test_import_data_robotwin():
-    from openwam.dataloader.robotwin import (  # noqa: F401
-        ROBOTWIN_ALL_TASKS,
-    )
-
-    assert len(ROBOTWIN_ALL_TASKS) == 50
-
-
 def test_import_data_transforms():
     from openwam.dataloader.transforms import RotationTransform, build_transforms  # noqa: F401
 
 
 def test_import_data_normalization_stats():
-    from openwam.dataloader.utils.stats_computation.robotwin_stats_computation import (  # noqa: F401
-        compute_multitask_robotwin_stats,
-        compute_normalization_stats,
-        parse_tasks_file,
-    )
+    import openwam.dataloader.utils.stats_computation.yam_sharpa_stats_computation  # noqa: F401
 
 
 def test_import_data_init():
     from openwam.dataloader import (  # noqa: F401
         BaseDataset,
-        MultiTaskRoboTwinDataset,
-        RoboTwinDataset,
+        MultiYamSharpaDataset,
+        YamSharpaDataset,
     )
 
 
@@ -91,13 +79,6 @@ def test_import_action_dit():
     )
 
 
-def test_import_moe_action_backbone():
-    from openwam.model.action_backbone.shared_action_backbone import (  # noqa: F401
-        ExpertFFNBlock,
-        SharedMoEActionBackbone,
-    )
-
-
 def test_import_action_scheduler():
     from openwam.model.action_backbone.scheduler import ActionScheduler
 
@@ -111,25 +92,16 @@ def test_import_model_config():
 
 
 def test_import_video_backbone():
-    from openwam.model.video_backbone import Wan21, Wan22Ti2v  # noqa: F401
+    from openwam.model.video_backbone import Wan22Ti2v  # noqa: F401
     from openwam.model.video_backbone.wan.loader import load_wan_components  # noqa: F401
 
 
 def test_import_architecture_registry():
-    from openwam.model import ARCHITECTURE_REGISTRY, build_architecture, list_supported_architectures
+    from openwam.model import build_architecture, list_supported_architectures
 
     supported = list_supported_architectures()
     assert "dual_system_cross_attn" in supported
     assert "dual_system_self_attn" in supported
-    assert "dual_system_idm" in supported
-    assert "single_system_vanilla" in supported
-    assert "single_system_moe" in supported
-    # tri_system is registered with status="supported". Both
-    # list_supported_architectures and the full registry
-    # surface it; we keep both assertions as a regression guard against
-    # accidental flip back to experimental.
-    assert "tri_system_joint_self_attn" in supported
-    assert "tri_system_joint_self_attn" in ARCHITECTURE_REGISTRY
 
     configs = {
         "dual_system_cross_attn": {
@@ -155,50 +127,11 @@ def test_import_architecture_registry():
             "num_heads": 4,
             "video_dim": 128,
         },
-        "dual_system_idm": {
-            "framework": "dual_system",
-            "variant": "idm",
-            "bridge_layers": (0, 1),
-            "action_dim": 7,
-            "dim": 128,
-            "ffn_dim": 256,
-            "num_heads": 4,
-            "video_dim": 128,
-            "idm_video_cond_noise_prob": 0.5,
-        },
-        "single_system_moe": {
-            "framework": "single_system",
-            "variant": "moe",
-            "action_dim": 7,
-            "video_dim": 128,
-            "expert_ffn_dim": 256,
-            "bridge_layers": (0, 1),
-        },
-        "single_system_vanilla": {
-            "framework": "single_system",
-            "variant": "vanilla",
-            "action_dim": 7,
-            "video_dim": 128,
-        },
-        # tri_system_joint_self_attn is intentionally omitted from this
-        # CPU build matrix — full instantiation requires real Wan2.2 (32GB) +
-        # Qwen3-VL (4GB) weights plus the deeper runtime plumbing.
-        # ``tests/test_tri_system_smoke.py`` covers the weights-free
-        # fake-module path, and the ``cfg=None`` smoke below covers registry
-        # dispatch for tri_system without weights.
     }
 
     for arch_name in configs:
         arch = build_architecture(arch_name, configs[arch_name])
         assert arch is not None
-
-    # tri_system: weights-free smoke. ``BaseWAMArchitecture.__init__``
-    # short-circuits on ``cfg=None`` (skips video_backbone / Qwen3-VL /
-    # UE / AE construction), so this exercises only registry dispatch +
-    # ``build_architecture`` plumbing.
-    arch = build_architecture("tri_system_joint_self_attn", None)
-    assert arch is not None
-    assert arch.video_backbone is None and arch.action_backbone is None
 
 
 def test_wan_dit_block_public_attrs_for_mot():
@@ -218,9 +151,9 @@ def test_wan_dit_block_public_attrs_for_mot():
 
     import torch.nn as nn
 
-    from openwam.model.video_backbone.wan.models.dit import DiTBlock
+    from openwam.model.video_backbone.wan.dit import DiTBlock
 
-    block = DiTBlock(has_image_input=False, dim=32, num_heads=4, ffn_dim=64, eps=1e-6)
+    block = DiTBlock(dim=32, num_heads=4, ffn_dim=64, eps=1e-6)
     for name in ("self_attn", "cross_attn", "norm1", "norm2", "norm3", "ffn", "modulation"):
         assert hasattr(block, name), f"DiTBlock missing public attr: {name}"
     for name in ("q", "k", "v", "o", "norm_q", "norm_k"):

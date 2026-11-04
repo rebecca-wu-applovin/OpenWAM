@@ -2,8 +2,7 @@
 produce numerically identical output to ``DiTBlock.forward`` / ``SelfAttnActionDiTBlock.forward``.
 
 The split is the foundation of the joint self-attention path. If it diverges
-from the plain block forward, every test that uses ``run_block`` (vanilla /
-MoE SingleSystem) silently keeps working while the new path quietly
+from the plain block forward, every test that uses ``run_block`` silently keeps working while the new path quietly
 produces wrong outputs. This file pins the equivalence at zero atol.
 """
 
@@ -13,12 +12,12 @@ import torch
 
 from openwam.model.action_backbone.separate_action_dit import ActionDiT, SelfAttnActionDiTBlock
 from openwam.model.video_backbone.base import BlockLoopState
-from openwam.model.video_backbone.wan.models.dit import DiTBlock, precompute_freqs_cis_3d
+from openwam.model.video_backbone.wan.dit import DiTBlock, precompute_freqs_cis_3d
 
 
 def _attention_single_stream(q, k, v, num_heads):
     """Standalone attention matching what DiTBlock.self_attn.attn does internally."""
-    from openwam.model.video_backbone.wan.models.dit import flash_attention
+    from openwam.model.video_backbone.wan.dit import flash_attention
 
     return flash_attention(q, k, v, num_heads=num_heads)
 
@@ -36,7 +35,7 @@ def _attention_action(q_bsd, k_bsd, v_bsd, num_heads):
 
 
 def _make_wan_dit_block(dim=64, num_heads=4, ffn_dim=128):
-    block = DiTBlock(has_image_input=False, dim=dim, num_heads=num_heads, ffn_dim=ffn_dim)
+    block = DiTBlock(dim=dim, num_heads=num_heads, ffn_dim=ffn_dim)
     block.eval()
     return block
 
@@ -78,7 +77,7 @@ def _wan_pre_post_via_adapter(block: DiTBlock, state: BlockLoopState, num_heads:
     the adapter drifts from the plain block forward.
     """
     del num_heads  # plumbed via block.self_attn.num_heads
-    from openwam.model.video_backbone.wan.models.dit import modulate, rope_apply
+    from openwam.model.video_backbone.wan.dit import modulate, rope_apply
 
     t_mod = state.time_mod
     chunks = (block.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)

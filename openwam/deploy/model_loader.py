@@ -119,58 +119,15 @@ def load_from_checkpoint_dir(
     if vb_components is not None:
         logger.info("Using config-embedded component specs for video-backbone construction")
         vb_cfg_dict = OmegaConf.to_container(cfg.model.video_backbone, resolve=True)
-        # CosmosPredict25 Reason1 self-containment: the ckpt's Reason1 weights
-        # live in the unified safetensors and the small structural artifacts
-        # (config.json + tokenizer.json) under ``<ckpt_dir>/reason1/`` —
-        # ``save_deploy_assets`` writes the component marker and the artifact
-        # dir together. Clearing ``text_encoder_path`` makes
-        # ``build_cosmos_predict25_pipeline`` take its deploy/empty-shell path;
-        # a missing ``reason1/`` dir then hard-errors inside ``from_empty``.
-        # Iterate the plain-dict copy. ``vb_components`` is an OmegaConf
-        # ``ListConfig`` whose entries are ``DictConfig`` (NOT a ``dict``
-        # subclass) — so ``isinstance(c, dict)`` would always be False
-        # against the real saved config, silently skipping the marker.
-        # ``source: state_dict`` distinguishes the Reason1 marker from Wan's
-        # umt5 ``text_encoder`` component (a ``model_class`` instantiation spec).
-        has_reason1_state_component = any(
-            isinstance(c, dict) and c.get("attr") == "text_encoder" and c.get("source") == "state_dict"
-            for c in (vb_cfg_dict.get("components") or [])
-        )
-        if has_reason1_state_component:
-            prev_path = vb_cfg_dict.get("text_encoder_path")
-            vb_cfg_dict["text_encoder_path"] = None
-            logger.info(
-                "Using self-contained Reason1 artifacts from %s (clearing external text_encoder_path=%r)",
-                os.path.join(ckpt_dir, "reason1"),
-                prev_path,
-            )
-        # Symmetric with the Reason1 clearing above: when the ckpt carries a VAE
-        # state component, its weights live in the unified safetensors (via
-        # ``vae``), so any training-time ``vae_path`` must be cleared.
-        # Otherwise ``build_cosmos_predict25_pipeline``'s deploy guard
-        # (``ckpt_dir is not None and vae_path_override is None``) stays False and
-        # ``_resolve_vae_path`` raises FileNotFoundError on a host lacking the
-        # original path, before weights ever load.
-        has_vae_state_component = any(
-            isinstance(c, dict) and c.get("attr") == "vae" for c in (vb_cfg_dict.get("components") or [])
-        )
-        if has_vae_state_component and vb_cfg_dict.get("vae_path") is not None:
-            prev_vae_path = vb_cfg_dict.get("vae_path")
-            vb_cfg_dict["vae_path"] = None
-            logger.info(
-                "Using self-contained VAE weights from checkpoint (clearing external vae_path=%r)",
-                prev_vae_path,
-            )
         vb_params["_source"] = vb_cfg_dict
         vb_params["_ckpt_dir"] = ckpt_dir
     else:
         model_path = OmegaConf.select(cfg, "model.video_backbone.model_path", default=None)
         if model_path is not None:
             vb_name = str(OmegaConf.select(cfg, "model.video_backbone.name", default=""))
-            if vb_name.startswith(("cosmos_predict25_", "cosmos3_")):
-                # Cosmos families carry fields the path-only string source would
-                # lose (predict2.5: `shift_video` / `model_variant` /
-                # `text_encoder_path`; cosmos3: `shift_video` / prompt knobs).
+            if vb_name.startswith("cosmos3_"):
+                # Cosmos3 carries fields the path-only string source would
+                # lose (`shift_video` / prompt knobs).
                 # `from_pretrained` accepts a dict natively (via
                 # `_video_backbone_cfg`). Wan never hits this branch.
                 vb_params["_source"] = {k: v for k, v in vb_params.items() if not str(k).startswith("_")}
@@ -186,19 +143,6 @@ def load_from_checkpoint_dir(
             logger.warning(
                 "No components or model_path in config; architecture __init__ will attempt to build from config."
             )
-
-    # tri_system: use VLM checkpoint saved in the checkpoint dir instead of
-    # the external training-time path. The trainer copies the VLM directory
-    # to ``<ckpt_dir>/vlm_backbone/`` so deploy is self-contained.
-    if resolved_arch.canonical.framework == "tri_system":
-        vlm_cfg = params.get("vlm_backbone", {})
-        if not isinstance(vlm_cfg, dict):
-            vlm_cfg = OmegaConf.to_container(vlm_cfg, resolve=True) or {}
-            params["vlm_backbone"] = vlm_cfg
-        vlm_dir = os.path.join(ckpt_dir, "vlm_backbone")
-        if os.path.isdir(vlm_dir):
-            vlm_cfg["checkpoint_path"] = vlm_dir
-            logger.info("Using self-contained VLM checkpoint from %s", vlm_dir)
 
     architecture = build_architecture(resolved_arch.registry_name, params)
     logger.info(
@@ -245,21 +189,15 @@ def load_from_checkpoint_dir(
 def repr_contract_from_cfg(cfg: DictConfig) -> dict:
     """Checkpoint representation fields that an eval client must match.
 
-    Optional legacy markers are advertised only when the training config
-    actually contains them.  Compact RoboCasa365 now defines gripper and mode
-    semantics as part of its representation and performs both projections in
-    the evaluation bridge, so its checkpoint contract needs only the
-    representation name.
+    Optional markers are advertised only when the training config actually
+    contains them.
     """
     dims = OmegaConf.select(cfg, "dataloader.binary_action_dims", default=None)
-    gripper_convention = OmegaConf.select(cfg, "dataloader.gripper_convention", default=None)
     contract = {
         "representation": str(OmegaConf.select(cfg, "dataloader.action_mode", default="joint")),
     }
     if dims:
         contract["binary_action_dims"] = [int(d) for d in dims]
-    if gripper_convention is not None:
-        contract["gripper_convention"] = gripper_convention
     return contract
 
 
@@ -437,8 +375,8 @@ class _UnifyAwareNormalizer:
 
     ckpts trained with ``dataloader.unify_action=true`` emit/consume UNIFY_DIM
     (e.g. 80-D) vectors, but the normalization stats live in RAW action space
-    (the Normalizer ran BEFORE the unify scatter — robotwin.py). So the correct
-    deploy directions are, mirroring ``RoboTwinDataset.denormalize_action``:
+    (the Normalizer ran BEFORE the unify scatter in the reader). So the correct
+    deploy directions are:
 
       * ``unnormalize`` (model action OUT): gather UNIFY_DIM → raw, THEN unnormalize.
       * ``normalize``   (proprio IN):       normalize raw, THEN scatter raw → UNIFY_DIM.
@@ -583,7 +521,7 @@ def _build_normalizer(cfg: DictConfig, ckpt_dir: str):
                 "AND raw dim can't be inferred (no normalization stats). Add unify_action_map to "
                 "config.yaml (mirrors the reader's identity-map fallback)."
             )
-        spec = list(range(raw_dim))  # identity, mirrors robotwin.py reader fallback
+        spec = list(range(raw_dim))  # identity, mirrors the reader's fallback
 
     action_dst_index = parse_unify_spec(spec, unify_dim)
     # Most datasets use one symmetric raw layout. RoboCasa365 compact is

@@ -9,10 +9,6 @@ video DiT integration).
 Canonical registry names (one per concrete architecture class):
     dual_system_cross_attn  / DualSystemCrossAttnArchitecture
     dual_system_self_attn   / DualSystemSelfAttnArchitecture
-    dual_system_idm         / DualSystemIDMArchitecture
-    single_system_vanilla / SingleSystemVanillaArchitecture
-    single_system_moe     / SingleSystemMoEArchitecture
-    tri_system_joint_self_attn / TriSystemJointSelfAttnArchitecture
 
 Usage:
     @register_architecture(
@@ -141,9 +137,6 @@ def resolve_architecture_config(
     vb_cfg = getattr(model_cfg, "video_backbone", None)
     if vb_cfg is not None:
         params["video_backbone"] = vb_cfg
-    vlm_cfg = getattr(model_cfg, "vlm_backbone", None)
-    if vlm_cfg is not None:
-        params["vlm_backbone"] = vlm_cfg
     if video_dim:
         params["video_dim"] = video_dim
     if num_dit_layers is not None:

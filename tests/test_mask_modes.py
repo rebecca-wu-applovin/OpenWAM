@@ -35,7 +35,7 @@ SV, SA, TPF = 6, 3, 2  # 3 video frames x 2 tokens, 3 action tokens
 FF = min(TPF, SV)  # first-frame token count = 2
 
 
-def _build(mode, n_tail=0):
+def _build(mode):
     return build_cross_modal_attention_mask(
         _VBFirstFrameCausal(),
         s_video=SV,
@@ -43,7 +43,6 @@ def _build(mode, n_tail=0):
         video_tokens_per_frame=TPF,
         mode=mode,
         device=torch.device("cpu"),
-        n_readonly_tail=n_tail,
     )
 
 
@@ -93,15 +92,3 @@ def test_video_sees_action():
     assert not mask[SV:, FF:SV].any()  # a -> later video blocked
     assert not mask[:FF, SV:].any()  # v -> a: first-frame rows excluded
     assert mask[FF:SV, SV:].all()  # later video rows see action
-
-
-def test_readonly_tail():
-    """tail (understanding/state): everyone sees it, it sees only itself."""
-    n_tail = 4
-    mask = _build(ACTION_SEES_VIDEO, n_tail=n_tail)
-    total = SV + SA + n_tail
-    assert mask.shape == (total, total)
-    tail = SV + SA
-    assert mask[:tail, tail:].all()  # video + action -> tail
-    assert mask[tail:, tail:].all()  # tail -> tail
-    assert not mask[tail:, :tail].any()  # tail -> video/action blocked

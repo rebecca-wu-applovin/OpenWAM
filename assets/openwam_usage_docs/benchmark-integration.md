@@ -39,7 +39,6 @@ The trainer uses `collate_fn=list`, so one item remains one dictionary. Return t
 # Video and prompt
 video             list[PIL.Image], length = num_video_frames
 first_frame_image list[PIL.Image], normally [video[0]]
-vace_video        None or list[PIL.Image]
 prompt            str
 
 # Action and state
@@ -116,7 +115,7 @@ print(len(dataset), sample['action'].shape, sample['video'])
 
 ## 2. Adapt the benchmark client
 
-The wire protocol is implemented by `PolicyServer` in [openwam/deploy/server.py](../../openwam/deploy/server.py) and mirrored by `WSPolicyClient` in [benchmarks/utils/transport.py](../../benchmarks/utils/transport.py). The server decodes and composes images, forwards the prompt, normalizes state, and denormalizes actions. Existing adapters are under [benchmarks/](../../benchmarks/).
+The wire protocol is implemented by `PolicyServer` in [openwam/deploy/server.py](../../openwam/deploy/server.py); clients (e.g. sim-policy-eval, launched through [benchmarks/simeval/serve.py](../../benchmarks/simeval/serve.py)) mirror it. The server decodes and composes images, forwards the prompt, normalizes state, and denormalizes actions.
 
 ### Messages and lifecycle
 
@@ -135,7 +134,7 @@ Keep one persistent WebSocket connection. Send one JSON observation per control 
 }
 ~~~
 
-`head_camera` is required. Wrist fields may be omitted or null; multiview servers black-fill missing slots and single-view servers ignore them. Encode RGB PNG with `encode_numpy_b64` or `encode_path_b64` from [benchmarks/utils/client.py](../../benchmarks/utils/client.py). Do not resize unless the training reader pre-resized a tile; reproduce that layout with `resize_for_lshape_slot`.
+`head_camera` is required. Wrist fields may be omitted or null; multiview servers black-fill missing slots and single-view servers ignore them. Encode RGB as base64 PNG. Do not resize unless the training reader pre-resized a tile.
 
 The response is a flat action array in physical units:
 
@@ -158,12 +157,12 @@ Reset at the start of every episode and after a hard control failure:
 {"type": "reset_ack"}
 ~~~
 
-Reset clears buffered chunks and in-flight asynchronous inference; it does not reload weights. `ping` returns a `pong` response. Malformed messages return an error object. `predict()` retries once after a dropped socket; use `predict_once()` when retrying an ambiguous action is unsafe.
+Reset clears buffered chunks and in-flight asynchronous inference; it does not reload weights. `ping` returns a `pong` response. Malformed messages return an error object.
 
 Synchronous and asynchronous execution use the same wire messages. The server may serve buffered action chunks without rerunning denoising on every step.
 
 ### Convert actions at the boundary
 
-Read the returned list in the exact order documented by the reader. Apply only benchmark-specific conversion, such as rot6d-to-quaternion or EEF-to-OSC delta; the server response is already in physical units. Preserve the training gripper sign and threshold. Existing NumPy converters are in [benchmarks/utils/action_conversion.py](../../benchmarks/utils/action_conversion.py).
+Read the returned list in the exact order documented by the reader. Apply only benchmark-specific conversion, such as rot6d-to-quaternion or EEF-to-OSC delta; the server response is already in physical units. Preserve the training action conventions.
 
 Add an adapter under `benchmarks/<name>/`, document its payload and lifecycle, and keep action conversion next to the client boundary so training and deployment conventions remain visible together.

@@ -5,8 +5,8 @@ decorator-based registry pattern (consistent with the architecture registry).
 
 Usage:
     # Register a dataset class
-    @register_dataset("droid")
-    class DROIDDataset(LeRobotBaseDataset):
+    @register_dataset("yam_sharpa")
+    class MultiYamSharpaDataset(BaseDataset):
         ...
 
     # Build from config
@@ -74,37 +74,8 @@ def list_registered_datasets():
 
 def _register_builtins():
     """Register all built-in dataset classes."""
-    from openwam.dataloader.agibotworld import MultiAgiBotWorldDataset
-    from openwam.dataloader.ebench import EBenchDataset
-    from openwam.dataloader.interndata_a1 import InternDataA1Dataset
-    from openwam.dataloader.libero import LiberoDataset
-    from openwam.dataloader.mixture import MixtureDataset
-    from openwam.dataloader.muka_franka import MukaFrankaDataset
-    from openwam.dataloader.oxe_droid import OxeDroidDataset
-    from openwam.dataloader.robocasa365 import MultiTaskRoboCasa365Dataset
-    from openwam.dataloader.robocasa_gr1 import MultiRoboCasaGR1Dataset
-    from openwam.dataloader.robocoin import MultiRobotCOINDataset
-    from openwam.dataloader.robodojo import MultiTaskRoboDojoDataset
-    from openwam.dataloader.robotwin import MultiTaskRoboTwinDataset
-    from openwam.dataloader.vlabench import VLABenchDataset
     from openwam.dataloader.yam_sharpa import MultiYamSharpaDataset
 
-    register_dataset("robotwin")(MultiTaskRoboTwinDataset)
-    register_dataset("robodojo")(MultiTaskRoboDojoDataset)
-    register_dataset("agibotworld")(MultiAgiBotWorldDataset)
-    register_dataset("mixture")(MixtureDataset)
-    register_dataset("robocasa_gr1")(MultiRoboCasaGR1Dataset)
-    register_dataset("robocoin")(MultiRobotCOINDataset)
-    register_dataset("ebench")(EBenchDataset)
-    register_dataset("libero")(LiberoDataset)
-    register_dataset("muka_franka")(MukaFrankaDataset)
-    register_dataset("oxe_droid")(OxeDroidDataset)
-    register_dataset("robocasa365")(MultiTaskRoboCasa365Dataset)
-    # Registered on the SINGLE-bucket class: its from_config returns either one
-    # bucket or a MultiInternDataA1Dataset depending on whether dataset_dir
-    # points at a bucket or at the dataset root.
-    register_dataset("interndata_a1")(InternDataA1Dataset)
-    register_dataset("vlabench")(VLABenchDataset)
     register_dataset("yam_sharpa")(MultiYamSharpaDataset)
 
 

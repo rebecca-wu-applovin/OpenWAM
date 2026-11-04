@@ -70,7 +70,7 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
         bl = resolve_bridge_layers(cfg)
         video_dim = self._resolve_video_dim(cfg)
         # Default the action-side raw context width to the loaded backbone's
-        # text_dim (Wan T5-XXL=4096, Cosmos-Predict2.5=1024); explicit cfg/CLI
+        # text_dim (Wan T5-XXL=4096); explicit cfg/CLI
         # still wins. Falls back to 4096 when the backbone doesn't expose it.
         _vb_text_dim = getattr(self.video_backbone, "text_dim", None)
         text_dim = int(self._cfg_get(cfg, "text_dim", _vb_text_dim or 4096))
@@ -205,13 +205,10 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
             seq_lens = pipeline_inputs["seq_lens"].to(device=action_context.device)
             positions = torch.arange(action_context.shape[1], device=action_context.device)
             action_context_mask = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
-        # Same 4D + clean-prefix-aligned t_mod opt-in as the joint_self_attn /
-        # single_system / IDM forwards. TI2V fires its own branch first so
-        # these kwargs are inert there. VACE and I2V do NOT emit
-        # ``first_frame_latents`` (VACE routes via ``vace_context``, I2V via
-        # the ``y`` channel), so ``zero_clean_prefix_t_mod`` is structurally
-        # inert for them — kept on for symmetry with joint_self_attn so the
-        # MoT driver gets a 4D ``t_mod``.
+        # Same 4D + clean-prefix-aligned t_mod opt-in as the joint_self_attn
+        # forward. TI2V fires its own branch first so
+        # these kwargs are inert there; kept on for symmetry with joint_self_attn
+        # so the MoT driver gets a 4D ``t_mod``.
         pipeline_inputs.setdefault("force_per_token_t_mod", True)
         pipeline_inputs.setdefault("zero_clean_prefix_t_mod", True)
         vstate = vb.prepare(
@@ -233,12 +230,6 @@ class DualSystemCrossAttnArchitecture(BaseWAMArchitecture):
             vstate = vb.run_block(block_id, vstate)
             if block_id in bridge_set:
                 bridge = vstate.hidden_states
-                if bridge.ndim == 5:
-                    # Cosmos lays out hidden state as (B, T, H, W, D); flatten
-                    # the spatial axes into a single token axis so the action
-                    # backbone's cross-attn sees the Wan-compatible 3D shape.
-                    B5, T5, H5, W5, D5 = bridge.shape
-                    bridge = bridge.reshape(B5, T5 * H5 * W5, D5)
                 bridges[block_id] = bridge.detach() if detach_bridge else bridge
 
         video_pred = vb.finalize(vstate)

@@ -5,11 +5,11 @@ denoise_schedule.py invert externally."""
 import torch
 
 from openwam.model.video_backbone.cosmos3.scheduler import Cosmos3FlowSchedulerAdapter
-from openwam.model.video_backbone.cosmos_predict25.scheduler import CosmosFlowSchedulerAdapter
+from openwam.model.video_backbone.common.flow_scheduler import FlowScheduler
 
 
 def test_subclass_of_predict25_adapter():
-    assert issubclass(Cosmos3FlowSchedulerAdapter, CosmosFlowSchedulerAdapter)
+    assert issubclass(Cosmos3FlowSchedulerAdapter, FlowScheduler)
 
 
 def test_training_grid_matches_shift_formula():

@@ -1,11 +1,10 @@
 """Deploy self-containment for the Cosmos3-Edge backbone.
 
-Much simpler than predict2.5's: every weight (``dit.*`` / ``vae.*``) rides the
+Every weight (``dit.*`` / ``vae.*``) rides the
 unified checkpoint safetensors, so the component spec is a marker only, and the
 sole side artifacts are the tokenizer's structural JSON files (copied into
 ``<ckpt_dir>/text_tokenizer/`` — the deploy builder reads the tokenizer from
-there). No ``text_encoder`` component is ever emitted, so the deploy loader's
-Reason1-clearing branch never triggers for this family.
+there). No ``text_encoder`` component is ever emitted.
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 defaults:
-  - model: dual_system            # [Optional]: dual_system(default), single_system, tri_system
-  - dataloader: robotwin          # [Optional]: robotwin(default), ebench, robocasa365, robocasa_gr1, robodojo, vlabench, libero
+  - model: dual_system            # [Optional]: dual_system
+  - dataloader: yam_sharpa        # [Optional]: yam_sharpa
   - _self_
 
 training:

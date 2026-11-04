@@ -3,7 +3,7 @@ from .device import IS_CUDA_AVAILABLE as IS_CUDA_AVAILABLE
 from .device import get_available_device_type as get_available_device_type
 from .device import parse_device_type as parse_device_type
 from .device import parse_nccl_backend as parse_nccl_backend
-from .gradient import gradient_checkpoint_forward as gradient_checkpoint_forward
+from openwam.model.video_backbone.common.checkpoint import gradient_checkpoint_forward as gradient_checkpoint_forward
 from .loader import ModelConfig as ModelConfig
 from .loader import hash_model_file as hash_model_file
 from .loader import hash_state_dict_keys as hash_state_dict_keys

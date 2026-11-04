@@ -22,7 +22,8 @@ pytest.importorskip("diffusers")
 from openwam.model.architectures.dual_system.mot_driver import DualSystemMoTDriver  # noqa: E402
 from openwam.model.architectures.utils.mask_modes import widen_mask_for_prefix_kv  # noqa: E402
 from openwam.model.video_backbone import Cosmos3EdgeVideoBackbone  # noqa: E402
-from openwam.model.video_backbone.cosmos3 import block_split, dit_forward, text_pack  # noqa: E402
+from openwam.model.video_backbone.cosmos3 import dit as cosmos3_dit  # noqa: E402
+from openwam.model.video_backbone.cosmos3 import text as cosmos3_text  # noqa: E402
 from openwam.model.video_backbone.cosmos3._vendor.transformer_cosmos3 import (  # noqa: E402
     Cosmos3OmniTransformer,
 )
@@ -54,16 +55,16 @@ NANO_MINI = dict(MINI, qk_norm_for_text=True, use_und_k_norm_for_gen=False, hidd
 def _build_state(net, ids, lat, ncp=0, *, padded_und: bool = True):
     """``padded_und=False`` reproduces the unpadded production shape, where the
     backbone passes ``und_mask=None`` all the way into SDPA."""
-    text_pos = text_pack.text_mrope_positions(ids.numel(), float_positions=True)
-    grid = text_pack.patch_grid(*lat.shape[2:], int(net.config.latent_patch_size))
-    _, vis_pos = text_pack.build_joint_positions(
+    text_pos = cosmos3_text.text_mrope_positions(ids.numel(), float_positions=True)
+    grid = cosmos3_text.patch_grid(*lat.shape[2:], int(net.config.latent_patch_size))
+    _, vis_pos = cosmos3_text.build_joint_positions(
         ids.numel(), grid, modality_margin=15000, fps=24.0, temporal_compression_factor=4
     )
-    cos_und, sin_und = dit_forward.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
+    cos_und, sin_und = cosmos3_dit.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
     und_mask = torch.ones(lat.shape[0], ids.numel(), dtype=torch.bool) if padded_und else None
     ids_b = ids.unsqueeze(0).expand(lat.shape[0], -1)
-    context, und_kv = dit_forward.run_und_tower(net, ids_b, und_mask, cos_und, sin_und)
-    state = dit_forward.prepare_block_loop(
+    context, und_kv = cosmos3_dit.run_und_tower(net, ids_b, und_mask, cos_und, sin_und)
+    state = cosmos3_dit.prepare_block_loop(
         net,
         latents=lat,
         timestep=torch.full((lat.shape[0],), 500.0),
@@ -91,9 +92,9 @@ def test_split_parity_matches_run_block(padded_und, cfg):
         assert (split.prefix_kv_mask is not None) is padded_und
 
         for i in range(len(net.layers)):
-            ref = dit_forward.run_block(net, i, ref)
+            ref = cosmos3_dit.run_block(net, i, ref)
 
-            q, k, v, post = block_split.state_pre_attn(net, i, split)
+            q, k, v, post = cosmos3_dit.state_pre_attn(net, i, split)
             assert k.shape[1] == q.shape[1] + split.prefix_kv_len
             # Driver-style mixed attention: single num_heads, rectangular mask.
             n = MINI["num_attention_heads"]
@@ -103,7 +104,7 @@ def test_split_parity_matches_run_block(padded_und, cfg):
             mask = torch.ones((q.shape[1], k.shape[1]), dtype=torch.bool)
             out = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask)
             out = out.transpose(1, 2).reshape(q.shape[0], q.shape[1], -1)
-            split = block_split.state_post_attn(split, out, post)
+            split = cosmos3_dit.state_post_attn(split, out, post)
 
             diff = (split.hidden_states - ref.hidden_states).abs().max().item()
             assert diff < 1e-5, f"layer {i}: split vs run_block diff {diff}"
@@ -157,7 +158,7 @@ def test_driver_isolated_mode_matches_run_block_loop(padded_und):
     with torch.no_grad():
         ref = _build_state(net, ids, lat, padded_und=padded_und)
         for i in range(len(net.layers)):
-            ref = dit_forward.run_block(net, i, ref)
+            ref = cosmos3_dit.run_block(net, i, ref)
 
         joint = _build_state(net, ids, lat, padded_und=padded_und)
         astate = types.SimpleNamespace(payload=types.SimpleNamespace(x_action=torch.randn(1, 5, MINI["hidden_size"])))
@@ -175,19 +176,19 @@ def _padded_state(net, poison: bool, pad: int = 2):
     ids = torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 0, 0]])
     und_mask = torch.tensor([[True] * 5, [True] * (5 - pad) + [False] * pad])
     lat = torch.randn(2, MINI["latent_channel"], 2, 2, 2)
-    text_pos = text_pack.text_mrope_positions(5, float_positions=True)
-    grid = text_pack.patch_grid(*lat.shape[2:], int(net.config.latent_patch_size))
-    _, vis_pos = text_pack.build_joint_positions(
+    text_pos = cosmos3_text.text_mrope_positions(5, float_positions=True)
+    grid = cosmos3_text.patch_grid(*lat.shape[2:], int(net.config.latent_patch_size))
+    _, vis_pos = cosmos3_text.build_joint_positions(
         5, grid, modality_margin=15000, fps=24.0, temporal_compression_factor=4
     )
-    cos_u, sin_u = dit_forward.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
-    ctx, und_kv = dit_forward.run_und_tower(net, ids, und_mask, cos_u, sin_u)
+    cos_u, sin_u = cosmos3_dit.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
+    ctx, und_kv = cosmos3_dit.run_und_tower(net, ids, und_mask, cos_u, sin_u)
     if poison:
         und_kv = [(k.clone(), v.clone()) for k, v in und_kv]
         for k, v in und_kv:  # sample 1's padded slots only
             k[1, 5 - pad : 5] = 1e4
             v[1, 5 - pad : 5] = 1e4
-    return dit_forward.prepare_block_loop(
+    return cosmos3_dit.prepare_block_loop(
         net,
         latents=lat,
         timestep=torch.full((2,), 500.0),
@@ -255,8 +256,8 @@ def test_padded_und_poison_is_detectable():
         state.extras = {**state.extras, "und_mask": None}
         with torch.no_grad():
             for i in range(len(net.layers)):
-                state = dit_forward.run_block(net, i, state)
-            outs.append(dit_forward.finalize_block_loop(net, state))
+                state = cosmos3_dit.run_block(net, i, state)
+            outs.append(cosmos3_dit.finalize_block_loop(net, state))
     assert (outs[0] - outs[1]).abs().max().item() > 1e-3, "poison is inert; the leak tests prove nothing"
 
 

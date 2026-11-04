@@ -35,7 +35,6 @@ def build_video_backbone(
     device: Optional[str] = None,
     ckpt_dir: Optional[str] = None,
     materialize_weights: bool = False,
-    external_encoder: Any = None,
     text_dim: Optional[int] = None,
 ) -> VideoBackbone:
     """Instantiate a VideoBackbone from the registry.
@@ -62,12 +61,6 @@ def build_video_backbone(
                   rather than leaving parameters on ``meta``. Set by the
                   training RESUME path, where accelerate's ``load_state``
                   fills the weights only after ``prepare``.
-        external_encoder: Optional pre-built :class:`VideoEncoder` to swap in
-                  for the backbone's native VAE. Forwarded to
-                  ``cls.from_pretrained`` on BOTH paths — training (built
-                  from yaml + model_path) and deploy (built from the saved
-                  components entry via :meth:`VideoEncoder.from_skeleton`,
-                  weights filled in by the architecture's checkpoint load).
         text_dim: Optional architecture-level raw text/context dimension.
                   Forwarded to the backbone so it can validate that its text
                   embedding expects the same context width as the action stream.
@@ -86,15 +79,9 @@ def build_video_backbone(
             kw["ckpt_dir"] = ckpt_dir
         if materialize_weights:
             kw["materialize_weights"] = True
-        if external_encoder is not None:
-            kw["external_encoder"] = external_encoder
         if text_dim is not None:
             kw["text_dim"] = int(text_dim)
         return cls.from_pretrained(source, **kw)
-    if external_encoder is not None:
-        if text_dim is not None:
-            return cls.from_pretrained(cfg, external_encoder=external_encoder, text_dim=int(text_dim))
-        return cls.from_pretrained(cfg, external_encoder=external_encoder)
     if text_dim is not None:
         return cls.from_pretrained(cfg, text_dim=int(text_dim))
     return cls.from_pretrained(cfg)

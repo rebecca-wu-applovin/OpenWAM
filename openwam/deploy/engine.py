@@ -3,8 +3,7 @@
 ``BaseInferenceEngine`` declares the engine interface; ``JointInferenceEngine``
 is the production implementation. The engine translates deploy config +
 per-request conditions into ``architecture.generate(...)`` arguments, builds
-the denoise schedule, and owns server-lifetime caches (prompt embeddings,
-VACE context). The actual denoising loop lives on the model side
+the denoise schedule, and owns the server-lifetime prompt-embedding cache. The actual denoising loop lives on the model side
 (``BaseWAMArchitecture.generate``).
 """
 
@@ -221,8 +220,6 @@ class JointInferenceEngine(BaseInferenceEngine):
             return value is True
         if name == "profile":
             return value is False
-        if name == "vace_cache":
-            return not bool(value)
         if name == "prompt_embed_cache":
             # None means the cache was disabled by config — dropping it is a no-op.
             return value is None or (
@@ -264,9 +261,6 @@ class JointInferenceEngine(BaseInferenceEngine):
         # Profiling
         self._profile = os.environ.get("WAM_PROFILE", "0") == "1"
 
-        # VACE context cache for closed-loop reuse
-        self._vace_cache: dict = {}
-
         # Prompt-keyed text embedding cache (bounded LRU). enabled: false turns
         # it off entirely: the backbones treat a None cache as "never cache".
         cache_enabled = True
@@ -283,7 +277,7 @@ class JointInferenceEngine(BaseInferenceEngine):
             logger.info("prompt_embed_cache disabled by config")
 
     def _init_cfg(self):
-        """Resolve Classifier-Free Guidance from cfg.inference (CosmosPredict25 only; cfg_scale=1.0 is a no-op).
+        """Resolve Classifier-Free Guidance from cfg.inference (no backbone produces an uncond context any more; cfg_scale=1.0 is a no-op).
 
         The uncond embedding is built by the backbone's live encoder
         (``_build_uncond_context`` → ``text_encoder("")``).
@@ -303,10 +297,8 @@ class JointInferenceEngine(BaseInferenceEngine):
         Args:
             conditions: dict with keys:
                 - prompt (str): text prompt
-                - vace_video (list[PIL.Image], optional): VACE conditioning video (Wan2.1-VACE only)
                 - first_frame_image (list[PIL.Image], optional): first frame of the
                   observation window; used as TI2V first-frame condition on Wan2.2-TI2V
-                  or as VACE spatial reference on Wan2.1-VACE
                 - num_frames (int, optional): raw state/action window length;
                   generated action chunk length is ``num_frames - 1``
                 - video_num_frames (int, optional): Wan video length after any
@@ -356,7 +348,6 @@ class JointInferenceEngine(BaseInferenceEngine):
             {
                 "schedule": schedule,
                 "prompt": conditions.get("prompt", ""),
-                "vace_video": conditions.get("vace_video", None),
                 "first_frame_image": conditions.get("first_frame_image", None),
                 "num_frames": video_num_frames,
                 "action_num_frames": action_num_frames,
@@ -370,7 +361,6 @@ class JointInferenceEngine(BaseInferenceEngine):
                 "dit_cache": self._dit_cache,
                 "decode_video": self._decode_video,
                 "profile": self._profile,
-                "vace_cache": self._vace_cache,
                 "prompt_embed_cache": self._prompt_embed_cache,
                 "proprio": proprio,
                 "cfg_scale": self._cfg_scale,

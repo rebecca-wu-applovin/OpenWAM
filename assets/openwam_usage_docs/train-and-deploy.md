@@ -6,35 +6,24 @@ OpenWAM composes each run from Hydra YAML. The top-level configuration is [confi
 
 ### Architecture
 
-Select the model group in [configs/train.yaml](../../configs/train.yaml), then edit the `architecture` block in the selected model file:
-
-- [configs/model/dual_system.yaml](../../configs/model/dual_system.yaml)
-- [configs/model/single_system.yaml](../../configs/model/single_system.yaml)
-- [configs/model/tri_system.yaml](../../configs/model/tri_system.yaml)
+The model group in [configs/train.yaml](../../configs/train.yaml) is `dual_system`; edit the `architecture` block in [configs/model/dual_system.yaml](../../configs/model/dual_system.yaml).
 
 ~~~yaml
 # configs/train.yaml
 defaults:
   # Model and data groups
-  - model: dual_system       # choose dual_system, single_system, or tri_system
-  - dataloader: robotwin     # choose a supported dataloader group
-~~~
-
-~~~text
-# Choose one model group
-model=dual_system
-model=single_system
-model=tri_system
+  - model: dual_system       # the only model group
+  - dataloader: yam_sharpa   # the only dataloader group
 ~~~
 
 All architecture options are under `architecture:`. Hydra exposes the composed values as `model.architecture.*` for CLI overrides.
 
 ~~~yaml
-# configs/model/tri_system.yaml
+# configs/model/dual_system.yaml
 architecture:
   # Architecture identity
-  framework: tri_system                 # single_system, dual_system, or tri_system
-  variant: joint_self_attn               # dual: joint_self_attn | joint_cross_attn | idm; single: vanilla | moe
+  framework: dual_system
+  variant: joint_self_attn               # joint_self_attn | joint_cross_attn
 
   # Token geometry and inputs
   action_dim: 80                         # action-token width; match dataloader output
@@ -51,15 +40,10 @@ architecture:
   mot_checkpoint_mixed_attn: true        # checkpoint mixed attention to reduce GPU memory
 
   # Variant-specific options
-  detach_bridge: false                   # DualSystem joint_cross_attn only
-  idm_video_cond_noise_prob: 0.5         # IDM video-condition noise probability
-  understanding_expert:                  # TriSystem understanding stream
-    dim: 512                              # projected VLM feature width
-    ffn_dim: 2048
-    vlm_projector_type: mlp3x_silu        # linear or mlp{N}x_silu
+  detach_bridge: false                   # joint_cross_attn only
 ~~~
 
-`idm` uses teacher-forced inverse dynamics and two-stage inference. `tri_system` adds a frozen Qwen3-VL stream. Implementations and registries are in [openwam/model/architectures/](../../openwam/model/architectures/). The selected model file composes the video, action, and (for TriSystem) VLM groups through its `defaults` list.
+Implementations and registries are in [openwam/model/architectures/](../../openwam/model/architectures/). The model file composes the video and action groups through its `defaults` list.
 
 ### Video backbone
 
@@ -68,13 +52,10 @@ Choose a Hydra group from [configs/model/video_backbone/](../../configs/model/vi
 ~~~text
 # Choose one video group
 model/video_backbone=wan22_ti2v_5b
-model/video_backbone=wan21_vace_1_3b
-model/video_backbone=wan21_i2v_14b_480p
-model/video_backbone=cosmos_predict25_2b
 model/video_backbone=cosmos3_edge
 ~~~
 
-Edit the selected group file, for example [wan22_ti2v_5b.yaml](../../configs/model/video_backbone/wan22_ti2v_5b.yaml), [cosmos_predict25_2b.yaml](../../configs/model/video_backbone/cosmos_predict25_2b.yaml), or [cosmos3_edge.yaml](../../configs/model/video_backbone/cosmos3_edge.yaml):
+Edit the selected group file, for example [wan22_ti2v_5b.yaml](../../configs/model/video_backbone/wan22_ti2v_5b.yaml), or [cosmos3_edge.yaml](../../configs/model/video_backbone/cosmos3_edge.yaml):
 
 ~~~yaml
 # configs/model/video_backbone/<selected_group>.yaml
@@ -82,42 +63,16 @@ Edit the selected group file, for example [wan22_ti2v_5b.yaml](../../configs/mod
 name: wan22_ti2v_5b                 # registry key; use the selected backbone name
 model_path: /path/to/video_backbone_checkpoint  # weights or bundle root
 
-# Initialization and scheduler
-from_scratch: false                 # rebuild Wan projections around an encoder
+# Scheduler
 shift_video: 5.0                    # flow-matching scheduler shift
 # Cosmos3 additionally defines fps, prompt_duration_template, and freeze_und.
 ~~~
 
 The selected backbone supplies video geometry to the architecture and action backbone. Keep `model_path` consistent with the assets in [Assets Preparation](../../README.md#assets-preparation).
 
-### VLM backbone
-
-TriSystem selects a VLM group from [configs/model/vlm_backbone/](../../configs/model/vlm_backbone/); implementation and registry code are in [openwam/model/vlm_backbone/](../../openwam/model/vlm_backbone/).
-
-~~~yaml
-# configs/model/vlm_backbone/qwen3_vl_2b.yaml
-# Identity and weights
-name: qwen3_vl_2b                       # Hydra group and registry key
-checkpoint_path: /path/to/qwen3_vl_2b    # pretrained VLM directory
-
-# Loading and sequence length
-load_pretrained: true                    # load checkpoint weights
-max_length: 512                          # processor text limit
-~~~
-
-Override with the merged path `model.vlm_backbone.*`:
-
-~~~text
-# Select the group
-model/vlm_backbone=qwen3_vl_2b
-
-# Override its checkpoint
-model.vlm_backbone.checkpoint_path=/path/to/qwen3_vl_2b
-~~~
-
 ### Action backbone
 
-DualSystem and TriSystem construct [separate_action_dit.yaml](../../configs/model/action_backbone/separate_action_dit.yaml); SingleSystem constructs [shared_action_backbone.yaml](../../configs/model/action_backbone/shared_action_backbone.yaml). Implementations are in [openwam/model/action_backbone/](../../openwam/model/action_backbone/), and there is no separate action-backbone registry.
+DualSystem constructs [separate_action_dit.yaml](../../configs/model/action_backbone/separate_action_dit.yaml). Implementations are in [openwam/model/action_backbone/](../../openwam/model/action_backbone/), and there is no separate action-backbone registry.
 
 ~~~yaml
 # configs/model/action_backbone/separate_action_dit.yaml
@@ -126,69 +81,33 @@ dim: 1024                        # ActionDiT hidden width
 ffn_dim: 4096                    # ActionDiT feed-forward width
 shift_action: 5.0                # action scheduler shift
 # num_layers, video_dim, num_heads, and attn_head_dim resolve from the video backbone
-
----
-# configs/model/action_backbone/shared_action_backbone.yaml
-# Shared action decoder dimensions
-action_decoder_hidden_dim: 1024  # shared action decoder width
-expert_ffn_dim: 4096             # MoE expert width
 ~~~
 
-Select a group with `model/action_backbone=separate_action_dit` or `model/action_backbone=shared_action_backbone`; keep its output aligned with `architecture.action_dim` and the dataloader.
-
-### Visual encoder and S-VAE
-
-Edit the encoder group file under [configs/model/video_backbone/encoder/](../../configs/model/video_backbone/encoder/); the selected encoder fields are merged into model.video_backbone.encoder.
-When from_scratch=true, select an external encoder under configs/model/video_backbone/encoder/: wan22_vae, flux2_vae, dinov3, or vjepa21. DINOv3, FLUX.2, and V-JEPA require this path; the encoder metadata supplies the latent geometry.
-
-~~~yaml
-# Select an external encoder when rebuilding the video backbone
-model:
-  video_backbone:
-    from_scratch: true
-    encoder:
-      name: dinov3                    # wan22_vae, flux2_vae, dinov3, or vjepa21
-      model_path: /path/to/visual_encoder
-
-      # Optional S-VAE reducer
-      svae_path: /path/to/svae_checkpoint
-      svae_target_dim: 48              # reducer output width
-~~~
-
-S-VAE is an offline feature reducer. Collect features with the complete data chain, train the reducer, then point svae_path at the resulting file. The scripts and reducer implementation are under scripts/svae_train/ and openwam/model/video_backbone/encoder/svae/.
+The only group is `model/action_backbone=separate_action_dit`; keep its output aligned with `architecture.action_dim` and the dataloader.
 
 ### Dataloader selection and loading
 
-Built-in registry names are:
-
-~~~text
-robotwin, robodojo, robocasa_gr1, ebench, libero, robocasa365, vlabench
-~~~
-
-The matching dataloader fields are in [configs/dataloader/](../../configs/dataloader/), for example [configs/dataloader/libero.yaml](../../configs/dataloader/libero.yaml).
+The built-in registry name is `yam_sharpa`; its fields are in [configs/dataloader/yam_sharpa.yaml](../../configs/dataloader/yam_sharpa.yaml).
 Readers are under openwam/dataloader/ and configs under configs/dataloader/. Select one with Hydra:
 
 ~~~bash
 # Select the dataloader and dataset
 bash scripts/train.sh \
-  dataloader=libero \
-  dataloader.dataset_dir=<dataset_dir_path> \
-  dataloader.unify_action=true \
-  dataloader.num_frames=33 \
-  dataloader.video_stride=4
+  dataloader=yam_sharpa \
+  dataloader.action_mode=fingertips_rel
 ~~~
 
 Each registered class implements from_config(config, split) and returns window samples. The trainer keeps samples as a list of dictionaries. num_frames is the raw state/action window length; the action horizon is num_frames - 1. Video is subsampled by video_stride, so the standard 33/4 setting yields 9 video frames. Camera layout, transforms, normalization, action maps, and masks belong to the dataloader.
 
 ## 2. Start training
 
-### Fresh, from-scratch, and fine-tuning runs
+### Fresh and fine-tuning runs
 
-With a pretrained video backbone, a fresh run loads the selected components and trains the unfrozen modules from step zero. from_scratch rebuilds the Wan2.2 DiT input/output projections around an external encoder.
+With a pretrained video backbone, a fresh run loads the selected components and trains the unfrozen modules from step zero.
 
 ~~~bash
 # Model and dataloader
-bash scripts/train.sh model=dual_system dataloader=robotwin \
+bash scripts/train.sh model=dual_system dataloader=yam_sharpa \
   dataloader.dataset_dir=<dataset_dir_path> \
   training.output_path=<output_dir_path> \
   training.batch_size=1 \
@@ -288,8 +207,6 @@ optimization:
     enabled: true                      # compile fixed-shape paths
     self_attn: {torch_mode: default, dynamic: false}
     cross_attn: {torch_mode: default, dynamic: false}
-    idm: {torch_mode: reduce-overhead, dynamic: false}
-    tri_system: {torch_mode: reduce-overhead, dynamic: false}
 
   # Reuse text features
   prompt_embed_cache: {enabled: true, maxsize: 32}

@@ -6,26 +6,12 @@ For users wiring their own robot or benchmark to an OpenWAM policy server.
 multi-view composition, or checkpoint. Just speak the WebSocket
 protocol below. Minimal client dependencies: `numpy`, `Pillow`, `websockets`
 (plus `opencv-python` if you decode camera frames yourself). The wire contract
-(message types) is mirrored on both sides: server constants in [`openwam/deploy/server.py`](../openwam/deploy/server.py), client constants in [`benchmarks/utils/transport.py`](utils/transport.py).
+(message types) is defined in [`openwam/deploy/server.py`](../openwam/deploy/server.py).
 
-Bundled clients:
+Bundled launcher:
 
-- [RoboTwin](robotwin/README.md)
-- [LIBERO](libero/README.md)
-- [LIBERO-plus](libero-plus/README.md)
-- [RoboCasa365](robocasa365/README.md)
-- [RoboCasa GR1](robocasa_gr1/README.md)
-- [VLABench](vlabench/README.md)
-- [EBench](ebench/README.md)
-
-Native Labtasker evaluation workflows:
-
-- [RoboTwin](robotwin/LABTASKER.md)
-- [LIBERO](libero/LABTASKER.md)
-
-RoboDojo trains through OpenWAM but evaluates through the external
-[XPolicyLab](https://github.com/XPolicyLab/XPolicyLab) repository — see
-[robodojo/README.md](robodojo/README.md).
+- [`simeval/serve.py`](simeval/serve.py) — starts the policy server for one checkpoint file, the way
+  sim-policy-eval's checkpoint watcher launches servers (`--ckpt <run_dir>/checkpoint_step_N.safetensors`).
 
 ## 1. What the client sends
 
@@ -45,20 +31,19 @@ One call per control step: up to three lossless PNG camera frames + the task `pr
 }
 ```
 
-> **Prompt formatting.** The server forwards `prompt` to the model **verbatim** — it does *not* wrap or reformat it. Send the exact string the model was trained on. Each benchmark owns its prompt template; for RoboTwin checkpoints, wrap the raw instruction with [`benchmarks/robotwin/prompt_template.py`](robotwin/prompt_template.py) (the RoboTwin eval adapter does this for you).
+> **Prompt formatting.** The server forwards `prompt` to the model **verbatim** — it does *not* wrap or reformat it. Send the exact string the model was trained on.
 
 Response (action message, Server → Client):
 
 ```json
-{"type": "action", "action": [float × 20 or 14], "step": int, "latency_ms": float}
+{"type": "action", "action": [float × action_dim], "step": int, "latency_ms": float}
 ```
 
 ## 2. Three things you don't need to handle
 
-- **Image sizing / aspect ratio.** Use the bundled benchmark adapter. RoboCasa365,
-  LIBERO, BEHAVIOR, EBench, VLABench, and RoboCasa-GR1 reproduce their unchanged
-  training readers' LANCZOS tile resize before sending; RoboTwin sends native
-  camera sizes because its reader performs BILINEAR composition directly.
+- **Image sizing / aspect ratio.** Send native camera frames unless your training
+  reader pre-resized a tile; the server composes the multi-view canvas the way the
+  training reader does.
 - **Action units.** For normalized checkpoints, the returned action is already denormalized to **physical units** (eef: xyz in meters, rot6d unitless, gripper 0-1; joint: radians). Feed it directly to your controller — do not multiply by any mean/std. If the checkpoint was trained with normalization disabled, deploy leaves actions and state in that raw training scale.
 - **Execution mode / chunking.** Whether the server runs the sync executor (buffer-and-replan) or the async one (background prefetch, `inference.inference_mode: async`) is invisible on the wire: the protocol is always one obs in, one action out.
 
@@ -68,13 +53,13 @@ Response (action message, Server → Client):
 - `left_wrist_camera`, `right_wrist_camera`: optional. If missing or `null`:
   - Server is single-view → the field is ignored.
   - Server is multi-view → the slot is filled with a black frame. The model still runs, but accuracy degrades since you're out of the training distribution for wrist-conditioned checkpoints.
-- `state`: required when the checkpoint has `model.architecture.use_proprioception: true`. The server validates the dimension before inference and returns a `ServerError` (status 400) for missing or mismatched state instead of failing later inside the model.
+- `state`: required when the checkpoint has `model.architecture.use_proprioception: true`. The server validates the dimension before inference and returns an error (status 400) for missing or mismatched state instead of failing later inside the model.
 
 ## 4. Episode lifecycle and reset
 
-Within one episode, just keep calling `client.predict(payload)`. The server caches an action chunk internally: the first call runs full inference (~seconds), the next N-1 are buffer pops (<10 ms). It re-infers automatically when the buffer empties.
+Within one episode, just keep sending `obs` messages. The server caches an action chunk internally: the first call runs full inference (~seconds), the next N-1 are buffer pops (<10 ms). It re-infers automatically when the buffer empties.
 
-**You must call `client.reset()` between episodes.** The server keeps per-episode executor state that leaks across episode boundaries otherwise:
+**You must send a `reset` message between episodes.** The server keeps per-episode executor state that leaks across episode boundaries otherwise:
 
 - the action chunk buffer — pending actions from the last inference
 - the step counter (and, in async mode, any in-flight background inference)
@@ -93,53 +78,9 @@ reset message  → {"type": "reset"}
 reset_ack      → {"type": "reset_ack"}
 ```
 
-## 5. Using `benchmarks.utils`
+## 5. Error cheatsheet
 
-Client helpers live under `benchmarks/utils/client.py` and can be imported directly:
-
-```python
-from benchmarks.utils import (
-    build_payload,  # assemble the {"images": {...}, "prompt": ...} dict
-    encode_path_b64,  # PNG path -> base64 str
-    WSPolicyClient,  # WebSocket transport — predict() / reset() / ping()
-    ServerError,  # structured server error: .status / .code / .message
-)
-
-ws_url = "ws://127.0.0.1:8848"
-
-# One persistent connection; obs/reset auto-reconnect once on a dropped socket,
-# ping fails fast. open_timeout caps connection setup; timeout caps a round-trip.
-with WSPolicyClient(ws_url, timeout=300.0, open_timeout=10.0) as client:
-    client.ping()  # verify / wait for the server to be up (raises if unreachable)
-
-    # --- start of episode ---
-    client.reset()
-
-    # --- per-step ---
-    head_b64 = encode_path_b64("/path/to/head.png")
-    left_b64 = encode_path_b64("/path/to/left.png")  # or None
-    right_b64 = encode_path_b64("/path/to/right.png")  # or None
-    current_state = [0.0] * 20  # replace with your raw proprio vector
-
-    payload = build_payload(
-        head=head_b64,
-        left_wrist=left_b64,
-        right_wrist=right_b64,
-        prompt="pick up the red bottle",  # sent verbatim; wrap per your checkpoint's template first
-        state=current_state,  # optional raw proprio; required for proprio-conditioned checkpoints
-    )
-    try:
-        action = client.predict(payload)["action"]  # already in physical units — feed to controller
-    except ServerError as e:
-        print(f"server rejected the request [{e.status} {e.code}]: {e.message}")
-        raise
-```
-
-The bundled test script ([scripts/inference_test/inference_single_test.py](../scripts/inference_test/inference_single_test.py)) imports from here, so it doubles as a reference integration. For a full real-robot adapter, see [benchmarks/robotwin/openwam2robotwin_interface.py](robotwin/openwam2robotwin_interface.py).
-
-## 6. Error cheatsheet
-
-| ServerError (status 400) message contains | Cause |
+| Server error (status 400) message contains | Cause |
 |---|---|
 | `head_camera is required` | Missing or `null` head_camera |
 | `client must send 'images' dict` | Legacy single-field `image` payload (no longer supported) |
@@ -148,7 +89,6 @@ The bundled test script ([scripts/inference_test/inference_single_test.py](../sc
 | `state dimension mismatch` | Payload `state` length differs from checkpoint `state_dim` |
 | `camera_layout` | Server config has fewer than 3 entries in `camera_layout` while multi-view is enabled — check the checkpoint |
 
-## 7. See also
+## 6. See also
 
 - Starting the server: [root README → Deployment](../README.md#deployment)
-- Reference client: [scripts/inference_test/inference_single_test.py](../scripts/inference_test/inference_single_test.py)

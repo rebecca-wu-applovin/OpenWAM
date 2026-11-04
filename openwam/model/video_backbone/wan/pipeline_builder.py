@@ -137,31 +137,7 @@ def _build_tokenizer(tok_cfg: dict, base_dir: str):
     return cls(**kwargs)
 
 
-def _filter_native_vae_configs(model_configs):
-    """Drop any ``ModelConfig`` whose path/pattern matches a Wan VAE weight
-    file. Used by callers that supply an external :class:`VideoEncoder` and
-    therefore want the native VAE to never materialize in RAM.
-
-    Match is case-insensitive on ``"vae"`` substring against ``path`` (str
-    or first entry of a sharded list) AND ``origin_file_pattern``; either
-    hit drops the config. Other model files (DiT, T5, CLIP) are untouched.
-    """
-    kept = []
-    for c in model_configs:
-        candidates = []
-        if isinstance(c.path, list):
-            candidates.extend(str(p) for p in c.path if p)
-        elif c.path is not None:
-            candidates.append(str(c.path))
-        if c.origin_file_pattern is not None:
-            candidates.append(str(c.origin_file_pattern))
-        if any("vae" in os.path.basename(s).lower() for s in candidates):
-            continue
-        kept.append(c)
-    return kept
-
-
-def build_training_pipeline(cfg: DictConfig, *, skip_native_vae: bool = False):
+def build_training_pipeline(cfg: DictConfig):
     """Build WanVideoPipeline from Hydra config.
 
     Auto-discovers model files in the directory specified by
@@ -171,11 +147,6 @@ def build_training_pipeline(cfg: DictConfig, *, skip_native_vae: bool = False):
     Args:
         cfg: Full Hydra config (reads ``cfg.training`` and
             ``cfg.model.video_backbone``).
-        skip_native_vae: When True, filter the discovered ``ModelConfig``
-            list to drop the native VAE weight file before it is loaded.
-            Used by :meth:`Wan22Ti2v.from_pretrained` on the
-            irreversible external-encoder path so the ~1.5GB Wan2.2 VAE
-            never materializes on CPU only to be released immediately.
 
     Returns:
         Initialized WanVideoPipeline ready for training.
@@ -191,8 +162,6 @@ def build_training_pipeline(cfg: DictConfig, *, skip_native_vae: bool = False):
     _warn_on_name_path_mismatch(backbone_cfg.get("name", None), model_dir)
 
     model_configs, tokenizer_config = discover_model_files(model_dir)
-    if skip_native_vae:
-        model_configs = _filter_native_vae_configs(model_configs)
 
     # Load components
     pipe = load_wan_components(

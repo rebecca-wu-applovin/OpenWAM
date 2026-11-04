@@ -122,13 +122,9 @@ STUDY_GROUPS: tuple[Group, ...] = (
         "OpenWAM_Study_Architecture",
         "openwam_study/architecture",
         (
-            Ckpt("robotwin_dual_system_idm", 24.8),
             Ckpt("robotwin_dual_system_joint_cross_attention", 24.8),
             Ckpt("robotwin_dual_system_joint_cross_attention_detach", 24.8),
             Ckpt("robotwin_dual_system_joint_self_attention", 24.8),
-            Ckpt("robotwin_single_system_moe", 24.8),
-            Ckpt("robotwin_single_system_vanilla", 24.8),
-            Ckpt("robotwin_tri_system_joint_self_attention", 29.3),
         ),
     ),
     Group(
@@ -150,26 +146,11 @@ STUDY_GROUPS: tuple[Group, ...] = (
         ),
     ),
     Group(
-        "OpenWAM_Study_Visual_Encoder",
-        "openwam_study/visual_encoder",
-        (
-            Ckpt("robotwin_dual_system_joint_self_attention_dinov3", 24.8),
-            Ckpt("robotwin_dual_system_joint_self_attention_dinov3_svae", 24.8),
-            Ckpt("robotwin_dual_system_joint_self_attention_flux2", 24.8),
-            Ckpt("robotwin_dual_system_joint_self_attention_vjepa21", 24.8),
-            Ckpt("robotwin_dual_system_joint_self_attention_vjepa21_svae", 24.8),
-            Ckpt("robotwin_dual_system_joint_self_attention_wan22_vae", 24.8),
-        ),
-    ),
-    Group(
         "OpenWAM_Study_Video_Backbone",
         "openwam_study/video_backbone",
         (
             Ckpt("robotwin_dual_system_joint_self_attention", 24.8, note="wan22_ti2v_5b"),
-            Ckpt("robotwin_dual_system_joint_self_attention_cosmos25", 22.4),
             Ckpt("robotwin_dual_system_joint_self_attention_cosmos3", 25.6),
-            Ckpt("robotwin_dual_system_joint_self_attention_wan21_i2v_14b", 49.7),
-            Ckpt("robotwin_dual_system_joint_self_attention_wan21_vace_1_3b", 17.2),
         ),
     ),
     Group(

@@ -24,9 +24,6 @@ _WAN_MODEL_NAME_TO_ATTR = {
     "wan_video_text_encoder": "text_encoder",
     "wan_video_dit": "dit",
     "wan_video_vae": "vae",
-    "wan_video_image_encoder": "image_encoder",
-    "wan_video_motion_controller": "motion_controller",
-    "wan_video_vace": "vace",
     "wan_video_vap": "vap",
     "wans2v_audio_encoder": "audio_encoder",
     "wan_video_animate_adapter": "animate_adapter",
@@ -103,7 +100,7 @@ def generate_video_backbone_component_specs(model_dir: str) -> dict:
     result = {"components": components}
     if os.path.isdir(os.path.join(model_dir, _WAN_TOKENIZER_REL)):
         result["tokenizer"] = {
-            "class": "openwam.model.video_backbone.wan.models.text_encoder.HuggingfaceTokenizer",
+            "class": "openwam.model.video_backbone.wan.text_encoder.HuggingfaceTokenizer",
             "attr": "tokenizer",
             "subdir": _WAN_TOKENIZER_SUBDIR,
             "path_kwarg": "name",

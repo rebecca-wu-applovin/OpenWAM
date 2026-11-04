@@ -2,21 +2,11 @@
 
 Supported architecture families:
 
-1. **Single System** (`framework=single_system`)
-   Action tokens are concatenated to the video DiT sequence and ride
-   through the shared blocks. Variants: `vanilla` (no extra capacity) /
-   `moe` (expert FFN at selected layers).
-
-2. **Dual-System** (`framework=dual_system`)
+1. **Dual-System** (`framework=dual_system`)
    A separate ActionDiT consumes features from the video DiT. Variants:
    `joint_cross_attn` (bridge cross-attention after a full video forward)
    / `joint_self_attn` (MMDiT-style mixed attention at every layer, driven
    by :class:`DualSystemMoTDriver`).
-
-3. **Tri-System** (`framework=tri_system`)
-   Motus-style mixture of transformers: Wan video DiT + action expert +
-   frozen VLM / understanding expert, with mixed attention implemented via
-   the video backbone adapter.
 
 Each architecture composes the backbones it owns and implements its own
 ``forward()``.
@@ -27,7 +17,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import numpy as np
 import torch
@@ -55,12 +45,10 @@ def _wrap_forward_in_no_grad(module: nn.Module) -> None:
     """Wrap ``forward`` of ``module`` AND every submodule in its subtree in ``torch.no_grad``.
 
     Recursion matters because callers commonly bypass the root forward and call a
-    nested submodule directly. The canonical case in OpenWAM is
-    ``Qwen3VLBackbone.extract_features`` which calls ``self.vlm_model.model(...)``
-    (the inner ``Qwen3VLModel``, skipping the LM head) — wrapping only
-    ``vlm_model.forward`` would leave that path grad-tracking. Recursively wrapping
-    every descendant makes the semantic complete: any entry point into the frozen
-    subtree is in ``no_grad``.
+    nested submodule directly (e.g. a frozen HF model whose inner ``.model`` is called
+    to skip the LM head) — wrapping only the root ``forward`` would leave that path
+    grad-tracking. Recursively wrapping every descendant makes the semantic complete:
+    any entry point into the frozen subtree is in ``no_grad``.
 
     Idempotent — a marker attribute on each module prevents double-wrapping if
     ``freeze_modules`` runs more than once. ``nn.Module.modules()`` deduplicates
@@ -69,13 +57,13 @@ def _wrap_forward_in_no_grad(module: nn.Module) -> None:
 
     Safe to apply to any module: if the caller already wraps the call in a
     ``no_grad`` context (e.g. ``prepare_inputs``), the inner ``no_grad`` is a
-    no-op; if the caller is inside a grad-tracking forward (the tri_system VLM
-    case this actually saves memory in), it short-circuits activation saving.
+    no-op; if the caller is inside a grad-tracking forward, it short-circuits
+    activation saving.
 
     **Subtree-level semantic, not per-parameter**: a trainable child under a frozen
     parent will NOT receive gradients, because every descendant ``forward`` is
     wrapped in ``no_grad``. For partial-freeze setups (e.g. LoRA on a frozen base,
-    or training only the LM head of an otherwise frozen VLM), do NOT pass the
+    or training only the head of an otherwise frozen model), do NOT pass the
     parent's dotted path to ``freeze_modules``; pass the specific leaves you want
     frozen instead. The current freeze list in ``configs/model/*.yaml``
     only names complete subtrees, so this limitation does not bite today.
@@ -86,47 +74,9 @@ def _wrap_forward_in_no_grad(module: nn.Module) -> None:
 
 logger = logging.getLogger(__name__)
 
-# Prefix for VLM backbone parameters in the architecture state_dict.
-# VLM weights are saved as a separate checkpoint directory (not in safetensors)
-# to avoid tied-weight deduplication complexity.
-VLM_STATE_DICT_PREFIX = "vlm_backbone."
-
-
-def _exclude_vlm_from_state_dict(state_dict: dict[str, "Tensor"]) -> dict[str, "Tensor"]:
-    """Filter out VLM backbone parameters from a state dict.
-
-    Note: this exclusion is prefix-based (``vlm_backbone.*``).  Future
-    trainable modules on the VLM (e.g. LoRA adapters) must be registered at
-    the architecture top level (as siblings of ``vlm_backbone``), NOT as
-    children under ``vlm_backbone``, otherwise they will be silently excluded
-    from the checkpoint.
-    """
-    return {k: v for k, v in state_dict.items() if not k.startswith(VLM_STATE_DICT_PREFIX)}
-
-
-def _assert_decode_video_supported(vb) -> None:
-    """Fail-fast guard for ``generate(decode_video=True)`` against backbones
-    wired to an irreversible external encoder (DINOv3 / V-JEPA2).
-
-    Silently returning ``video=None`` would mask a config mismatch (the
-    caller asked for pixels but the encoder cannot produce them). Pulled
-    out of :meth:`BaseWAMArchitecture.generate` so it is independently
-    unit-testable without standing up the full denoising loop.
-    """
-    enc = vb.external_encoder
-    if enc is not None and not enc.properties.pixel_decode:
-        raise ValueError(
-            f"generate(decode_video=True) but the configured encoder "
-            f"({type(enc).__name__}) is irreversible (properties.pixel_decode=False). "
-            "Pass decode_video=False to retrieve raw latents."
-        )
-
-
 if TYPE_CHECKING:
-    from openwam.model.action_backbone.base import ActionDiTBackbone, SharedActionBackbone
+    from openwam.model.action_backbone.base import ActionDiTBackbone
     from openwam.model.video_backbone.base import VideoBackbone
-
-    AnyActionBackbone = Union["ActionDiTBackbone", "SharedActionBackbone"]
 
 
 @dataclass
@@ -135,7 +85,7 @@ class ActionState:
 
     Only ``DualSystemSelfAttnArchitecture`` needs this — its action stream is
     threaded through ``DualSystemMoTDriver``, which mutates the payload across
-    layers. SingleSystem and DualSystem cross-attn don't go through this
+    layers. DualSystem cross-attn doesn't go through this
     container.
 
     Fields:
@@ -168,7 +118,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         super().__init__()
         self.cfg = cfg
         self.video_backbone: Optional["VideoBackbone"] = None
-        self.action_backbone: Optional["AnyActionBackbone"] = None
+        self.action_backbone: Optional["ActionDiTBackbone"] = None
         self._device = torch.device("cuda")
         self._dtype = torch.bfloat16
 
@@ -204,16 +154,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
         - ``name``: registry key → training-time path
 
         Both paths flow through the public :func:`build_video_backbone`.
-
-        Optional ``video_backbone.encoder`` block (yaml-whitelisted to
-        ``{name, model_path}``) swaps the backbone's native VAE for an
-        external :class:`VideoEncoder`. The encoder block is **only** read
-        when ``video_backbone.from_scratch=true`` — the DiT must be
-        reinitialized when its latent space changes. When the block is set
-        but ``from_scratch=false`` we silently route through the native
-        ``pipe.vae`` (with an INFO log explaining what happened) so that the
-        default yaml's documentation-friendly ``encoder:`` block doesn't
-        break the default training command.
         """
         from openwam.model.video_backbone import build_video_backbone
 
@@ -223,90 +163,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         source = vb_cfg.get("_source") if isinstance(vb_cfg, dict) else getattr(vb_cfg, "_source", None)
         vb_name = vb_cfg.get("name") if isinstance(vb_cfg, dict) else getattr(vb_cfg, "name", None)
-        from_scratch = bool(self._cfg_get(vb_cfg, "from_scratch", False))
-
-        # ------------------------------------------------------------------
-        # External encoder gate. Four cases, only one of which builds an
-        # encoder:
-        #   - encoder set + from_scratch=true  → build external encoder
-        #   - encoder set + from_scratch=false → INFO log + skip (silent
-        #     ignore is the right UX since the default yaml ships an
-        #     encoder: block for documentation discoverability, and we
-        #     don't want the default training command to fail)
-        #   - encoder unset + from_scratch=true → reset DiT weights only
-        #   - encoder unset + from_scratch=false → no-op (default path)
-        # ------------------------------------------------------------------
-        enc_cfg = vb_cfg.get("encoder") if isinstance(vb_cfg, dict) else getattr(vb_cfg, "encoder", None)
-        external_encoder = None
-        # Single gate, identical for training and deploy: encoder block is
-        # honored ONLY when ``from_scratch=true``. The framework yamls ship
-        # an inline ``encoder:`` block for discoverability even at default
-        # ``from_scratch=false`` — that block must be
-        # silently ignored on both paths so default training and deploy of
-        # ``from_scratch=false`` checkpoints (state_dict topology
-        # ``_pipe.vae.*``) keep working bit-exactly.
-        if enc_cfg is not None and from_scratch:
-            if source is None:
-                # Training: build the encoder from yaml + model_path.
-                from openwam.model.video_backbone.encoder import build_video_encoder
-
-                external_encoder = build_video_encoder(enc_cfg)
-            else:
-                # Deploy: reconstruct the encoder skeleton from the saved
-                # components entry; weights filled in by the architecture's
-                # subsequent ``load_checkpoint`` strict load. ``source`` is
-                # the dict produced by deploy/model_loader.py. ``_ckpt_dir``
-                # is plumbed onto ``vb_cfg`` by model_loader and forwarded
-                # to :meth:`VideoEncoder.from_skeleton` so each encoder can
-                # consult the checkpoint-local artifacts that its
-                # :meth:`VideoEncoder.save_deploy_assets` wrote at save
-                # time. For example, V-JEPA 2.1 prefers
-                # ``<ckpt_dir>/manifest.json`` with a fallback to
-                # ``encoder.model_path``. The user-side weight directory does
-                # not need to be reachable on the deploy host.
-                ckpt_dir_for_encoder = (
-                    vb_cfg.get("_ckpt_dir") if isinstance(vb_cfg, dict) else getattr(vb_cfg, "_ckpt_dir", None)
-                )
-                external_encoder = self._build_external_encoder_skeleton(enc_cfg, source, ckpt_dir=ckpt_dir_for_encoder)
-        elif enc_cfg is not None and source is None:
-            # Training with encoder block set but from_scratch=false. Two
-            # sub-cases:
-            #   (a) ``encoder.name == "wan22_vae"`` (the default-yaml template
-            #       value) — stay silent (INFO only). Native ``pipe.vae``
-            #       and the wan22_vae external encoder are bit-identical, so
-            #       nothing is lost; the default yaml ships the
-            #       ``encoder:`` block as a discoverable hint and
-            #       fail-fast here would break every default config.
-            #   (b) ``encoder.name`` is anything else (``vjepa21`` /
-            #       ``dinov3`` / ...) — that is an explicit
-            #       choice that *cannot* take effect under
-            #       ``from_scratch=false``: the pre-trained DiT's first
-            #       conv channels are bound to the native Wan VAE's
-            #       ``z_dim`` and there is no way to wire a different
-            #       encoder's latent space through without re-initializing
-            #       the DiT. Silently INFO-logging would produce a Wan-VAE
-            #       run that *looks* like a V-JEPA run from the yaml, so
-            #       fail-fast.
-            enc_name = ""
-            if isinstance(enc_cfg, dict):
-                enc_name = str(enc_cfg.get("name", ""))
-            else:
-                enc_name = str(getattr(enc_cfg, "name", ""))
-            if enc_name and enc_name != "wan22_vae":
-                raise ValueError(
-                    f"video_backbone.encoder.name='{enc_name}' is incompatible "
-                    "with from_scratch=false: the pre-trained DiT's first conv "
-                    "channels are bound to native Wan VAE's z_dim and cannot "
-                    "consume a different encoder's latent space. Set "
-                    "from_scratch=true to activate the encoder swap (and re-init "
-                    "the DiT), or remove the encoder block to keep the native "
-                    "Wan VAE path."
-                )
-            logger.info(
-                "video_backbone.encoder is set but from_scratch=false; "
-                "encoder block IGNORED, using native pipe.vae. Set from_scratch=true "
-                "to activate the encoder swap."
-            )
 
         text_dim = self._cfg_get(cfg, "text_dim", None)
         text_dim = None if text_dim in (None, 0) else int(text_dim)
@@ -327,113 +183,26 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 device="cpu",
                 ckpt_dir=ckpt_dir,
                 materialize_weights=materialize,
-                external_encoder=external_encoder,
                 text_dim=text_dim,
             )
         elif vb_name is not None:
-            self.video_backbone = build_video_backbone(
-                vb_name, cfg, external_encoder=external_encoder, text_dim=text_dim
-            )
+            self.video_backbone = build_video_backbone(vb_name, cfg, text_dim=text_dim)
 
         # Cross-check: yaml-declared temporal contract must match what the
-        # backbone actually exposes (sourced from external encoder spec on the
-        # external path, native VAE defaults otherwise). Drift here would let
-        # the dataloader enforce the wrong divisibility rule and let the
-        # mask-downsampler produce a wrong-length tail, so we fail-fast at
-        # backbone init. We read from the backbone (not directly from the
-        # encoder spec) so the contract has a single owner — see A1's
-        # dit_patch_size ABC-property design.
+        # backbone actually exposes. Drift here would let the dataloader
+        # enforce the wrong divisibility rule and let the mask-downsampler
+        # produce a wrong-length tail, so we fail-fast at backbone init.
         if self.video_backbone is not None:
             declared_tc = self._cfg_get(vb_cfg, "temporal_compression", 4)
             declared_causal = self._cfg_get(vb_cfg, "causal_temporal", True)
             actual_tc = self.video_backbone.temporal_compression
             actual_causal = self.video_backbone.causal_temporal
-            if external_encoder is not None:
-                encoder_src = f"external encoder {type(external_encoder).__name__}"
-            else:
-                encoder_src = "native VAE"
             if (declared_tc, declared_causal) != (actual_tc, actual_causal):
                 raise ValueError(
                     f"video_backbone.temporal_compression / causal_temporal yaml "
-                    f"({declared_tc}, {declared_causal}) does not match {encoder_src} "
+                    f"({declared_tc}, {declared_causal}) does not match native VAE "
                     f"({actual_tc}, {actual_causal}). Update the yaml fields to match."
                 )
-
-        # Optional from-scratch DiT: keep the Wan video backbone structure
-        # but discard the loaded DiT weights and re-randomize them in place.
-        # VAE and the text encoder stay pretrained and are frozen by the
-        # training strategy yaml. Reproducibility comes from
-        # ``cfg.project.seed`` which ``OpenWAMTrainer`` applies before
-        # architecture construction. Applies uniformly to every architecture
-        # that builds its video backbone via this method (dual_system /
-        # single_system / tri_system).
-        #
-        # IMPORTANT: gated on ``source is None`` (training path only). On
-        # deploy, ``cfg.video_backbone.from_scratch`` is True because the
-        # config was saved from a from-scratch training run, but DiT weights
-        # come from the checkpoint, NOT from a re-initialization. Calling
-        # reinit here would silently wipe the trained DiT weights and the
-        # subsequent ``load_checkpoint`` would overwrite them again — wasted
-        # work in the best case, but if the checkpoint had any missing keys
-        # the strict load would surface them against zeroed weights instead
-        # of the random init, masking the diagnostic.
-        # Both the training reset (source is None) and the deploy reshape-only
-        # path (source set + external encoder) are owned by the backbone via the
-        # ``reinit_for_from_scratch`` contract — the architecture never
-        # reaches into ``vb.dit`` / ``wan.reinit``. Non-Wan backbones raise
-        # NotImplementedError, so this stays gated on from_scratch.
-        if self.video_backbone is not None and from_scratch:
-            self.video_backbone.reinit_for_from_scratch(
-                external_encoder=external_encoder,
-                source=source,
-            )
-
-    @staticmethod
-    def _build_external_encoder_skeleton(enc_cfg, source, *, ckpt_dir=None):
-        """Deploy-time external encoder constructor.
-
-        Reads the encoder ``name`` and reaches into the saved ``source`` dict
-        for the ``components`` list to find the ``attr == "vae"`` entry. That
-        entry's ``model_class`` / ``extra_kwargs`` is handed to the
-        encoder class's :meth:`VideoEncoder.from_skeleton` classmethod,
-        which instantiates the underlying module with zero weights. The
-        architecture's :meth:`load_checkpoint` strict load fills in the
-        weights immediately after.
-
-        ``ckpt_dir`` is forwarded to ``from_skeleton`` so encoders that
-        depend on side files can read them from the checkpoint dir itself,
-        not from the user-side weight directory. Two patterns coexist:
-        V-JEPA 2.1 prefers ``<ckpt_dir>/manifest.json`` and falls back to
-        ``encoder.model_path`` for older checkpoints.
-
-        Refuses to silently fall back to the native VAE path here: if the
-        cfg has an encoder block but the components list is missing a vae
-        entry (e.g. corrupted save), raise so the operator sees the
-        mismatch up front.
-        """
-        from openwam.model.video_backbone.encoder import _VIDEO_ENCODER_REGISTRY
-
-        enc_name = enc_cfg["name"] if isinstance(enc_cfg, dict) else enc_cfg.name
-        if enc_name not in _VIDEO_ENCODER_REGISTRY:
-            available = ", ".join(sorted(_VIDEO_ENCODER_REGISTRY)) or "(none)"
-            raise KeyError(f"Unknown video encoder '{enc_name}'. Available: {available}")
-
-        components = (source or {}).get("components") if isinstance(source, dict) else None
-        if not components:
-            raise RuntimeError(
-                "Deploy with encoder block but saved config has no "
-                "video_backbone.components — cannot reconstruct encoder skeleton. "
-                "Re-save the checkpoint with the current code, or strip the "
-                "encoder block from config.yaml to fall back to native VAE."
-            )
-        vae_entry = next((e for e in components if e.get("attr") == "vae"), None)
-        if vae_entry is None:
-            raise RuntimeError(
-                "Deploy with encoder block but components list has no attr=vae "
-                "entry to construct the encoder skeleton from."
-            )
-        encoder_cls = _VIDEO_ENCODER_REGISTRY[enc_name]
-        return encoder_cls.from_skeleton(vae_entry, encoder_cfg=enc_cfg, ckpt_dir=ckpt_dir)
 
     def _resolve_video_dim(self, cfg) -> int:
         """Resolve video_dim from config or video_backbone; raise if neither provides it."""
@@ -450,8 +219,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
     def backbones(self) -> dict[str, nn.Module]:
         """All backbone modules owned by this architecture.
 
-        Subclasses with additional backbones (e.g. TriSystem with a VLM
-        backbone) should override this to include them. The returned dict
+        Subclasses with additional backbones should override this to include
+        them. The returned dict
         is used by ``init_training_schedulers``, ``set_dtype_device``,
         ``move_frozen_to_device``, and ``save_assets_for_deployment`` to iterate
         over all backbones generically.
@@ -478,14 +247,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
         if self.video_backbone is None:
             raise RuntimeError("video_backbone is not initialized")
         return self.video_backbone.scheduler
-
-    @property
-    def external_encoder(self):
-        """The video backbone's external encoder, or ``None`` (native VAE / no video
-        backbone). Train/deploy read this instead of reaching into video_backbone
-        internals (the layering boundary: only the architecture talks to backbones)."""
-        vb = self.video_backbone
-        return vb.external_encoder if vb is not None else None
 
     @property
     def action_dim(self) -> int:
@@ -685,7 +446,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
     # --- Checkpoint save / load ---
 
     def save_checkpoint(self, path: str, *, state_dict: dict | None = None) -> None:
-        """Save architecture state to safetensors. VLM params excluded (saved separately).
+        """Save architecture state to safetensors.
 
         ``state_dict`` defaults to ``self.state_dict()`` (deploy export); the
         trainer passes a gathered state_dict (ZeRO/DDP all-gather) instead.
@@ -694,17 +455,13 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         if state_dict is None:
             state_dict = self.state_dict()
-        state_dict = _exclude_vlm_from_state_dict(state_dict)
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         save_file(state_dict, path)
 
     def load_checkpoint(self, path: str, strict: bool = True) -> None:
         """Load architecture state from a safetensors checkpoint.
 
-        VLM backbone weights are not stored in the safetensors file (they
-        are saved as a separate directory). When a VLM backbone is present,
-        missing ``vlm_backbone.*`` keys are tolerated; unexpected or missing
-        non-VLM keys still raise under ``strict=True``.
+        Missing or unexpected keys raise under ``strict=True``.
 
         Meta-device sub-modules (self-contained deploy empty shells built
         via ``from_empty`` / ``init_empty_weights``) need
@@ -718,18 +475,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
         from safetensors.torch import load_file
 
         state_dict = load_file(path)
-        has_vlm = getattr(self, "vlm_backbone", None) is not None
         has_meta = any(p.device.type == "meta" for p in self.parameters())
         missing, unexpected = self.load_state_dict(state_dict, strict=False, assign=has_meta)
-        if strict and not has_vlm:
-            if missing or unexpected:
-                raise RuntimeError(f"Strict load failed: missing={missing}, unexpected={unexpected}")
-        elif strict and has_vlm:
-            non_vlm_missing = [k for k in missing if not k.startswith(VLM_STATE_DICT_PREFIX)]
-            if non_vlm_missing or unexpected:
-                raise RuntimeError(
-                    f"Strict load failed (VLM keys excluded): missing={non_vlm_missing}, unexpected={unexpected}"
-                )
+        if strict and (missing or unexpected):
+            raise RuntimeError(f"Strict load failed: missing={missing}, unexpected={unexpected}")
 
     # --- Training: module management ---
 
@@ -775,13 +524,12 @@ class BaseWAMArchitecture(ABC, nn.Module):
         For text_encoder / vae, which are already called under the
         ``@torch.no_grad()`` ``prepare_inputs`` decorator, the wrapper is a
         no-op (nested ``no_grad``). For modules called inside the training
-        forward graph (e.g. tri_system's frozen Qwen3-VL backbone), the
-        wrapper is what actually saves activation memory.
+        forward graph, the wrapper is what actually saves activation memory.
 
         Uses ``nn.Module.get_submodule()`` so dotted paths like
         ``video_backbone.text_encoder`` work naturally; unknown names
         are silently skipped, so a freeze list mentioning modules absent on a
-        given architecture (e.g. ``vlm_backbone.vlm_model`` on dual_system)
+        given architecture (a module that exists only on another backbone)
         is harmless.
         """
         frozen = []
@@ -916,7 +664,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         all_frames: list = []
         all_prompts: list = []
-        all_vace_videos: list = []
         all_ref_images: list = []
         all_actions: list = []
         all_proprios: list = []
@@ -927,7 +674,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
         for sample in samples:
             all_frames.append(sample["video"])
             all_prompts.append(sample["prompt"])
-            all_vace_videos.append(sample.get("vace_video"))
             all_ref_images.append(sample.get("first_frame_image"))
 
             action = sample.get("action")
@@ -999,7 +745,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
         preprocessed = self.preprocess(
             frames=all_frames,
             text=all_prompts,
-            vace_videos=all_vace_videos,
             ref_images=all_ref_images if ref_flags[0] else None,
             **extra,
         )
@@ -1042,21 +787,13 @@ class BaseWAMArchitecture(ABC, nn.Module):
             # ``latent[0]`` is a clean conditioning frame (and must be excluded
             # from the loss mask) when either:
             #   (a) the input batch carries ``first_frame_latents`` (Wan TI2V
-            #       / cosmos_predict25 TI2V — per-batch signal), in which case
+            #       — per-batch signal), in which case
             #       ``base.compute_loss`` will clean-replace ``latents[:, :, 0:1]``
             #       on every step; or
             #   (b) the backbone's *configuration* always reserves ``latent[0]``
             #       for conditioning (only TI2V via the
             #       ``fuse_vae_embedding_in_latents`` / per-token-t=0 path
             #       today).
-            # Wan I2V: side-channel ``y`` carries the first-frame reference;
-            # ``latent[0]`` itself is fully noised on both train and deploy
-            # and must be supervised — NOT in the skip list.
-            # Wan VACE: first-frame condition rides on ``vace_context``;
-            # video latents are fully noised, ``latent[0]`` enters the loss
-            # as a predicted frame. NOT in the skip list.
-            # CosmosPredict25 T2V: no first-frame conditioning at all — both
-            # signals off.
             skip_first = inputs.get("first_frame_latents") is not None or self.video_backbone.needs_first_frame_skip
             # Pass the backbone's temporal_compression so the tail-grouping
             # divisor matches the actual latent-T produced by the encoder.
@@ -1252,14 +989,11 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         n_skip = 0
         if inputs.get("first_frame_latents") is not None:
-            # TI2V (Wan + cosmos_predict25): trim the leading clean conditioning
-            # latent(s) from the loss. Wan adapter emits
-            # ``num_clean_prefix_frames=0`` (one implicit conditioning latent
-            # at index 0); cosmos_predict25 wrapper emits ``num_clean_prefix_frames=1``
-            # (explicit count). Both should drop exactly the conditioning
-            # latent(s), so use ``max(prefix, 1)``. VACE never enters this
-            # branch — its conditioning rides on ``vace_context``, the video
-            # latent path is fully noised + fully supervised.
+            # TI2V: trim the leading clean conditioning latent(s) from the
+            # loss. Wan emits ``num_clean_prefix_frames=0`` (one implicit
+            # conditioning latent at index 0); an explicit count is also
+            # accepted. Both drop exactly the conditioning latent(s), so use
+            # ``max(prefix, 1)``.
             n_skip = max(num_clean_prefix, 1)
         elif num_clean_prefix > 0:
             # Clean-prefix flagged without first_frame_latents: trim prefix
@@ -1414,7 +1148,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
         schedule,
         prompt: str,
         *,
-        vace_video=None,
         first_frame_image=None,
         num_frames: int = 49,
         action_num_frames: Optional[int] = None,
@@ -1430,7 +1163,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
         dit_cache=None,
         decode_video: bool = True,
         profile: bool = False,
-        vace_cache: Optional[dict] = None,
         prompt_embed_cache: Optional[dict] = None,
         proprio: Optional[Tensor] = None,
         cfg_scale: float = 1.0,
@@ -1464,7 +1196,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         # Defensive: deploy/model_loader.py:161 already flips eval at load,
         # but ad-hoc callers (notebooks, mid-training eval callbacks) might
         # invoke `generate()` without going through that path. Idempotent
-        # — guards CFG dropout (e.g. CosmosPredict25 §14.7) and any other
+        # — guards CFG dropout and any other
         # training-only behavior from firing during inference.
         self.eval()
 
@@ -1488,14 +1220,13 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         action_num_frames = int(action_num_frames if action_num_frames is not None else num_frames)
 
-        # CFG knobs ARE forwarded so a CFG-capable backbone (CosmosPredict25)
+        # CFG knobs ARE forwarded so a CFG-capable backbone
         # can materialise ``inputs_shared['uncond_context']`` from its own
         # encoder; the denoising loop below then applies CFG via
         # ``cfg_scale_f`` / ``cfg_merge``. Wan does no CFG at inference and
         # swallows these via ``**kw``, so its behaviour is unchanged.
         inputs_shared = vb.preprocess_input_for_inference(
             prompt=prompt,
-            vace_video=vace_video,
             first_frame_image=first_frame_image,
             num_frames=num_frames,
             height=height,
@@ -1504,7 +1235,6 @@ class BaseWAMArchitecture(ABC, nn.Module):
             num_inference_steps=num_inference_steps,
             shift=shift,
             tiled=tiled,
-            vace_cache=vace_cache,
             prompt_embed_cache=prompt_embed_cache,
             cfg_scale=cfg_scale,
             cfg_merge=cfg_merge,
@@ -1517,8 +1247,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         if input_video_latents is not None:
             inputs_shared["latents"] = input_video_latents
-        # Architecture-specific pipeline inputs (e.g. tri_system's vlm_inputs /
-        # vlm_hidden / vlm_attention_mask) are forwarded as-is. Subclasses
+        # Architecture-specific pipeline inputs are forwarded as-is. Subclasses
         # extract what they recognize in their forward(); unrelated architectures
         # never see these keys because callers only pass them via super().generate.
         for key, value in extra_pipeline_inputs.items():
@@ -1566,11 +1295,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 torch.cuda.synchronize()
             logger.info("[WAM_PROFILE] denoising_loop: %.3fs", time.time() - t_loop)
 
-        # VAE decode. Fail-fast when the backbone is wired to an irreversible
-        # external encoder — silently returning None would mask a config
-        # mismatch (caller asked for pixels but the encoder cannot produce them).
+        # VAE decode (only when pixels were requested).
         if decode_video:
-            _assert_decode_video_supported(vb)
             video_frames = vb.decode_video(inputs_shared["latents"], tiled=tiled)
         else:
             video_frames = None
@@ -1887,10 +1613,6 @@ _CFG_BATCH_AXIS_KEYS: tuple = (
     "first_frame_latents",
     "seq_lens",
     "context_mask",
-    # cosmos_predict25 TI2V emits ``condition_mask`` of shape (B, 1, T_lat, H_lat, W_lat)
-    # in ``_finalize_ti2v_inputs`` and the wrapper cats it to ``x_in`` along
-    # dim=1; cfg_merge=True must double B here or that cat shape-mismatches.
-    "condition_mask",
 )
 
 

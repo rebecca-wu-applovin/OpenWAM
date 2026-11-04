@@ -14,7 +14,7 @@ class BaseDataset(ABC, torch.utils.data.Dataset):
     (``normalization_stats``) is NOT part of the base contract — the
     project happens to train action-conditioned models today, but the
     dataset abstraction shouldn't bake that in. Consumers that need such
-    metadata (``MixtureDataset``, the trainer's normalizer loading)
+    metadata (the trainer's normalizer loading)
     discover it via duck-typed ``getattr`` with sensible defaults, so
     future pure-video or pure-prompt subclasses stay clean subclasses
     without lying about action fields.
@@ -36,7 +36,6 @@ class BaseDataset(ABC, torch.utils.data.Dataset):
             proprio_mask:    Tensor (1,) bool
             prompt:          str
             first_frame_image: List[PIL.Image]
-            vace_video:      Optional[List[PIL.Image]]
 
         ``video`` is returned as PIL Images because the legacy
         WanVideoPipeline.preprocess_video handles cropping, resizing, and

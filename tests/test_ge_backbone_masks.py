@@ -80,7 +80,7 @@ def test_ge_native_bidirectional_video_only():
 
 def test_native_noise_sampler_matches_ge_trainer():
     # ge_trainer.py: idx = floor(u*1000), sigma = FlowMatchEuler(shift 1).sigmas[idx], t = floor(sigma*1000), w = 1.
-    from openwam.model.video_backbone.ge_backbone import GEBaseFastVideoBackbone
+    from openwam.model.video_backbone.ge.backbone import GEBaseFastVideoBackbone
 
     torch.manual_seed(0)
     ts, sig, w = GEBaseFastVideoBackbone.sample_training_noise(None, 4096, device="cpu", dtype=torch.float32)

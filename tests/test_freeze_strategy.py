@@ -10,8 +10,8 @@ class MockPipeline:
         self.dit = nn.Linear(10, 10)
         self.vae = nn.Linear(10, 10)
         self.text_encoder = nn.Linear(10, 10)
-        self.image_encoder = nn.Linear(10, 10)
-        self.vace = nn.Linear(10, 10)
+        self.aux_frozen = nn.Linear(10, 10)
+        self.aux_trainable = nn.Linear(10, 10)
 
 
 def _apply_freeze(pipe, freeze_list):
@@ -23,31 +23,31 @@ def _apply_freeze(pipe, freeze_list):
 
 
 def test_default_freeze_strategy():
-    """Default freeze: text_encoder, vae, image_encoder frozen; dit, vace trainable."""
+    """Default freeze: text_encoder, vae, aux_frozen frozen; dit, aux_trainable trainable."""
     pipe = MockPipeline()
-    freeze_list = ["text_encoder", "vae", "image_encoder"]
+    freeze_list = ["text_encoder", "vae", "aux_frozen"]
     _apply_freeze(pipe, freeze_list)
 
     # Frozen
     assert not any(p.requires_grad for p in pipe.text_encoder.parameters())
     assert not any(p.requires_grad for p in pipe.vae.parameters())
-    assert not any(p.requires_grad for p in pipe.image_encoder.parameters())
+    assert not any(p.requires_grad for p in pipe.aux_frozen.parameters())
 
     # Trainable
     assert all(p.requires_grad for p in pipe.dit.parameters())
-    assert all(p.requires_grad for p in pipe.vace.parameters())
+    assert all(p.requires_grad for p in pipe.aux_trainable.parameters())
 
 
 def test_freeze_everything_except_dit():
     """FastWAM-style: freeze all except dit."""
     pipe = MockPipeline()
-    freeze_list = ["text_encoder", "vae", "image_encoder", "vace"]
+    freeze_list = ["text_encoder", "vae", "aux_frozen", "aux_trainable"]
     _apply_freeze(pipe, freeze_list)
 
     assert not any(p.requires_grad for p in pipe.text_encoder.parameters())
     assert not any(p.requires_grad for p in pipe.vae.parameters())
-    assert not any(p.requires_grad for p in pipe.image_encoder.parameters())
-    assert not any(p.requires_grad for p in pipe.vace.parameters())
+    assert not any(p.requires_grad for p in pipe.aux_frozen.parameters())
+    assert not any(p.requires_grad for p in pipe.aux_trainable.parameters())
     assert all(p.requires_grad for p in pipe.dit.parameters())
 
 
@@ -59,8 +59,8 @@ def test_empty_freeze_list():
     assert all(p.requires_grad for p in pipe.dit.parameters())
     assert all(p.requires_grad for p in pipe.vae.parameters())
     assert all(p.requires_grad for p in pipe.text_encoder.parameters())
-    assert all(p.requires_grad for p in pipe.image_encoder.parameters())
-    assert all(p.requires_grad for p in pipe.vace.parameters())
+    assert all(p.requires_grad for p in pipe.aux_frozen.parameters())
+    assert all(p.requires_grad for p in pipe.aux_trainable.parameters())
 
 
 def test_freeze_nonexistent_module():

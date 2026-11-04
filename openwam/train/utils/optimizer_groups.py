@@ -8,9 +8,8 @@ def build_trainable_parameters(model, *, action_lr=None, video_lr=None):
 
     - ``video_backbone`` → optional ``video_lr``
     - ``action_backbone`` → optional ``action_lr``
-    - every other trainable top-level module (tri_system's ``vlm_backbone`` /
-      ``understanding_expert`` / …) → the optimizer base ``learning_rate``, never a
-      per-group override.
+    - every other trainable top-level module → the optimizer base ``learning_rate``,
+      never a per-group override.
 
     Source of truth: ``BaseWAMArchitecture.get_trainable_modules()`` (top-level
     children that hold at least one ``requires_grad`` param). Only ``requires_grad``

@@ -124,7 +124,6 @@ sqlalchemy==2.0.54
 starlette==1.7.0
 sympy==1.14.0
 synchronicity==0.12.6
-timm==1.0.30
 tokenizers==0.23.2
 toml==0.10.2
 tomli==2.5.0

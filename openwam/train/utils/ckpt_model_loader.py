@@ -265,7 +265,7 @@ def build_architecture_from_ckpt_dir(ckpt_dir: str, *, weights_required: bool, o
     params["video_backbone"] = vb_params
     # ``_source`` comes from the SAME resolved config the skeletons were sized
     # from, not from ckpt_cfg directly — otherwise a live override of a
-    # video_backbone key (shift_video, from_scratch, ...) would reach the
+    # video_backbone key (shift_video, ...) would reach the
     # architecture but not the backbone build that reads it back off ``_source``.
     vb_params["_source"] = OmegaConf.to_container(model_cfg.video_backbone, resolve=True)
     vb_params["_ckpt_dir"] = ckpt_dir

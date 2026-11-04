@@ -25,7 +25,7 @@ import torch
 
 from openwam.deploy.denoise_schedule import make_schedule, schedule_sync
 from openwam.model.action_backbone.scheduler import ActionScheduler
-from openwam.model.video_backbone.wan.shared.diffusion import FlowMatchScheduler
+from openwam.model.video_backbone.wan.scheduler import FlowMatchScheduler
 
 
 def _make_pair() -> tuple[FlowMatchScheduler, ActionScheduler]:

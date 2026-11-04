@@ -1,6 +1,6 @@
 """Shared ActionDiT for OpenWAM joint video-action architectures.
 
-Dual-system and tri-system architectures share this module. It owns the
+Dual-system architectures share this module. It owns the
 action-side parameters and exposes both a standalone cross-attention path and
 a split pre/post interface for mixed self-attention drivers.
 
@@ -19,11 +19,6 @@ Three variants share this module:
   :class:`DualSystemMoTDriver` drives the per-layer loop via
   :meth:`pre_attn_at_layer` / :meth:`post_attn_at_layer`, concatenating
   Q/K/V across modalities and running a single mixed attention.
-
-- ``variant='idm'``: reuses the same MoT-driven block layout as
-  ``joint_self_attn``. The architecture changes the training/inference
-  orchestration into IDM's two-stage denoising, but the action expert's
-  per-layer computation is identical.
 
 Inspired by:
 - CoVAR: Bridge attention between video and action streams (cross_attn).
@@ -47,13 +42,13 @@ from openwam.model.action_backbone.components import (
     precompute_freqs_cis_1d,
     rope_apply_1d,
 )
-from openwam.model.video_backbone.wan.shared.core.gradient.gradient_checkpoint import gradient_checkpoint_forward
+from openwam.model.video_backbone.common.checkpoint import gradient_checkpoint_forward
 
 if TYPE_CHECKING:
     from openwam.model.architectures.base import ActionState
 
 
-_MOT_VARIANTS = ("joint_self_attn", "idm")
+_MOT_VARIANTS = ("joint_self_attn",)
 
 
 @dataclass
@@ -333,7 +328,7 @@ class ActionDiT(ActionDiTBackbone):
     decoder. They differ in how video features enter the action stream:
 
     - ``joint_cross_attn`` → :class:`CrossAttnActionDiTBlock` + :meth:`forward`.
-    - ``joint_self_attn`` / ``idm`` → :class:`SelfAttnActionDiTBlock` +
+    - ``joint_self_attn`` → :class:`SelfAttnActionDiTBlock` +
       :meth:`pre_attn_at_layer` / :meth:`post_attn_at_layer`, driven by
       :class:`DualSystemMoTDriver`.
 
@@ -365,7 +360,7 @@ class ActionDiT(ActionDiTBackbone):
             action block (1:1 mapping). Self-attn variant: typically the full
             ``range(num_layers)`` — the driver runs joint attention at every
             layer regardless and this is informational only.
-        variant: ``"joint_cross_attn"``, ``"joint_self_attn"``, or ``"idm"``.
+        variant: ``"joint_cross_attn"`` or ``"joint_self_attn"``.
     """
 
     def __init__(
@@ -707,7 +702,7 @@ class ActionDiT(ActionDiTBackbone):
         )
 
     # ------------------------------------------------------------------
-    # joint_self_attn / idm variants: MoT-driven entry points
+    # joint_self_attn variant: MoT-driven entry points
     # ------------------------------------------------------------------
 
     def prepare_state(
@@ -732,7 +727,7 @@ class ActionDiT(ActionDiTBackbone):
         action_context_mask = None
         if self.variant in _MOT_VARIANTS:
             if context is None:
-                raise ValueError("ActionDiT.prepare_state requires raw context for variant='joint_self_attn' or 'idm'.")
+                raise ValueError("ActionDiT.prepare_state requires raw context for variant='joint_self_attn'.")
             action_context, action_context_mask = self._prepare_context(
                 context,
                 context_mask,

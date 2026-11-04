@@ -21,21 +21,18 @@ def test_dataset_base_class_interface():
     assert abstracts == {"__getitem__", "__len__"}
 
 
-def test_robotwin_dataset_imports():
-    """RoboTwin datasets should be importable and follow interface."""
-    from openwam.dataloader import MultiTaskRoboTwinDataset, RoboTwinDataset
+def test_yam_sharpa_dataset_imports():
+    """yam_sharpa datasets should be importable and follow interface."""
+    from openwam.dataloader import MultiYamSharpaDataset, YamSharpaDataset
 
-    assert issubclass(RoboTwinDataset, torch.utils.data.Dataset)
-    assert issubclass(MultiTaskRoboTwinDataset, torch.utils.data.Dataset)
+    assert issubclass(YamSharpaDataset, torch.utils.data.Dataset)
+    assert issubclass(MultiYamSharpaDataset, torch.utils.data.Dataset)
 
 
 def test_all_datasets_inherit_base():
     """All concrete datasets must inherit from BaseDataset."""
-    from openwam.dataloader import (
-        MultiTaskRoboTwinDataset,
-        RoboTwinDataset,
-    )
+    from openwam.dataloader import MultiYamSharpaDataset, YamSharpaDataset
     from openwam.dataloader.bases import BaseDataset
 
-    for cls in [RoboTwinDataset, MultiTaskRoboTwinDataset]:
+    for cls in [YamSharpaDataset, MultiYamSharpaDataset]:
         assert issubclass(cls, BaseDataset), f"{cls.__name__} missing BaseDataset"

@@ -3,7 +3,7 @@
 Builds the vendored ``Cosmos3OmniTransformer`` (weights from the diffusers-style
 bundle's ``transformer/`` sharded safetensors), the ``AutoencoderKLWan`` VAE
 (``vae/`` subfolder) and the ``PreTrainedTokenizerFast`` (``text_tokenizer/``),
-returning a plain namespace the backbone drains (predict2.5 holder parity).
+returning a plain namespace the backbone drains.
 
 Config validation happens before any heavy import so CPU CI reproduces the same
 errors. The deploy path (``ckpt_dir is not None``) builds empty meta shells from
@@ -289,7 +289,7 @@ def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
 
 
 def _video_backbone_cfg(source: Any) -> Any:
-    """Normalize the four accepted source shapes (predict2.5 parity)."""
+    """Normalize the four accepted source shapes."""
     if source is None:
         return None
     if isinstance(source, (str, Path)):
@@ -429,7 +429,7 @@ def build_cosmos3_pipeline(
     if not freeze_und:
         raise NotImplementedError(
             "cosmos3_edge freeze_und=false is not supported: the und tower always runs under "
-            "no_grad (dit_forward.run_und_tower), so its parameters can never receive gradients "
+            "no_grad (dit.run_und_tower), so its parameters can never receive gradients "
             "— the flag would silently allocate optimizer state for weights that never train. "
             "Remove the override, or implement a grad-enabled und path first."
         )
@@ -471,7 +471,7 @@ def build_cosmos3_pipeline(
         # shell must materialize them itself or the post-load `.to()` raises
         # "Cannot copy out of meta tensor". The only one is the rotary
         # inv_freq, fully determined by config — recompute it here.
-        from openwam.model.video_backbone.cosmos3.dit_forward import rotary_inv_freq
+        from openwam.model.video_backbone.cosmos3.dit import rotary_inv_freq
 
         inv_freq = rotary_inv_freq(
             int(net_kwargs["head_dim"]), float(net_kwargs["rope_theta"])
@@ -516,7 +516,7 @@ def build_cosmos3_pipeline(
         raise ValueError(
             f"Cosmos3 bundle config diverges from the {name} entry on weightless "
             f"fields {mismatches} (got, expected). Update its _COSMOS3_VARIANTS entry and port "
-            "any behavioral change (text_pack positions / dit_forward) before training."
+            "any behavioral change (text positions / dit) before training."
         )
     # Freeze unconditionally. Gating this on ``deploy`` would be wrong: the
     # training finetune/resume path also sets ``ckpt_dir`` (see

@@ -188,9 +188,9 @@ class TestLossMasking:
         loss = arch._compute_video_loss(pred, target, torch.tensor([0]), inputs, device="cpu")
         assert abs(loss.item() - 4.0) < 1e-5, f"got {loss.item()}"
 
-    def test_video_loss_i2v_conditioning_latent_without_prefix(self):
-        """I2V has no ref-prefix metadata, but its tail mask still excludes the
-        leading first-frame conditioning latent."""
+    def test_video_loss_conditioning_latent_without_prefix(self):
+        """No ref-prefix metadata and no ``first_frame_latents``, but the tail mask still
+        excludes the leading first-frame conditioning latent."""
         arch = _make_arch()
         target = torch.zeros(1, 1, 3, 1, 1)
         pred = torch.zeros(1, 1, 3, 1, 1)
@@ -201,8 +201,6 @@ class TestLossMasking:
         inputs = {
             "num_clean_prefix_frames": 0,
             "first_frame_latents": None,
-            "clip_feature": torch.zeros(1, 257, 1280),
-            "y": torch.zeros(1, 20, 3, 1, 1),
             "video_is_pad": torch.tensor([[False, True]]),
         }
 
@@ -288,8 +286,8 @@ class TestLossMasking:
 #
 # Reviewer @wayrise flagged that `prepare_inputs` previously decided
 # ``skip_first`` purely from ``inputs.get("first_frame_latents")``. That
-# matched Wan TI2V / VACE / cosmos_predict25 TI2V (those set the field) and
-# cosmos_predict25 T2V (no FFL, no skip). But Wan I2V wires conditioning through
+# matched Wan TI2V (it sets the field) and
+# T2V backbones (no FFL, no skip). But Wan I2V wires conditioning through
 # the ``y`` channel *without* setting ``first_frame_latents``, and a
 # future Wan T2V configuration would (silently) also lose its skip.
 #
@@ -348,9 +346,9 @@ class TestPrepareInputsSkipFirst:
 
         return _ConfigurableBackbone(dim=64, num_layers=2)
 
-    def test_wan_i2v_path_skips_via_property_when_no_first_frame_latents(self):
-        """Wan I2V signature: `needs_first_frame_skip=True` but no
-        ``first_frame_latents`` (image rides on ``y``). Mask must still be
+    def test_skip_via_property_when_no_first_frame_latents(self):
+        """Backbone signature: `needs_first_frame_skip=True` but no
+        ``first_frame_latents``. Mask must still be
         sized to T_lat-1 so the loss-side shape-fallback trims latent[0]."""
         vb = self._make_backbone(emit_first_frame_latents=False, needs_skip=True)
         arch = _make_arch_with_backbone(vb)
@@ -364,8 +362,8 @@ class TestPrepareInputsSkipFirst:
             f"expected (1, 2) tail mask after skip_first, got {tuple(inputs['video_is_pad'].shape)}"
         )
 
-    def test_wan_t2v_path_keeps_frame_zero_when_no_signal(self):
-        """Wan T2V signature: no ``first_frame_latents`` AND
+    def test_t2v_path_keeps_frame_zero_when_no_signal(self):
+        """T2V signature: no ``first_frame_latents`` AND
         ``needs_first_frame_skip=False``. ``video_is_pad`` must cover the
         full T_lat so latent[0] enters the loss as a predicted frame."""
         vb = self._make_backbone(emit_first_frame_latents=False, needs_skip=False)
@@ -389,8 +387,7 @@ class TestPrepareInputsSkipFirst:
         assert torch.equal(inputs["video_is_pad"][0].cpu(), expected)
 
     def test_per_batch_signal_still_wins_when_property_is_false(self):
-        """cosmos_predict25 TI2V case: ``needs_first_frame_skip=False`` (TI2V is
-        data-driven on cosmos), but the batch carries ``first_frame_latents``.
+        """Data-driven TI2V case: ``needs_first_frame_skip=False``, but the batch carries ``first_frame_latents``.
         The OR clause must still trip skip_first."""
         vb = self._make_backbone(emit_first_frame_latents=True, needs_skip=False)
         arch = _make_arch_with_backbone(vb)

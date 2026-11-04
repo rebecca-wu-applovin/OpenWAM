@@ -1,5 +1,8 @@
 # Docker validation scope
 
+> Historical record (2026-09-11), before single/tri-system, IDM, the gripper datasets and the old benchmark clients
+> were removed (2026-10-21). Test names and datasets below refer to that revision.
+
 Results apply to the named revision/image and environment. Use
 [docker.md](docker.md) for setup and test commands. No Cosmos or LIBERO assets
 were downloaded for the 2026-09-11 checks below.

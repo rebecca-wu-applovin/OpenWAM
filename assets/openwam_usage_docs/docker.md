@@ -104,19 +104,14 @@ docker compose logs --tail=50 serve
 ```
 
 Allow several minutes for loading. Once health changes to `healthy`, check
-protocol readiness and run one prediction:
+protocol readiness:
 
 ```bash
 docker compose exec -T serve python /opt/openwam/docker/healthcheck.py
-docker compose exec -T serve python scripts/inference_test/inference_single_test.py \
-  --test --state-dim 20
 ```
 
-The health command exits silently with code 0; it only sends a ping. The
-prediction test should report `Smoke test passed.` and 20 action values.
-The first prediction can be slow while compilation warms up. Random test
-observations validate execution, not policy quality. Other checkpoints may
-require a different raw state dimension.
+The health command exits silently with code 0; it only sends a ping. The first
+prediction from a client can be slow while compilation warms up.
 
 The endpoint defaults to `ws://127.0.0.1:8848` on the GPU host. Stop services
 with `docker compose down`; cache, outputs and weights remain on the host.
@@ -164,14 +159,11 @@ readiness/prediction checks.
 
 ## Train
 
-Prepare the dataset and backbone from a **connected checkout**. Skip downloads
-for assets already present:
+Prepare the backbone from a **connected checkout** (the yam_sharpa data has no
+bundled downloader; place it under the assets tree). Skip downloads for assets
+already present:
 
 ```bash
-docker compose -f compose.yaml -f docker/compose.dev.yaml run --rm \
-  -e HF_HUB_OFFLINE=0 -e TRANSFORMERS_OFFLINE=0 dev \
-  python scripts/download_assets/download_benchmark_data.py --name LIBERO --yes
-
 docker compose -f compose.yaml -f docker/compose.dev.yaml run --rm \
   -e HF_HUB_OFFLINE=0 -e TRANSFORMERS_OFFLINE=0 dev \
   python scripts/download_assets/download_video_backbone.py \
@@ -183,8 +175,9 @@ to that host tree (default `./assets`), and pass explicit **container** paths:
 
 ```bash
 docker compose run --rm train train \
-  dataloader=libero training.debug=true training.num_epochs=null training.batch_size=1 \
-  dataloader.dataset_dir=/opt/openwam/assets/benchmark_data/libero \
+  dataloader=yam_sharpa training.debug=true training.num_epochs=null training.batch_size=1 \
+  dataloader.sources.simteleop.dataset_dir=/opt/openwam/assets/<simteleop_data> \
+  dataloader.sources.gpt_rollout.dataset_dir=/opt/openwam/assets/<gpt_rollout_data> \
   model.video_backbone.model_path=/opt/openwam/assets/video_backbone_ckpt/Wan2.2-TI2V-5B
 ```
 
@@ -450,16 +443,3 @@ The inventory is carried inside offline image archives too. These pins stabilize
 dependency selection; they do not promise byte-identical rebuilt image layers.
 Keep the built image or offline bundle for exact redeployment, including beyond
 the snapshot service's retention period.
-
-### Optional Cosmos image
-
-```bash
-git submodule update --init third_party/cosmos-predict2.5
-docker build --platform linux/amd64 --target cosmos --build-arg VCS_REF="$(git rev-parse HEAD)" \
-  -f docker/Dockerfile -t openwam:cosmos-cu128 .
-```
-
-This separate target reuses `scripts/install_cosmos_predict25.sh` and compiles
-Transformer Engine. It needs its own GPU/checkpoint validation. Upstream Cosmos
-metadata conflicts with restored OpenWAM transformer versions; the standard
-image's clean `pip check` does not apply to this optional target.

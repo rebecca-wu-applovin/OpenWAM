@@ -29,14 +29,13 @@ def test_repr_contract_preserves_optional_legacy_markers():
             "dataloader": {
                 "action_mode": "legacy",
                 "binary_action_dims": [3],
-                "gripper_convention": "minus1_closed_plus1_open",
+                "gripper_convention": "minus1_closed_plus1_open",  # gripper-era key: no longer advertised
             }
         }
     )
     assert repr_contract_from_cfg(cfg) == {
         "representation": "legacy",
         "binary_action_dims": [3],
-        "gripper_convention": "minus1_closed_plus1_open",
     }
 
 

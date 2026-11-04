@@ -47,9 +47,8 @@ def test_all_backbone_bases_declare_hook():
     """Direction-A contract: every backbone base declares save_deploy_assets on
     itself (default no-op), so the dispatcher calls it unconditionally rather than
     probing with hasattr. ``vars`` (not hasattr) catches a root that forgot it."""
-    from openwam.model.action_backbone.base import ActionDiTBackbone, SharedActionBackbone
+    from openwam.model.action_backbone.base import ActionDiTBackbone
     from openwam.model.video_backbone.base import VideoBackbone
-    from openwam.model.vlm_backbone.base import VlmBackbone
 
-    for base in (VideoBackbone, SharedActionBackbone, ActionDiTBackbone, VlmBackbone):
+    for base in (VideoBackbone, ActionDiTBackbone):
         assert "save_deploy_assets" in vars(base), f"{base.__name__} must declare the no-op hook"

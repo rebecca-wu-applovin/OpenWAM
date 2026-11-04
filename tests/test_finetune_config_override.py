@@ -28,12 +28,11 @@ CKPT_CFG = {
         "video_backbone": {
             "name": "wan22_ti2v_5b",
             "model_path": "/ckpt-host/Wan2.2-TI2V-5B",
-            "from_scratch": False,
             "shift_video": 5.0,
             "components": [
                 {
                     "attr": "dit",
-                    "model_class": "openwam.model.video_backbone.wan.models.dit.WanModel",
+                    "model_class": "openwam.model.video_backbone.wan.dit.WanModel",
                     "extra_kwargs": {"dim": 3072, "num_layers": 30, "num_heads": 24},
                 }
             ],
@@ -193,7 +192,7 @@ def test_video_backbone_name_mismatch_raises(tmp_path, capture):
 def test_architecture_framework_mismatch_raises(tmp_path, capture):
     """A different framework is a different architecture class and state_dict."""
     ckpt_dir = _write_ckpt_cfg(tmp_path)
-    cfg = _live_cfg(architecture__framework="single_system")
+    cfg = _live_cfg(architecture__framework="other_system")
 
     with pytest.raises(ValueError, match="model.architecture.framework"):
         cml.build_architecture_from_ckpt_dir(ckpt_dir, weights_required=True, override_cfg=cfg)

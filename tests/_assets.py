@@ -22,9 +22,6 @@ _VIDEO_BACKBONES = PROJECT_ROOT / "assets" / "video_backbone_ckpt"
 # canonical env var -> (legacy env vars, default location written by the downloader)
 _ASSETS: dict[str, tuple[tuple[str, ...], Path]] = {
     "OPENWAM_WAN22_TI2V_5B": (("WAN22_TI2V_5B", "WAN_TI2V_5B_PATH"), _VIDEO_BACKBONES / "Wan2.2-TI2V-5B"),
-    "OPENWAM_WAN21_VACE_1_3B": (("WAN21_VACE_1_3B",), _VIDEO_BACKBONES / "Wan2.1-VACE-1.3B"),
-    "OPENWAM_COSMOS25_2B": (("COSMOS25_ASSET_PATH",), _VIDEO_BACKBONES / "Cosmos-Predict2.5-2B"),
-    "OPENWAM_COSMOS_REASON1_7B": (("REASON1_ASSET_PATH",), _VIDEO_BACKBONES / "Cosmos-Reason1-7B"),
     "OPENWAM_COSMOS3_EDGE": (("COSMOS3_EDGE_ASSET_PATH",), _VIDEO_BACKBONES / "Cosmos3-Edge"),
     "OPENWAM_COSMOS3_NANO": (("COSMOS3_NANO_ASSET_PATH",), _VIDEO_BACKBONES / "Cosmos3-Nano"),
 }

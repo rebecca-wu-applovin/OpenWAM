@@ -1,7 +1,6 @@
 # Import architecture packages to trigger @register_architecture decorators
 from openwam.model import architectures  # noqa: F401
 from openwam.model.action_backbone.separate_action_dit import ActionDiT, ActionDiTState
-from openwam.model.action_backbone.shared_action_backbone import SharedMoEActionBackbone
 from openwam.model.architectures import (
     ARCHITECTURE_METADATA,
     ARCHITECTURE_REGISTRY,
@@ -19,7 +18,6 @@ from openwam.model.architectures import (
 __all__ = [
     "ActionDiT",
     "ActionDiTState",
-    "SharedMoEActionBackbone",
     "BaseWAMArchitecture",
     "ActionState",
     "ARCHITECTURE_METADATA",

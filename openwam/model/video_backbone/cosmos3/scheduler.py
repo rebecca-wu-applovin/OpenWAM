@@ -1,6 +1,6 @@
 """Flow-matching scheduler adapter for the Cosmos3-Edge backbone.
 
-Reuses :class:`CosmosFlowSchedulerAdapter` verbatim — the α-shift sigma grid and
+Reuses :class:`FlowScheduler` verbatim — the α-shift sigma grid and
 ``timesteps = sigmas × num_train_timesteps`` linear relation are hard constraints
 (``generate()`` / ``deploy/denoise_schedule.py`` invert ``σ = t / num_train_ts``
 outside the adapter), and Cosmos3's rectified-flow training uses the same
@@ -19,9 +19,9 @@ semantics; multi-step UniPC correction is a possible later deploy enhancement.
 
 from __future__ import annotations
 
-from openwam.model.video_backbone.cosmos_predict25.scheduler import CosmosFlowSchedulerAdapter
+from openwam.model.video_backbone.common.flow_scheduler import FlowScheduler
 
 
-class Cosmos3FlowSchedulerAdapter(CosmosFlowSchedulerAdapter):
-    """Identical math to the predict2.5 adapter; separate class so the two
-    backbones can diverge (e.g. a UniPC deploy grid) without cross-family edits."""
+class Cosmos3FlowSchedulerAdapter(FlowScheduler):
+    """Identical math to :class:`FlowScheduler`; separate class so cosmos3
+    can diverge (e.g. a UniPC deploy grid) without touching the shared one."""

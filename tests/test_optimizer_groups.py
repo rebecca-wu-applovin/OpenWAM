@@ -35,8 +35,7 @@ class _FakeArchitecture(torch.nn.Module):
         super().__init__()
         self.video_backbone = _FakeVideoBackbone()
         self.action_backbone = _FakeActionBackbone()
-        # A trainable top-level module that is neither video nor action — mirrors
-        # tri_system's understanding_expert / vlm_backbone.
+        # A trainable top-level module that is neither video nor action.
         self.understanding_expert = torch.nn.Linear(4, 4)
 
     def get_trainable_modules(self, freeze_list=()):

@@ -44,13 +44,6 @@ var/
 wheels/
 share/python-wheels/
 references/
-# third_party/ holds submodules (currently cosmos-predict2.5). Build outputs
-# and bytecode that the submodule produces locally should not contaminate it.
-third_party/**/*.pyc
-third_party/**/__pycache__/
-third_party/**/build/
-third_party/**/dist/
-third_party/**/*.egg-info/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -213,10 +206,6 @@ assets/*
 # Versioned repository images.
 !assets/repo_images/
 !assets/repo_images/**
-# Versioned RoboDojo score verification (see issue #23).
-!assets/robodojo_verification/
-!assets/robodojo_verification/**
-
 # Local Labtasker state and attempt journals
 .labtasker/
 /docs/

@@ -17,9 +17,9 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from openwam.model.video_backbone.wan.models.text_encoder import HuggingfaceTokenizer
+from openwam.model.video_backbone.wan.text_encoder import HuggingfaceTokenizer
 from openwam.model.video_backbone.wan.shared.core.device.torch_device import get_device_type
-from openwam.model.video_backbone.wan.shared.diffusion import FlowMatchScheduler
+from openwam.model.video_backbone.wan.scheduler import FlowMatchScheduler
 from openwam.model.video_backbone.wan.shared.models.model_loader import ModelPool
 
 logger = logging.getLogger(__name__)
@@ -28,13 +28,8 @@ logger = logging.getLogger(__name__)
 # others stay plain attributes). Mirrors WanVideoPipeline's old attribute set.
 _MODULE_SLOTS = (
     "text_encoder",
-    "image_encoder",
     "dit",
-    "dit2",
     "vae",
-    "motion_controller",
-    "vace",
-    "vace2",
     "vap",
     "animate_adapter",
     "audio_encoder",
@@ -45,10 +40,6 @@ _REDIRECT_DICT = {
     "models_t5_umt5-xxl-enc-bf16.pth": (
         "DiffSynth-Studio/Wan-Series-Converted-Safetensors",
         "models_t5_umt5-xxl-enc-bf16.safetensors",
-    ),
-    "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth": (
-        "DiffSynth-Studio/Wan-Series-Converted-Safetensors",
-        "models_clip_open-clip-xlm-roberta-large-vit-huge-14.safetensors",
     ),
     "Wan2.1_VAE.pth": ("DiffSynth-Studio/Wan-Series-Converted-Safetensors", "Wan2.1_VAE.safetensors"),
     "Wan2.2_VAE.pth": ("DiffSynth-Studio/Wan-Series-Converted-Safetensors", "Wan2.2_VAE.safetensors"),
@@ -117,19 +108,8 @@ def load_wan_components(
         )
 
     c.text_encoder = model_pool.fetch_model("wan_video_text_encoder")
-    dit = model_pool.fetch_model("wan_video_dit", index=2)
-    if isinstance(dit, list):
-        c.dit, c.dit2 = dit
-    else:
-        c.dit = dit
+    c.dit = model_pool.fetch_model("wan_video_dit")
     c.vae = model_pool.fetch_model("wan_video_vae")
-    c.image_encoder = model_pool.fetch_model("wan_video_image_encoder")
-    c.motion_controller = model_pool.fetch_model("wan_video_motion_controller")
-    vace = model_pool.fetch_model("wan_video_vace", index=2)
-    if isinstance(vace, list):
-        c.vace, c.vace2 = vace
-    else:
-        c.vace = vace
     c.vap = model_pool.fetch_model("wan_video_vap")
     c.audio_encoder = model_pool.fetch_model("wans2v_audio_encoder")
     c.animate_adapter = model_pool.fetch_model("wan_video_animate_adapter")
@@ -184,23 +164,16 @@ def build_holder_from_components(
     device: str = "cpu",
     ckpt_dir: str = None,
     model_path: str = None,
-    *,
-    skip_native_vae: bool = False,
 ):
     """Build an empty component holder from specs. Weights are NOT
     loaded here (``load_checkpoint`` does that). Tokenizer resolves
     ckpt-local first, then falls back to the ``model_path`` layout.
-
-    ``skip_native_vae`` drops the ``vae`` entry so it never allocates CPU
-    tensors (irreversible external-encoder path).
     """
     from openwam.model.video_backbone.wan.pipeline_builder import _build_tokenizer, _import_class
 
     holder = new_components(device=device, torch_dtype=torch.bfloat16)
 
     for entry in components:
-        if skip_native_vae and entry.get("attr") == "vae":
-            continue
         cls = _import_class(entry["model_class"])
         kwargs = entry.get("extra_kwargs", {}) or {}
         logger.info(
@@ -247,19 +220,11 @@ def build_holder_from_components(
     return holder
 
 
-def build_holder_from_model_path(model_path: str, device: str = "cpu", *, skip_native_vae: bool = False):
-    """Build a component holder from a model dir without full Hydra config.
-    ``skip_native_vae`` drops the native VAE weight file before it
-    materializes (irreversible external-encoder path).
-    """
-    from openwam.model.video_backbone.wan.pipeline_builder import (
-        _filter_native_vae_configs,
-        discover_model_files,
-    )
+def build_holder_from_model_path(model_path: str, device: str = "cpu"):
+    """Build a component holder from a model dir without full Hydra config."""
+    from openwam.model.video_backbone.wan.pipeline_builder import discover_model_files
 
     model_configs, tokenizer_config = discover_model_files(model_path)
-    if skip_native_vae:
-        model_configs = _filter_native_vae_configs(model_configs)
     return load_wan_components(
         model_configs,
         tokenizer_config,
@@ -268,7 +233,7 @@ def build_holder_from_model_path(model_path: str, device: str = "cpu", *, skip_n
     )
 
 
-def build_holder(source, *, skip_native_vae: bool = False, **kw):
+def build_holder(source, **kw):
     """Resolve a ``from_pretrained`` source into a transient component holder.
 
     Sources: ``DictConfig`` (full Hydra cfg → pipeline builder), ``str`` dir
@@ -280,10 +245,10 @@ def build_holder(source, *, skip_native_vae: bool = False, **kw):
     if isinstance(source, DictConfig):
         from openwam.model.video_backbone.wan.pipeline_builder import build_training_pipeline
 
-        return build_training_pipeline(source, skip_native_vae=skip_native_vae)
+        return build_training_pipeline(source)
     if isinstance(source, str):
         if os.path.isdir(source):
-            return build_holder_from_model_path(source, device=kw.get("device", "cpu"), skip_native_vae=skip_native_vae)
+            return build_holder_from_model_path(source, device=kw.get("device", "cpu"))
         raise ValueError(f"from_pretrained(str) expects a directory path, got: {source!r}.")
     if isinstance(source, dict):
         vb_cfg = source.get("video_backbone", source)
@@ -297,12 +262,9 @@ def build_holder(source, *, skip_native_vae: bool = False, **kw):
                 device=kw.get("device", "cpu"),
                 ckpt_dir=kw.get("ckpt_dir"),
                 model_path=vb_cfg.get("model_path"),
-                skip_native_vae=skip_native_vae,
             )
         model_path = vb_cfg.get("model_path") if isinstance(vb_cfg, dict) else getattr(vb_cfg, "model_path", None)
         if model_path is None:
             raise ValueError("dict source must contain 'video_backbone.components' or 'video_backbone.model_path'")
-        return build_holder_from_model_path(
-            str(model_path), device=kw.get("device", "cpu"), skip_native_vae=skip_native_vae
-        )
+        return build_holder_from_model_path(str(model_path), device=kw.get("device", "cpu"))
     return source

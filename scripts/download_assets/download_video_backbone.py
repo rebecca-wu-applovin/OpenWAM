@@ -88,39 +88,12 @@ MODELS: dict[str, Model] = {
         config_fields=("model_path",),
     ),
     "2": Model(
-        name="Wan2.1-VACE-1.3B",
-        config="wan21_vace_1_3b.yaml",
-        downloads=(Download("Wan-AI/Wan2.1-VACE-1.3B", "Wan2.1-VACE-1.3B", approx_gb=19.0),),
-        config_fields=("model_path",),
-    ),
-    "3": Model(
-        name="Wan2.1-I2V-14B-480P",
-        config="wan21_i2v_14b_480p.yaml",
-        downloads=(Download("Wan-AI/Wan2.1-I2V-14B-480P", "Wan2.1-I2V-14B-480P", approx_gb=82.3),),
-        config_fields=("model_path",),
-    ),
-    "4": Model(
-        name="Cosmos-Predict2.5-2B",
-        config="cosmos_predict25_2b.yaml",
-        downloads=(
-            Download(
-                "nvidia/Cosmos-Predict2.5-2B",
-                "Cosmos-Predict2.5-2B",
-                approx_gb=4.6,
-                allow_patterns=("base/post-trained/*", "tokenizer.pth"),
-            ),
-            Download("nvidia/Cosmos-Reason1-7B", "Cosmos-Reason1-7B", approx_gb=16.6),
-        ),
-        config_fields=("model_path", "text_encoder_path"),
-        hf_only=True,
-    ),
-    "5": Model(
         name="Cosmos3-Edge",
         config="cosmos3_edge.yaml",
         downloads=(Download("nvidia/Cosmos3-Edge", "Cosmos3-Edge", approx_gb=9.2, ms_id="nv-community/Cosmos3-Edge"),),
         config_fields=("model_path",),
     ),
-    "6": Model(
+    "3": Model(
         name="Cosmos3-Nano",
         config="cosmos3_nano.yaml",
         downloads=(

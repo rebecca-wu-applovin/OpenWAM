@@ -4,8 +4,7 @@ These helpers used to live inside ``robotwin.py``. The image utilities
 (``crop_and_resize`` / ``assemble_multiview_layout``) are dataset-neutral and
 reused by both the RoboTwin dataloader and the deployment ``policy_server``.
 ``format_prompt_for_inference`` is RoboTwin's training-time prompt template —
-deploy no longer uses it (the server is prompt-agnostic; the RoboTwin eval
-client owns its own copy in ``benchmarks/robotwin/prompt_template.py``).
+deploy no longer uses it (the server is prompt-agnostic).
 Keeping these in a transform module avoids deploy → dataset hard-coupling.
 """
 
@@ -178,10 +177,8 @@ def format_prompt_for_inference(base_prompt: str) -> str:
     """RoboTwin training-time prompt template.
 
     The RoboTwin dataloader wraps every instruction with this before the model
-    sees it. Deploy is prompt-agnostic on the server side, so the RoboTwin
-    benchmark client re-implements this byte-for-byte in
-    ``benchmarks/robotwin/prompt_template.py`` (pinned by a regression test) to
-    keep eval prompts in-distribution with training.
+    sees it. Deploy is prompt-agnostic on the server side, so an eval client
+    must apply the same template to keep prompts in-distribution with training.
     """
     return "A video recorded from a robot's point of view executing the following instruction: " + base_prompt
 

@@ -14,7 +14,6 @@ import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(PROJECT_ROOT / "third_party"))
 
 
 # ---------------------------------------------------------------------------
@@ -274,24 +273,6 @@ class TestDeployConfigLoading:
             "mode": "reduce-overhead",
         }
 
-        idm_cfg = {"idm": {}}
-        idm_section = compile_options.idm_compile_cfg(idm_cfg)
-        assert compile_options.section_enabled(idm_section, default=False) is True
-        assert compile_options.torch_compile_kwargs(idm_section) == {
-            "dynamic": False,
-            "mode": "reduce-overhead",
-        }
-        assert compile_options.section_enabled(idm_section.video_loop, default=False) is True
-        assert compile_options.section_enabled(idm_section.action_cache, default=False) is True
-
-        tri_cfg = {"tri_system": {}}
-        tri_section = compile_options.tri_system_compile_cfg(tri_cfg)
-        assert compile_options.section_enabled(tri_section, default=False) is True
-        assert compile_options.torch_compile_kwargs(tri_section) == {
-            "dynamic": False,
-            "mode": "reduce-overhead",
-        }
-
     def test_compile_section_enabled_false_is_respected(self):
         compile_options = self._compile_options()
 
@@ -302,32 +283,6 @@ class TestDeployConfigLoading:
         cross_cfg = {"cross_attn": {"enabled": False}}
         cross_section = compile_options.cross_attn_compile_cfg(cross_cfg)
         assert compile_options.section_enabled(cross_section, default=True) is False
-
-        idm_cfg = {"idm": {"enabled": False}}
-        idm_section = compile_options.idm_compile_cfg(idm_cfg)
-        assert compile_options.section_enabled(idm_section, default=True) is False
-        assert compile_options.section_enabled(idm_section.video_loop, default=True) is False
-        assert compile_options.section_enabled(idm_section.action_cache, default=True) is False
-
-        tri_cfg = {"tri_system": {"enabled": False}}
-        tri_section = compile_options.tri_system_compile_cfg(tri_cfg)
-        assert compile_options.section_enabled(tri_section, default=True) is False
-
-    def test_idm_compile_subsections_can_be_disabled_independently(self):
-        compile_options = self._compile_options()
-
-        idm_section = compile_options.idm_compile_cfg(
-            {
-                "idm": {
-                    "video_loop": {"enabled": False},
-                    "action_cache": {"enabled": True},
-                }
-            }
-        )
-
-        assert compile_options.section_enabled(idm_section, default=True) is True
-        assert compile_options.section_enabled(idm_section.video_loop, default=True) is False
-        assert compile_options.section_enabled(idm_section.action_cache, default=False) is True
 
     def test_compile_enabled_validation_rejects_non_bool_values(self):
         compile_options = self._compile_options()
@@ -538,7 +493,6 @@ class TestJointEngineCompileFlags:
                         "enabled": compile_enabled,
                         "self_attn": {"torch_mode": "reduce-overhead", "dynamic": False},
                         "cross_attn": {"torch_mode": "reduce-overhead", "dynamic": False},
-                        "tri_system": {"torch_mode": "reduce-overhead", "dynamic": False},
                     },
                     "dit_cache": {"enabled": False},
                     "schedule": {"type": None, "action_steps": 4},

@@ -28,8 +28,6 @@ __all__ = [
     "BlockLoopState",
     "VideoBackbone",
     "Wan22Ti2v",
-    "Wan21",
-    "CosmosPredict25VideoBackbone",
     "Cosmos3EdgeVideoBackbone",
     "build_video_backbone",
     "register_video_backbone",
@@ -38,39 +36,31 @@ __all__ = [
 
 # Built-in registrations (kept at the bottom so the implementation can import
 # from ``registry`` / ``base`` without circular issues).
-from openwam.model.video_backbone.wan_backbone import Wan21, Wan22Ti2v  # noqa: E402
+from openwam.model.video_backbone.wan.backbone import Wan22Ti2v  # noqa: E402
 
 register_video_backbone("wan22_ti2v_5b")(Wan22Ti2v)
-register_video_backbone("wan21_vace_1_3b")(Wan21)
-register_video_backbone("wan21_i2v_14b_480p")(Wan21)
-
-# Cosmos-Predict2.5 backbone. Importing the module is CPU-only-CI safe — the
-# heavy ``cosmos_predict2`` import is deferred to ``from_pretrained``.
-from openwam.model.video_backbone.cosmos_predict25_backbone import CosmosPredict25VideoBackbone  # noqa: E402
-
-register_video_backbone("cosmos_predict25_2b")(CosmosPredict25VideoBackbone)
 
 # Cosmos3 backbones (Edge 4B / Nano 16B share one class; the variant is picked
 # by cfg.name in cosmos3/pipeline_builder._COSMOS3_VARIANTS). CPU-only-CI safe —
 # the vendored transformer (which pulls ``diffusers``) is deferred to ``from_pretrained``.
-from openwam.model.video_backbone.cosmos3_backbone import Cosmos3EdgeVideoBackbone  # noqa: E402
+from openwam.model.video_backbone.cosmos3.backbone import Cosmos3EdgeVideoBackbone  # noqa: E402
 
 register_video_backbone("cosmos3_edge")(Cosmos3EdgeVideoBackbone)
 register_video_backbone("cosmos3_nano")(Cosmos3EdgeVideoBackbone)
 
 # LongLive2.0-Robot-S: Wan2.2-TI2V-5B structure with the LongLive DiT weights (07).
-from openwam.model.video_backbone.longlive_backbone import LongLiveRobotS  # noqa: E402
+from openwam.model.video_backbone.wan.longlive import LongLiveRobotS  # noqa: E402
 
 register_video_backbone("longlive2_robot_s")(LongLiveRobotS)
 
 # GE-Base-fast (Genie Envisioner): multi-view LTX DiT + LTX VAE / T5 (07). CPU-only-CI safe —
 # diffusers / transformers are imported inside from_pretrained.
-from openwam.model.video_backbone.ge_backbone import GEBaseFastVideoBackbone  # noqa: E402
+from openwam.model.video_backbone.ge.backbone import GEBaseFastVideoBackbone  # noqa: E402
 
 register_video_backbone("ge_base_fast")(GEBaseFastVideoBackbone)
 
 # flux-3-action-base video trunk (07). CPU-only-CI safe — NATTEN (VAE) and transformers (Qwen)
 # are imported inside from_pretrained.
-from openwam.model.video_backbone.flux_action import FluxActionVideoBackbone  # noqa: E402
+from openwam.model.video_backbone.flux import FluxActionVideoBackbone  # noqa: E402
 
 register_video_backbone("flux3_action_base")(FluxActionVideoBackbone)

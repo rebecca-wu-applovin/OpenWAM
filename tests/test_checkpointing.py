@@ -278,10 +278,10 @@ def test_verify_resume_normalization_stats_rejects_shared_semantic_mismatch(tmp_
     src = tmp_path / "dataset_stats.npy"
     dst_dir = tmp_path / "run"
     dst_dir.mkdir()
-    np.save(src, {"eef": {**transform, "gripper_convention": "minus1_closed_plus1_open"}})
+    np.save(src, {"eef": {**transform, "representation": "absolute_eef10"}})
     np.save(
         dst_dir / "normalization_stats.npy",
-        {"eef": {**transform, "gripper_convention": "plus1_closed_minus1_open"}},
+        {"eef": {**transform, "representation": "relative_eef10"}},
     )
 
     class _Dataset:

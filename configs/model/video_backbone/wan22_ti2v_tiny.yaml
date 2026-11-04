@@ -4,18 +4,13 @@
 # So DiT, T5 and VAE are all random; shapes / masks / data flow match real training, values don't.
 # Used by configs/train_debug.yaml.
 
-defaults:
-  - encoder: wan22_vae
-  - _self_
-
 name: wan22_ti2v_5b   # keep: registry dispatch + adapter class
 model_path: /root/projects/2610_policy_model/OpenWAM/assets/video_backbone_ckpt/Wan2.2-TI2V-5B  # only the tokenizer is read from here
-from_scratch: false
 shift_video: 5.0
 
 components:
   - attr: dit
-    model_class: openwam.model.video_backbone.wan.models.dit.WanModel
+    model_class: openwam.model.video_backbone.wan.dit.WanModel
     extra_kwargs:              # real TI2V-5B: dim 3072, ffn 14336, heads 24, layers 30, text_dim 4096
       dim: 768
       ffn_dim: 3072
@@ -23,23 +18,20 @@ components:
       num_layers: 4
       text_dim: 128            # must equal text_encoder.dim (context width)
       # unchanged from TI2V-5B:
-      has_image_input: false
       patch_size: [1, 2, 2]
       in_dim: 48
       out_dim: 48
       freq_dim: 256
       eps: 1.0e-06
       seperated_timestep: true
-      require_clip_embedding: false
-      require_vae_embedding: false
       fuse_vae_embedding_in_latents: true
   - attr: vae
-    model_class: openwam.model.video_backbone.wan.models.vae.WanVideoVAE38
+    model_class: openwam.model.video_backbone.wan.vae.WanVideoVAE38
     extra_kwargs:
       z_dim: 48                # latent channels: must stay 48 (DiT in_dim)
       dim: 32                  # real: 160. Barely shrinks it (561M vs 705M, meta-device count); VAE is frozen + random either way
   - attr: text_encoder
-    model_class: openwam.model.video_backbone.wan.models.text_encoder.WanTextEncoder
+    model_class: openwam.model.video_backbone.wan.text_encoder.WanTextEncoder
     extra_kwargs:              # real umT5-XXL: 4096 / 4096 / 10240 / 64 heads / 24 layers
       dim: 128
       dim_attn: 128
@@ -48,7 +40,7 @@ components:
       num_layers: 2
 
 tokenizer:                     # real umT5 tokenizer (vocab 256384), read from model_path/google/umt5-xxl
-  class: openwam.model.video_backbone.wan.models.text_encoder.HuggingfaceTokenizer
+  class: openwam.model.video_backbone.wan.text_encoder.HuggingfaceTokenizer
   attr: tokenizer
   subdir: tokenizer/google/umt5-xxl
   path_kwarg: name

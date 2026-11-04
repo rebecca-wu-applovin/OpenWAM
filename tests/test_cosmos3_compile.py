@@ -10,7 +10,7 @@ pytest.importorskip("diffusers")
 from openwam.model.compile_options import cosmos3_blocks_compile_cfg  # noqa: E402
 from openwam.model.video_backbone import Cosmos3EdgeVideoBackbone  # noqa: E402
 from openwam.model.video_backbone.base import BlockLoopState, VideoBackbone  # noqa: E402
-from openwam.model.video_backbone.cosmos3 import dit_forward  # noqa: E402
+from openwam.model.video_backbone.cosmos3 import dit as cosmos3_dit  # noqa: E402
 from openwam.model.video_backbone.cosmos3._vendor.transformer_cosmos3 import (  # noqa: E402
     Cosmos3OmniTransformer,
 )
@@ -75,14 +75,14 @@ def test_default_options():
 
 def test_custom_compile_options_are_forwarded(monkeypatch):
     vb = _backbone()
-    compiler = Mock(return_value=dit_forward._gen_block_forward)
+    compiler = Mock(return_value=cosmos3_dit._gen_block_forward)
     monkeypatch.setattr(torch, "compile", compiler)
     vb.apply_compile_optimizations(
         {"enabled": True, "cosmos3_blocks": {"torch_mode": "max-autotune-no-cudagraphs", "dynamic": True}}
     )
     with torch.no_grad():
         vb.run_block(0, _state())
-    compiler.assert_called_once_with(dit_forward._gen_block_forward, dynamic=True, mode="max-autotune-no-cudagraphs")
+    compiler.assert_called_once_with(cosmos3_dit._gen_block_forward, dynamic=True, mode="max-autotune-no-cudagraphs")
 
 
 def test_invalid_public_switch_is_rejected():
@@ -112,7 +112,7 @@ def test_disabled_is_eager(monkeypatch, cfg):
 def test_lazy_reuse_reset_and_checkpoint_keys(monkeypatch):
     vb = _backbone()
     before = {key: value.clone() for key, value in vb.state_dict().items()}
-    compiled = Mock(wraps=dit_forward._gen_block_forward)
+    compiled = Mock(wraps=cosmos3_dit._gen_block_forward)
     compiler = Mock(return_value=compiled)
     monkeypatch.setattr(torch, "compile", compiler)
     vb.apply_compile_optimizations({"enabled": True})
@@ -122,7 +122,7 @@ def test_lazy_reuse_reset_and_checkpoint_keys(monkeypatch):
             state = _state()
             for i in range(2):
                 vb.run_block(i, state)
-    compiler.assert_called_once_with(dit_forward._gen_block_forward, dynamic=False, mode="default")
+    compiler.assert_called_once_with(cosmos3_dit._gen_block_forward, dynamic=False, mode="default")
     assert compiled.call_count == 4
     after = vb.state_dict()
     assert before.keys() == after.keys()
@@ -204,7 +204,7 @@ def test_fullgraph_block_loop_parity(monkeypatch, padded, masked, mask_4d):
             kwargs = dict(batch=2, seq=seq, padded=padded, masked=masked, mask_4d=mask_4d)
             eager, fast = _state(**kwargs), _state(**kwargs)
             for i in range(2):
-                dit_forward.run_block(vb.dit, i, eager)
+                cosmos3_dit.run_block(vb.dit, i, eager)
                 vb.run_block(i, fast)
                 assert vb._gen_block_compile_enabled  # Do not let fallback hide a capture failure.
                 torch.testing.assert_close(fast.hidden_states, eager.hidden_states, rtol=1e-5, atol=1e-5)
@@ -219,7 +219,7 @@ def test_late_failure_preserves_previous_layer_progress(monkeypatch, caplog):
     def fail_at_second_layer(layer, *args):
         if layer is vb.dit.layers[1]:
             raise RuntimeError("second layer failed")
-        return dit_forward._gen_block_forward(layer, *args)
+        return cosmos3_dit._gen_block_forward(layer, *args)
 
     compiled = Mock(side_effect=fail_at_second_layer)
     monkeypatch.setattr(torch, "compile", Mock(return_value=compiled))
@@ -227,7 +227,7 @@ def test_late_failure_preserves_previous_layer_progress(monkeypatch, caplog):
     eager, fast = _state(), _state()
     with torch.no_grad():
         for i in range(2):
-            dit_forward.run_block(vb.dit, i, eager)
+            cosmos3_dit.run_block(vb.dit, i, eager)
             vb.run_block(i, fast)
             torch.testing.assert_close(fast.hidden_states, eager.hidden_states)
     assert compiled.call_count == 2
@@ -247,7 +247,7 @@ def test_actual_outer_compile_does_not_nest_inner_compile(monkeypatch, warm_inne
         if warm_inner:
             vb.run_block(0, _state())
         calls_before = compiler.call_count
-        expected = dit_forward.run_block(vb.dit, 0, _state()).hidden_states
+        expected = cosmos3_dit.run_block(vb.dit, 0, _state()).hidden_states
         outer = real_compile(lambda state: vb.run_block(0, state).hidden_states, backend="eager", fullgraph=True)
         torch.testing.assert_close(outer(_state()), expected)
         assert compiler.call_count == calls_before

@@ -39,7 +39,6 @@ dependencies = [
     "websockets>=16,<17",
     "msgpack>=1,<2",
     "av>=12,<18",
-    "timm>=1.0.20,<1.1",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -68,9 +67,6 @@ openwam-serve = "openwam.deploy.server:main"
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-exclude = [
-    "third_party/",
-]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]

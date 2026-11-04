@@ -347,7 +347,6 @@ class YamSharpaDataset(LeRobotV3Reader):
 
         return {
             "video": video,
-            "vace_video": None,
             "first_frame_image": [video[0]] if video else [],
             "action": torch.from_numpy(action),
             "action_mask": torch.from_numpy(action_mask),
@@ -430,9 +429,9 @@ class MultiYamSharpaDataset(BaseDataset):
     draws). ``set_epoch`` re-draws; it reaches worker copies only with
     ``persistent_workers=False``.
 
-    (The generic ``MixtureDataset`` is not used: under ``manual`` weights it
-    takes ``arange(virtual_n) % n_real`` per source, so a down-weighted source
-    only ever yields its first ``virtual_n`` windows.)
+    (A former generic ``MixtureDataset`` was not used: under ``manual`` weights it
+    took ``arange(virtual_n) % n_real`` per source, so a down-weighted source
+    only ever yielded its first ``virtual_n`` windows.)
     """
 
     def __init__(

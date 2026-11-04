@@ -9,7 +9,6 @@ logger = logging.getLogger(__name__)
 
 _NORMALIZATION_TRANSFORM_KEYS = ("mean", "std", "min", "max", "q01", "q99")
 _NORMALIZATION_SEMANTIC_KEYS = (
-    "gripper_convention",
     "representation",
     "osc_position_scale",
     "osc_rotation_scale",

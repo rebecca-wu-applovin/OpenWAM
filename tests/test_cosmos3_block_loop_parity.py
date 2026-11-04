@@ -13,7 +13,8 @@ import torch
 
 pytest.importorskip("diffusers")
 
-from openwam.model.video_backbone.cosmos3 import dit_forward, text_pack  # noqa: E402
+from openwam.model.video_backbone.cosmos3 import dit as cosmos3_dit  # noqa: E402
+from openwam.model.video_backbone.cosmos3 import text as cosmos3_text  # noqa: E402
 from openwam.model.video_backbone.cosmos3._vendor.transformer_cosmos3 import (  # noqa: E402
     Cosmos3OmniTransformer,
 )
@@ -74,10 +75,10 @@ def _native_velocity(net, ids, lat, text_pos, vis_pos, grid, ncp, t_val):
 
 def _mine_velocity(net, ids, lat, text_pos, vis_pos, ncp, t_val):
     with torch.no_grad():
-        cos_und, sin_und = dit_forward.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
+        cos_und, sin_und = cosmos3_dit.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
         und_mask = torch.ones(1, ids.numel(), dtype=torch.bool)
-        context, und_kv = dit_forward.run_und_tower(net, ids.unsqueeze(0), und_mask, cos_und, sin_und)
-        state = dit_forward.prepare_block_loop(
+        context, und_kv = cosmos3_dit.run_und_tower(net, ids.unsqueeze(0), und_mask, cos_und, sin_und)
+        state = cosmos3_dit.prepare_block_loop(
             net,
             latents=lat,
             timestep=torch.tensor([t_val]),
@@ -88,15 +89,15 @@ def _mine_velocity(net, ids, lat, text_pos, vis_pos, ncp, t_val):
             num_clean_prefix_frames=ncp,
         )
         for i in range(len(net.layers)):
-            state = dit_forward.run_block(net, i, state)
-        return dit_forward.finalize_block_loop(net, state)
+            state = cosmos3_dit.run_block(net, i, state)
+        return cosmos3_dit.finalize_block_loop(net, state)
 
 
 def _positions(net, und_len, latent_grid):
     p = int(net.config.latent_patch_size)
-    grid = text_pack.patch_grid(*latent_grid, p)
-    text_pos = text_pack.text_mrope_positions(und_len, float_positions=True)
-    _, vis_pos = text_pack.build_joint_positions(
+    grid = cosmos3_text.patch_grid(*latent_grid, p)
+    text_pos = cosmos3_text.text_mrope_positions(und_len, float_positions=True)
+    _, vis_pos = cosmos3_text.build_joint_positions(
         und_len,
         grid,
         modality_margin=int(net.config.unified_3d_mrope_temporal_modality_margin),
@@ -145,10 +146,10 @@ def test_batched_engine_consistent_with_single():
     text_pos, vis_pos, _ = _positions(net, 4, (3, 2, 2))
 
     with torch.no_grad():
-        cos_und, sin_und = dit_forward.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
+        cos_und, sin_und = cosmos3_dit.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
         und_mask = torch.ones(2, 4, dtype=torch.bool)
-        context, und_kv = dit_forward.run_und_tower(net, ids, und_mask, cos_und, sin_und)
-        state = dit_forward.prepare_block_loop(
+        context, und_kv = cosmos3_dit.run_und_tower(net, ids, und_mask, cos_und, sin_und)
+        state = cosmos3_dit.prepare_block_loop(
             net,
             latents=lat,
             timestep=torch.tensor([500.0, 500.0]),
@@ -159,8 +160,8 @@ def test_batched_engine_consistent_with_single():
             num_clean_prefix_frames=1,
         )
         for i in range(len(net.layers)):
-            state = dit_forward.run_block(net, i, state)
-        batched = dit_forward.finalize_block_loop(net, state)
+            state = cosmos3_dit.run_block(net, i, state)
+        batched = cosmos3_dit.finalize_block_loop(net, state)
 
     single = _mine_velocity(net, ids[0], lat1, text_pos, vis_pos, ncp=1, t_val=500.0)
     assert torch.allclose(batched[0], batched[1], atol=1e-6)
@@ -179,9 +180,9 @@ def test_none_und_mask_matches_all_true_tensor():
     outs = []
     for und_mask in (all_true, None):
         with torch.no_grad():
-            cos_u, sin_u = dit_forward.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
-            ctx, und_kv = dit_forward.run_und_tower(net, ids.unsqueeze(0), und_mask, cos_u, sin_u)
-            state = dit_forward.prepare_block_loop(
+            cos_u, sin_u = cosmos3_dit.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
+            ctx, und_kv = cosmos3_dit.run_und_tower(net, ids.unsqueeze(0), und_mask, cos_u, sin_u)
+            state = cosmos3_dit.prepare_block_loop(
                 net,
                 latents=lat,
                 timestep=torch.tensor([500.0]),
@@ -192,8 +193,8 @@ def test_none_und_mask_matches_all_true_tensor():
                 num_clean_prefix_frames=1,
             )
             for i in range(len(net.layers)):
-                state = dit_forward.run_block(net, i, state)
-            outs.append((ctx, dit_forward.finalize_block_loop(net, state), state.prefix_kv_mask))
+                state = cosmos3_dit.run_block(net, i, state)
+            outs.append((ctx, cosmos3_dit.finalize_block_loop(net, state), state.prefix_kv_mask))
 
     (ctx_a, out_a, pm_a), (ctx_b, out_b, pm_b) = outs
     assert torch.allclose(ctx_a, ctx_b, atol=1e-6), "und tower diverges between masked and causal paths"
@@ -275,7 +276,7 @@ def test_pristine_inv_freq_is_not_a_buffer():
 def test_rotary_inv_freq_recomputed_when_build_is_already_cast():
     """A net handed over already bf16 must not seed the copy from rounded bits."""
     net = _build(MINI).bfloat16()
-    expected = dit_forward.rotary_inv_freq(int(net.config.head_dim), float(net.config.rope_theta))
+    expected = cosmos3_dit.rotary_inv_freq(int(net.config.head_dim), float(net.config.rope_theta))
     vb = _mini_backbone(net)
     assert vb._pristine_inv_freq.dtype == torch.float32
     assert torch.equal(vb._pristine_inv_freq, expected)
@@ -306,10 +307,10 @@ def test_gradients_reach_gen_pathway():
     lat = torch.randn(1, MINI["latent_channel"], 3, 2, 2)
     text_pos, vis_pos, _ = _positions(net, ids.numel(), (3, 2, 2))
 
-    cos_und, sin_und = dit_forward.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
+    cos_und, sin_und = cosmos3_dit.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
     und_mask = torch.ones(1, 4, dtype=torch.bool)
-    context, und_kv = dit_forward.run_und_tower(net, ids.unsqueeze(0), und_mask, cos_und, sin_und)
-    state = dit_forward.prepare_block_loop(
+    context, und_kv = cosmos3_dit.run_und_tower(net, ids.unsqueeze(0), und_mask, cos_und, sin_und)
+    state = cosmos3_dit.prepare_block_loop(
         net,
         latents=lat,
         timestep=torch.tensor([500.0]),
@@ -320,8 +321,8 @@ def test_gradients_reach_gen_pathway():
         num_clean_prefix_frames=1,
     )
     for i in range(len(net.layers)):
-        state = dit_forward.run_block(net, i, state)
-    out = dit_forward.finalize_block_loop(net, state)
+        state = cosmos3_dit.run_block(net, i, state)
+    out = cosmos3_dit.finalize_block_loop(net, state)
     out[:, :, 1:].square().mean().backward()
 
     gen = net.layers[0].self_attn.add_q_proj.weight.grad
@@ -401,8 +402,8 @@ def test_padding_gate_changes_the_padded_sample_only():
     vb = _tokenizer_backbone()
     net = vb.dit
     tok = vb._require_tokenizer()
-    ids_list = [text_pack.tokenize_prompt(tok, t, max_length=512) for t in ("abcd", "ef")]
-    input_ids, real_gate, _ = text_pack.pad_und_batch(ids_list, pad_token_id=int(tok.pad_token_id))
+    ids_list = [cosmos3_text.tokenize_prompt(tok, t, max_length=512) for t in ("abcd", "ef")]
+    input_ids, real_gate, _ = cosmos3_text.pad_und_batch(ids_list, pad_token_id=int(tok.pad_token_id))
     und_len = input_ids.shape[1]
     torch.manual_seed(3)
     lat = torch.randn(2, MINI["latent_channel"], 2, 2, 2)
@@ -410,9 +411,9 @@ def test_padding_gate_changes_the_padded_sample_only():
 
     def velocity(gate):
         with torch.no_grad():
-            cos_u, sin_u = dit_forward.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
-            _, und_kv = dit_forward.run_und_tower(net, input_ids, gate, cos_u, sin_u)
-            state = dit_forward.prepare_block_loop(
+            cos_u, sin_u = cosmos3_dit.compute_rotary(net, text_pos.unsqueeze(1), lat.device, lat.dtype)
+            _, und_kv = cosmos3_dit.run_und_tower(net, input_ids, gate, cos_u, sin_u)
+            state = cosmos3_dit.prepare_block_loop(
                 net,
                 latents=lat,
                 timestep=torch.full((2,), 500.0),
@@ -423,8 +424,8 @@ def test_padding_gate_changes_the_padded_sample_only():
                 num_clean_prefix_frames=0,
             )
             for i in range(len(net.layers)):
-                state = dit_forward.run_block(net, i, state)
-            return dit_forward.finalize_block_loop(net, state)
+                state = cosmos3_dit.run_block(net, i, state)
+            return cosmos3_dit.finalize_block_loop(net, state)
 
     gated, ungated = velocity(real_gate), velocity(None)
     padded = (gated[1] - ungated[1]).abs().max().item()

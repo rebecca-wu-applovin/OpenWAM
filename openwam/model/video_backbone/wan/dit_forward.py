@@ -1,9 +1,7 @@
-"""Wan DiT forward-path helpers: time modulation + post-block VACE residual.
+"""Wan DiT forward-path helper: time modulation.
 
-Free functions, dependency-injected, no backbone import. ``build_time_modulation``
-takes the DiT / timestep / latents / patch_size explicitly; ``apply_post_block_residuals``
-reads everything it needs off the passed ``state`` (``extras["vace"]`` / ``vace_hints``),
-so neither touches the backbone instance.
+Free function, dependency-injected, no backbone import: ``build_time_modulation``
+takes the DiT / timestep / latents / patch_size explicitly.
 """
 
 from __future__ import annotations
@@ -13,7 +11,7 @@ from typing import Tuple
 import torch
 from torch import Tensor
 
-from openwam.model.video_backbone.wan.models.dit import sinusoidal_embedding_1d
+from openwam.model.video_backbone.wan.dit import sinusoidal_embedding_1d
 
 
 def build_time_modulation(
@@ -46,7 +44,7 @@ def build_time_modulation(
         time_embed = dit.time_embedding(time_sinusoid.to(latents.dtype)).reshape(batch_size, -1, dit.dim)
         time_modulation = dit.time_projection(time_embed).unflatten(2, (6, dit.dim))
     elif force_per_token_t_mod:
-        # Non-TI2V backbones under joint-attention / single_system need 4D
+        # Non-TI2V backbones under joint-attention need 4D
         # t_mod. Compute the time embedding once on (B,) and broadcast to
         # (B, L, dim) — a per-token MLP would repeat the stack L times.
         batch_size = latents.shape[0]
@@ -78,31 +76,3 @@ def build_time_modulation(
         time_embed = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
         time_modulation = dit.time_projection(time_embed).unflatten(1, (6, dit.dim))
     return time_embed, time_modulation
-
-
-def apply_post_block_residuals(block_id: int, state) -> None:
-    """Apply the VACE hint residual to ``state.hidden_states`` in place.
-    Shared by run_block and post_attn_at_layer.
-    """
-    vace = state.extras.get("vace")
-
-    if state.vace_hints is not None and vace is not None and block_id in vace.vace_layers_mapping:
-        current_vace_hint = state.vace_hints[vace.vace_layers_mapping[block_id]]
-        vace_len = current_vace_hint.shape[1]
-        if state.hidden_states.shape[1] == vace_len:
-            # dual_system / video-only: hint spans the full sequence.
-            state.hidden_states = state.hidden_states + current_vace_hint
-        elif state.hidden_states.shape[1] > vace_len:
-            # single_system: residual applies only to the leading video
-            # slice; action/state tokens get VACE via self-attention.
-            video_slice = state.hidden_states[:, :vace_len] + current_vace_hint
-            state.hidden_states = torch.cat([video_slice, state.hidden_states[:, vace_len:]], dim=1)
-        else:
-            # Defensive: hidden_states shorter than the hint breaks the
-            # video-token-count invariant — investigate before patching.
-            raise ValueError(
-                f"apply_post_block_residuals: state.hidden_states.shape[1]={state.hidden_states.shape[1]} "
-                f"< vace_hint.shape[1]={vace_len} at block {block_id}; "
-                "this is unreachable under dual_system or single_system today—"
-                "investigate the upstream caller before patching this branch."
-            )

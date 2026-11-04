@@ -69,8 +69,6 @@ class _MockPipeline:
         self.dit = _MockDiT(dim=dim)
         self.vae = nn.Linear(4, 4)
         self.text_encoder = nn.Linear(4, 4)
-        self.vace = None
-        self.image_encoder = None
         self.torch_dtype = torch.float32
         self.device = "cpu"
         self.scheduler = _MockScheduler()
@@ -194,8 +192,7 @@ class _MockVideoBackbone(VideoBackbone):
         x = torch.randn(B, num_tokens, self._dim)
         # Per-token t_mod (B, T, 6, dim) mirrors Wan2.2-TI2V-5B's
         # ``seperated_timestep=True + fuse_vae_embedding_in_latents=True`` mode,
-        # which is what production runs and what SingleSystem's forward
-        # fail-fast enforces.
+        # which is what production runs.
         t_mod = torch.zeros(B, num_tokens, 6, self._dim)
         freq_dim = self._dim // 2
         freqs = torch.polar(torch.ones(num_tokens, 1, freq_dim), torch.zeros(num_tokens, 1, freq_dim))
@@ -230,7 +227,7 @@ class _MockVideoBackbone(VideoBackbone):
     def post_attn_at_layer(self, layer_id: int, state: BlockLoopState, attn_out, post_state: dict) -> BlockLoopState:
         """Trivial post-attn: residual + attn_out so the driver round-trips.
 
-        No cross-attn, no FFN, no VACE residuals — those are the real
+        No cross-attn, no FFN — those are the real
         backbone's responsibility and aren't exercised by the trainer mock.
         """
         state.hidden_states = post_state["residual"] + attn_out
@@ -244,36 +241,9 @@ class _MockVideoBackbone(VideoBackbone):
         state.hidden_states = torch.cat([state.hidden_states, action_tokens.to(state.hidden_states.dtype)], dim=1)
         return state
 
-    def inject_shared_tokens(
-        self,
-        state,
-        action_tokens,
-        n_action,
-        *,
-        state_tokens=None,
-        n_state=0,
-        timestep=None,
-    ):
-        self.last_injected = {"n_action": int(n_action), "n_state": int(n_state)}
-        pieces = []
-        if n_action:
-            pieces.append(action_tokens.to(state.hidden_states.dtype))
-        if n_state:
-            pieces.append(state_tokens.to(state.hidden_states.dtype))
-        state.hidden_states = torch.cat([state.hidden_states, *pieces], dim=1)
-        return state
-
     def extract_action_tokens(self, state, n_action):
         n_video = state.hidden_states.shape[1] - n_action
         action_tokens = state.hidden_states[:, n_video:, :]
-        state.hidden_states = state.hidden_states[:, :n_video, :]
-        return state, action_tokens
-
-    def extract_shared_tokens(self, state, n_action, *, n_state=0):
-        self.last_extracted = {"n_action": int(n_action), "n_state": int(n_state)}
-        n_tail = n_action + n_state
-        n_video = state.hidden_states.shape[1] - n_tail
-        action_tokens = state.hidden_states[:, n_video : n_video + n_action, :]
         state.hidden_states = state.hidden_states[:, :n_video, :]
         return state, action_tokens
 
@@ -598,38 +568,6 @@ def test_save_load_checkpoint():
             assert torch.equal(v1, v2), f"Weight mismatch for {k1}"
 
 
-def test_save_checkpoint_excludes_vlm_backbone():
-    """Architecture save_checkpoint must exclude vlm_backbone params (saved separately)."""
-    from openwam.model.architectures.base import BaseWAMArchitecture
-
-    class _VLMArch(BaseWAMArchitecture):
-        def __init__(self):
-            super().__init__(cfg=None)
-            self.action_head = nn.Linear(16, 8)
-            self.vlm_backbone = nn.Linear(16, 32)
-
-        def forward(self, *args, **kwargs):  # pragma: no cover
-            raise NotImplementedError
-
-    arch = _VLMArch()
-    with torch.no_grad():
-        arch.action_head.weight.copy_(torch.randn_like(arch.action_head.weight))
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        ckpt_path = str(Path(tmpdir) / "vlm_ckpt.safetensors")
-        arch.save_checkpoint(ckpt_path)
-
-        from safetensors.torch import load_file
-
-        saved = load_file(ckpt_path)
-        assert not any(k.startswith("vlm_backbone.") for k in saved), "vlm_backbone params should be excluded"
-        assert any(k.startswith("action_head.") for k in saved), "non-VLM params should be saved"
-
-        reloaded = _VLMArch()
-        reloaded.load_checkpoint(ckpt_path)
-        assert torch.equal(reloaded.action_head.weight, arch.action_head.weight)
-
-
 def test_manage_checkpoints():
     """manage_checkpoints should keep only the latest K files."""
     from openwam.train.utils.checkpointing import manage_checkpoints
@@ -682,11 +620,4 @@ def test_architecture_variant_strings_for_sampler_guard():
     from openwam.model.architectures.registry import normalize_architecture_spec
 
     assert normalize_architecture_spec("dual_system_self_attn").variant == "joint_self_attn"
-    assert normalize_architecture_spec("tri_system_joint_self_attn").variant == "joint_self_attn"
-    for name in (
-        "dual_system_cross_attn",
-        "dual_system_idm",
-        "single_system_vanilla",
-        "single_system_moe",
-    ):
-        assert normalize_architecture_spec(name).variant != "joint_self_attn"
+    assert normalize_architecture_spec("dual_system_cross_attn").variant != "joint_self_attn"

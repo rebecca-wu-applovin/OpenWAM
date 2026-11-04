@@ -206,8 +206,8 @@ class DualSystemMoTDriver:
         INVARIANT (consumed by :meth:`_step_checkpointed`): this method must
         only reassign the two layer-varying tensor fields ``vstate.hidden_states`` and
         ``astate.payload.x_action``. It MUST NOT mutate any layer-invariant
-        field of ``vstate`` / ``astate`` in place — concretely, do not append
-        to ``vace_hints``, write into ``extras``, or mutate ``context`` /
+        field of ``vstate`` / ``astate`` in place — concretely, do not
+        write into ``extras``, or mutate ``context`` /
         ``freqs`` / ``t_mod``. ``_step_checkpointed`` runs this body inside
         ``torch.utils.checkpoint`` against shallow copies of the state
         objects; only ``x`` / ``x_action`` are isolated, everything else is
@@ -274,7 +274,7 @@ class DualSystemMoTDriver:
         We avoid that by giving the closure shallow copies of the state
         containers (``copy.copy`` on the dataclass / payload — same field
         references, fresh wrappers). Layer-invariant fields like
-        ``context`` / ``freqs`` / ``t_mod`` / ``vace_hints`` / ``extras``
+        ``context`` / ``freqs`` / ``t_mod`` / ``extras``
         are still shared by reference (cheap), but the two tensor fields
         the body writes (``x`` / ``x_action``) live on the local copies so
         recompute never touches the outer references the caller and the
@@ -325,12 +325,8 @@ class DualSystemMoTDriver:
         :meth:`step` for memory/compute trade-offs.
         """
         # Resolve sequence shapes from the backbone-populated f/h/w fields.
-        # ``vstate.hidden_states.shape[1]`` is identical to ``f*tokens_per_frame`` for
-        # backbones that carry a 3D ``(B, S, D)`` state (Wan), but for
-        # backbones whose ``state.hidden_states`` is natively 5D ``(B, T, H, W, D)``
-        # (CosmosPredict25) ``shape[1]`` is just ``T`` — wrong. Going through f and
-        # the shared ``compute_video_tokens_per_frame`` helper is the only
-        # formulation that works for both layouts.
+        # Going through f and the shared ``compute_video_tokens_per_frame`` helper
+        # avoids depending on the layout of ``vstate.hidden_states``.
         s_video = int(vstate.grid_frames) * self._video_tokens_per_frame(vstate)
         payload = astate.payload
         if payload is None or not hasattr(payload, "x_action"):

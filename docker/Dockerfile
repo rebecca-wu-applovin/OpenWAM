@@ -101,12 +101,5 @@ EXPOSE 8848
 ENTRYPOINT ["python", "/usr/local/lib/openwam/runtime_user.py"]
 CMD ["serve", "--help"]
 
-# Optional, separate dependency boundary. Requires the initialized submodule.
-# Upstream Cosmos has known metadata pin conflicts; see install_cosmos_predict25.sh.
-FROM openwam AS cosmos
-USER root
-RUN LD_PRELOAD= PYBIN=/opt/venv/bin/python bash scripts/install_cosmos_predict25.sh
-USER 1000:1000
-
 # Plain `docker build` keeps the standard Wan environment as its default.
 FROM openwam AS default

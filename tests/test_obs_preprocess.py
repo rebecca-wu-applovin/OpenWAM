@@ -200,21 +200,6 @@ def test_prompt_wrap_empty_instruction():
     )
 
 
-def test_prompt_wrap_matches_dataset_training_output():
-    """Regression guard: deploy-side wrapping must equal the dataset's
-    training-time prompt byte-for-byte."""
-    from openwam.dataloader.robotwin import _resolve_prompt
-
-    base = "pick up the red bottle"
-    training_output = _resolve_prompt(
-        instructions={"episode0.json": {"seen": [base]}},
-        ep_file="episode0.hdf5",
-        split="val",  # deterministic: picks pool[0]
-        task_name="dummy",
-    )
-    assert training_output == format_prompt_for_inference(base)
-
-
 def test_decode_passes_prompt_through():
     # The server is prompt-agnostic: it forwards the client's prompt verbatim.
     # Prompt wrapping now lives in each benchmark's client, not the server.

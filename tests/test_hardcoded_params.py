@@ -5,10 +5,7 @@ import pytest
 import torch
 
 from openwam.model.action_backbone.separate_action_dit import ActionDiT
-from openwam.model.action_backbone.shared_action_backbone import SharedMoEActionBackbone
 from openwam.model.architectures.dual_system import DualSystemCrossAttnArchitecture
-from openwam.model.architectures.single_system.moe import SingleSystemMoEArchitecture
-from openwam.model.architectures.single_system.vanilla import SingleSystemVanillaArchitecture
 
 # ---------------------------------------------------------------------------
 # Step 3: sigma uses scheduler.num_train_timesteps, not hardcoded 1000
@@ -60,52 +57,9 @@ def test_action_dit_requires_all_params():
     assert dit.dim == 64
 
 
-def test_moe_dit_requires_all_params():
-    """SharedMoEActionBackbone should raise TypeError when required params are missing."""
-    with pytest.raises(TypeError):
-        SharedMoEActionBackbone()
-
-    with pytest.raises(TypeError):
-        SharedMoEActionBackbone(action_dim=20)
-
-    # Should succeed with all required params (num_experts is derived from bridge_layers)
-    moe = SharedMoEActionBackbone(
-        action_dim=14,
-        video_dim=128,
-        expert_ffn_dim=512,
-        bridge_layers=(0, 1, 2),
-    )
-    assert moe.action_dim == 14
-    assert moe._video_dim == 128
-    assert moe.num_experts == 3
-
-
 # ---------------------------------------------------------------------------
 # Step 5: vanilla.py video_dim raises without config or backbone
 # ---------------------------------------------------------------------------
-
-
-def test_vanilla_no_video_dim_raises():
-    """SingleSystemVanilla should raise when video_dim is not specified."""
-    cfg = {
-        "framework": "single_system",
-        "variant": "vanilla",
-        "action_dim": 20,
-    }
-    with pytest.raises(ValueError, match="video_dim must be specified"):
-        SingleSystemVanillaArchitecture(cfg=cfg)
-
-
-def test_vanilla_explicit_video_dim_works():
-    """SingleSystemVanilla should work with explicit video_dim."""
-    cfg = {
-        "framework": "single_system",
-        "variant": "vanilla",
-        "action_dim": 20,
-        "video_dim": 128,
-    }
-    arch = SingleSystemVanillaArchitecture(cfg=cfg)
-    assert arch.action_dim == 20
 
 
 # ---------------------------------------------------------------------------
@@ -126,19 +80,6 @@ def test_dual_system_cross_attn_no_video_dim_raises():
     }
     with pytest.raises(ValueError, match="video_dim must be specified"):
         DualSystemCrossAttnArchitecture(cfg=cfg)
-
-
-def test_moe_architecture_no_video_dim_raises():
-    """SingleSystemMoE should raise when video_dim is not specified."""
-    cfg = {
-        "framework": "single_system",
-        "variant": "moe",
-        "action_dim": 20,
-        "bridge_layers": (0, 1, 2),
-        "expert_ffn_dim": 512,
-    }
-    with pytest.raises(ValueError, match="video_dim must be specified"):
-        SingleSystemMoEArchitecture(cfg=cfg)
 
 
 # ---------------------------------------------------------------------------

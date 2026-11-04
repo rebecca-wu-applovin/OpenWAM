@@ -120,8 +120,7 @@ def _train_openwam(cfg: DictConfig) -> None:
     from openwam.train.utils.seeding import seed_everything
 
     # Seed Python random / numpy / torch BEFORE dataset construction so that
-    # any reader-time randomness (e.g. MixtureDataset index_map shuffle when
-    # seed isn't explicitly set, lerobot splits, etc.) is reproducible.
+    # any reader-time randomness (e.g. lerobot splits) is reproducible.
     # OpenWAMTrainer.__init__ re-seeds via seed_process for model init using the
     # same RANK_OFFSET rank stride (cudnn stays as configured here). Null
     # cfg.project.seed = production stochastic run, so we skip seeding here.

@@ -8,25 +8,23 @@ import torch
 
 
 def test_import_pipeline():
-    """The Wan construction entry (loader) + golden-reference forward import cleanly."""
-    from openwam.model.video_backbone.wan._reference import model_fn_wan_video
+    """The Wan construction entry (loader) imports cleanly."""
     from openwam.model.video_backbone.wan.loader import load_wan_components, new_components
 
     assert callable(load_wan_components)
     assert callable(new_components)
-    assert callable(model_fn_wan_video)
 
 
 def test_import_wan_model():
     """WanModel (video DiT) should be importable."""
-    from openwam.model.video_backbone.wan.models.dit import WanModel
+    from openwam.model.video_backbone.wan.dit import WanModel
 
     assert WanModel is not None
 
 
 def test_wan_model_has_dim():
     """WanModel instance should expose .dim attribute for video_dim derivation."""
-    from openwam.model.video_backbone.wan.models.dit import WanModel
+    from openwam.model.video_backbone.wan.dit import WanModel
 
     # Tiny model for testing (not real weights)
     model = WanModel(
@@ -40,110 +38,42 @@ def test_wan_model_has_dim():
         patch_size=(1, 2, 2),
         num_heads=4,
         num_layers=2,
-        has_image_input=False,
     )
     assert model.dim == 64
 
 
 def test_import_vae():
     """WanVideoVAE should be importable."""
-    from openwam.model.video_backbone.wan.models.vae import WanVideoVAE
+    from openwam.model.video_backbone.wan.vae import WanVideoVAE
 
     assert WanVideoVAE is not None
 
 
 def test_import_text_encoder():
     """WanTextEncoder should be importable."""
-    from openwam.model.video_backbone.wan.models.text_encoder import WanTextEncoder
+    from openwam.model.video_backbone.wan.text_encoder import WanTextEncoder
 
     assert WanTextEncoder is not None
 
 
-def test_wan_video_backbone_adapter_freq_helpers():
-    """extend_freqs_with_action_tokens appends 1D action RoPE by default."""
-    from openwam.model.video_backbone.wan import action_tokens
-
-    freqs = torch.polar(torch.ones(4, 1, 6), torch.zeros(4, 1, 6))
-    extended = action_tokens.extend_freqs_with_action_tokens(freqs, 2)
-    assert extended.shape == (6, 1, 6)
-    assert torch.allclose(extended[-2], torch.ones_like(extended[-2]))
-    assert not torch.allclose(extended[-1], torch.ones_like(extended[-1]))
-
-    # n_action_tokens=0 is a passthrough.
-    assert action_tokens.extend_freqs_with_action_tokens(freqs, 0) is freqs
-
-
-def test_wan_video_backbone_is_ti2v():
-    """_is_ti2v returns True when fuse_vae_embedding_in_latents is set."""
+def test_wan_needs_first_frame_skip_is_true():
+    """Wan is TI2V-only: ``latent[0]`` is always a clean conditioning frame the
+    loss must skip, so ``needs_first_frame_skip`` is True regardless of the DiT flags."""
     from types import SimpleNamespace
 
-    from openwam.model.video_backbone.wan_backbone import Wan21
+    from openwam.model.video_backbone.wan.backbone import Wan22Ti2v
 
-    pipe_a = SimpleNamespace(
-        dit=SimpleNamespace(seperated_timestep=True, fuse_vae_embedding_in_latents=True),
-        use_unified_sequence_parallel=False,
-    )
-    adapter_a = Wan21(pipe_a)
-    assert adapter_a._is_ti2v is True
-
-    pipe_b = SimpleNamespace(
-        dit=SimpleNamespace(seperated_timestep=False),
-        use_unified_sequence_parallel=False,
-    )
-    adapter_b = Wan21(pipe_b)
-    assert adapter_b._is_ti2v is False
-
-
-def test_wan_needs_first_frame_skip_truth_table():
-    """``needs_first_frame_skip`` is True only for Wan configs where
-    ``latent[0]`` is unconditionally a clean conditioning frame the loss
-    must skip: TI2V (``fuse_vae_embedding_in_latents``) is the only such
-    variant today.
-
-    I2V is *not* on the skip list. Its first-frame reference rides on the
-    ``y`` side channel; ``latent[0]`` itself is fully noised on both train
-    and deploy, and deploy must denoise it from pure noise into the
-    predicted frame 0. Skipping it during training leaves frame 0
-    unsupervised → garbage at inference (train/deploy divergence). Same
-    rationale as VACE — both fully supervise ``latent[0]``.
-
-    VACE is *not* on the skip list: its first-frame condition flows
-    through the ``vace_context`` bypass while the video latent path stays
-    fully noised + fully supervised (matching native ``WanVideoUnit_VACE``
-    semantics).
-
-    Future T2V (none of the three) returns False so ``latent[0]`` enters
-    the loss as a predicted frame.
-    """
-    from types import SimpleNamespace
-
-    from openwam.model.video_backbone.wan_backbone import Wan21
-
-    def _make_adapter(*, ti2v=False, vace=False, image_input=False):
+    for ti2v in (True, False):
         pipe = SimpleNamespace(
-            dit=SimpleNamespace(
-                seperated_timestep=ti2v,
-                fuse_vae_embedding_in_latents=ti2v,
-                has_image_input=image_input,
-            ),
-            vace=object() if vace else None,
+            dit=SimpleNamespace(seperated_timestep=ti2v, fuse_vae_embedding_in_latents=ti2v),
             use_unified_sequence_parallel=False,
         )
-        return Wan21(pipe)
-
-    assert _make_adapter(ti2v=True).needs_first_frame_skip is True
-    # I2V: y side-channel conveys frame 0; latent[0] is fully noised on
-    # train and deploy and must be supervised — skip stays off.
-    assert _make_adapter(image_input=True).needs_first_frame_skip is False
-    # VACE: native convention noises every frame; loss covers latent[0].
-    assert _make_adapter(vace=True).needs_first_frame_skip is False
-    # Future Wan T2V: no TI2V / no VACE / no image input → skip stays off.
-    assert _make_adapter().needs_first_frame_skip is False
+        assert Wan22Ti2v(pipe).needs_first_frame_skip is True
 
 
 def test_video_backbone_abc_needs_first_frame_skip_default_false():
-    """The ABC default keeps every backbone that doesn't opt in OFF, so cosmos_predict25
-    T2V (no override) treats ``latent[0]`` as a predicted frame in the loss."""
+    """The ABC default keeps every backbone that doesn't opt in OFF, so a T2V
+    backbone (no override) treats ``latent[0]`` as a predicted frame in the loss."""
     from openwam.model.video_backbone.base import VideoBackbone
 
     # Property is defined on the ABC so we can read it off the class without
@@ -169,8 +99,8 @@ def _build_tiny_wan_backbone(*, ti2v: bool):
     """
     from types import SimpleNamespace
 
-    from openwam.model.video_backbone.wan.models.dit import WanModel
-    from openwam.model.video_backbone.wan_backbone import Wan21
+    from openwam.model.video_backbone.wan.dit import WanModel
+    from openwam.model.video_backbone.wan.backbone import Wan22Ti2v
 
     model = WanModel(
         dim=64,
@@ -183,17 +113,11 @@ def _build_tiny_wan_backbone(*, ti2v: bool):
         patch_size=(1, 2, 2),
         num_heads=4,
         num_layers=1,
-        has_image_input=False,
         seperated_timestep=ti2v,
         fuse_vae_embedding_in_latents=ti2v,
     )
-    pipe = SimpleNamespace(
-        dit=model,
-        motion_controller=None,
-        vace=None,
-        use_unified_sequence_parallel=False,
-    )
-    return Wan21(pipe), model
+    pipe = SimpleNamespace(dit=model, use_unified_sequence_parallel=False)
+    return Wan22Ti2v(pipe), model
 
 
 def test_force_per_token_t_mod_broadcast_shape():
@@ -233,7 +157,7 @@ def test_zero_clean_prefix_t_mod_overwrites_first_frame():
     timestep = torch.tensor([500.0])
     context = torch.randn(B, 3, 32)
     # ``first_frame_latents`` non-None is the trigger that mirrors how
-    # ``WanVideoBackbone.preprocess_input_for_train`` flags VACE in production.
+    # ``preprocess_input_for_train`` flags a clean reference in production.
     first_frame_latents = latents[:, :, 0:1].clone()
 
     state = backbone.prepare(
@@ -262,7 +186,7 @@ def test_zero_clean_prefix_t_mod_overwrites_first_frame():
     )
 
     # Sanity: the first-frame row must match the manually computed t=0 projection.
-    from openwam.model.video_backbone.wan.models.dit import sinusoidal_embedding_1d
+    from openwam.model.video_backbone.wan.dit import sinusoidal_embedding_1d
 
     zero_ts = torch.zeros_like(timestep)
     t_zero = model.time_embedding(sinusoidal_embedding_1d(model.freq_dim, zero_ts).to(latents.dtype))
@@ -273,8 +197,8 @@ def test_zero_clean_prefix_t_mod_overwrites_first_frame():
 def test_zero_clean_prefix_t_mod_inactive_without_trigger():
     """Without ``first_frame_latents`` AND ``num_clean_prefix_frames=0``, the
     ``zero_clean_prefix_t_mod=True`` flag is a no-op — every token retains the
-    sampled-timestep projection. This guards I2V (which has no
-    ``first_frame_latents``) from accidentally getting first-frame zeroing."""
+    sampled-timestep projection. This guards a no-reference batch
+    (no ``first_frame_latents``) from accidentally getting first-frame zeroing."""
     backbone, _ = _build_tiny_wan_backbone(ti2v=False)
     latents = torch.randn(1, 4, 2, 4, 4)
     timestep = torch.tensor([500.0])
@@ -346,7 +270,6 @@ if __name__ == "__main__":
     test_wan_model_has_dim()
     test_import_vae()
     test_import_text_encoder()
-    test_wan_video_backbone_adapter_freq_helpers()
-    test_wan_video_backbone_is_ti2v()
+    test_wan_needs_first_frame_skip_is_true()
     test_license_exists()
     print("All smoke tests passed.")

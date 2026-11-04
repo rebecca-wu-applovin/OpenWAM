@@ -9,7 +9,7 @@ def _two_schedulers():
     Both implement the same shifted-sigmoid Wan-equivalent formula.
     """
     from openwam.model.action_backbone.scheduler import ActionScheduler
-    from openwam.model.video_backbone.wan.shared.diffusion import FlowMatchScheduler
+    from openwam.model.video_backbone.wan.scheduler import FlowMatchScheduler
 
     return FlowMatchScheduler("Wan"), ActionScheduler()
 

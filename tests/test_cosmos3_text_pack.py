@@ -1,4 +1,4 @@
-"""text_pack: prompt templates, und padding, and mRoPE positions.
+"""cosmos3 text: prompt templates, und padding, and mRoPE positions.
 
 Position assertions are pinned to facts observed in the native-pipeline golden
 dump (cosmos3_golden/golden_step0.pt): und_len 68 → vision T starts at
@@ -9,27 +9,27 @@ when fps modulation is on.
 
 import torch
 
-from openwam.model.video_backbone.cosmos3 import text_pack
+from openwam.model.video_backbone.cosmos3 import text as cosmos3_text
 
 
 def test_prompt_templates_match_upstream_strings():
-    text = text_pack.apply_prompt_templates("A robot.", num_frames=29, height=480, width=832, fps=24.0)
+    text = cosmos3_text.apply_prompt_templates("A robot.", num_frames=29, height=480, width=832, fps=24.0)
     assert text == ("A robot. The video is 1.2 seconds long and is of 24 FPS. This video is of 480x832 resolution.")
-    neg = text_pack.apply_prompt_templates("", num_frames=29, height=480, width=832, fps=24.0, negative=True)
+    neg = cosmos3_text.apply_prompt_templates("", num_frames=29, height=480, width=832, fps=24.0, negative=True)
     assert neg == ("The video is not 1.2 seconds long and is not of 24 FPS. This video is not of 480x832 resolution.")
-    img = text_pack.apply_prompt_templates("X", num_frames=1, height=480, width=832, fps=24.0)
+    img = cosmos3_text.apply_prompt_templates("X", num_frames=1, height=480, width=832, fps=24.0)
     assert img == "X. This image is of 480x832 resolution."
 
 
 def test_pad_und_batch_right_pads_and_masks():
-    ids, mask, lens = text_pack.pad_und_batch([[1, 2, 3], [4, 5]], pad_token_id=0)
+    ids, mask, lens = cosmos3_text.pad_und_batch([[1, 2, 3], [4, 5]], pad_token_id=0)
     assert ids.tolist() == [[1, 2, 3], [4, 5, 0]]
     assert mask.tolist() == [[True, True, True], [True, True, False]]
     assert lens.tolist() == [3, 2]
 
 
 def test_text_positions_shared_axes():
-    pos = text_pack.text_mrope_positions(5, float_positions=True)
+    pos = cosmos3_text.text_mrope_positions(5, float_positions=True)
     assert pos.shape == (3, 5)
     assert pos.dtype == torch.float32
     assert torch.equal(pos[0], pos[1]) and torch.equal(pos[0], pos[2])
@@ -39,7 +39,7 @@ def test_text_positions_shared_axes():
 def test_vision_positions_match_golden_facts():
     und_len, margin = 68, 15000
     grid = (8, 15, 26)
-    text_pos, vis_pos = text_pack.build_joint_positions(
+    text_pos, vis_pos = cosmos3_text.build_joint_positions(
         und_len, grid, modality_margin=margin, fps=24.0, temporal_compression_factor=4
     )
     assert text_pos.shape == (3, 68) and vis_pos.shape == (3, 8 * 15 * 26)
@@ -59,21 +59,21 @@ def test_vision_positions_match_golden_facts():
 
 def test_vision_positions_fps_scaling():
     # 12 fps at tc=4 → 3 tokens/sec vs base 6 → T advances 2.0 per latent frame.
-    _, vis_pos = text_pack.build_joint_positions(
+    _, vis_pos = cosmos3_text.build_joint_positions(
         10, (3, 1, 1), modality_margin=15000, fps=12.0, temporal_compression_factor=4
     )
     assert vis_pos[0].tolist() == [15010.0, 15012.0, 15014.0]
 
 
 def test_patch_grid_ceil():
-    assert text_pack.patch_grid(8, 30, 52, 2) == (8, 15, 26)
-    assert text_pack.patch_grid(3, 5, 7, 2) == (3, 3, 4)
+    assert cosmos3_text.patch_grid(8, 30, 52, 2) == (8, 15, 26)
+    assert cosmos3_text.patch_grid(3, 5, 7, 2) == (3, 3, 4)
 
 
 def test_prompt_templates_can_drop_the_duration_sentence():
     """The duration sentence asserts a clip fps nothing in the dataloader stack
     reports; it must be droppable without losing the (measured) resolution one."""
-    text = text_pack.apply_prompt_templates(
+    text = cosmos3_text.apply_prompt_templates(
         "A robot.", num_frames=9, height=384, width=320, fps=24.0, add_duration_template=False
     )
     assert text == "A robot. This video is of 384x320 resolution."
@@ -94,7 +94,7 @@ class _StubTokenizer:
         return body + (self._HDR if add_generation_prompt else [])
 
     def convert_tokens_to_ids(self, token):
-        return 91 if token == text_pack.START_OF_GENERATION_TOKEN else self.unk_token_id
+        return 91 if token == cosmos3_text.START_OF_GENERATION_TOKEN else self.unk_token_id
 
 
 def test_tokenize_truncation_preserves_the_whole_constant_tail():
@@ -106,10 +106,10 @@ def test_tokenize_truncation_preserves_the_whole_constant_tail():
     tok = _StubTokenizer()
     tail = [_StubTokenizer._END, *_StubTokenizer._HDR]
 
-    untruncated = text_pack.tokenize_prompt(tok, "hi")
+    untruncated = cosmos3_text.tokenize_prompt(tok, "hi")
     assert untruncated[-5:] == [*tail, tok.eos_token_id, 91]
 
-    ids = text_pack.tokenize_prompt(tok, "x" * 200, max_length=32)
+    ids = cosmos3_text.tokenize_prompt(tok, "x" * 200, max_length=32)
     assert len(ids) == 32
     assert ids[-5:] == [*tail, tok.eos_token_id, 91]
     # The kept body is a genuine prefix of the untruncated body: a cut, not a shift.
@@ -124,7 +124,7 @@ def test_tokenize_truncation_never_exceeds_max_length():
     otherwise push the output back over the cap."""
     tok = _StubTokenizer()
     for max_length in (8, 9, 12, 40):
-        ids = text_pack.tokenize_prompt(tok, "y" * 200, max_length=max_length)
+        ids = cosmos3_text.tokenize_prompt(tok, "y" * 200, max_length=max_length)
         assert len(ids) <= max_length, f"max_length={max_length} produced {len(ids)} ids"
 
 
@@ -136,5 +136,5 @@ def test_tokenize_falls_back_when_the_tail_is_not_a_suffix():
             body = [1] + [ord(c) % 60 + 2 for c in conversations[-1]["content"]]
             return ([7] + body) if add_generation_prompt else body
 
-    ids = text_pack.tokenize_prompt(_Interleaving(), "y" * 200, max_length=20)
+    ids = cosmos3_text.tokenize_prompt(_Interleaving(), "y" * 200, max_length=20)
     assert len(ids) == 20 and ids[0] == 7

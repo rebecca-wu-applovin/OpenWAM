@@ -13,7 +13,6 @@ The canonical sample dict every subclass emits::
 
     {
       "video": [PIL.Image x num_video_frames],
-      "vace_video": None,
       "first_frame_image": [video[0]],
       "action": (T-1, action_dim) float32,
       "action_mask": (T-1, action_dim) bool,
@@ -622,8 +621,7 @@ class LeRobotV3Reader(BaseDataset):
             ``__init__`` builds the window index from ``end - start`` and
             ``_getitem_impl`` offsets BOTH the parquet slice and the video decode
             by ``start``, so the two stay aligned and no window can reach a
-            trimmed row or frame. AgiBotWorld uses this for the segment-boundary
-            cleanup (see :meth:`~openwam.dataloader.agibotworld.AgiBotWorldDataset._filter_episodes`).
+            trimmed row or frame.
 
         Contract: emit them as a PAIR, with ``0 <= start < end <= length``. They
         are consumed as given — an out-of-range value would silently read into
@@ -912,7 +910,6 @@ class LeRobotV3Reader(BaseDataset):
 
         return {
             "video": video,
-            "vace_video": None,
             "first_frame_image": [video[0]] if video else [],
             "action": torch.from_numpy(action),
             "action_mask": torch.from_numpy(action_mask),

@@ -60,7 +60,7 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         bl = resolve_bridge_layers(cfg)
         video_dim = self._resolve_video_dim(cfg)
         # Default the action-side raw context width to the loaded backbone's
-        # text_dim (Wan T5-XXL=4096, Cosmos-Predict2.5=1024); explicit cfg/CLI
+        # text_dim (Wan T5-XXL=4096); explicit cfg/CLI
         # still wins. Falls back to 4096 when the backbone doesn't expose it.
         _vb_text_dim = getattr(self.video_backbone, "text_dim", None)
         text_dim = int(self._cfg_get(cfg, "text_dim", _vb_text_dim or 4096))
@@ -198,12 +198,7 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         # Opt every Wan backbone into 4D + clean-prefix-aligned t_mod (mirrors
         # TI2V's native ``seperated_timestep + fuse_vae_embedding_in_latents``
         # path; TI2V itself fires that path first so these kwargs are inert for
-        # it). VACE and I2V do NOT emit ``first_frame_latents`` (VACE routes
-        # its first-frame condition through ``vace_context``; I2V uses the
-        # ``y`` channel), so for them ``zero_clean_prefix_t_mod`` is
-        # structurally inert — kept on only so the joint MoT driver gets the
-        # 4D ``t_mod`` it needs. ``setdefault`` so explicit callers can still
-        # pass False.
+        # it). ``setdefault`` so explicit callers can still pass False.
         pipeline_inputs.setdefault("force_per_token_t_mod", True)
         pipeline_inputs.setdefault("zero_clean_prefix_t_mod", True)
         vstate = vb.prepare(

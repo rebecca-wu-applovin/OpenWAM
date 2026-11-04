@@ -79,8 +79,8 @@ def test_wan22_vae_factor_four_round_up_still_works(capsys):
     assert "num_frames" in out and "9" in out
 
 
-def test_vjepa_factor_two_already_compliant_no_round_up(capsys):
-    """V-JEPA 2.1: factor=2, remainder=1, num_frames=9 satisfies 9 % 2 == 1.
+def test_factor_two_already_compliant_no_round_up(capsys):
+    """factor=2, remainder=1, num_frames=9 satisfies 9 % 2 == 1.
     Method returns 9 unchanged and prints nothing."""
     pipe = _StubPipe(time_division_factor=2, time_division_remainder=1)
     assert _call(pipe, 9) == 9
@@ -88,8 +88,8 @@ def test_vjepa_factor_two_already_compliant_no_round_up(capsys):
     assert "num_frames" not in out
 
 
-def test_vjepa_factor_two_round_up_still_works(capsys):
-    """Regression guard: V-JEPA round-up still works. num_frames=10, factor=2,
+def test_factor_two_round_up_still_works(capsys):
+    """Regression guard: factor-2 round-up still works. num_frames=10, factor=2,
     remainder=1 → round up to 11."""
     pipe = _StubPipe(time_division_factor=2, time_division_remainder=1)
     assert _call(pipe, 10) == 11
