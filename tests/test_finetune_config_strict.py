@@ -4,9 +4,10 @@ Finetune starts a new run from a checkpoint's weights. The weights only fit the 
 the launch's ``model`` + ``common`` (minus the derived ``common.layout``) must equal the checkpoint's key by key;
 any difference raises (nothing is merged or written back). ``training`` / ``dataloader`` may differ.
 
-Resume continues one run: ``load_resume_cfg`` compares the whole config once (``check_resume_cfg``; more cases in
-``tests/test_resume_config_strict.py``), so the launch config IS the run's config and the shell is built from it. The safetensors are never read
-(accelerate's ``load_state`` fills the shell after prepare), so the shell gets storage instead.
+Resume continues one run: ``decide_run_mode`` compares the whole config once (more cases in
+``tests/test_resume_config_strict.py``), so the launch config IS the run's config and the shell is built from it. The
+safetensors are never read (accelerate's ``load_state`` fills the shell after prepare), so the shell gets storage
+instead. Both checks run in ``decide_run_mode``, before any build.
 
 ``build_architecture_from_ckpt_dir`` is stubbed out (the real one builds a multi-GB skeleton), so these run on
 CPU with no checkpoint; everything up to it — reading the ckpt config, the comparison — is real.
@@ -112,8 +113,19 @@ def _live_cfg(**patch):
     return resolve_config(cfg)
 
 
+def _finetune(source, **patch):
+    """Decide FINETUNE from ``source`` on a live launch (``patch`` as in :func:`_live_cfg`), then build.
+
+    Returns:
+        (cfg, architecture): the resolved launch config and what ``build_training_architecture`` returned.
+    """
+    cfg = _live_cfg(training__finetune_ckpt_path=source, **patch)
+    run_mode, ckpt_path = cml.decide_run_mode(cfg)
+    return cfg, cml.build_training_architecture(run_mode, ckpt_path, cfg, TEST_TRAIN_OPTIONS)
+
+
 def _resume_cfg(tmp_path, **patch):
-    """A resume launch: the run's saved config (minus its derived layout), patched, re-resolved.
+    """A resume launch of the run dir ``tmp_path``: its saved config (minus the derived layout), patched, re-resolved.
 
     Args:
         tmp_path: the ckpt (run) dir.
@@ -124,6 +136,7 @@ def _resume_cfg(tmp_path, **patch):
     """
     cfg = OmegaConf.load(tmp_path / "config.yaml")
     del cfg.common["layout"]
+    cfg.training.resume_ckpt_path = str(tmp_path)
     for dotted, val in patch.items():
         OmegaConf.update(cfg, dotted.replace("__", "."), val, force_add=True)
     return resolve_config(cfg)
@@ -160,12 +173,12 @@ def test_finetune_lists_every_difference(tmp_path, capture):
     _edit_saved(tmp_path, lambda c: c.model.action_backbone.pop("ffn_dim"))
 
     with pytest.raises(ValueError, match="on 3 key") as err:
-        cml.build_for_finetune(ckpt_dir, _live_cfg(), TEST_TRAIN_OPTIONS)
+        _finetune(ckpt_dir)
 
     msg = str(err.value)
-    assert "model.architecture.clean_attention: ckpt='causal' launch='bidirectional'" in msg
-    assert "model.video_backbone.extra: ckpt=1 launch='<absent>'" in msg
-    assert "model.action_backbone.ffn_dim: ckpt='<absent>' launch=4096" in msg
+    assert "model.architecture.clean_attention: saved='causal' launch='bidirectional'" in msg
+    assert "model.video_backbone.extra: saved=1 launch='<absent>'" in msg
+    assert "model.action_backbone.ffn_dim: saved='<absent>' launch=4096" in msg
     assert "model_cfg" not in capture, "the check runs before the shell is built"
 
 
@@ -173,21 +186,19 @@ def test_finetune_compares_common_but_not_layout(tmp_path, capture):
     """``common`` is decisive config; ``common.layout`` is derived from the compared keys, so it is not compared."""
     ckpt_dir = _write_ckpt_cfg(tmp_path)
     _edit_saved(tmp_path, lambda c: OmegaConf.update(c, "common.x", 1, force_add=True))
-    with pytest.raises(ValueError, match=r"common\.x: ckpt=1 launch='<absent>'"):
-        cml.build_for_finetune(ckpt_dir, _live_cfg(), TEST_TRAIN_OPTIONS)
+    with pytest.raises(ValueError, match=r"common\.x: saved=1 launch='<absent>'"):
+        _finetune(ckpt_dir)
 
     # Only the layout differs: no error.
     _edit_saved(tmp_path, lambda c: c.common.pop("x"))
     _edit_saved(tmp_path, lambda c: OmegaConf.update(c, "common.layout.num_latents", 99))
-    cml.build_for_finetune(ckpt_dir, _live_cfg(), TEST_TRAIN_OPTIONS)
+    _finetune(ckpt_dir)
 
 
 def test_finetune_same_model_builds_from_live_cfg(tmp_path, capture):
     """A matching launch builds the shell from its own merge(common, model) slice and loads the weights once."""
     ckpt_dir = _write_ckpt_cfg(tmp_path)
-    cfg = _live_cfg()
-
-    cml.build_for_finetune(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
+    cfg, _ = _finetune(ckpt_dir)
 
     assert capture["model_cfg"] == OmegaConf.merge(cfg.common, cfg.model)
     assert capture["model_cfg"].layout.num_latents == 3 and capture["model_cfg"].action_dim == 80
@@ -200,9 +211,7 @@ def test_finetune_same_model_builds_from_live_cfg(tmp_path, capture):
 def test_finetune_allows_training_and_dataloader_differences(tmp_path, capture):
     """A new run may change how it trains and samples (the layout follows; it is not compared)."""
     ckpt_dir = _write_ckpt_cfg(tmp_path)
-    cfg = _live_cfg(training__learning_rate=3e-5, dataloader__history_offsets=[-4, 0])
-
-    cml.build_for_finetune(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
+    _finetune(ckpt_dir, training__learning_rate=3e-5, dataloader__history_offsets=[-4, 0])
 
     assert capture["model_cfg"].layout.num_hist_frames == 2
 
@@ -210,9 +219,7 @@ def test_finetune_allows_training_and_dataloader_differences(tmp_path, capture):
 def test_finetune_ignores_assets(tmp_path, capture):
     """Another host keeps the upstream files elsewhere: a different assets.video_backbone.model_path is no difference."""
     ckpt_dir = _write_ckpt_cfg(tmp_path)
-    cfg = _live_cfg(assets__video_backbone__model_path="/other-host/Wan2.2-TI2V-5B")
-
-    cml.build_for_finetune(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
+    _finetune(ckpt_dir, assets__video_backbone__model_path="/other-host/Wan2.2-TI2V-5B")
 
     assert capture["loaded"] == ["w.safetensors"]
     assert "assets" not in capture["model_cfg"]
@@ -224,7 +231,7 @@ def test_explicit_weights_file_is_loaded(tmp_path, capture):
     weights = tmp_path / "checkpoint_step_7.safetensors"
     weights.write_bytes(b"")
 
-    cml.build_for_finetune(str(weights), _live_cfg(), TEST_TRAIN_OPTIONS)
+    _finetune(str(weights))
 
     assert capture["ckpt_dir"] == ckpt_dir
     assert capture["loaded"] == [str(weights)]
@@ -235,7 +242,7 @@ def test_resume_builds_from_the_run_config(tmp_path, capture):
     ckpt_dir = _write_ckpt_cfg(tmp_path)
     cfg = resolve_config(OmegaConf.load(tmp_path / "config.yaml"))
 
-    architecture = cml.build_for_resume(ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
+    architecture = cml.build_training_architecture(cml.RunMode.RESUME, ckpt_dir, cfg, TEST_TRAIN_OPTIONS)
 
     assert architecture is not None and not isinstance(architecture, tuple)
     assert capture["model_cfg"] == OmegaConf.merge(cfg.common, cfg.model)
@@ -244,22 +251,22 @@ def test_resume_builds_from_the_run_config(tmp_path, capture):
 
 
 def test_resume_rejects_a_differing_launch(tmp_path):
-    """A launch that differs from the saved config raises in load_resume_cfg (before any build)."""
-    ckpt_dir = _write_ckpt_cfg(tmp_path)
+    """A launch that differs from the saved config raises in decide_run_mode (before any build)."""
+    _write_ckpt_cfg(tmp_path)
     cfg = _resume_cfg(tmp_path, model__architecture__clean_attention="causal")
     with pytest.raises(
         ValueError, match=r"model\.architecture\.clean_attention: saved='bidirectional' launch='causal'"
     ):
-        cml.load_resume_cfg(cfg, ckpt_dir)
+        cml.decide_run_mode(cfg)
 
 
 def test_resume_rejects_layout_mismatch(tmp_path):
     """The whole-config check covers the layout and the dataloader keys it comes from."""
-    ckpt_dir = _write_ckpt_cfg(tmp_path)
+    _write_ckpt_cfg(tmp_path)
     cfg = _resume_cfg(tmp_path, dataloader__history_offsets=[-4, 0])  # H = 2 vs the ckpt's H = 1
 
     with pytest.raises(ValueError) as err:
-        cml.load_resume_cfg(cfg, ckpt_dir)
+        cml.decide_run_mode(cfg)
 
     msg = str(err.value)
     assert "common.layout.num_hist_frames: saved=1 launch=2" in msg
@@ -278,29 +285,23 @@ def test_resume_rejects_layout_mismatch(tmp_path):
 def test_resume_rejects_layout_source_value_change(tmp_path, key, value):
     """Same frame counts (same common.layout) but other dataloader values: the dataset would draw other rows than
     the ckpt was trained on, so resume raises and names the key with both values."""
-    ckpt_dir = _write_ckpt_cfg(tmp_path, dataloader__history_offsets=[-8, 0])
+    _write_ckpt_cfg(tmp_path, dataloader__history_offsets=[-8, 0])
     cfg = _resume_cfg(tmp_path, **{f"dataloader__{key}": value})
 
     with pytest.raises(ValueError, match=rf"dataloader\.{key}: saved=") as err:
-        cml.load_resume_cfg(cfg, ckpt_dir)
+        cml.decide_run_mode(cfg)
 
     assert "common.layout" not in str(err.value)
 
 
-@pytest.mark.parametrize(
-    "read",
-    [
-        lambda run_dir, cfg: cml.build_for_finetune(run_dir, cfg, TEST_TRAIN_OPTIONS),
-        lambda run_dir, cfg: cml.load_resume_cfg(cfg, run_dir),
-    ],
-    ids=["finetune", "resume"],
-)
-def test_ckpt_config_without_a_model_section_raises(tmp_path, capture, read):
-    """Not a run dir written by this trainer — say so instead of an AttributeError."""
+@pytest.mark.parametrize("switch", ["finetune_ckpt_path", "resume_ckpt_path"])
+def test_ckpt_config_without_a_model_section_raises(tmp_path, capture, switch):
+    """Not a run dir written by this trainer: every model key is listed as absent on the saved side."""
     OmegaConf.save(OmegaConf.create({"training": {"batch_size": 4}}), tmp_path / "config.yaml")
 
-    with pytest.raises(ValueError, match="no `model:` section"):
-        read(str(tmp_path), _live_cfg())
+    with pytest.raises(ValueError, match=r"model\.architecture\.framework: saved='<absent>'"):
+        cml.decide_run_mode(_live_cfg(**{f"training__{switch}": str(tmp_path)}))
+    assert "model_cfg" not in capture
 
 
 def test_build_architecture_from_ckpt_dir_uses_checkpoint_mode(tmp_path, monkeypatch):
@@ -373,7 +374,7 @@ def test_trainer_finetune_freezes_from_training_freeze(tmp_path, monkeypatch):
     frozen: dict = {}
     _stub_trainer_arch(monkeypatch, frozen)
 
-    run_mode, ckpt_path = cml.decide_run_mode(cfg.training)
+    run_mode, ckpt_path = cml.decide_run_mode(cfg)
     assert (run_mode, ckpt_path) == (cml.RunMode.FINETUNE, ckpt_dir)
     OpenWAMTrainer(cfg, cpu_accelerator(), None, run_mode, ckpt_path, rank=0)
 
@@ -388,23 +389,27 @@ def test_trainer_finetune_freezes_from_training_freeze(tmp_path, monkeypatch):
     assert frozen["names"] == ["video_backbone.vae"]
 
 
-@pytest.mark.parametrize(
-    "finetune, resume, want",
-    [(None, None, "FRESH"), ("ft", None, "FINETUNE"), (None, "run", "RESUME")],
-)
-def test_decide_run_mode(tmp_path, finetune, resume, want):
+@pytest.mark.parametrize("want", ["FRESH", "FINETUNE", "RESUME"])
+def test_decide_run_mode(tmp_path, want):
     """The two ckpt-path switches decide the mode once; resume hands on the run dir, finetune the source as given."""
-    paths = {"ft": str(tmp_path / "ft"), "run": str(tmp_path)}
-    training = OmegaConf.create(
-        {"finetune_ckpt_path": paths.get(finetune), "resume_ckpt_path": paths.get(resume)}
-    )
-    run_mode, ckpt_path = cml.decide_run_mode(training)
-    assert run_mode is cml.RunMode[want]
-    assert ckpt_path == paths.get(finetune or resume)
+    ckpt_dir = _write_ckpt_cfg(tmp_path)
+    cfg = {
+        "FRESH": lambda: _live_cfg(),
+        "FINETUNE": lambda: _live_cfg(training__finetune_ckpt_path=ckpt_dir),
+        "RESUME": lambda: _resume_cfg(tmp_path),
+    }[want]()
+    assert cml.decide_run_mode(cfg) == (cml.RunMode[want], None if want == "FRESH" else ckpt_dir)
+
+
+def test_finetune_source_must_exist(tmp_path):
+    """A typo'd weights file fails when the mode is decided, not after the skeleton is built."""
+    _write_ckpt_cfg(tmp_path)
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        cml.decide_run_mode(_live_cfg(training__finetune_ckpt_path=str(tmp_path / "checkpoint_step_9.safetensors")))
 
 
 def test_decide_run_mode_rejects_both(tmp_path):
     """finetune and resume are mutually exclusive."""
-    training = OmegaConf.create({"finetune_ckpt_path": str(tmp_path), "resume_ckpt_path": str(tmp_path)})
+    cfg = OmegaConf.create({"training": {"finetune_ckpt_path": str(tmp_path), "resume_ckpt_path": str(tmp_path)}})
     with pytest.raises(ValueError, match="mutually exclusive"):
-        cml.decide_run_mode(training)
+        cml.decide_run_mode(cfg)

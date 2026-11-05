@@ -1,71 +1,36 @@
-"""Run mode (fresh / finetune / resume) and the training architecture each mode builds.
+"""Run mode (fresh / finetune / resume): decided and checked once, then the training architecture each mode builds.
 
-``scripts/train.py`` decides the mode once (:func:`decide_run_mode`) from ``training.finetune_ckpt_path`` /
-``training.resume_ckpt_path`` and hands ``(run_mode, ckpt_path)`` to the trainer, which builds its architecture with
-:func:`build_training_architecture`:
+``scripts/train.py`` calls :func:`decide_run_mode` on the resolved launch config and hands ``(run_mode, ckpt_path)``
+to the trainer, which builds its architecture with :func:`build_training_architecture`:
 
   - FRESH: the upstream pretrained backbone weights (``assets.video_backbone``).
-  - FINETUNE (:func:`build_for_finetune`, a new run from these weights): the launch's ``model`` + ``common`` (minus
-    the derived ``common.layout``) must equal the checkpoint's key by key (:func:`check_finetune_cfg`);
-    ``training`` / ``dataloader`` may differ. Then a strict ``load_checkpoint`` of the requested / latest safetensors.
-  - RESUME (:func:`build_for_resume`, the same run continued): ``scripts/train.py`` already runs the run's own
-    config (:func:`load_resume_cfg`, which compares the whole config once), so the launch config IS the saved one.
-    Storage is given to the meta shell (``materialize_meta``); accelerate's ``load_state`` fills it after ``prepare``.
+  - FINETUNE (a new run from a checkpoint's weights): the launch's ``model`` + ``common`` (minus the derived
+    ``common.layout``) must equal the checkpoint's; ``training`` / ``dataloader`` may differ. Then a strict
+    ``load_checkpoint`` of the named / latest safetensors.
+  - RESUME (the same run continued): the whole launch config must equal the run's ``config.yaml`` except the
+    ``RESUME_LAUNCH_KEYS``, so the launch config IS the run's config and trains as is. Storage is given to the meta
+    shell (``materialize_meta``); accelerate's ``load_state`` fills it after ``prepare``.
 
 Finetune / resume build the shell with the same :func:`openwam.model.build_architecture_from_ckpt_dir` the deploy
-loader uses: module skeletons from the model config (yaml geometry), non-weight assets (tokenizers / processors /
-third-party ``config.json``) from the checkpoint dir, so the original pretrained backbone directory
-(``assets.video_backbone.model_path``) need not exist on the training host. Nothing is merged or written back.
+loader uses: module skeletons from the model config, non-weight assets (tokenizers / processors / third-party
+``config.json``) from the checkpoint dir, so the upstream backbone dir need not exist on the training host.
 """
 
 import enum
 import logging
 import os
-from typing import Any
 
-from omegaconf import DictConfig, OmegaConf, open_dict
+from omegaconf import DictConfig, OmegaConf
 
-from openwam.config import cfg_get
+from openwam.config.diff import check_same_cfg
 from openwam.model.architectures.base import BaseWAMArchitecture, TrainOptions
 from openwam.train.checkpointing import find_latest_weights
 
 logger = logging.getLogger(__name__)
 
-
-def _resolve_ckpt_path(source: str) -> tuple[str, str | None]:
-    """Split a finetune source.
-
-    Args:
-        source: str, a checkpoint dir or one of its ``checkpoint_step_*.safetensors`` files.
-
-    Returns:
-        (ckpt_dir, explicit_weights): the dir, and the file when one was named (else None).
-    """
-    source = os.fspath(source)
-    if source.endswith(".safetensors"):
-        # Fail fast on a typo'd filename — otherwise safetensors only errors
-        # after minutes of architecture-skeleton construction.
-        if not os.path.isfile(source):
-            raise FileNotFoundError(f"Explicit checkpoint weights file does not exist: {source}")
-        return os.path.dirname(os.path.abspath(source)), os.path.abspath(source)
-    return source, None
-
-
-def _resume_dir(source: str) -> str:
-    """Check a resume source names a run dir (resume always continues from the latest accel state in it).
-
-    Args:
-        source: str, ``training.resume_ckpt_path``.
-
-    Returns:
-        str, the run dir (unchanged). Raises ValueError when it is not an existing directory.
-    """
-    if not os.path.isdir(source):
-        raise ValueError(
-            f"training.resume_ckpt_path={source!r} is not a directory: resume continues a run dir (its latest "
-            "accel_state_step_*). To start a new run from a weights file use training.finetune_ckpt_path."
-        )
-    return source
+# Keys a resume launch legitimately sets differently from the run's config.yaml: where to resume from, and the
+# fresh-run dir fields a resume launch drops (the run dir is resume_ckpt_path's).
+RESUME_LAUNCH_KEYS = ("training.resume_ckpt_path", "training.output_path", "training.run_dir_name")
 
 
 class RunMode(enum.Enum):
@@ -76,282 +41,59 @@ class RunMode(enum.Enum):
     RESUME = "resume"
 
 
-def decide_run_mode(training: DictConfig) -> tuple[RunMode, str | None]:
-    """The run mode and its checkpoint source, decided once from the two ckpt-path switches (null = off).
+def decide_run_mode(cfg: DictConfig) -> tuple[RunMode, str | None]:
+    """The run mode from the two ckpt-path switches (null = off), with its source checked against this launch.
 
     Args:
-        training: ``cfg.training`` (``finetune_ckpt_path``, ``resume_ckpt_path``; resolve_config rejects "").
+        cfg: DictConfig, the launch's whole run config after ``resolve_config`` (carries ``common.layout``);
+            ``training.finetune_ckpt_path`` / ``training.resume_ckpt_path`` pick the mode.
 
     Returns:
-        (run_mode, ckpt_path): FRESH with None; FINETUNE with the finetune source (a run dir or one
-        ``checkpoint_step_*.safetensors`` in it); RESUME with the run dir (ValueError when it is not a directory).
-        ValueError when both switches are set.
+        (run_mode, ckpt_path): FRESH with None; FINETUNE with the source as given (a run dir, or one
+        ``checkpoint_step_*.safetensors`` in it); RESUME with the run dir. Raises ValueError when both switches are
+        set, a resume source is not a directory, or the source's ``config.yaml`` differs where it must not
+        (finetune: ``model`` + ``common`` minus the layout; resume: everything but ``RESUME_LAUNCH_KEYS``).
     """
-    finetune_path, resume_path = training.finetune_ckpt_path, training.resume_ckpt_path
+    finetune_path, resume_path = cfg.training.finetune_ckpt_path, cfg.training.resume_ckpt_path
     if finetune_path is not None and resume_path is not None:
         raise ValueError("finetune_ckpt_path and resume_ckpt_path are mutually exclusive; set at most one.")
+
     if finetune_path is not None:
-        return RunMode.FINETUNE, str(finetune_path)
-    if resume_path is not None:
-        return RunMode.RESUME, _resume_dir(str(resume_path))
-    return RunMode.FRESH, None
-
-
-# ----------------------------------------------------------------------------
-# config comparison (finetune: model + common; resume: the whole config)
-# ----------------------------------------------------------------------------
-
-# Cap on a single value's printed length in the diff report: long lists (e.g. the
-# cosmos3 VAE latents_mean) would bury the keys that actually changed.
-_DIFF_VALUE_MAXLEN = 110
-# Placeholder for the side of a difference that lacks the key.
-ABSENT = "<absent>"
-# Keys a resume launch legitimately sets differently from the run's config.yaml: where to resume
-# from, and the fresh-run dir fields a resume launch drops (the run dir is resume_ckpt_path's).
-RESUME_LAUNCH_KEYS = ("training.resume_ckpt_path", "training.output_path", "training.run_dir_name")
-# Subtrees only the saved config.yaml carries: resolve_config derives the layout and writes it before save_config.
-# Derived, so finetune does not compare it either (its sources are compared, or may differ on purpose).
-SAVED_ONLY_KEYS = ("common.layout",)
-
-
-def _flatten_cfg(node, prefix: str = "") -> dict:
-    """Flatten a plain-container config into ``{dotted.key: leaf}``.
-
-    Lists stay leaves: per-index keys would bury the real diff.
-
-    Args:
-        node: dict (or None), a plain container from ``OmegaConf.to_container``.
-        prefix: str prepended to every key (``"model."`` etc.).
-
-    Returns:
-        dict ``{dotted.key: leaf}``; an empty dict value is a leaf.
-    """
-    flat: dict = {}
-    for key, val in (node or {}).items():
-        path = f"{prefix}{key}"
-        if isinstance(val, dict) and val:
-            flat.update(_flatten_cfg(val, prefix=f"{path}."))
-        else:
-            flat[path] = val
-    return flat
-
-
-def _short(val) -> str:
-    """``repr(val)`` cut to ``_DIFF_VALUE_MAXLEN`` characters (for diff reports).
-
-    Args:
-        val: any config leaf.
-
-    Returns:
-        str, the (possibly truncated) repr.
-    """
-    text = repr(val)
-    return text if len(text) <= _DIFF_VALUE_MAXLEN else text[: _DIFF_VALUE_MAXLEN - 3] + "..."
-
-
-def _under(key: str, prefixes: tuple) -> bool:
-    """True if dotted ``key`` is one of ``prefixes`` or lies below one of them."""
-    return any(key == p or key.startswith(p + ".") for p in prefixes)
-
-
-def _diff_flat(saved: dict, live: dict) -> list[tuple[str, Any, Any]]:
-    """Every key where two flat configs disagree.
-
-    Args:
-        saved: dict ``{dotted.key: leaf}``, the checkpoint's side.
-        live: dict ``{dotted.key: leaf}``, the launch's side.
-
-    Returns:
-        list of ``(dotted_key, saved_value, live_value)`` sorted by key; a side that lacks the key holds ``ABSENT``.
-    """
-    diffs = []
-    for key in sorted(saved.keys() | live.keys()):
-        s, v = saved.get(key, ABSENT), live.get(key, ABSENT)
-        if s != v:
-            diffs.append((key, s, v))
-    return diffs
-
-
-def model_identity(cfg: DictConfig) -> dict:
-    """The keys that decide what the model is: ``model`` and ``common`` minus the derived ``common.layout``.
-
-    Args:
-        cfg: DictConfig, a whole run config (a checkpoint's config.yaml or the launch config).
-
-    Returns:
-        dict ``{"model.<dotted>": leaf, "common.<dotted>": leaf}`` with interpolations evaluated (compare what the
-        values are, not how the yaml spells them); lists stay leaves. KeyError when ``model`` / ``common`` is missing.
-    """
-    flat: dict = {}
-    for section in ("model", "common"):
-        flat.update(_flatten_cfg(OmegaConf.to_container(cfg_get(cfg, section), resolve=True), prefix=f"{section}."))
-    # The layout is derived from model / dataloader keys: not a decision of its own.
-    return {k: v for k, v in flat.items() if not _under(k, SAVED_ONLY_KEYS)}
-
-
-def check_finetune_cfg(ckpt_cfg: DictConfig, live_cfg: DictConfig, path: str) -> None:
-    """Raise if a finetune launch's model / common config differs from the checkpoint's.
-
-    The shell is built from the launch config and the checkpoint's weights loaded strictly into it, so the two
-    must describe the same model; any intended model change is a new config for a new pretraining, not a finetune.
-
-    Args:
-        ckpt_cfg: DictConfig, the checkpoint's ``config.yaml``.
-        live_cfg: DictConfig, the launch config (resolved).
-        path: str, path of the checkpoint's ``config.yaml`` (for the message).
-
-    Returns:
-        None; raises ValueError listing every differing key as ``  <key>: ckpt=<v> launch=<v>``.
-    """
-    diffs = _diff_flat(model_identity(ckpt_cfg), model_identity(live_cfg))
-    if not diffs:
-        return
-    lines = "\n".join(f"  {k}: ckpt={_short(s)} launch={_short(v)}" for k, s, v in diffs)
-    raise ValueError(
-        f"[finetune] this launch's model / common config differs from {path} on {len(diffs)} key(s); the "
-        f"checkpoint's weights only fit the model they were trained as, so set these keys to the checkpoint's "
-        f"values:\n{lines}"
-    )
-
-
-def diff_resume_cfg(saved_cfg: DictConfig, live_cfg: DictConfig) -> list:
-    """Every key where a resume launch's config disagrees with the run's saved config.yaml.
-
-    Args:
-        saved_cfg: DictConfig, the run's ``config.yaml``.
-        live_cfg: DictConfig, the config this launch composed (yaml defaults + CLI).
-
-    Returns:
-        sorted list of ``(dotted_key, saved_value, live_value)``; a side that lacks the key holds
-        ``ABSENT``. ``RESUME_LAUNCH_KEYS`` and saved-only ``SAVED_ONLY_KEYS`` are not differences.
-    """
-    # Unresolved: compare what the yaml says, not what interpolations evaluate to on this host.
-    saved = _flatten_cfg(OmegaConf.to_container(saved_cfg, resolve=False))
-    live = _flatten_cfg(OmegaConf.to_container(live_cfg, resolve=False))
-    return [
-        (k, s, v)
-        for k, s, v in _diff_flat(saved, live)
-        if not (_under(k, RESUME_LAUNCH_KEYS) or (v == ABSENT and _under(k, SAVED_ONLY_KEYS)))
-    ]
-
-
-def check_resume_cfg(saved_cfg: DictConfig, live_cfg: DictConfig, path: str) -> None:
-    """Raise if a resume launch's config differs from the run's saved config.yaml.
-
-    Args:
-        saved_cfg: DictConfig, the run's ``config.yaml``.
-        live_cfg: DictConfig, the config this launch composed.
-        path: str, path of ``config.yaml`` (for the message).
-
-    Returns:
-        None; raises ValueError listing every differing key.
-    """
-    diffs = diff_resume_cfg(saved_cfg, live_cfg)
-    if not diffs:
-        return
-    lines = "\n".join(f"  {k}: saved={_short(s)} launch={_short(v)}" for k, s, v in diffs)
-    raise ValueError(
-        f"[resume] this launch's config differs from {path} on {len(diffs)} key(s); a resume must run "
-        f"the run's own config (use training.finetune_ckpt_path to start a new run from these weights "
-        f"with a different config):\n{lines}"
-    )
-
-
-def load_resume_cfg(live_cfg: DictConfig, run_dir: str) -> DictConfig:
-    """The config a resume runs with: the run's saved ``config.yaml``, which the launch must match.
-
-    A resume continues ONE run, so every section (model, training, dataloader, project) comes from
-    the file the run started with. Any other difference between this launch's config and that file
-    (changed code defaults, a new CLI override) raises instead of silently changing the run.
-
-    Args:
-        live_cfg: DictConfig, the config this launch composed.
-        run_dir: str, the run dir :func:`decide_run_mode` returned for RESUME.
-
-    Returns:
-        DictConfig, the saved config with the ``RESUME_LAUNCH_KEYS`` taken from ``live_cfg``.
-    """
-    path = os.path.join(run_dir, "config.yaml")
-    saved = _load_ckpt_cfg(run_dir)
-    check_resume_cfg(saved, live_cfg, path)
-    # Only the resume-location keys come from the launch (written into the just-loaded file, before resolve_config).
-    with open_dict(saved):
-        for key in RESUME_LAUNCH_KEYS:
-            OmegaConf.update(saved, key, cfg_get(live_cfg, key), force_add=True)
-    return saved
-
-
-def _load_ckpt_cfg(ckpt_dir: str) -> DictConfig:
-    """Read a run dir's ``config.yaml`` as written (not resolved).
-
-    Args:
-        ckpt_dir: str, checkpoint (run) dir.
-
-    Returns:
-        DictConfig. Raises ValueError when it has no ``model`` section (not a dir written by this trainer).
-    """
-    path = os.path.join(ckpt_dir, "config.yaml")
-    ckpt_cfg = OmegaConf.load(path)
-    if "model" not in ckpt_cfg:
-        raise ValueError(
-            f"{path} has no `model:` section, so there is nothing to build the architecture from. Point "
-            "training.finetune_ckpt_path / resume_ckpt_path at a run directory written by this trainer."
+        source = str(finetune_path)
+        # A weights file names its run dir; a typo'd file fails here, not after minutes of skeleton building.
+        if not os.path.exists(source):
+            raise FileNotFoundError(f"training.finetune_ckpt_path={source!r} does not exist")
+        path = os.path.join(source if os.path.isdir(source) else os.path.dirname(source), "config.yaml")
+        saved = OmegaConf.load(path)
+        # The model's identity, interpolations evaluated (what the values are, not how the yaml spells them).
+        saved, live = ({k: OmegaConf.to_container(c[k], resolve=True) for k in ("model", "common") if k in c}
+                       for c in (saved, cfg))
+        check_same_cfg(
+            saved, live, ignore=("common.layout",),
+            context=f"[finetune] the checkpoint's weights only fit the model they were trained as; set these keys "
+                    f"to {path}'s values. This launch's model / common config differs",
         )
-    return ckpt_cfg
+        return RunMode.FINETUNE, source
 
+    if resume_path is not None:
+        run_dir = str(resume_path)
+        if not os.path.isdir(run_dir):
+            raise ValueError(
+                f"training.resume_ckpt_path={run_dir!r} is not a directory: resume continues a run dir (its latest "
+                "accel_state_step_*). To start a new run from a weights file use training.finetune_ckpt_path."
+            )
+        path = os.path.join(run_dir, "config.yaml")
+        # Unresolved on both sides: compare what the yaml says, not what interpolations evaluate to on this host.
+        check_same_cfg(
+            OmegaConf.to_container(OmegaConf.load(path), resolve=False),
+            OmegaConf.to_container(cfg, resolve=False),
+            ignore=RESUME_LAUNCH_KEYS,
+            context=f"[resume] a resume must run the run's own config (use training.finetune_ckpt_path to start a "
+                    f"new run from these weights with a different config); this launch differs from {path}",
+        )
+        return RunMode.RESUME, run_dir
 
-def build_for_finetune(source: str, cfg: DictConfig, train_options: TrainOptions) -> BaseWAMArchitecture:
-    """Warm-start: the launch config's architecture (checked equal to the checkpoint's), weights loaded strictly.
-
-    Args:
-        source: str, ``training.finetune_ckpt_path`` (a run dir, or one ``checkpoint_step_*.safetensors`` in it).
-        cfg: the launch run config, resolved and read-only; its ``model`` + ``common`` must equal the
-            checkpoint's (:func:`check_finetune_cfg`); ``merge(cfg.common, cfg.model)`` builds the shell.
-        train_options: TrainOptions the trainer decided (passed to the architecture constructor).
-
-    Returns:
-        BaseWAMArchitecture with every weight loaded from the requested / latest safetensors.
-    """
-    from openwam.model import build_architecture_from_ckpt_dir
-
-    ckpt_dir, explicit_weights = _resolve_ckpt_path(source)
-    # Compare before building: a differing model would fail the strict load only after minutes of construction.
-    check_finetune_cfg(_load_ckpt_cfg(ckpt_dir), cfg, os.path.join(ckpt_dir, "config.yaml"))
-    logger.info("[finetune] building architecture from ckpt dir: %s", ckpt_dir)
-    architecture = build_architecture_from_ckpt_dir(ckpt_dir, OmegaConf.merge(cfg.common, cfg.model), train_options)
-    weights = explicit_weights or find_latest_weights(ckpt_dir)
-    # Plain print so the warm-start is visible on the launch terminal even
-    # when logger output is drowned out; non-main ranks have print disabled.
-    print(f"[finetune] loading pretrained weights: {weights}", flush=True)
-    architecture.load_checkpoint(weights)
-    print("[finetune] pretrained weights loaded OK", flush=True)
-    return architecture
-
-
-def build_for_resume(run_dir: str, cfg: DictConfig, train_options: TrainOptions) -> BaseWAMArchitecture:
-    """Resume: the run's own architecture, with zeroed storage for accelerate ``load_state`` to fill.
-
-    The safetensors are not read: ``load_state`` restores a strict superset (module weights incl. frozen
-    params) after ``prepare``, and the latest safetensors may be truncated by a mid-save kill even though the
-    run is still recoverable from its accel state.
-
-    Args:
-        run_dir: str, the run dir :func:`decide_run_mode` returned for RESUME.
-        cfg: the run config from :func:`load_resume_cfg` (already compared with the saved config.yaml), resolved
-            and read-only; ``merge(cfg.common, cfg.model)`` builds the shell.
-        train_options: TrainOptions the trainer decided (passed to the architecture constructor).
-
-    Returns:
-        BaseWAMArchitecture with real (zero) storage everywhere and the shell's real buffers kept.
-    """
-    from openwam.model import build_architecture_from_ckpt_dir
-    from openwam.model.video_backbone.common.weights import materialize_meta
-
-    logger.info("[resume] building architecture from ckpt dir: %s", run_dir)
-    architecture = build_architecture_from_ckpt_dir(run_dir, OmegaConf.merge(cfg.common, cfg.model), train_options)
-    # set_dtype_device runs before load_state and cannot copy out of meta tensors.
-    materialize_meta(architecture, "cpu")
-    return architecture
+    return RunMode.FRESH, None
 
 
 def build_training_architecture(
@@ -360,28 +102,43 @@ def build_training_architecture(
     """The architecture a training run starts from, per run mode (the one place the mode picks the build).
 
     Args:
-        run_mode: RunMode from :func:`decide_run_mode`.
+        run_mode: RunMode from :func:`decide_run_mode` (which already checked the source).
         ckpt_path: str, that mode's checkpoint source (None for FRESH).
-        cfg: the run config, resolved and read-only.
+        cfg: the run config, resolved and read-only; ``merge(cfg.common, cfg.model)`` builds the shell.
         train_options: TrainOptions the trainer decided (passed to the architecture constructor).
 
     Returns:
         BaseWAMArchitecture: FRESH = upstream pretrained weights; FINETUNE = the checkpoint's weights loaded;
         RESUME = zeroed storage for ``load_state``. Weights land before the trainer's freeze.
     """
-    if run_mode is RunMode.FINETUNE:
-        return build_for_finetune(ckpt_path, cfg, train_options)
-    if run_mode is RunMode.RESUME:
-        return build_for_resume(ckpt_path, cfg, train_options)
-    from openwam.model import build_architecture
+    from openwam.model import build_architecture, build_architecture_from_ckpt_dir
     from openwam.model.video_backbone import LoadMode
+    from openwam.model.video_backbone.common.weights import materialize_meta
 
-    # The architecture's slice: the shared values (action / state dims, layout) under the model block;
-    # the upstream file paths come separately (assets, not part of the model).
-    return build_architecture(
-        OmegaConf.merge(cfg.common, cfg.model),
-        mode=LoadMode.PRETRAINED,
-        assets=cfg.assets.video_backbone,
-        ckpt_dir=None,
-        train_options=train_options,
-    )
+    # The architecture's slice: the shared values (action / state dims, layout) under the model block.
+    model_cfg = OmegaConf.merge(cfg.common, cfg.model)
+    if run_mode is RunMode.FRESH:
+        # The upstream file paths come separately (assets, not part of the model).
+        return build_architecture(
+            model_cfg, mode=LoadMode.PRETRAINED, assets=cfg.assets.video_backbone, ckpt_dir=None,
+            train_options=train_options,
+        )
+
+    # FINETUNE may name one weights file; its dir is the checkpoint dir.
+    is_file = run_mode is RunMode.FINETUNE and not os.path.isdir(ckpt_path)
+    ckpt_dir = os.path.dirname(os.path.abspath(ckpt_path)) if is_file else ckpt_path
+    logger.info("[%s] building architecture from ckpt dir: %s", run_mode.value, ckpt_dir)
+    architecture = build_architecture_from_ckpt_dir(ckpt_dir, model_cfg, train_options)
+
+    if run_mode is RunMode.FINETUNE:
+        weights = os.path.abspath(ckpt_path) if is_file else find_latest_weights(ckpt_dir)
+        # Plain print so the warm-start shows on the launch terminal (non-main ranks have print disabled).
+        print(f"[finetune] loading pretrained weights: {weights}", flush=True)
+        architecture.load_checkpoint(weights)
+        print("[finetune] pretrained weights loaded OK", flush=True)
+    else:
+        # RESUME: the safetensors are not read. load_state restores a strict superset (frozen params too) after
+        # prepare, and the latest safetensors may be truncated by a mid-save kill while the accel state is intact.
+        # set_dtype_device runs before load_state and cannot copy out of meta tensors, so give them storage.
+        materialize_meta(architecture, "cpu")
+    return architecture

@@ -15,7 +15,8 @@ parameter groups / step budget / LR schedule (``optim``), phase timing / metric 
 rollouts (``visualization``).
 
 Usage (``scripts/train.py``):
-    run_mode, ckpt_path = decide_run_mode(cfg.training)
+    resolve_config(cfg)
+    run_mode, ckpt_path = decide_run_mode(cfg)
     trainer = OpenWAMTrainer(cfg, accelerator, dataset, run_mode, ckpt_path, rank=rank)
     trainer.train()
 """

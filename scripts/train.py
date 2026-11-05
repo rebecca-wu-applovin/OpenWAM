@@ -101,18 +101,15 @@ def _build_trainer(cfg: DictConfig):
     """
     from openwam.config import resolve_config
     from openwam.dataloader.registry import build_dataset
-    from openwam.train.run_mode import RunMode, decide_run_mode, load_resume_cfg
+    from openwam.train.run_mode import decide_run_mode
     from openwam.train.seeding import seed_everything
     from openwam.train.trainer import OpenWAMTrainer
 
-    # Fresh / finetune / resume, decided here once; the trainer gets the decision, not the two cfg keys.
-    run_mode, ckpt_path = decide_run_mode(cfg.training)
-    if run_mode is RunMode.RESUME:
-        # A resume runs the run's own config.yaml (raises if this launch's config differs), so the
-        # dataset, trainer and wandb below are all built from what the run started with.
-        cfg = load_resume_cfg(cfg, ckpt_path)
     # The one place the run config's derived values (cfg.common.layout) are computed and checked.
     resolve_config(cfg)
+    # Fresh / finetune / resume, decided here once; the trainer gets the decision, not the two cfg keys. A resume
+    # raises unless this launch's config equals the run's config.yaml, so everything below runs the run's config.
+    run_mode, ckpt_path = decide_run_mode(cfg)
 
     # Seed Python random / numpy / torch BEFORE dataset construction so that
     # any reader-time randomness (e.g. lerobot splits) is reproducible.
