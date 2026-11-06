@@ -51,7 +51,7 @@ CPU="${CPU:-64}"
 MEMORY_GB="${MEMORY_GB:-512}"
 NUM_WORKERS="${NUM_WORKERS:-8}"   # per rank; 8 x 8 = 64 workers on 64 cores
 MODAL="${MODAL:-.venv/bin/modal}"
-SIMEVAL="${SIMEVAL:-1}"   # 1: also launch the sim-policy-eval watch for a new run (needs the deployed openwam-yjw-simeval app)
+SIMEVAL="${SIMEVAL:-1}"   # 1: also launch the sim-policy-eval watch for a new run (needs the deployed openwam-yjw-simeval-refactor app)
 "${MODAL}" profile activate axon >/dev/null   # make sure we launch in the team workspace
 
 if [[ "${1:-}" == "--debug" ]]; then

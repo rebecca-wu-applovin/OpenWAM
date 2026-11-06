@@ -15,12 +15,12 @@ evaluations, commits the results, and respawns the watch before Modal's 24 h cap
 The only thing read from the run here is the W&B project / group of its ``config.yaml``; the server reads the rest
 (action mode, canvas, history) from the same file, and its spec tells the client.
 
-    modal deploy scripts/modal/simeval_watch.py                               # after every code change (both repos)
+    modal deploy scripts/modal/simeval_watch.py                               # after every code change
     modal run scripts/modal/simeval_watch.py::smoke --run <group>/<index>_<name> [--step N] [--shards 2]   # 3 scenes
         (its own watch <run>_smoke, W&B project openwam-simeval-smoke group debug, exported to eval_step_<N>_smoke/)
     modal run scripts/modal/simeval_watch.py::launch --run <group>/<index>_<name> [--shards 16] [--intermediate split=id]
         (run_modal.sh calls this for every new run; the watch waits for the run's config.yaml if it is not there yet)
-    modal app logs openwam-yjw-simeval
+    modal app logs openwam-yjw-simeval-refactor
 
 ``--run`` is relative to openwam-runs:/yjw/outputs (run_modal.sh's run dir). Results: every finished checkpoint is
 exported to ``<run_dir>/eval_step_<N>/`` (videos + result.json per rollout, the summary) and its rollouts are then
@@ -36,7 +36,7 @@ from pathlib import Path
 
 import modal
 
-APP = "openwam-yjw-simeval"
+APP = "openwam-yjw-simeval-refactor"   # not the 1008 checkout's openwam-yjw-simeval: a deploy bakes in its serve.py
 REMOTE_REPO = "/opt/openwam"                 # this checkout (policy server), same path as the training image
 SIM_EVAL = "/opt/sim-policy-eval"            # the sibling sim-policy-eval checkout (the benchmark and watcher)
 RUNS, ASSETS, SCENES, RESULTS = "/runs", "/assets", "/scenes", "/results"
@@ -569,7 +569,7 @@ def _deployed(shards: int):
 @app.local_entrypoint()
 def launch(run: str, intermediate: str = "split=id", final: str = "split=id", shards: int = 16, workers: int = 4,
            extra: str = ""):
-    """Start watching a run on the deployed app; returns at once (follow: modal app logs openwam-yjw-simeval).
+    """Start watching a run on the deployed app; returns at once (follow: modal app logs openwam-yjw-simeval-refactor).
     The run may not exist yet: the watch polls for its config.yaml (up to CONFIG_WAIT_S), so it can be launched
     together with the training run. ``shards`` GPUs per scene set (0: one container), ``workers`` evaluate processes
     per GPU."""
