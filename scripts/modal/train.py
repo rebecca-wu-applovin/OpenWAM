@@ -84,7 +84,13 @@ def _merge_overrides(user_overrides: list[str]) -> list[str]:
     flags = [tok for tok in user_overrides if tok.startswith("-")]
     rest = [tok for tok in user_overrides if not tok.startswith("-")]
     user_keys = {tok.split("=", 1)[0].lstrip("+~") for tok in rest if "=" in tok}
-    defaults = [f"{k}={v}" for k, v in PATH_OVERRIDES.items() if k not in user_keys]
+    # Nodes the user deletes (e.g. `~dataloader.sources.gpt_rollout`): no path default under them, else the
+    # dropped source would still be staged and Hydra would set a key it then deletes.
+    deleted = {tok[1:].split("=", 1)[0] for tok in rest if tok.startswith("~")}
+    defaults = [
+        f"{k}={v}" for k, v in PATH_OVERRIDES.items()
+        if k not in user_keys and not any(k == d or k.startswith(d + ".") for d in deleted)
+    ]
     return flags + defaults + rest
 
 

@@ -1,5 +1,5 @@
-"""scripts/modal/train.py code shipping on local folders (no Modal calls): which checkout files a run ships, and a
-failed first attempt moved aside by _auto_resume leaves the launch's code/ with the fresh attempt."""
+"""scripts/modal/train.py on local folders (no Modal calls): which checkout files a run ships, a failed first attempt
+moved aside by _auto_resume leaves the launch's code/ with the fresh attempt, and path defaults skip deleted sources."""
 
 import importlib.util
 from pathlib import Path
@@ -43,3 +43,11 @@ def test_failed_attempt_moved_aside_keeps_the_code(tmp_path, monkeypatch):
     assert (run_dir / "code" / "openwam" / "__init__.py").exists() and not (run_dir / "config.yaml").exists()
     (aside,) = tmp_path.glob("outputs/g/0001_run.failed_*")
     assert (aside / "config.yaml").exists() and not (aside / "code").exists()
+
+
+def test_path_defaults_skip_a_deleted_source():
+    """`~dataloader.sources.gpt_rollout` drops that source's dataset_dir default (else it would be staged)."""
+    merged = _module()._merge_overrides(["~dataloader.sources.gpt_rollout", "training.batch_size=4"])
+    assert not any(t.startswith("dataloader.sources.gpt_rollout.") for t in merged)
+    assert "dataloader.sources.simteleop.dataset_dir=/data/simteleop_1004_fleet" in merged
+    assert merged[-2:] == ["~dataloader.sources.gpt_rollout", "training.batch_size=4"]
